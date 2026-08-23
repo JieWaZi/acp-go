@@ -1,9 +1,9 @@
 schema: comet.native.v4
 name: codex-runtime
 language: zh-CN
-phase: build
+phase: verify
 status: active
-state_version: 2
+state_version: 3
 brief: brief.md
 spec_changes:
   - capability: codex-runtime
@@ -15,7 +15,7 @@ workspace:
   target_branch: main
   finish: null
 loop:
-  stage: building
+  stage: verify-ready
   goal_cycle: 1
   iteration: 1
   attempt: 0
@@ -24,7 +24,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: submit-builder-candidate
+  next_action: run-required-checks-and-dispatch-verifier
 acceptance:
   - id: A1
     source: brief.md
@@ -210,7 +210,120 @@ acceptance:
     text: A13：early/stale/exit 竞态保护。
     result: pending
     reason: null
-builder_handoff: null
+builder_handoff:
+  candidate_id: 67d381f8-d447-443f-a5d5-0248eafc2a5b
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:4658a749-7830-4fa9-a0ed-ef793b9e22a9
+  iteration: 1
+  summary:
+    text: 基于固定 codex-acp ba5bcc3 与 acp-go-sdk v0.13.5 完成 Codex V1
+      runtime：用户预装可执行文件与版本探测、唯一 app-server、有界无 jsonrpc
+      NDJSON、initialize、thread/session generation 与 close
+      fence、prompt/early/stale completion、cancel/late interrupt、每 session FIFO
+      steering、process fatal fan-out、connection ready barrier，并接入 cmd
+      组合根。全部状态机与关键失败路径已用中文注释和确定性回归测试约束，UPSTREAM.md 记录直接映射与 Go 边界差异。提交
+      b5673e9e7f5ece1f64b9a3d3cb72a874a9381f7c。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+    - A9
+    - A10
+    - A11
+    - A12
+    - A13
+    - A14
+    - A15
+    - A16
+    - A17
+    - A18
+    - A19
+    - A20
+    - A21
+    - A22
+    - A23
+    - A24
+    - A25
+    - A26
+    - A27
+    - A28
+    - A29
+    - A30
+    - A31
+    - A32
+    - A33
+    - A34
+    - A35
+  checks:
+    - name:
+        text: gofmt + git diff --check
+        truncated: false
+      result: passed
+      note:
+        text: 全部修改 Go 文件已格式化，工作树差异无 whitespace 错误
+        truncated: false
+    - name:
+        text: go test ./... -count=1 -timeout=120s
+        truncated: false
+      result: passed
+      note:
+        text: 全部 6 个 package 通过
+        truncated: false
+    - name:
+        text: go test -race ./... -count=1 -timeout=240s
+        truncated: false
+      result: passed
+      note:
+        text: 全部 6 个 package 通过且无 data race
+        truncated: false
+    - name:
+        text: go vet ./...
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: go run ./tools/protocolgen --check
+        truncated: false
+      result: passed
+      note:
+        text: 已合并协议生成快照未被 runtime 手写绕过或改写
+        truncated: false
+    - name:
+        text: go build ./cmd/acp-agent
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: GOOS=linux GOARCH=amd64 go build ./cmd/acp-agent
+        truncated: false
+      result: passed
+      note:
+        text: best-effort 交叉构建
+        truncated: false
+    - name:
+        text: GOOS=windows GOARCH=amd64 go build ./cmd/acp-agent
+        truncated: false
+      result: passed
+      note:
+        text: best-effort 交叉构建
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 按 child brief 的明确 Non-goal，完整 events/tool/approval/config/auth mapper 留给
+        codex-events-config；本 runtime 仅路由 agent message/reasoning 文本，未安装
+        approval handler 时 app-server server request 会有界 fail-closed。
+      truncated: false
+    - text: 固定 TS initialize 的 experimentalApi 字段已被父协议阶段有意从稳定 V1 生成类型隐藏；runtime 不手写重复
+        DTO，差异已记录于 UPSTREAM.md。
+      truncated: false
+  known_limits_truncated: false
+  submitted_at: 2026-08-23T15:14:46.707Z
 blockers: []
 verification: null
 history: []
