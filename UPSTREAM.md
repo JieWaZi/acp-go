@@ -76,22 +76,29 @@ go run ./tools/protocolgen --check
 | `src/app-server/v2/TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` | 对应生成类型 | required thread/turn identity、输入数组和 steering precondition |
 | `src/app-server/v2/ThreadItem.ts`、`UserInput.ts` | `ThreadItem`、`UserInput` 及 discriminator enum | 消息、reasoning、command、file、MCP、Text/Image/Resource 相关 wire union |
 | `src/CodexAppServerClient.ts` 的 `initialize`、`turnStart`、`runTurn`、approval request handlers | 后续 JSON-RPC client/runtime；当前提供其所需具名协议类型 | 请求与响应配对、early completion 捕获、stale approval fail-closed 所需 identity 字段 |
-| `src/CodexApprovalHandler.ts` 的 `handleCommandExecution`、`handleFileChange`、`handlePermissionsRequest` | 后续 approval mapper；当前生成三类 Params/Response | 三类有效 decision union、失败时 cancel/reject 的 wire 形状 |
+| `src/CodexEventHandler.ts` 的 `handleNotification`、`createItemEvent`、`completeItemEvent`、`completeCommandExecutionEvent` | `internal/codex/event_router.go`、`event_handler.go` | typed method 分派、thread/turn/session identity、消息/reasoning/plan/usage 去重、terminal output fallback/exit 与 unknown 安全摘要 |
+| `src/CodexToolCallMapper.ts`、`CommandUtils.ts`、`TerminalOutputMode.ts` | `internal/codex/tool_mapper.go` | Command/File/MCP ToolCall、稳定 ID、终端/输出、raw input/output；file update/move 的有意 raw fallback 见下文 |
+| `src/CodexApprovalHandler.ts`、`ApprovalOptionId.ts` | `internal/codex/approval.go` | 三类 permission request/response、common permission meta、amendment option、全异常 fail closed 与 generation 双检 |
+| `src/AgentMode.ts`、`ModelConfigOption.ts`、`CodexAcpClient.ts` 的 model/session config helpers | `internal/codex/config.go` | read-only/agent/full-access 权限边界、model/reasoning option、未知选择失败 |
+| `src/CodexAcpClient.ts` 的 `buildPromptItems`、`imageDataUrl`、`formatUriAsLink` | `internal/codex/content.go` | ACP SDK Text/Image/Resource 到生成协议 input；Audio 按 V1 明确拒绝 |
+| `src/CodexAuthMethod.ts`、`CodexAcpClient.ts` 的 `authenticateWithApiKey`、`authenticateWithChatGpt`、`awaitNextLoginCompleted` | `internal/codex/auth.go` | 仅 API Key/ChatGPT、完成通知先订阅、取消 login、secret-safe 错误边界 |
 
 使用 Codex 0.148.0 `generate-ts` 重新生成后，以下固定 clone 文件均做过逐字节对照且完全一致：`ClientRequest.ts`、`ServerRequest.ts`、`ServerNotification.ts`、`ThreadStartParams.ts`、`ThreadResumeParams.ts`、`TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` 以及三类 approval Params。
 
 ## Fixture → Go 测试映射
 
-| codex-acp fixture | 约束的 Go surface/后续测试 |
+| codex-acp fixture/test | 约束的 Go surface/测试 |
 | --- | --- |
 | `src/__tests__/CodexACPAgent/data/send-attachments-turn-start.json` | `TurnStartParams`、`UserInput` 的 text、URL image、data URL 与 resource 转换 wire |
 | `src/__tests__/CodexACPAgent/data/load-session-history.json` | `ThreadReadResponse`、`ThreadItem` 历史消息/tool item；后续 load mapper fixture |
-| `src/__tests__/CodexACPAgent/data/approval-command-allow-once.json` | Command approval decision union 与 raw params |
-| `src/__tests__/CodexACPAgent/data/approval-file-change.json` | File Change approval Params/Response 与 grantRoot nullable |
-| `src/__tests__/CodexACPAgent/data/approval-permissions-request.json` | Permissions profile、session/turn grant 与 reject decision |
-| `src/__tests__/CodexACPAgent/data/agent-message-phases.json` | notification/item discriminator 与 commentary/final phase 字段 |
-| `src/__tests__/CodexACPAgent/data/terminal-full-flow.json` | item/commandExecution lifecycle、output delta 与 typed `ThreadItem` |
-| `src/__tests__/CodexACPAgent/data/reasoning-deltas-and-section-break.json` | reasoning 三类 delta 通知与 method/params 分派 |
+| `approval-command-allow-once.json`、`approval-command-*.json`、`approval-file-change.json`、`approval-permissions-request.json` 及 `approval-events.test.ts` | `approval_test.go` 的三类有效 option/decision、grantRoot、policy amendment、空 permission meta、取消/异常/stale fail closed |
+| `agent-message-phases.json`、`reasoning-deltas-and-section-break.json`、`reasoning-completed-parts.json` | `event_handler_test.go` 的 message phase、reasoning section break、delta/completed 去重与 fallback |
+| `plan-checklist-update.json`、`plan-completed-fallback.json`、`token-usage-session-update*.json` | plan checklist、usage latest snapshot 与跨 turn 隔离 |
+| `terminal-full-flow.json`、`terminal-output-completion-fallback.json`、`terminal-output-events.test.ts` | `tool_mapper_test.go` 的 started→delta→completed 顺序、无 delta 聚合输出回退、`terminal_exit` 与完成重放 exactly-once |
+| `command-action-events.test.ts`、`file-change-events.test.ts` 及其 snapshots | parsed Command action、File add/delete rich diff 与 update/move typed raw 保留 |
+| `mcp-session.test.ts`、`mcp-tool-in-progress.json`、`mcp-tool-repeated-progress.json`、`mcp-tool-completed-with-logs.json` | MCP title、稳定 ToolCallID、重复 progress、typed raw input/output 与终态 |
+| `session-config-options.test.ts` | `config_test.go` 的三模式安全边界、model/effort 保留/回退与未知选择错误 |
+| `initialize.test.ts` 和 `CodexAcpClient.test.ts` API Key/ChatGPT cases | `auth_test.go` 的 V1 method 声明、凭据优先级、subscribe-before-start、取消 login 与 secret-safe 失败 |
 
 固定 clone 中 `input-server-events.json` 是 0 字节占位文件，不作为回归证据。当前 `protocol_test.go` 锁住 envelope method/params 耦合、typed Item、optional+nullable 三态、tagged discriminator、登录完成通知和审批 union 往返。运行时子变更应直接移植上表非空 fixture 的完整行为断言，而不是在协议生成层重复 mapper 逻辑。
 
@@ -103,13 +110,18 @@ go run ./tools/protocolgen --check
 - 空 object response 生成 `map[string]json.RawMessage`；JSON-RPC 层仍按对应 method 的具名响应职责配对。
 - JSON-RPC framing、request correlation、取消和 transport 继续由 `github.com/coder/acp-go-sdk`/后续 runtime 使用，本层没有重写 JSON-RPC。
 - 生成代码保留纳入 V1 声明的上游英文文档；被明确排除的 experimental 构造项及其专属说明由可审计薄适配一并移除，不增加逐字段中文翻译。中文注释规范仅适用于手写 Go。
+- event/config/auth/approval 组件直接使用生成协议 method/Params 和 `github.com/coder/acp-go-sdk@v0.13.5` 的 ContentBlock、SessionUpdate、ToolCall、PermissionOption、AuthMethod、ConfigOption DTO；没有复制 ACP 或 Codex wire DTO。
+- 上游 file update/move 依赖 npm `diff` 与文件读取重建 rich diff。Go V1 不自写 patch parser：add/delete 直接使用 SDK diff DTO，update/move 与 patchUpdated 保留生成协议 typed raw changes。
+- 上游静默过滤 Audio；V1 未声明 Audio，因此 `content.go` 明确返回请求错误。固定 schema 没有历史 completed plan 的生成常量，兼容分支只识别其 discriminator，稳定计划仍消费 `turn/plan/updated`。
+- Go approval 在外部 permission callback 前后读取 runtime generation，并把 error/panic/取消/非法 option/缺 handler 统一 fail closed；空 common permission changes 与上游一致，省略 `permission` meta。
+- unknown method 只从 raw params 提取 string thread/turn identity，并连同当前 ACP session、method、payload bytes 记录安全摘要；其他 payload 不进入日志。认证错误同样不包装可能回显凭据的上游详情。
 
 ## 明确跳过
 
 - 任何只有 `--experimental` 才出现的 schema 定义、方法和字段，以及默认 bundle 中 V1 不支持的 experimental capability/variant 构造项；
 - codex-acp 的 Review、Goal、Session List 管理扩展、client-provided MCP server、Gateway Auth、Audio/realtime、多 Agent 协作 UI 等父 V1 Non-goals；父 V1 runtime 不实现也不宣告这些行为，即使默认稳定 envelope 为前向兼容带出了部分 DTO；
 - 完整 codex-acp vendoring、TypeScript 构建产物和 ACP SDK 内部协议实现；
-- 本子变更不实现子进程、session/turn 状态、event mapper、approval handler 或配置逻辑，这些由后续子变更消费本协议包。
+- event/tool/approval/config/content/auth 已作为独立小接口组件实现；它们与子进程、session/turn runtime、prompt/steering 和 Agent composition root 的最终 wiring 由后续 stabilization 子变更完成。
 
 ## 增量同步步骤
 
@@ -124,3 +136,4 @@ go run ./tools/protocolgen --check
 
 - 2026-08-23：建立 V1 初始固定点：acp-go-sdk v0.13.5、codex-acp 1.6.2、ACP TS SDK 1.4.0、Codex 0.148.0、quicktype 26.0.0；固定默认稳定 schema 与 Go 快照，并完成关键 generated TS、source imports 和 fixture 的直接对照。
 - 2026-08-23：收窄 V1 roots，移除 quicktype 完整 envelope 字段并集；加入封闭 typed envelope dispatcher、集中方法常量、approval nullable 三态、typed Item 和登录完成通知，同时把 0 字节占位 fixture 从回归证据中移除。
+- 2026-08-23：按 codex-acp `ba5bcc3` 等价移植 event/tool/approval/config/content/auth 组件；补齐 terminal completion fallback/exit、unknown identity 安全摘要、空 permission meta 和并发 stale approval 证据，明确最终 runtime wiring 与 file update/move raw fallback 边界。
