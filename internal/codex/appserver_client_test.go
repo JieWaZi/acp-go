@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -425,4 +426,36 @@ func TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal(t *testing.T)
 		login.Close()
 		account.Close()
 	})
+}
+
+// TestAppServerClientRejectsRepeatedModelCursor 验证破损分页不会无界请求和累积模型。
+func TestAppServerClientRejectsRepeatedModelCursor(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	calls := 0
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if request.Method() != protocol.MethodModelList {
+			return errors.New("unexpected call: " + request.Method())
+		}
+		calls++
+		if calls > 2 {
+			return errors.New("model/list pagination was not bounded")
+		}
+		cursor := "same-cursor"
+		response := result.(*protocol.ModelListResponse)
+		response.Data = testModels()[:1]
+		response.NextCursor = &cursor
+		return nil
+	}
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := newAppServerClient(runtimeCtx, rpc)
+
+	_, err := client.ListModels(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "repeated model/list cursor") {
+		t.Fatalf("重复 cursor 错误为 %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("model/list 调用了 %d 次，期望在第二页停止", calls)
+	}
 }

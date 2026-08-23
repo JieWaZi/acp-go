@@ -93,6 +93,89 @@ func TestSteeringFIFOStartsThenInjects(t *testing.T) {
 	))
 }
 
+// TestSteeringFallbackInheritsSessionConfiguration 验证无活动 turn 的 steering 复用当前 session 配置。
+// 若 fallback 绕过 Prompt 的 model/effort/mode 映射，本测试应失败。
+func TestSteeringFallbackInheritsSessionConfiguration(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnParams := make(chan protocol.TurnStartParams, 1)
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "configured-steering-thread"
+			return nil
+		case protocol.MethodTurnStart:
+			wire, err := json.Marshal(request)
+			if err != nil {
+				return err
+			}
+			var envelope struct {
+				// Params 保留 steering fallback 真实发送的 turn/start 参数。
+				Params protocol.TurnStartParams `json:"params"`
+			}
+			if err = json.Unmarshal(wire, &envelope); err != nil {
+				return err
+			}
+			turnParams <- envelope.Params
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: "configured-steering-turn", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	created, err := agent.NewSession(context.Background(), acp.NewSessionRequest{
+		Cwd: "/configured-workspace", McpServers: []acp.McpServer{},
+	})
+	if err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+	if _, err = agent.SetSessionMode(context.Background(), acp.SetSessionModeRequest{
+		SessionId: created.SessionId, ModeId: "agent-full-access",
+	}); err != nil {
+		t.Fatalf("设置 mode 失败: %v", err)
+	}
+	if _, err = agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{
+			SessionId: created.SessionId, ConfigId: modelConfigID, Value: "slow-model",
+		},
+	}); err != nil {
+		t.Fatalf("设置 model 失败: %v", err)
+	}
+	if _, err = agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{
+			SessionId: created.SessionId, ConfigId: reasoningEffortConfigID, Value: "low",
+		},
+	}); err != nil {
+		t.Fatalf("设置 effort 失败: %v", err)
+	}
+
+	result, err := agent.HandleExtensionMethod(
+		context.Background(),
+		steeringExtensionMethod,
+		steeringRawParams(t, string(created.SessionId), "continue"),
+	)
+	if err != nil || result != (steeringResponse{Outcome: steeringStartedNewTurn}) {
+		t.Fatalf("steering fallback 响应为 %#v, %v", result, err)
+	}
+	params := <-turnParams
+	if params.Model == nil || *params.Model != "slow-model" ||
+		params.Effort == nil || *params.Effort != "low" ||
+		params.ApprovalPolicy == nil || params.ApprovalPolicy.Enum == nil ||
+		*params.ApprovalPolicy.Enum != protocol.Never || params.SandboxPolicy == nil ||
+		params.SandboxPolicy.Type != protocol.SandboxPolicyTypeDangerFullAccess ||
+		params.Cwd == nil || *params.Cwd != "/configured-workspace" {
+		t.Fatalf("steering fallback turn/start 参数为 %#v", params)
+	}
+	agent.client.HandleNotification(context.Background(), completeNotification(
+		t, "configured-steering-thread", "configured-steering-turn", protocol.FluffyCompleted,
+	))
+}
+
 // TestSteeringFailureDoesNotStallNextRequest 验证单项 unexpected steer 失败返回 failed，FIFO 继续下一项。
 func TestSteeringFailureDoesNotStallNextRequest(t *testing.T) {
 	t.Parallel()

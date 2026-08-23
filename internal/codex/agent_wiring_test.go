@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"acp-go/agents/codex/protocol"
@@ -20,6 +21,38 @@ type recordingHistoryUpdater struct {
 	notifications []acp.SessionNotification
 	// err 使外部 SDK callback 可确定性失败。
 	err error
+}
+
+// barrierHistoryUpdater 在第一条历史通知内提供可控 generation 切换屏障。
+type barrierHistoryUpdater struct {
+	// first 在第一条通知已进入 callback 时关闭。
+	first chan struct{}
+	// release 允许第一条 callback 返回。
+	release chan struct{}
+	// mu 保护 count。
+	mu sync.Mutex
+	// count 记录 stale 切换前后实际发送的通知数。
+	count int
+}
+
+// SessionUpdate 在首条 callback 暂停，使测试可在两个 content block 之间关闭 session。
+func (u *barrierHistoryUpdater) SessionUpdate(context.Context, acp.SessionNotification) error {
+	u.mu.Lock()
+	u.count++
+	count := u.count
+	u.mu.Unlock()
+	if count == 1 {
+		close(u.first)
+		<-u.release
+	}
+	return nil
+}
+
+// notificationCount 返回当前通知数快照。
+func (u *barrierHistoryUpdater) notificationCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.count
 }
 
 // SessionUpdate 记录通知或返回预置错误。
@@ -265,6 +298,52 @@ func TestAgentRejectsMissingRequiredSessionModel(t *testing.T) {
 	}
 }
 
+// TestAgentFailureCleanupDetachesFromCancelledRequest 验证已获得的远端 thread 使用独立有界 context 释放。
+func TestAgentFailureCleanupDetachesFromCancelledRequest(t *testing.T) {
+	t.Parallel()
+
+	rpc := newFakeAppServerRPC()
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	cleanupContext := make(chan error, 1)
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "cancelled-config-thread"
+			response.Model = "fast-model"
+			return nil
+		case protocol.MethodModelList:
+			cancelRequest()
+			return requestCtx.Err()
+		case protocol.MethodThreadUnsubscribe:
+			cleanupContext <- ctx.Err()
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
+	t.Cleanup(cancelRuntime)
+	agent := newAgentWithClient(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		runtimeCtx,
+		cancelRuntime,
+		newAppServerClient(runtimeCtx, rpc),
+	)
+	initializeTestAgent(t, agent)
+
+	if _, err := agent.NewSession(requestCtx, acp.NewSessionRequest{
+		Cwd: "/workspace", McpServers: []acp.McpServer{},
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消配置错误为 %v，期望 context.Canceled", err)
+	}
+	if cleanupErr := <-cleanupContext; cleanupErr != nil {
+		t.Fatalf("unsubscribe 继承了已取消请求 context: %v", cleanupErr)
+	}
+}
+
 // TestAgentLoadReplaysHistoryThroughExistingMappers 验证 load 复用 eventHandler/toolMapper 并去重完成项。
 func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	t.Parallel()
@@ -272,6 +351,13 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	rpc := newFakeAppServerRPC()
 	text := "hello from history"
 	answer := "history answer"
+	completedStatus := "completed"
+	command := "/bin/sh -lc ls"
+	cwd := "/workspace"
+	output := "README.md\n"
+	exitCode := int64(0)
+	mcpServer := "github"
+	mcpTool := "search"
 	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
 		switch request.Method() {
 		case protocol.MethodInitialize:
@@ -293,6 +379,21 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 						},
 						{ID: "agent-1", Type: protocol.AgentMessage, Text: &answer},
 						{ID: "agent-1", Type: protocol.AgentMessage, Text: &answer},
+						{
+							ID: "command-1", Type: protocol.CommandExecution, Status: &completedStatus,
+							Command: &command, Cwd: &cwd, AggregatedOutput: &output, ExitCode: &exitCode,
+						},
+						{
+							ID: "file-1", Type: protocol.FileChange, Status: &completedStatus,
+							Changes: []protocol.ChangeElement{{
+								Path: "/workspace/README.md", Diff: "hello\n",
+								Kind: protocol.PatchChangeKind{Type: protocol.Add},
+							}},
+						},
+						{
+							ID: "mcp-1", Type: protocol.MCPToolCall, Status: &completedStatus,
+							Server: &mcpServer, Tool: &mcpTool, Arguments: json.RawMessage(`{"query":"codex"}`),
+						},
 					},
 				}},
 			}
@@ -312,8 +413,8 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("LoadSession 返回错误: %v", err)
 	}
-	if len(updater.notifications) != 2 {
-		t.Fatalf("历史更新数为 %d，期望去重后 2", len(updater.notifications))
+	if len(updater.notifications) != 6 {
+		t.Fatalf("历史更新数为 %d，期望去重并补齐工具后 6", len(updater.notifications))
 	}
 	user := updater.notifications[0].Update.UserMessageChunk
 	if user == nil || user.Content.Text == nil || user.Content.Text.Text != text {
@@ -322,6 +423,23 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	agentMessage := updater.notifications[1].Update.AgentMessageChunk
 	if agentMessage == nil || agentMessage.Content.Text == nil || agentMessage.Content.Text.Text != answer {
 		t.Fatalf("Agent 历史更新为 %#v", updater.notifications[1])
+	}
+	commandStart := updater.notifications[2].Update.ToolCall
+	commandComplete := updater.notifications[3].Update.ToolCallUpdate
+	if commandStart == nil || commandStart.Title != "ls" || commandStart.Status != acp.ToolCallStatusCompleted ||
+		commandComplete == nil || commandComplete.Status == nil ||
+		*commandComplete.Status != acp.ToolCallStatusCompleted || commandComplete.Meta == nil {
+		t.Fatalf("命令历史更新为 %#v / %#v", updater.notifications[2], updater.notifications[3])
+	}
+	fileStart := updater.notifications[4].Update.ToolCall
+	if fileStart == nil || fileStart.Title != "Editing files" || fileStart.Kind != acp.ToolKindEdit ||
+		fileStart.Status != acp.ToolCallStatusCompleted || len(fileStart.Content) != 1 {
+		t.Fatalf("文件历史更新为 %#v", updater.notifications[4])
+	}
+	mcpStart := updater.notifications[5].Update.ToolCall
+	if mcpStart == nil || mcpStart.Title != "mcp.github.search" ||
+		mcpStart.Status != acp.ToolCallStatusCompleted || mcpStart.RawInput == nil {
+		t.Fatalf("MCP 历史更新为 %#v", updater.notifications[5])
 	}
 }
 
@@ -373,5 +491,63 @@ func TestAgentLoadHistoryFailureDoesNotLeaveInstalledSession(t *testing.T) {
 	if got := rpc.calls; len(got) != 5 || got[3] != protocol.MethodModelList ||
 		got[4] != protocol.MethodThreadUnsubscribe {
 		t.Fatalf("失败 load 调用顺序为 %v，期望最终 unsubscribe", got)
+	}
+}
+
+// TestAgentLoadStopsBetweenUserHistoryBlocksAfterClose 验证每次外部 callback 前后都检查 generation。
+func TestAgentLoadStopsBetweenUserHistoryBlocksAfterClose(t *testing.T) {
+	t.Parallel()
+
+	rpc := newFakeAppServerRPC()
+	first := "first"
+	second := "second"
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize, protocol.MethodThreadUnsubscribe:
+			return nil
+		case protocol.MethodThreadResume:
+			result.(*protocol.ThreadResumeResponse).Thread.ID = "multi-block-thread"
+			return nil
+		case protocol.MethodThreadRead:
+			result.(*protocol.ThreadReadResponse).Thread = protocol.Thread{
+				ID: "multi-block-thread",
+				Turns: []protocol.TurnElement{{
+					ID: "turn-1",
+					Items: []protocol.ThreadItem{{
+						ID: "user-1", Type: protocol.UserMessage,
+						Content: []protocol.ContentElement{
+							{UserInput: &protocol.UserInput{Type: protocol.UserInputTypeText, Text: &first}},
+							{UserInput: &protocol.UserInput{Type: protocol.UserInputTypeText, Text: &second}},
+						},
+					}},
+				}},
+			}
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	updater := &barrierHistoryUpdater{first: make(chan struct{}), release: make(chan struct{})}
+	agent.connectionMu.Lock()
+	agent.sessionUpdater = updater
+	agent.connectionMu.Unlock()
+	loadResult := make(chan error, 1)
+	go func() {
+		_, err := agent.LoadSession(context.Background(), acp.LoadSessionRequest{
+			SessionId: "multi-block-thread", Cwd: "/workspace", McpServers: []acp.McpServer{},
+		})
+		loadResult <- err
+	}()
+	<-updater.first
+	if _, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: "multi-block-thread"}); err != nil {
+		t.Fatalf("关闭 history session 失败: %v", err)
+	}
+	close(updater.release)
+	if err := <-loadResult; !errors.Is(err, ErrSessionClosing) {
+		t.Fatalf("stale history load 错误为 %v，期望 ErrSessionClosing", err)
+	}
+	if got := updater.notificationCount(); got != 1 {
+		t.Fatalf("session close 后仍发送 %d 条 history block，期望 1", got)
 	}
 }

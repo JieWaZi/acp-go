@@ -123,6 +123,19 @@ func TestSessionConfigurationKeepsUncataloguedCurrentModel(t *testing.T) {
 	}
 }
 
+// TestSessionConfigurationUsesUpstreamFallbackEffortForCustomModel 验证未编目模型缺省 effort 使用 upstream medium。
+func TestSessionConfigurationUsesUpstreamFallbackEffortForCustomModel(t *testing.T) {
+	t.Parallel()
+
+	config, err := newSessionConfiguration(testModels(), "custom-model", "", "agent")
+	if err != nil {
+		t.Fatalf("newSessionConfiguration 返回错误: %v", err)
+	}
+	if got := config.Selection(); got.Model != "custom-model" || got.Effort != "medium" {
+		t.Fatalf("自定义模型选择为 %#v，期望 medium fallback", got)
+	}
+}
+
 // TestSessionConfigurationRejectsUnknownSelections 验证未知 model、effort、mode 和 config id 立即失败。
 func TestSessionConfigurationRejectsUnknownSelections(t *testing.T) {
 	t.Parallel()

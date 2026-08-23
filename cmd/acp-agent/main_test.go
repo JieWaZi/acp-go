@@ -317,6 +317,8 @@ func TestRunRejectsUnexpectedArguments(t *testing.T) {
 // runInitializeExchange 启动命令、发送 initialize，并在收到响应后关闭客户端输入。
 func runInitializeExchange(t *testing.T, args []string) acp.InitializeResponse {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	serverInput, clientOutput := io.Pipe()
 	clientInput, serverOutput := io.Pipe()
@@ -331,7 +333,7 @@ func runInitializeExchange(t *testing.T, args []string) acp.InitializeResponse {
 	exitResult := make(chan int, 1)
 	go func() {
 		exitResult <- run(
-			context.Background(),
+			ctx,
 			args,
 			processIO{
 				input:       serverInput,
@@ -342,14 +344,47 @@ func runInitializeExchange(t *testing.T, args []string) acp.InitializeResponse {
 	}()
 
 	request := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}` + "\n"
-	if _, err := io.WriteString(clientOutput, request); err != nil {
-		t.Fatalf("写入 initialize 请求失败: %v", err)
+	writeResult := make(chan error, 1)
+	go func() {
+		_, writeErr := io.WriteString(clientOutput, request)
+		writeResult <- writeErr
+	}()
+	select {
+	case err := <-writeResult:
+		if err != nil {
+			t.Fatalf("写入 initialize 请求失败: %v，诊断: %s", err, diagnostics.String())
+		}
+	case exitCode := <-exitResult:
+		t.Fatalf("initialize 写入前命令已退出，退出码为 %d，诊断: %s", exitCode, diagnostics.String())
+	case <-ctx.Done():
+		t.Fatalf("等待 initialize 写入失败: %v，诊断: %s", ctx.Err(), diagnostics.String())
 	}
 
-	responseLine, err := bufio.NewReader(clientInput).ReadBytes('\n')
-	if err != nil {
-		t.Fatalf("读取 initialize 响应失败: %v", err)
+	type readResult struct {
+		// line 是 fake Agent 返回的一条完整 ACP 帧。
+		line []byte
+		// err 是 pipe 读取失败。
+		err error
 	}
+	readResults := make(chan readResult, 1)
+	go func() {
+		line, readErr := bufio.NewReader(clientInput).ReadBytes('\n')
+		readResults <- readResult{line: line, err: readErr}
+	}()
+	var responseLine []byte
+	select {
+	case result := <-readResults:
+		if result.err != nil {
+			t.Fatalf("读取 initialize 响应失败: %v，诊断: %s", result.err, diagnostics.String())
+		}
+		responseLine = result.line
+	case exitCode := <-exitResult:
+		t.Fatalf("initialize 响应前命令已退出，退出码为 %d，诊断: %s", exitCode, diagnostics.String())
+	case <-ctx.Done():
+		t.Fatalf("等待 initialize 响应失败: %v，诊断: %s", ctx.Err(), diagnostics.String())
+	}
+
+	var err error
 	var envelope map[string]json.RawMessage
 	if err = json.Unmarshal(responseLine, &envelope); err != nil {
 		t.Fatalf("响应不是合法 JSON: %v", err)

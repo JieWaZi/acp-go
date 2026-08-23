@@ -4,12 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 
 	"acp-go/agents/codex/protocol"
 )
 
-const maxCapturedCompletionsPerTurnStart = 64
+const (
+	// maxCapturedCompletionsPerTurnStart 限制 turn/start 响应前捕获的 completion 数。
+	maxCapturedCompletionsPerTurnStart = 64
+	// maxModelListPages 限制单次配置加载的 app-server 分页数。
+	maxModelListPages = 128
+	// maxListedModels 限制单次配置加载累积的模型数。
+	maxListedModels = 4096
+)
 
 // appServerRPC 是 typed client 消费的最小传输接口，不泄漏进程或 ACP 生命周期。
 type appServerRPC interface {
@@ -398,7 +406,8 @@ func (c *appServerClient) ThreadUnsubscribe(ctx context.Context, threadID string
 func (c *appServerClient) ListModels(ctx context.Context) ([]protocol.DatumElement, error) {
 	models := []protocol.DatumElement{}
 	var cursor *string
-	for {
+	seenCursors := make(map[string]struct{})
+	for page := 0; page < maxModelListPages; page++ {
 		var response protocol.ModelListResponse
 		err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
 			return protocol.NewModelListRequest(id, protocol.ModelListParams{Cursor: cursor})
@@ -406,13 +415,21 @@ func (c *appServerClient) ListModels(ctx context.Context) ([]protocol.DatumEleme
 		if err != nil {
 			return nil, err
 		}
+		if len(models)+len(response.Data) > maxListedModels {
+			return nil, fmt.Errorf("model/list exceeded %d models", maxListedModels)
+		}
 		models = append(models, response.Data...)
 		if response.NextCursor == nil || *response.NextCursor == "" {
 			return models, nil
 		}
 		nextCursor := *response.NextCursor
+		if _, repeated := seenCursors[nextCursor]; repeated {
+			return nil, fmt.Errorf("repeated model/list cursor %q", nextCursor)
+		}
+		seenCursors[nextCursor] = struct{}{}
 		cursor = &nextCursor
 	}
+	return nil, fmt.Errorf("model/list exceeded %d pages", maxModelListPages)
 }
 
 // AccountRead 直接发送生成协议的 account/read 请求。

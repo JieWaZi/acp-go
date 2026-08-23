@@ -33,9 +33,9 @@ func (a *Agent) replayThreadHistory(ctx context.Context, state *sessionState, th
 					continue
 				}
 				seenUserMessages[item.ID] = struct{}{}
-				err = replayUserMessage(ctx, handler, item)
+				err = a.replayUserMessage(ctx, state, handler, item)
 			} else {
-				err = handler.handleItemCompleted(ctx, protocol.ItemCompletedNotification{
+				err = handler.handleHistoryItem(ctx, protocol.ItemCompletedNotification{
 					ThreadID: thread.ID,
 					TurnID:   turn.ID,
 					Item:     item,
@@ -54,14 +54,26 @@ func (a *Agent) replayThreadHistory(ctx context.Context, state *sessionState, th
 }
 
 // replayUserMessage 把一个历史 userMessage 的内容按原顺序发送为 ACP chunks。
-func replayUserMessage(ctx context.Context, handler *eventHandler, item protocol.ThreadItem) error {
+// 每个外部 SDK callback 前后都重新检查 session generation，防止 close 后继续回放多块消息。
+func (a *Agent) replayUserMessage(
+	ctx context.Context,
+	state *sessionState,
+	handler *eventHandler,
+	item protocol.ThreadItem,
+) error {
 	for _, content := range item.Content {
 		blocks := historyContentBlocks(content)
 		for _, block := range blocks {
+			if !a.sessions.isCurrent(state) {
+				return ErrSessionClosing
+			}
 			update := acp.UpdateUserMessage(block)
 			update.UserMessageChunk.MessageId = &item.ID
 			if err := handler.emit(ctx, update); err != nil {
 				return err
+			}
+			if !a.sessions.isCurrent(state) {
+				return ErrSessionClosing
 			}
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
@@ -23,6 +24,8 @@ const (
 	agentTitle = "Codex"
 	// agentVersion 是当前仓库尚未注入构建版本时的显式开发标识。
 	agentVersion = "development"
+	// appServerCleanupTimeout 为已获得的远端资源提供不继承请求取消的有界释放窗口。
+	appServerCleanupTimeout = 5 * time.Second
 )
 
 var (
@@ -329,7 +332,9 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	}
 	configuration, err := a.configurationForSession(ctx, response.Model, response.ReasoningEffort)
 	if err != nil {
-		unsubscribeErr := a.client.ThreadUnsubscribe(ctx, response.Thread.ID)
+		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+		defer cancelCleanup()
+		unsubscribeErr := a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID)
 		return acp.NewSessionResponse{}, fmt.Errorf(
 			"configuring new codex thread %q: %w",
 			response.Thread.ID,
@@ -338,7 +343,9 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	}
 	generation, err := a.sessions.beginOpen(response.Thread.ID)
 	if err != nil {
-		return acp.NewSessionResponse{}, err
+		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+		defer cancelCleanup()
+		return acp.NewSessionResponse{}, errors.Join(err, a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID))
 	}
 	state, installed := a.sessions.install(response.Thread.ID, request.Cwd, generation, configuration)
 	if !installed {
@@ -372,7 +379,9 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 		return acp.LoadSessionResponse{}, err
 	}
 	if err = a.replayThreadHistory(ctx, state, thread); err != nil {
-		_, closeErr := a.CloseSession(ctx, acp.CloseSessionRequest{SessionId: request.SessionId})
+		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+		defer cancelCleanup()
+		_, closeErr := a.CloseSession(cleanupCtx, acp.CloseSessionRequest{SessionId: request.SessionId})
 		return acp.LoadSessionResponse{}, fmt.Errorf(
 			"replaying codex thread %q: %w",
 			request.SessionId,
@@ -468,11 +477,48 @@ func sessionConfigurationResponse(
 	return &modes, state.configuration.Options()
 }
 
+// turnParamsForSession 在 session 锁内快照 cwd 与当前配置，供普通 Prompt 和 steering fallback 共用。
+// 返回值不持有 session 内部指针，后续配置更新不会改写已发送的 turn/start。
+func turnParamsForSession(
+	state *sessionState,
+	input []protocol.InputElement,
+	messageID *string,
+) protocol.TurnStartParams {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	cwd := state.cwd
+	params := protocol.TurnStartParams{
+		ThreadID:            state.id,
+		Input:               input,
+		ClientUserMessageID: messageID,
+		Cwd:                 &cwd,
+	}
+	if state.configuration == nil {
+		return params
+	}
+	selection := state.configuration.Selection()
+	mode := state.configuration.ModeDefinition()
+	params.Model = &selection.Model
+	if selection.Effort != "" {
+		params.Effort = &selection.Effort
+	}
+	params.ApprovalPolicy = &mode.ApprovalPolicy
+	params.SandboxPolicy = &mode.SandboxPolicy
+	return params
+}
+
+// newAppServerCleanupContext 从原请求中只保留 value，用独立 deadline 确保 unsubscribe/cancel 能实际写出。
+func newAppServerCleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), appServerCleanupTimeout)
+}
+
 // cleanupFailedSubscribedOpen 释放已订阅但后续 read/配置失败的 thread。
 func (a *Agent) cleanupFailedSubscribedOpen(ctx context.Context, sessionID string, generation uint64, cause error) error {
 	if a.sessions.beginStaleCleanup(sessionID, generation) {
 		defer a.sessions.endClose(sessionID)
-		if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
+		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+		defer cancelCleanup()
+		if err := a.client.ThreadUnsubscribe(cleanupCtx, sessionID); err != nil {
 			return fmt.Errorf("reading codex thread %q: %w", sessionID, errors.Join(cause, err))
 		}
 	}
@@ -483,7 +529,9 @@ func (a *Agent) cleanupFailedSubscribedOpen(ctx context.Context, sessionID strin
 func (a *Agent) closeStaleOpen(ctx context.Context, sessionID string, generation uint64) error {
 	if a.sessions.beginStaleCleanup(sessionID, generation) {
 		defer a.sessions.endClose(sessionID)
-		if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
+		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+		defer cancelCleanup()
+		if err := a.client.ThreadUnsubscribe(cleanupCtx, sessionID); err != nil {
 			return fmt.Errorf("closing stale session %q: %w", sessionID, errors.Join(ErrSessionClosing, err))
 		}
 	}
@@ -572,24 +620,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		err error
 	}
 	resultChannel := make(chan turnResult, 1)
-	turnParams := protocol.TurnStartParams{
-		ThreadID:            state.id,
-		Input:               input,
-		ClientUserMessageID: request.MessageId,
-		Cwd:                 &state.cwd,
-	}
-	state.mu.Lock()
-	if state.configuration != nil {
-		selection := state.configuration.Selection()
-		mode := state.configuration.ModeDefinition()
-		turnParams.Model = &selection.Model
-		if selection.Effort != "" {
-			turnParams.Effort = &selection.Effort
-		}
-		turnParams.ApprovalPolicy = &mode.ApprovalPolicy
-		turnParams.SandboxPolicy = &mode.SandboxPolicy
-	}
-	state.mu.Unlock()
+	turnParams := turnParamsForSession(state, input, request.MessageId)
 	go func() {
 		defer a.finishPromptBackground(prompt)
 		completion, runErr := a.client.RunTurn(prompt.runCtx, turnParams, func(turnID string) {
@@ -819,25 +850,30 @@ func (a *Agent) SetSessionConfigOption(
 		})
 	}
 	value := request.ValueId
-	state, ok := a.sessions.get(string(value.SessionId))
-	if !ok || !a.sessions.isCurrent(state) {
+	var options []acp.SessionConfigOption
+	err := a.sessions.withCurrent(string(value.SessionId), func(state *sessionState) error {
+		if state.configuration == nil {
+			return acp.NewInvalidParams(map[string]any{
+				"error": "session configuration is unavailable",
+			})
+		}
+		if selectErr := state.configuration.Select(value.ConfigId, string(value.Value)); selectErr != nil {
+			return acp.NewInvalidParams(map[string]any{"error": selectErr.Error()})
+		}
+		options = state.configuration.Options()
+		return nil
+	})
+	if errors.Is(err, ErrSessionNotFound) {
 		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf(
 			"setting config for session %q: %w",
 			value.SessionId,
 			ErrSessionNotFound,
 		)
 	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.configuration == nil {
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{
-			"error": "session configuration is unavailable",
-		})
+	if err != nil {
+		return acp.SetSessionConfigOptionResponse{}, err
 	}
-	if err := state.configuration.Select(value.ConfigId, string(value.Value)); err != nil {
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
-	}
-	return acp.SetSessionConfigOptionResponse{ConfigOptions: state.configuration.Options()}, nil
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
 }
 
 // SetSessionMode 复用 mode 配置选择；未知模式绝不回退到更宽松权限。
@@ -845,23 +881,26 @@ func (a *Agent) SetSessionMode(
 	_ context.Context,
 	request acp.SetSessionModeRequest,
 ) (acp.SetSessionModeResponse, error) {
-	state, ok := a.sessions.get(string(request.SessionId))
-	if !ok || !a.sessions.isCurrent(state) {
+	err := a.sessions.withCurrent(string(request.SessionId), func(state *sessionState) error {
+		if state.configuration == nil {
+			return acp.NewInvalidParams(map[string]any{
+				"error": "session configuration is unavailable",
+			})
+		}
+		if selectErr := state.configuration.Select(modeConfigID, string(request.ModeId)); selectErr != nil {
+			return acp.NewInvalidParams(map[string]any{"error": selectErr.Error()})
+		}
+		return nil
+	})
+	if errors.Is(err, ErrSessionNotFound) {
 		return acp.SetSessionModeResponse{}, fmt.Errorf(
 			"setting mode for session %q: %w",
 			request.SessionId,
 			ErrSessionNotFound,
 		)
 	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.configuration == nil {
-		return acp.SetSessionModeResponse{}, acp.NewInvalidParams(map[string]any{
-			"error": "session configuration is unavailable",
-		})
-	}
-	if err := state.configuration.Select(modeConfigID, string(request.ModeId)); err != nil {
-		return acp.SetSessionModeResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
+	if err != nil {
+		return acp.SetSessionModeResponse{}, err
 	}
 	return acp.SetSessionModeResponse{}, nil
 }

@@ -188,6 +188,30 @@ func mapMCPStarted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	return update, nil
 }
 
+// mapMCPHistory 等价 upstream createMcpToolCallUpdate，在单条 completed tool_call 中同时保留输入与输出。
+func mapMCPHistory(item protocol.ThreadItem) (acp.SessionUpdate, error) {
+	status, err := mapToolStatus(item.Status)
+	if err != nil {
+		return acp.SessionUpdate{}, err
+	}
+	server := stringValue(item.Server)
+	tool := stringValue(item.Tool)
+	options := []acp.ToolCallStartOpt{
+		acp.WithStartKind(acp.ToolKindExecute),
+		acp.WithStartStatus(status),
+		acp.WithStartRawInput(mcpRawInput(server, tool, item.Arguments)),
+	}
+	if item.Result != nil || item.Error != nil {
+		options = append(options, acp.WithStartRawOutput(map[string]any{
+			"result": item.Result,
+			"error":  item.Error,
+		}))
+	}
+	update := acp.StartToolCall(acp.ToolCallId(item.ID), fmt.Sprintf("mcp.%s.%s", server, tool), options...)
+	update.ToolCall.Meta = map[string]any{"is_mcp_tool_call": true}
+	return update, nil
+}
+
 // mapMCPCompleted 映射 MCP 最终状态以及可选 result/error 原始输出。
 func mapMCPCompleted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	status, err := mapToolStatus(item.Status)

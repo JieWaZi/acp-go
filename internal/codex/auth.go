@@ -181,9 +181,11 @@ func (a *authenticator) authenticateChatGPT(ctx context.Context) error {
 	completion, waitErr := subscription.Wait(ctx)
 	if waitErr != nil {
 		if (errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded)) && login.LoginID != nil {
-			// 取消请求不能复用已取消的 ctx，否则 app-server 无法收到清理信号。
+			// 取消请求不能复用已取消的 ctx，且独立清理必须有界。
+			cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+			defer cancelCleanup()
 			if _, cancelErr := a.server.AccountLoginCancel(
-				context.WithoutCancel(ctx),
+				cleanupCtx,
 				protocol.CancelLoginAccountParams{LoginID: *login.LoginID},
 			); cancelErr != nil {
 				a.logger.Error("取消 ChatGPT 登录失败")

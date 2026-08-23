@@ -119,14 +119,20 @@ func newSessionConfiguration(
 		return nil, fmt.Errorf("unknown agent mode %q", currentMode)
 	}
 	// app-server 可省略 reasoningEffort；对应 upstream createModelId，按目录默认值补齐。
+	modelFound := false
 	for _, model := range models {
 		if model.ID != currentModel {
 			continue
 		}
+		modelFound = true
 		if currentEffort == "" {
 			currentEffort = model.DefaultReasoningEffort
 		}
 		break
+	}
+	// 固定 upstream 对自定义 provider 的未编目模型保留 ID，并在缺失 effort 时回退 medium。
+	if !modelFound && currentEffort == "" {
+		currentEffort = "medium"
 	}
 	return &sessionConfiguration{
 		models: append([]protocol.DatumElement(nil), models...),

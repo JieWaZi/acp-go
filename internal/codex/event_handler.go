@@ -192,6 +192,53 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 	return err
 }
 
+// handleHistoryItem 精确复制 upstream createHistoryUpdates 的 V1 工具形状。
+// command 先发完整 tool_call 再发终态 update；file/MCP 只发一条 completed tool_call。
+func (h *eventHandler) handleHistoryItem(
+	ctx context.Context,
+	params protocol.ItemCompletedNotification,
+) error {
+	item := params.Item
+	if _, completed := h.completedItems[item.ID]; completed {
+		return nil
+	}
+	switch item.Type {
+	case protocol.CommandExecution:
+		if err := h.handleItemStarted(ctx, protocol.ItemStartedNotification{
+			ThreadID: params.ThreadID,
+			TurnID:   params.TurnID,
+			Item:     item,
+		}); err != nil {
+			return err
+		}
+		return h.handleItemCompleted(ctx, params)
+	case protocol.FileChange:
+		update, err := h.tools.mapStarted(item)
+		if err != nil {
+			return err
+		}
+		if update != nil {
+			if err = h.emit(ctx, *update); err != nil {
+				return err
+			}
+		}
+		h.completedItems[item.ID] = struct{}{}
+		return nil
+	case protocol.MCPToolCall:
+		update, err := mapMCPHistory(item)
+		if err != nil {
+			return err
+		}
+		if err = h.emit(ctx, update); err != nil {
+			return err
+		}
+		h.completedItems[item.ID] = struct{}{}
+		return nil
+	default:
+		return h.handleItemCompleted(ctx, params)
+	}
+}
+
 // decorateCommandCompletion 为 terminal 命令补齐 exit，并仅在缺少 delta 时回退聚合输出。
 func (h *eventHandler) decorateCommandCompletion(item protocol.ThreadItem, update *acp.SessionUpdate) {
 	if _, terminal := h.terminalCommands[item.ID]; !terminal || update.ToolCallUpdate == nil {

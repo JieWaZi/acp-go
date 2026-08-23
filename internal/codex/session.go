@@ -162,6 +162,20 @@ func (s *sessionStore) isCurrent(state *sessionState) bool {
 	return s.closing[state.id] == 0 && s.generations[state.id] == state.generation && s.sessions[state.id] == state
 }
 
+// withCurrent 在 store→state 统一锁序下验证当前身份并执行一次短变更。
+// callback 不得调用 sessionStore；持有 store 锁直到变更结束，使 close 与配置更新形成全序。
+func (s *sessionStore) withCurrent(sessionID string, callback func(*sessionState) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[sessionID]
+	if state == nil || s.closing[sessionID] > 0 || s.generations[sessionID] != state.generation {
+		return ErrSessionNotFound
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return callback(state)
+}
+
 // closeAll 提升所有 generation、移除 session，并返回需要取消的状态快照。
 func (s *sessionStore) closeAll() []*sessionState {
 	s.mu.Lock()
