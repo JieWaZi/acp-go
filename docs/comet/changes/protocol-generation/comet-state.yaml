@@ -1,9 +1,9 @@
 schema: comet.native.v4
 name: protocol-generation
 language: zh-CN
-phase: verify
+phase: archive
 status: active
-state_version: 9
+state_version: 13
 brief: brief.md
 spec_changes:
   - capability: protocol-upstream
@@ -13,89 +13,115 @@ workspace:
   isolation: worktree
   change_branch: codex/protocol-generation
   target_branch: main
-  finish: null
+  finish: merge
 loop:
-  stage: verify-ready
+  stage: archive-ready
   goal_cycle: 1
   iteration: 3
-  attempt: 0
+  attempt: 1
   retry_epoch: 0
   failed_iteration_count: 2
   no_progress_count: 0
   execution_failure_count: 0
-  previous_unresolved_ids:
-    - A7
-  next_action: run-required-checks-and-dispatch-verifier
+  previous_unresolved_ids: []
+  next_action: archive
 acceptance:
   - id: A1
     source: brief.md
     text: A1：固定稳定 schema 可通过受控命令重复生成可编译 Go 类型；连续两次生成结果一致，freshness 检查通过。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 固定 schema、确定性生成、freshness 与编译通过。
+      truncated: false
   - id: A2
     source: brief.md
     text: A2：生成文件带标准禁止手改标记和精确来源，手写代码不重复声明已生成 DTO，experimental 类型不进入 V1 surface。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 生成标记和来源正确，V1 public surface 无 experimental-only 类型。
+      truncated: false
   - id: A3
     source: brief.md
     text: A3：`UPSTREAM.md` 精确记录 SDK、codex-acp、Codex/schema 版本以及关键 TS
       文件、symbol、fixture 到 Go 目标职责的映射。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: UPSTREAM.md 完整记录版本、TS symbol、fixture 与 Go 职责映射。
+      truncated: false
   - id: A4
     source: brief.md
     text: A4：本地 `.upstream/codex-acp` clone 的 HEAD 校验通过，实现依据来自该 clone 的源码而不是二手摘要。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 指定本地 clone HEAD 精确匹配且直接对照源码与 fixtures。
+      truncated: false
   - id: A5
     source: brief.md
     text: A5：protocol package 测试、`go test ./...`、`go vet ./...` 和生成 freshness 检查通过。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: protocol、全仓测试、vet 与 freshness 均通过。
+      truncated: false
   - id: A6
     source: specs/protocol-upstream/spec.md
     text: 固定 Codex 0.148.0 默认稳定 app-server JSON Schema；不传 `--experimental`。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 固定 Codex 0.148.0 默认稳定 schema，未使用 --experimental。
+      truncated: false
   - id: A7
     source: specs/protocol-upstream/spec.md
     text: 生成独立 Go protocol package，保持 request/response/notification、wire
       field、optional/nullable 和 tagged union 语义。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: Client/Server 整数和字符串 RequestID 均以 JSON 标量序列化并成功往返；typed
+        envelope、method/params、nullable、typed Item/RawMessage 均未回归。
+      truncated: false
   - id: A8
     source: specs/protocol-upstream/spec.md
     text: 生成文件含 `Code generated` 标记、来源和上游原始文档，不手工编辑或维护中文翻译层。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 生成标记、固定来源与上游原始文档完整。
+      truncated: false
   - id: A9
     source: specs/protocol-upstream/spec.md
     text: 仓库提供确定性生成命令和 freshness 检查；相同输入必须产生逐字节一致输出。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 受控生成与逐字节 freshness 检查通过。
+      truncated: false
   - id: A10
     source: specs/protocol-upstream/spec.md
     text: 生成快照随仓库提交；schema 变化必须先再生类型，再修改运行时、mapper 和测试。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: schema、roots、生成快照和同步流程已提交。
+      truncated: false
   - id: A11
     source: specs/protocol-upstream/spec.md
     text: "`/Users/ryan/Desktop/aix/acp-go/.upstream/codex-acp` 必须是 HEAD 为
       `ba5bcc3d7759250dde9d4d2286a1bec11b363208` 的本地 Git clone。"
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: upstream HEAD 为 ba5bcc3d7759250dde9d4d2286a1bec11b363208。
+      truncated: false
   - id: A12
     source: specs/protocol-upstream/spec.md
     text: "`UPSTREAM.md` 固定 acp-go-sdk v0.13.5、codex-acp 1.6.2、ACP TS SDK
       1.4.0、Codex 0.148.0，并列出纳入/跳过模块、关键 TS→Go 映射、等价改写和同步步骤。"
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 固定版本、范围、映射、等价改写和同步步骤齐全。
+      truncated: false
   - id: A13
     source: specs/protocol-upstream/spec.md
     text: 实现前直接读取 clone 中对应源文件、symbol 与 fixture；不得仅依赖 README 或摘要重造协议语义。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 直接源码、symbol 与非空 fixture 对照证据完整。
+      truncated: false
 builder_handoff:
   candidate_id: 2261a51d-3e6f-4a0e-a797-96ec35d1d412
   identity_provider: skill-coordinated
@@ -147,7 +173,91 @@ builder_handoff:
   known_limits_truncated: false
   submitted_at: 2026-08-23T13:56:09.649Z
 blockers: []
-verification: null
+verification:
+  candidate_id: 2261a51d-3e6f-4a0e-a797-96ec35d1d412
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:ae67e626-8731-4138-a379-7da5e24d9e32
+  iteration: 3
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: request-id-roundtrip
+      name:
+        text: Client and server request ID round-trip
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: ./agents/codex/protocol
+          truncated: false
+        - text: -run
+          truncated: false
+        - text: Test(Client|Server)RequestIDRoundTrip
+          truncated: false
+        - text: -count=1
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 1437
+    - id: protocol-freshness
+      name:
+        text: Protocol generated snapshot freshness
+        truncated: false
+      argv_display:
+        - text: run
+          truncated: false
+        - text: ./tools/protocolgen
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4860
+    - id: go-test
+      name:
+        text: Protocol and generator tests
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: -count=1
+          truncated: false
+        - text: ./...
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 46441
+    - id: go-vet
+      name:
+        text: Go vet
+        truncated: false
+      argv_display:
+        - text: vet
+          truncated: false
+        - text: ./...
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 1072
+  summary:
+    text: 第3轮候选 A1-A13 全部通过；RequestID 标量 wire 与 typed envelope 语义经独立往返 probe 和全量检查验证。
+    truncated: false
+  risks:
+    - text: 重新生成仍依赖 Node.js/npm。
+      truncated: false
+    - text: quicktype 的部分内部对象 union 要求 runtime 严格按 discriminator 读取对应字段。
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-08-23T14:07:44.519Z
 history:
   - goal_cycle: 1
     iteration: 1
@@ -172,6 +282,16 @@ history:
         对象，缺少整数/字符串 ID 往返测试。
       truncated: false
     completed_at: 2026-08-23T13:52:29.904Z
+  - goal_cycle: 1
+    iteration: 3
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 第3轮候选 A1-A13 全部通过；RequestID 标量 wire 与 typed envelope 语义经独立往返 probe
+        和全量检查验证。
+      truncated: false
+    completed_at: 2026-08-23T14:07:44.519Z
 history_overflow:
   dropped_entries: 0
   first_dropped_at: null
@@ -182,7 +302,7 @@ history_overflow:
     blocked: 0
     execution-error: 0
     recovery: 0
-verification_result: pending
-verification_report: null
+verification_result: pass
+verification_report: verification.md
 archived: false
 created_at: 2026-08-23T12:17:35.430Z
