@@ -126,6 +126,14 @@ func mapCommandAction(
 	}
 }
 
+// commandExecutionUsesTerminalOutput 等价判断 upstream 命令是否走 ACP terminal 分支。
+func commandExecutionUsesTerminalOutput(item protocol.ThreadItem) bool {
+	if len(item.CommandActions) != 1 {
+		return true
+	}
+	return item.CommandActions[0].Type == protocol.CommandActionTypeUnknown
+}
+
 // mapCommandCompleted 映射命令最终状态和聚合输出，不在此重复 start 内容。
 func mapCommandCompleted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	status, err := mapToolStatus(item.Status)
@@ -288,6 +296,32 @@ func terminalOutputMeta(terminalID, data string) map[string]any {
 	return map[string]any{
 		"terminal_output_delta": map[string]any{"data": data, "terminal_id": terminalID},
 	}
+}
+
+// terminalCompletionMeta 等价生成 upstream command completion 的输出回退和退出元数据。
+func terminalCompletionMeta(
+	terminalID string,
+	aggregatedOutput string,
+	exitCode *int64,
+	hadOutput bool,
+) map[string]any {
+	var exitCodeValue any
+	if exitCode != nil {
+		exitCodeValue = *exitCode
+	}
+	meta := map[string]any{
+		"terminal_exit": map[string]any{
+			"exit_code":   exitCodeValue,
+			"signal":      nil,
+			"terminal_id": terminalID,
+		},
+	}
+	if !hadOutput && aggregatedOutput != "" {
+		meta["terminal_output"] = map[string]any{
+			"data": aggregatedOutput, "terminal_id": terminalID,
+		}
+	}
+	return meta
 }
 
 // searchTitle 等价移植 upstream 对 query/path 四种组合的标题规则。

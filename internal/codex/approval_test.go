@@ -2,8 +2,10 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 
 	"acp-go/agents/codex/protocol"
@@ -26,12 +28,41 @@ type recordingPermissionRequester struct {
 // panickingPermissionRequester 模拟客户端 permission 回调越过接口边界抛出 panic。
 type panickingPermissionRequester struct{}
 
+// blockingPermissionRequester 用显式通道屏障暂停 permission 回调，制造真实并发 stale 窗口。
+type blockingPermissionRequester struct {
+	// entered 在回调已经开始等待时关闭。
+	entered chan struct{}
+	// release 由测试在 generation 失效后关闭。
+	release chan struct{}
+}
+
 // RequestPermission 始终 panic，用于验证 approval handler 的 fail-closed 防线。
 func (panickingPermissionRequester) RequestPermission(
 	context.Context,
 	acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
 	panic("simulated callback failure")
+}
+
+// RequestPermission 在屏障处等待，并在释放后返回 allow_once。
+func (r *blockingPermissionRequester) RequestPermission(
+	_ context.Context,
+	_ acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	close(r.entered)
+	<-r.release
+	return selectedPermission("allow_once"), nil
+}
+
+// atomicGenerationGuard 为并发 stale 测试提供无数据竞争的 generation 状态。
+type atomicGenerationGuard struct {
+	// current 原子表示目标 generation 是否仍然有效。
+	current atomic.Bool
+}
+
+// IsCurrent 原子读取测试 generation 当前性。
+func (g *atomicGenerationGuard) IsCurrent(turnGeneration) bool {
+	return g.current.Load()
 }
 
 // RequestPermission 实现 approval 组件需要的最小 ACP 连接接口。
@@ -208,6 +239,35 @@ func TestApprovalHandlerFailsClosedForAllExceptionalPaths(t *testing.T) {
 	})
 }
 
+// TestApprovalHandlerRechecksGenerationAcrossConcurrentCallback 验证回调等待期间失效的 turn 不能获批。
+func TestApprovalHandlerRechecksGenerationAcrossConcurrentCallback(t *testing.T) {
+	t.Parallel()
+
+	guard := &atomicGenerationGuard{}
+	guard.current.Store(true)
+	requester := &blockingPermissionRequester{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	response := make(chan protocol.CommandExecutionRequestApprovalResponse, 1)
+	go func() {
+		response <- newTestApprovalHandler(requester, guard).HandleCommand(
+			context.Background(),
+			protocol.CommandExecutionRequestApprovalParams{
+				ThreadID: "thread-1", TurnID: "turn-1", ItemID: "command-concurrent",
+			},
+		)
+	}()
+
+	<-requester.entered
+	guard.current.Store(false)
+	close(requester.release)
+	result := <-response
+	if result.Decision == nil || result.Decision.Enum == nil || *result.Decision.Enum != protocol.Cancel {
+		t.Fatalf("并发 stale response = %#v，期望 cancel", result)
+	}
+}
+
 // TestApprovalHandlerPermissionFailureIsStrictAndEmpty 验证 permissions 异常不会遗留任何授权。
 func TestApprovalHandlerPermissionFailureIsStrictAndEmpty(t *testing.T) {
 	t.Parallel()
@@ -256,6 +316,28 @@ func TestPermissionsOptionsPreserveDenyAndEntries(t *testing.T) {
 	filesystem := changes[1].(map[string]any)
 	if filesystem["type"] != "policy_rule" || filesystem["ruleBehavior"] != "deny" {
 		t.Fatalf("filesystem deny change = %#v", filesystem)
+	}
+}
+
+// TestPermissionsOptionsOmitEmptyPermissionMetadata 锁定 upstream 空 changes 时省略 permission 元数据。
+func TestPermissionsOptionsOmitEmptyPermissionMetadata(t *testing.T) {
+	t.Parallel()
+
+	request := permissionsPermissionRequest("session-1", protocol.PermissionsRequestApprovalParams{
+		ThreadID: "thread-1", TurnID: "turn-1", ItemID: "permissions-empty", Cwd: "/work",
+	})
+	want := []string{
+		`{"codex":{"decision":"allowPermissionsForSession","permissions":{}}}`,
+		`{"codex":{"decision":"allowPermissionsForTurn","permissions":{}}}`,
+	}
+	for index, expected := range want {
+		encoded, err := json.Marshal(request.Options[index].Meta)
+		if err != nil {
+			t.Fatalf("序列化 option[%d] meta 失败: %v", index, err)
+		}
+		if string(encoded) != expected {
+			t.Fatalf("option[%d] meta = %s，期望 %s", index, encoded, expected)
+		}
 	}
 }
 

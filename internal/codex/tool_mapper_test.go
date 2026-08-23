@@ -44,9 +44,58 @@ func TestEventRouterMapsCommandLifecycle(t *testing.T) {
 	if completed == nil || completed.ToolCallId != "command-1" || completed.Status == nil || *completed.Status != acp.ToolCallStatusCompleted {
 		t.Fatalf("command completed = %#v", completed)
 	}
+	if completed.Meta["terminal_output"] != nil {
+		t.Fatalf("已有 delta 时不应重复 terminal_output: %#v", completed.Meta)
+	}
+	exit, ok := completed.Meta["terminal_exit"].(map[string]any)
+	if !ok {
+		t.Fatalf("command completion 缺 terminal_exit: %#v", completed.Meta)
+	}
+	if exit["exit_code"] != int64(0) || exit["signal"] != nil || exit["terminal_id"] != "command-1" {
+		t.Fatalf("terminal exit = %#v", exit)
+	}
 	rawOutput := completed.RawOutput.(map[string]any)
 	if rawOutput["formatted_output"] != "hello\n" || rawOutput["exit_code"] != int64(0) {
 		t.Fatalf("command raw output = %#v", rawOutput)
+	}
+}
+
+// TestEventRouterFallsBackToTerminalOutputOnCommandCompletion 锁定固定 upstream completion fallback fixture。
+func TestEventRouterFallsBackToTerminalOutputOnCommandCompletion(t *testing.T) {
+	t.Parallel()
+
+	updater := &recordingSessionUpdater{}
+	router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.Default())
+	started := `{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"commandExecution","id":"command-terminal-output-completion","command":"git status --short","cwd":"/test/project","status":"inProgress","commandActions":[]}}}`
+	completed := `{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"commandExecution","id":"command-terminal-output-completion","command":"git status --short","cwd":"/test/project","status":"completed","commandActions":[],"aggregatedOutput":"M src/CodexEventHandler.ts\n","exitCode":0}}}`
+	for _, raw := range []string{started, completed, completed} {
+		if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+			t.Fatalf("HandleJSON 返回错误: %v", err)
+		}
+	}
+	if got, want := len(updater.notifications), 2; got != want {
+		t.Fatalf("completion fallback update 数 = %d，期望 %d", got, want)
+	}
+	update := updater.notifications[1].Update.ToolCallUpdate
+	if update == nil {
+		t.Fatal("缺少 command completion update")
+	}
+	output, ok := update.Meta["terminal_output"].(map[string]any)
+	if !ok {
+		t.Fatalf("command completion 缺 terminal_output fallback: %#v", update.Meta)
+	}
+	if output["data"] != "M src/CodexEventHandler.ts\n" || output["terminal_id"] != "command-terminal-output-completion" {
+		t.Fatalf("terminal output fallback = %#v", output)
+	}
+	if update.Meta["terminal_output_delta"] != nil {
+		t.Fatalf("completion fallback 不应伪装成 delta: %#v", update.Meta)
+	}
+	exit, ok := update.Meta["terminal_exit"].(map[string]any)
+	if !ok {
+		t.Fatalf("command completion 缺 terminal_exit: %#v", update.Meta)
+	}
+	if exit["exit_code"] != int64(0) || exit["signal"] != nil || exit["terminal_id"] != "command-terminal-output-completion" {
+		t.Fatalf("terminal exit = %#v", exit)
 	}
 }
 

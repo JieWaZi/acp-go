@@ -46,6 +46,10 @@ type eventHandler struct {
 	streamedReasoning map[string]struct{}
 	// completedItems 标记已成功处理的完成项，避免 app-server 重放导致重复通知。
 	completedItems map[string]struct{}
+	// terminalCommands 标记 started 阶段实际展示了 ACP terminal 的命令。
+	terminalCommands map[string]struct{}
+	// terminalCommandOutputs 标记 terminal 命令已经发送过非空输出增量。
+	terminalCommandOutputs map[string]struct{}
 	// usage 保存当前 turn 最新 usage 快照。
 	usage *turnUsage
 }
@@ -56,13 +60,15 @@ func newEventHandler(updater sessionUpdater, sessionID acp.SessionId, logger *sl
 		logger = slog.Default()
 	}
 	return &eventHandler{
-		updater:           updater,
-		sessionID:         sessionID,
-		logger:            logger,
-		messagePhases:     make(map[string]protocol.PhaseEnum),
-		streamedMessages:  make(map[string]struct{}),
-		streamedReasoning: make(map[string]struct{}),
-		completedItems:    make(map[string]struct{}),
+		updater:                updater,
+		sessionID:              sessionID,
+		logger:                 logger,
+		messagePhases:          make(map[string]protocol.PhaseEnum),
+		streamedMessages:       make(map[string]struct{}),
+		streamedReasoning:      make(map[string]struct{}),
+		completedItems:         make(map[string]struct{}),
+		terminalCommands:       make(map[string]struct{}),
+		terminalCommandOutputs: make(map[string]struct{}),
 	}
 }
 
@@ -78,6 +84,14 @@ func (h *eventHandler) Usage() (turnUsage, bool) {
 func (h *eventHandler) handleItemStarted(ctx context.Context, params protocol.ItemStartedNotification) error {
 	if params.Item.Type == protocol.AgentMessage && params.Item.Phase != nil {
 		h.messagePhases[params.Item.ID] = *params.Item.Phase
+	}
+	if params.Item.Type == protocol.CommandExecution {
+		if commandExecutionUsesTerminalOutput(params.Item) {
+			h.terminalCommands[params.Item.ID] = struct{}{}
+		} else {
+			delete(h.terminalCommands, params.Item.ID)
+			delete(h.terminalCommandOutputs, params.Item.ID)
+		}
 	}
 	update, err := h.tools.mapStarted(params.Item)
 	if err != nil {
@@ -97,6 +111,28 @@ func (h *eventHandler) handleItemStarted(ctx context.Context, params protocol.It
 		)
 	}
 	return nil
+}
+
+// handleCommandOutputDelta 记录 terminal 输出状态并发出 upstream terminal_output_delta。
+func (h *eventHandler) handleCommandOutputDelta(
+	ctx context.Context,
+	params protocol.CommandExecutionOutputDeltaNotification,
+) error {
+	if _, terminal := h.terminalCommands[params.ItemID]; terminal && params.Delta != "" {
+		h.terminalCommandOutputs[params.ItemID] = struct{}{}
+	}
+	return h.emit(ctx, mapCommandOutputDelta(params))
+}
+
+// handleTerminalInteraction 按 upstream 将 stdin 回显视为 terminal 命令的非空输出。
+func (h *eventHandler) handleTerminalInteraction(
+	ctx context.Context,
+	params protocol.TerminalInteractionNotification,
+) error {
+	if _, terminal := h.terminalCommands[params.ItemID]; terminal {
+		h.terminalCommandOutputs[params.ItemID] = struct{}{}
+	}
+	return h.emit(ctx, mapTerminalInteraction(params))
 }
 
 // handleAgentMessageDelta 将 agent 文本 delta 映射为带 messageId 和 phase 的 ACP chunk。
@@ -139,6 +175,9 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 		var update *acp.SessionUpdate
 		update, err = h.tools.mapCompleted(item)
 		if err == nil && update != nil {
+			if item.Type == protocol.CommandExecution {
+				h.decorateCommandCompletion(item, update)
+			}
 			err = h.emit(ctx, *update)
 		}
 	default:
@@ -147,8 +186,24 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 	// 只在成功后记录完成态；客户端发送失败时允许调用方重试同一事件。
 	if err == nil {
 		h.completedItems[item.ID] = struct{}{}
+		delete(h.terminalCommands, item.ID)
+		delete(h.terminalCommandOutputs, item.ID)
 	}
 	return err
+}
+
+// decorateCommandCompletion 为 terminal 命令补齐 exit，并仅在缺少 delta 时回退聚合输出。
+func (h *eventHandler) decorateCommandCompletion(item protocol.ThreadItem, update *acp.SessionUpdate) {
+	if _, terminal := h.terminalCommands[item.ID]; !terminal || update.ToolCallUpdate == nil {
+		return
+	}
+	_, hadOutput := h.terminalCommandOutputs[item.ID]
+	update.ToolCallUpdate.Meta = terminalCompletionMeta(
+		item.ID,
+		stringValue(item.AggregatedOutput),
+		item.ExitCode,
+		hadOutput,
+	)
 }
 
 // handleCompletedAgentMessage 在未流式发送 delta 时补发完整消息，否则仅完成去重状态。

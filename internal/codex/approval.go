@@ -413,15 +413,19 @@ func permissionGrantOption(
 	scope string,
 	permissions protocol.Permissions,
 ) acp.PermissionOption {
+	meta := map[string]any{
+		"codex": map[string]any{"decision": decision, "permissions": permissions},
+	}
+	// upstream 在没有任何 common permission change 时省略整个 permission 扩展。
+	if changes := permissionChanges(scope, permissions); len(changes) > 0 {
+		meta["permission"] = map[string]any{
+			"version": 1,
+			"changes": changes,
+		}
+	}
 	return acp.PermissionOption{
 		OptionId: id, Name: name, Kind: kind,
-		Meta: map[string]any{
-			"permission": map[string]any{
-				"version": 1,
-				"changes": permissionChanges(scope, permissions),
-			},
-			"codex": map[string]any{"decision": decision, "permissions": permissions},
-		},
+		Meta: meta,
 	}
 }
 

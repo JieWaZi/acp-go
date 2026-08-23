@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -70,7 +71,19 @@ func (r *eventRouter) HandleJSON(ctx context.Context, raw []byte) error {
 // Handle 对强类型通知执行 generation/thread/turn 校验后分派。
 func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNotification, rawSize int) error {
 	if unknown, ok := notification.(*protocol.UnknownServerNotification); ok {
-		r.logger.Info("忽略未知 Codex 通知", "method", unknown.Method(), "payload_bytes", len(unknown.Params))
+		threadID, turnID := unknownNotificationIdentity(unknown.Params)
+		attributes := []any{
+			"method", unknown.Method(),
+			"session_id", string(r.generation.SessionID),
+			"payload_bytes", len(unknown.Params),
+		}
+		if threadID != "" {
+			attributes = append(attributes, "thread_id", threadID)
+		}
+		if turnID != "" {
+			attributes = append(attributes, "turn_id", turnID)
+		}
+		r.logger.Info("忽略未知 Codex 通知", attributes...)
 		return nil
 	}
 	threadID, turnID, scoped := notificationScope(notification)
@@ -101,9 +114,9 @@ func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNo
 	case *protocol.ThreadTokenUsageUpdatedEnvelope:
 		return r.handler.handleTokenUsage(ctx, event.Params)
 	case *protocol.CommandExecutionOutputDeltaEnvelope:
-		return r.handler.emit(ctx, mapCommandOutputDelta(event.Params))
+		return r.handler.handleCommandOutputDelta(ctx, event.Params)
 	case *protocol.TerminalInteractionEnvelope:
-		return r.handler.emit(ctx, mapTerminalInteraction(event.Params))
+		return r.handler.handleTerminalInteraction(ctx, event.Params)
 	case *protocol.MCPToolCallProgressEnvelope:
 		return r.handler.emit(ctx, mapMCPProgress(event.Params))
 	case *protocol.FileChangePatchUpdatedEnvelope:
@@ -116,6 +129,24 @@ func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNo
 		)
 		return nil
 	}
+}
+
+// unknownNotificationIdentity 只从未知 params 中提取安全 thread/turn 字符串，不记录其他字段。
+func unknownNotificationIdentity(params json.RawMessage) (threadID string, turnID string) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(params, &fields); err != nil {
+		return "", ""
+	}
+	return rawIdentityString(fields["threadId"]), rawIdentityString(fields["turnId"])
+}
+
+// rawIdentityString 仅接受 JSON string identity，其他形状一律按不可用处理。
+func rawIdentityString(raw json.RawMessage) string {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return value
 }
 
 // Usage 返回该路由器绑定 turn 的最新 usage 快照。

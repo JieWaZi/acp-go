@@ -183,27 +183,47 @@ func TestEventRouterSuppressesStaleGeneration(t *testing.T) {
 	}
 }
 
-// TestEventRouterLogsOnlySafeUnknownSummary 验证未知 method/item 的日志不会包含原始敏感 payload。
+// TestEventRouterLogsOnlySafeUnknownSummary 验证未知 method 单独记录安全 identity 而不泄漏 payload。
 func TestEventRouterLogsOnlySafeUnknownSummary(t *testing.T) {
 	t.Parallel()
 
 	updater := &recordingSessionUpdater{}
 	var logs bytes.Buffer
 	router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.New(slog.NewTextHandler(&logs, nil)))
-	for _, raw := range []string{
-		`{"method":"future/notification","params":{"threadId":"thread-1","turnId":"turn-1","secret":"never-log-this"}}`,
-		`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"futureItem","id":"future-1","text":"never-log-item-text"}}}`,
-	} {
-		if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
-			t.Fatalf("unknown HandleJSON 返回错误: %v", err)
-		}
+	raw := `{"method":"future/notification","params":{"threadId":"thread-1","turnId":"turn-1","secret":"never-log-this"}}`
+	if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+		t.Fatalf("unknown HandleJSON 返回错误: %v", err)
 	}
 	got := logs.String()
-	if !strings.Contains(got, "future/notification") || !strings.Contains(got, "futureItem") || !strings.Contains(got, "future-1") {
-		t.Fatalf("安全摘要日志 = %q，缺少 method/type/id", got)
+	for _, identity := range []string{
+		"future/notification", "session-1", "thread-1", "turn-1", "payload_bytes=",
+	} {
+		if !strings.Contains(got, identity) {
+			t.Fatalf("未知 method 安全摘要 = %q，缺少 %q", got, identity)
+		}
 	}
-	if strings.Contains(got, "never-log-this") || strings.Contains(got, "never-log-item-text") {
+	if strings.Contains(got, "never-log-this") {
 		t.Fatalf("日志泄漏原始 payload: %q", got)
+	}
+}
+
+// TestEventRouterLogsOnlySafeUnknownItemSummary 验证未知 completed item 的摘要与未知 method 相互隔离。
+func TestEventRouterLogsOnlySafeUnknownItemSummary(t *testing.T) {
+	t.Parallel()
+
+	updater := &recordingSessionUpdater{}
+	var logs bytes.Buffer
+	router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.New(slog.NewTextHandler(&logs, nil)))
+	raw := `{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"futureItem","id":"future-1","text":"never-log-item-text"}}}`
+	if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+		t.Fatalf("unknown item HandleJSON 返回错误: %v", err)
+	}
+	got := logs.String()
+	if !strings.Contains(got, "futureItem") || !strings.Contains(got, "future-1") {
+		t.Fatalf("未知 item 安全摘要 = %q，缺少 type/id", got)
+	}
+	if strings.Contains(got, "never-log-item-text") || strings.Contains(got, "future/notification") {
+		t.Fatalf("未知 item 日志泄漏或混入其他测试: %q", got)
 	}
 }
 
