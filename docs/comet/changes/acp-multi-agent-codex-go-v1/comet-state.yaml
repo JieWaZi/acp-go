@@ -3,24 +3,24 @@ name: acp-multi-agent-codex-go-v1
 language: zh-CN
 phase: build
 status: active
-state_version: 2
+state_version: 7
 brief: brief.md
-children_contract_hash: e1df2cfd01de6670de7bd392b02d2f1c7c9cc246e4f5b9e0aa1502b4762831ed
+children_contract_hash: 3eb2cbdad694bcd48c93d37bbc794c51b561d84ee2ad5f24a3902e41bad4b81a
 spec_changes:
   - capability: codex-config
-    operation: create
+    operation: modify
     source: specs/codex-config/spec.md
   - capability: codex-events
-    operation: create
+    operation: modify
     source: specs/codex-events/spec.md
   - capability: codex-runtime
-    operation: create
+    operation: modify
     source: specs/codex-runtime/spec.md
   - capability: framework
-    operation: create
+    operation: modify
     source: specs/framework/spec.md
   - capability: protocol-upstream
-    operation: create
+    operation: modify
     source: specs/protocol-upstream/spec.md
   - capability: verification
     operation: create
@@ -32,7 +32,7 @@ workspace:
   finish: null
 loop:
   stage: building
-  goal_cycle: 1
+  goal_cycle: 2
   iteration: 1
   attempt: 0
   retry_epoch: 0
@@ -861,7 +861,30 @@ acceptance:
 builder_handoff: null
 blockers: []
 verification: null
-history: []
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A3
+      - A17
+    summary:
+      text: FAIL：固定 upstream 要求进程崩溃错误保留 exit code/stderr；当前 Go stdout scanner.Err 分支绕过
+        EOFError/process.FinalError。Runtime 关键压力 count=20 命中 2 次；隔离 count=100,
+        parallel=16 命中 2 次，而 parallel=1 的 100 次全部通过，确认是调度竞态。默认 go
+        test、race、vet、protocolgen、格式化与三平台构建其余通过。
+      truncated: false
+    completed_at: 2026-08-23T22:09:58.475Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native child declarations changed
+      truncated: false
+    completed_at: 2026-08-23T22:11:01.389Z
 history_overflow:
   dropped_entries: 0
   first_dropped_at: null

@@ -88,3 +88,6 @@ children:
   - name: stabilization
     depends_on: [codex-events-config, codex-runtime]
     covers: [A17, A18]
+  - name: process-exit-repair
+    depends_on: [stabilization]
+    covers: [A3, A17]
