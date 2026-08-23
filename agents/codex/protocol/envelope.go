@@ -49,6 +49,8 @@ const (
 	MethodModelRerouted                   = "model/rerouted"
 	MethodWarning                         = "warning"
 	MethodAccountLoginCompleted           = "account/login/completed"
+	// MethodAccountUpdated 仅作为 logout 完成屏障；V1 不消费其账号 payload。
+	MethodAccountUpdated = "account/updated"
 )
 
 // ClientRequest 是 V1 客户端请求的封闭变体集合；每个具体类型固定唯一 method 和 Params 类型。

@@ -27,6 +27,8 @@ type sessionState struct {
 	mu sync.Mutex
 	// activePrompt 是该 session 唯一 pending/active turn。
 	activePrompt *activePrompt
+	// configuration 是 config 子组件维护的 model、effort 与安全模式状态。
+	configuration *sessionConfiguration
 	// promptClosed 阻止 close fence 建立后仍持有旧 state 的并发请求安装 prompt。
 	promptClosed bool
 }
@@ -69,14 +71,24 @@ func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
 }
 
 // install 仅在 generation、最新 open 身份与 close fence 全部匹配时安装状态。
-func (s *sessionStore) install(sessionID, cwd string, generation uint64) (*sessionState, bool) {
+func (s *sessionStore) install(
+	sessionID string,
+	cwd string,
+	generation uint64,
+	configuration *sessionConfiguration,
+) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	openGeneration, opening := s.opening[sessionID]
 	if s.closing[sessionID] > 0 || s.generations[sessionID] != generation || !opening || openGeneration != generation {
 		return nil, false
 	}
-	state := &sessionState{id: sessionID, cwd: cwd, generation: generation}
+	state := &sessionState{
+		id:            sessionID,
+		cwd:           cwd,
+		generation:    generation,
+		configuration: configuration,
+	}
 	s.sessions[sessionID] = state
 	delete(s.opening, sessionID)
 	return state, true

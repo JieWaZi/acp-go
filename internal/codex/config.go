@@ -118,6 +118,16 @@ func newSessionConfiguration(
 	if _, ok := findAgentMode(currentMode); !ok {
 		return nil, fmt.Errorf("unknown agent mode %q", currentMode)
 	}
+	// app-server 可省略 reasoningEffort；对应 upstream createModelId，按目录默认值补齐。
+	for _, model := range models {
+		if model.ID != currentModel {
+			continue
+		}
+		if currentEffort == "" {
+			currentEffort = model.DefaultReasoningEffort
+		}
+		break
+	}
 	return &sessionConfiguration{
 		models: append([]protocol.DatumElement(nil), models...),
 		current: modelSelection{

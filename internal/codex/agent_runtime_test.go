@@ -64,6 +64,28 @@ func writeRuntimeWireResult(
 // newRuntimeTestAgent 使用 fake typed client 创建已完成 connection barrier 的 Agent。
 func newRuntimeTestAgent(t *testing.T, rpc *fakeAppServerRPC) *Agent {
 	t.Helper()
+	originalHandler := rpc.handleCall
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		// 通用 fixture 补齐 upstream schema-required model，并为会话配置提供稳定目录。
+		if request.Method() == protocol.MethodModelList {
+			result.(*protocol.ModelListResponse).Data = testModels()
+			return nil
+		}
+		if err := originalHandler(ctx, request, result); err != nil {
+			return err
+		}
+		switch response := result.(type) {
+		case *protocol.ThreadStartResponse:
+			if response.Model == "" {
+				response.Model = "fast-model"
+			}
+		case *protocol.ThreadResumeResponse:
+			if response.Model == "" {
+				response.Model = "fast-model"
+			}
+		}
+		return nil
+	}
 	runtimeCtx, cancel := context.WithCancel(context.Background())
 	client := newAppServerClient(runtimeCtx, rpc)
 	agent := newAgentWithClient(
@@ -118,8 +140,9 @@ func TestAgentNewAndLoadSessionUseUpstreamThreadFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载 session 失败: %v", err)
 	}
-	if got := rpc.calls; len(got) != 4 || got[1] != protocol.MethodThreadStart ||
-		got[2] != protocol.MethodThreadResume || got[3] != protocol.MethodThreadRead {
+	if got := rpc.calls; len(got) != 6 || got[1] != protocol.MethodThreadStart ||
+		got[2] != protocol.MethodModelList || got[3] != protocol.MethodThreadResume ||
+		got[4] != protocol.MethodThreadRead || got[5] != protocol.MethodModelList {
 		t.Fatalf("请求顺序为 %v", got)
 	}
 }
@@ -183,7 +206,12 @@ func TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce(t *testing.T) {
 		case protocol.MethodInitialize:
 			return nil
 		case protocol.MethodThreadStart:
-			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "thread-1"
+			response.Model = "fast-model"
+			return nil
+		case protocol.MethodModelList:
+			result.(*protocol.ModelListResponse).Data = testModels()
 			return nil
 		case protocol.MethodTurnStart:
 			turnMu.Lock()
@@ -404,7 +432,7 @@ func TestAgentCloseSessionObservesLateTurnStartOverRealTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建立 wire session open 身份失败: %v", err)
 	}
-	state, installed := agent.sessions.install("thread-wire-close", "/tmp", generation)
+	state, installed := agent.sessions.install("thread-wire-close", "/tmp", generation, nil)
 	if !installed {
 		t.Fatal("安装 wire session 状态失败")
 	}
@@ -702,7 +730,12 @@ func TestAgentPromptWaitsForConnectionBinder(t *testing.T) {
 		case protocol.MethodInitialize:
 			return nil
 		case protocol.MethodThreadStart:
-			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "thread-1"
+			response.Model = "fast-model"
+			return nil
+		case protocol.MethodModelList:
+			result.(*protocol.ModelListResponse).Data = testModels()
 			return nil
 		case protocol.MethodTurnStart:
 			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{

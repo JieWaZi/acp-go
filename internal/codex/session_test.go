@@ -16,7 +16,7 @@ func TestSessionStoreStaleOpenCannotCleanNewInstallation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("开始新 open 失败: %v", err)
 	}
-	if _, installed := store.install("thread-1", "/tmp", newGeneration); !installed {
+	if _, installed := store.install("thread-1", "/tmp", newGeneration, nil); !installed {
 		t.Fatal("新 generation 未安装")
 	}
 	if store.beginStaleCleanup("thread-1", oldGeneration) {
@@ -28,7 +28,7 @@ func TestSessionStoreStaleOpenCannotCleanNewInstallation(t *testing.T) {
 func TestSessionStoreInstallRequiresMatchingOpenIdentity(t *testing.T) {
 	t.Parallel()
 	store := newSessionStore()
-	if _, installed := store.install("thread-1", "/tmp", 0); installed {
+	if _, installed := store.install("thread-1", "/tmp", 0, nil); installed {
 		t.Fatal("没有 beginOpen 的零 generation 被错误安装")
 	}
 }

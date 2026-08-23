@@ -11,11 +11,102 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 )
+
+// recordingACPClient 是 production composition E2E 使用的最小 SDK Client。
+type recordingACPClient struct {
+	// mu 保护 SDK 通知 goroutine 写入的 updates。
+	mu sync.Mutex
+	// updates 按 ACP session/update 到达顺序保存。
+	updates []acp.SessionNotification
+}
+
+// ReadTextFile 实现 SDK Client；本 E2E 不声明文件读取能力。
+func (*recordingACPClient) ReadTextFile(
+	context.Context,
+	acp.ReadTextFileRequest,
+) (acp.ReadTextFileResponse, error) {
+	return acp.ReadTextFileResponse{}, errors.New("测试客户端不支持读文件")
+}
+
+// WriteTextFile 实现 SDK Client；本 E2E 不声明文件写入能力。
+func (*recordingACPClient) WriteTextFile(
+	context.Context,
+	acp.WriteTextFileRequest,
+) (acp.WriteTextFileResponse, error) {
+	return acp.WriteTextFileResponse{}, errors.New("测试客户端不支持写文件")
+}
+
+// RequestPermission 实现 SDK Client；本 E2E 的 fake turn 不发起审批。
+func (*recordingACPClient) RequestPermission(
+	context.Context,
+	acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	return acp.RequestPermissionResponse{}, errors.New("测试 fake turn 不应请求审批")
+}
+
+// SessionUpdate 记录 production event router 发送的 ACP 更新。
+func (c *recordingACPClient) SessionUpdate(
+	_ context.Context,
+	notification acp.SessionNotification,
+) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updates = append(c.updates, notification)
+	return nil
+}
+
+// CreateTerminal 实现 SDK Client；本 E2E 不声明 terminal 能力。
+func (*recordingACPClient) CreateTerminal(
+	context.Context,
+	acp.CreateTerminalRequest,
+) (acp.CreateTerminalResponse, error) {
+	return acp.CreateTerminalResponse{}, errors.New("测试客户端不支持 terminal")
+}
+
+// KillTerminal 实现 SDK Client；本 E2E 不声明 terminal 能力。
+func (*recordingACPClient) KillTerminal(
+	context.Context,
+	acp.KillTerminalRequest,
+) (acp.KillTerminalResponse, error) {
+	return acp.KillTerminalResponse{}, errors.New("测试客户端不支持 terminal")
+}
+
+// TerminalOutput 实现 SDK Client；本 E2E 不声明 terminal 能力。
+func (*recordingACPClient) TerminalOutput(
+	context.Context,
+	acp.TerminalOutputRequest,
+) (acp.TerminalOutputResponse, error) {
+	return acp.TerminalOutputResponse{}, errors.New("测试客户端不支持 terminal")
+}
+
+// ReleaseTerminal 实现 SDK Client；本 E2E 不声明 terminal 能力。
+func (*recordingACPClient) ReleaseTerminal(
+	context.Context,
+	acp.ReleaseTerminalRequest,
+) (acp.ReleaseTerminalResponse, error) {
+	return acp.ReleaseTerminalResponse{}, errors.New("测试客户端不支持 terminal")
+}
+
+// WaitForTerminalExit 实现 SDK Client；本 E2E 不声明 terminal 能力。
+func (*recordingACPClient) WaitForTerminalExit(
+	context.Context,
+	acp.WaitForTerminalExitRequest,
+) (acp.WaitForTerminalExitResponse, error) {
+	return acp.WaitForTerminalExitResponse{}, errors.New("测试客户端不支持 terminal")
+}
+
+// snapshotUpdates 返回一份不与 SDK 通知 goroutine 共享底层数组的快照。
+func (c *recordingACPClient) snapshotUpdates() []acp.SessionNotification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]acp.SessionNotification(nil), c.updates...)
+}
 
 // TestRunStartsDefaultAndExplicitCodex 验证默认选择与显式 codex 都进入真实 SDK stdio 服务。
 // 若默认值改变、显式选择走不同实现或 composition root 未启动 SDK，本测试应失败。
@@ -41,6 +132,109 @@ func TestRunStartsDefaultAndExplicitCodex(t *testing.T) {
 				t.Fatalf("Agent 信息为 %#v，期望 codex", response.AgentInfo)
 			}
 		})
+	}
+}
+
+// TestRunProductionCompositionSessionFlow 验证生产组合根经 SDK stdio 驱动真实 fake app-server 子进程。
+// 若认证、session 配置或 event router 仅在单元测试被接入，本测试应失败。
+func TestRunProductionCompositionSessionFlow(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake Codex 仅在 Unix 运行；Windows 由交叉构建覆盖")
+	}
+	t.Setenv("CODEX_PATH", writeFakeCodex(t))
+
+	serverInput, clientOutput := io.Pipe()
+	clientInput, serverOutput := io.Pipe()
+	t.Cleanup(func() {
+		closeTestPipe(t, serverInput)
+		closeTestPipe(t, clientOutput)
+		closeTestPipe(t, clientInput)
+		closeTestPipe(t, serverOutput)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var diagnostics bytes.Buffer
+	exitResult := make(chan int, 1)
+	go func() {
+		exitResult <- run(ctx, nil, processIO{
+			input: serverInput, output: serverOutput, diagnostics: &diagnostics,
+		})
+	}()
+
+	client := &recordingACPClient{}
+	connection := acp.NewClientSideConnection(client, clientOutput, clientInput)
+	initialized, err := connection.Initialize(ctx, acp.InitializeRequest{
+		ProtocolVersion:    acp.ProtocolVersionNumber,
+		ClientCapabilities: acp.ClientCapabilities{},
+	})
+	if err != nil {
+		t.Fatalf("production initialize 失败: %v，诊断: %s", err, diagnostics.String())
+	}
+	if initialized.AgentCapabilities.Auth.Logout == nil ||
+		len(initialized.AuthMethods) != 2 {
+		t.Fatalf("认证能力为 %#v，methods=%#v", initialized.AgentCapabilities.Auth, initialized.AuthMethods)
+	}
+
+	if _, err = connection.Authenticate(ctx, acp.AuthenticateRequest{
+		MethodId: "api-key",
+		Meta: map[string]any{
+			"api-key": map[string]any{"apiKey": "TEST_ONLY_E2E_TOKEN"},
+		},
+	}); err != nil {
+		t.Fatalf("production Authenticate 失败: %v", err)
+	}
+	created, err := connection.NewSession(ctx, acp.NewSessionRequest{
+		Cwd: t.TempDir(), McpServers: []acp.McpServer{},
+	})
+	if err != nil {
+		t.Fatalf("production NewSession 失败: %v", err)
+	}
+	if created.SessionId != "e2e-thread" || created.Modes == nil || len(created.ConfigOptions) != 3 {
+		t.Fatalf("新 session 响应为 %#v", created)
+	}
+	if _, err = connection.SetSessionMode(ctx, acp.SetSessionModeRequest{
+		SessionId: created.SessionId, ModeId: "agent-full-access",
+	}); err != nil {
+		t.Fatalf("production SetSessionMode 失败: %v", err)
+	}
+	if _, err = connection.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{
+			SessionId: created.SessionId, ConfigId: "model", Value: "slow-model",
+		},
+	}); err != nil {
+		t.Fatalf("production SetSessionConfigOption 失败: %v", err)
+	}
+	prompt, err := connection.Prompt(ctx, acp.PromptRequest{
+		SessionId: created.SessionId,
+		Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello e2e"}}},
+	})
+	if err != nil || prompt.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("production Prompt 响应为 %#v, %v", prompt, err)
+	}
+	updates := client.snapshotUpdates()
+	if len(updates) != 1 || updates[0].Update.AgentMessageChunk == nil ||
+		updates[0].Update.AgentMessageChunk.Content.Text == nil ||
+		updates[0].Update.AgentMessageChunk.Content.Text.Text != "fake answer" {
+		t.Fatalf("production session updates 为 %#v", updates)
+	}
+	if _, err = connection.Logout(ctx, acp.LogoutRequest{}); err != nil {
+		t.Fatalf("production Logout 失败: %v", err)
+	}
+	if _, err = connection.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId}); err != nil {
+		t.Fatalf("production CloseSession 失败: %v", err)
+	}
+
+	if err = clientOutput.Close(); err != nil {
+		t.Fatalf("关闭 SDK 客户端输出失败: %v", err)
+	}
+	select {
+	case exitCode := <-exitResult:
+		if exitCode != 0 {
+			t.Fatalf("production composition 退出码为 %d，诊断: %s", exitCode, diagnostics.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("等待 production composition 退出失败: %v，诊断: %s", ctx.Err(), diagnostics.String())
 	}
 }
 
@@ -192,7 +386,7 @@ func closeTestPipe(t *testing.T, closer io.Closer) {
 	}
 }
 
-// writeFakeCodex 创建支持 --version 与 app-server initialize 的本地 fake 可执行文件。
+// writeFakeCodex 创建支持 V1 关键链路的可控本地 fake app-server。
 func writeFakeCodex(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -208,9 +402,39 @@ if [ "$1" != "app-server" ]; then
   exit 2
 fi
 while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"test","userAgent":"fake"}}'
+      printf '{"id":%s,"result":{"codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"test","userAgent":"fake"}}\n' "$id"
+      ;;
+    *'"method":"account/login/start"'*)
+      printf '{"id":%s,"result":{"type":"apiKey"}}\n' "$id"
+      printf '%s\n' '{"method":"account/login/completed","params":{"success":true}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"approvalPolicy":"on-request","approvalsReviewer":"user","cwd":"/workspace","model":"fast-model","modelProvider":"openai","reasoningEffort":"medium","sandbox":{"type":"workspaceWrite"},"thread":{"cliVersion":"0.148.0","createdAt":1,"cwd":"/workspace","ephemeral":false,"id":"e2e-thread","modelProvider":"openai","preview":"","sessionId":"e2e-session","source":{},"status":{"type":"idle"},"turns":[],"updatedAt":1}}}\n' "$id"
+      ;;
+    *'"method":"model/list"'*)
+      printf '{"id":%s,"result":{"data":[{"defaultReasoningEffort":"medium","description":"Fast","displayName":"Fast model","hidden":false,"id":"fast-model","isDefault":true,"model":"fast-model","supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Balanced"}]},{"defaultReasoningEffort":"low","description":"Slow","displayName":"Slow model","hidden":false,"id":"slow-model","isDefault":false,"model":"slow-model","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"medium","description":"Balanced"}]}]}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)
+      case "$line" in
+        *'"model":"slow-model"'*'"approvalPolicy":"never"'*|*'"approvalPolicy":"never"'*'"model":"slow-model"'*)
+          printf '{"id":%s,"result":{"turn":{"id":"e2e-turn","items":[],"status":"inProgress"}}}\n' "$id"
+          printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"fake answer","itemId":"e2e-message","threadId":"e2e-thread","turnId":"e2e-turn"}}'
+          printf '%s\n' '{"method":"turn/completed","params":{"threadId":"e2e-thread","turn":{"id":"e2e-turn","items":[],"status":"completed"}}}'
+          ;;
+        *)
+          printf '{"id":%s,"error":{"code":-32602,"message":"turn/start missing selected configuration"}}\n' "$id"
+          ;;
+      esac
+      ;;
+    *'"method":"account/logout"'*)
+      printf '{"id":%s,"result":{}}\n' "$id"
+      printf '%s\n' '{"method":"account/updated","params":{"account":null}}'
+      ;;
+    *'"method":"thread/unsubscribe"'*)
+      printf '{"id":%s,"result":{"status":"unsubscribed"}}\n' "$id"
       ;;
   esac
 done

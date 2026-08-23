@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -106,6 +107,8 @@ type Agent struct {
 	sessions *sessionStore
 	// steering 管理每 session 有界 FIFO extension 请求。
 	steering *steeringManager
+	// auth 复用已验证的 API Key 与 ChatGPT 认证组件。
+	auth *authenticator
 	// initializeMu 保护 initialized。
 	initializeMu sync.RWMutex
 	// initialized 表示 app-server initialize/initialized 已成功完成。
@@ -116,6 +119,8 @@ type Agent struct {
 	connection *acp.AgentSideConnection
 	// approvalRequester 是 approval 组件消费的窄接口；生产值始终与 connection 相同，测试可独立注入。
 	approvalRequester permissionRequester
+	// sessionUpdater 是 event/history 组件消费的 SDK 原生 session/update 窄接口。
+	sessionUpdater sessionUpdater
 	// connectionReady 是 notification/approval 路由的启动 barrier。
 	connectionReady chan struct{}
 	// connectionReadyOnce 保证 binder 重复调用不会 panic。
@@ -206,6 +211,7 @@ func newAgentWithClient(
 		prompts:         make(map[*activePrompt]*sessionState),
 	}
 	agent.steering = newSteeringManager(agent, defaultSteeringQueueCapacity)
+	agent.auth = newAuthenticator(client, client, systemBrowserOpener{}, os.Getenv, logger)
 	client.SetNotificationHandler(agent.handleNotification)
 	return agent
 }
@@ -217,6 +223,7 @@ func (a *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 	if a.connection == nil {
 		a.connection = connection
 		a.approvalRequester = connection
+		a.sessionUpdater = connection
 	}
 	a.connectionMu.Unlock()
 	a.markConnectionReady()
@@ -242,9 +249,21 @@ func (a *Agent) waitConnection(ctx context.Context) (*acp.AgentSideConnection, e
 	}
 }
 
-// Authenticate 未在 runtime 子变更声明认证能力。
-func (a *Agent) Authenticate(context.Context, acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
-	return acp.AuthenticateResponse{}, acp.NewMethodNotFound(acp.AgentMethodAuthenticate)
+// Authenticate 把 ACP 认证请求交给现有 authenticator，不在 Agent 重写登录状态机。
+func (a *Agent) Authenticate(
+	ctx context.Context,
+	request acp.AuthenticateRequest,
+) (acp.AuthenticateResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acp.AuthenticateResponse{}, err
+	}
+	if a.auth == nil {
+		return acp.AuthenticateResponse{}, errors.New("codex authenticator is unavailable")
+	}
+	if err := a.auth.Authenticate(ctx, request); err != nil {
+		return acp.AuthenticateResponse{}, err
+	}
+	return acp.AuthenticateResponse{}, nil
 }
 
 // Initialize 先完成唯一 app-server 握手，再声明真实可用的 session/prompt 能力。
@@ -265,6 +284,7 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
+			Auth:        acp.AgentAuthCapabilities{Logout: &acp.LogoutCapabilities{}},
 			LoadSession: true,
 			PromptCapabilities: acp.PromptCapabilities{
 				Image: true, EmbeddedContext: true,
@@ -273,13 +293,25 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 				Close: &acp.SessionCloseCapabilities{}, Resume: &acp.SessionResumeCapabilities{},
 			},
 		},
-		AgentInfo: &acp.Implementation{Name: agentName, Title: &title, Version: agentVersion},
+		AgentInfo:   &acp.Implementation{Name: agentName, Title: &title, Version: agentVersion},
+		AuthMethods: codexAuthMethods(true),
 	}, nil
 }
 
-// Logout 未在 runtime 子变更声明认证能力。
-func (a *Agent) Logout(context.Context, acp.LogoutRequest) (acp.LogoutResponse, error) {
-	return acp.LogoutResponse{}, acp.NewMethodNotFound(acp.AgentMethodLogout)
+// Logout 等价执行 upstream 的 subscribe account/updated → account/logout → wait 顺序。
+func (a *Agent) Logout(ctx context.Context, _ acp.LogoutRequest) (acp.LogoutResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acp.LogoutResponse{}, err
+	}
+	subscription := a.client.SubscribeAccountUpdated()
+	defer subscription.Close()
+	if err := a.client.AccountLogout(ctx); err != nil {
+		return acp.LogoutResponse{}, fmt.Errorf("logging out Codex account: %w", err)
+	}
+	if err := subscription.Wait(ctx); err != nil {
+		return acp.LogoutResponse{}, fmt.Errorf("waiting for Codex account update: %w", err)
+	}
+	return acp.LogoutResponse{}, nil
 }
 
 // NewSession 把 ACP session/new 映射为 Codex thread/start 并安装 generation 状态。
@@ -295,14 +327,29 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if response.Thread.ID == "" {
 		return acp.NewSessionResponse{}, errors.New("starting codex thread: empty thread id")
 	}
+	configuration, err := a.configurationForSession(ctx, response.Model, response.ReasoningEffort)
+	if err != nil {
+		unsubscribeErr := a.client.ThreadUnsubscribe(ctx, response.Thread.ID)
+		return acp.NewSessionResponse{}, fmt.Errorf(
+			"configuring new codex thread %q: %w",
+			response.Thread.ID,
+			errors.Join(err, unsubscribeErr),
+		)
+	}
 	generation, err := a.sessions.beginOpen(response.Thread.ID)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
-	if _, installed := a.sessions.install(response.Thread.ID, request.Cwd, generation); !installed {
+	state, installed := a.sessions.install(response.Thread.ID, request.Cwd, generation, configuration)
+	if !installed {
 		return acp.NewSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
 	}
-	return acp.NewSessionResponse{SessionId: acp.SessionId(response.Thread.ID)}, nil
+	modes, options := sessionConfigurationResponse(state)
+	return acp.NewSessionResponse{
+		SessionId:     acp.SessionId(response.Thread.ID),
+		Modes:         modes,
+		ConfigOptions: options,
+	}, nil
 }
 
 // ResumeSession 使用 thread/resume 恢复订阅，并受 generation/close fence 保护。
@@ -310,21 +357,30 @@ func (a *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
 ) (acp.ResumeSessionResponse, error) {
-	_, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, false)
+	_, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, false)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	return acp.ResumeSessionResponse{}, nil
+	modes, options := sessionConfigurationResponse(state)
+	return acp.ResumeSessionResponse{Modes: modes, ConfigOptions: options}, nil
 }
 
 // LoadSession 按固定 upstream 顺序执行 thread/resume→thread/read(includeTurns=true)，再安装状态。
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	_, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, true)
+	thread, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, true)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
-	// 历史到 ACP update 的完整 mapper 由 codex-events-config 子变更消费；runtime 已保证读取发生在安装前。
-	return acp.LoadSessionResponse{}, nil
+	if err = a.replayThreadHistory(ctx, state, thread); err != nil {
+		_, closeErr := a.CloseSession(ctx, acp.CloseSessionRequest{SessionId: request.SessionId})
+		return acp.LoadSessionResponse{}, fmt.Errorf(
+			"replaying codex thread %q: %w",
+			request.SessionId,
+			errors.Join(err, closeErr),
+		)
+	}
+	modes, options := sessionConfigurationResponse(state)
+	return acp.LoadSessionResponse{Modes: modes, ConfigOptions: options}, nil
 }
 
 // openExistingSession 复用 resume/load 的 generation 状态机，并按需在安装前读取历史。
@@ -333,18 +389,18 @@ func (a *Agent) openExistingSession(
 	sessionID string,
 	cwd string,
 	includeHistory bool,
-) (protocol.Thread, error) {
+) (protocol.Thread, *sessionState, error) {
 	if err := a.requireInitialized(); err != nil {
-		return protocol.Thread{}, err
+		return protocol.Thread{}, nil, err
 	}
 	generation, err := a.sessions.beginOpen(sessionID)
 	if err != nil {
-		return protocol.Thread{}, err
+		return protocol.Thread{}, nil, err
 	}
 	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{ThreadID: sessionID, Cwd: &cwd})
 	if err != nil {
 		a.sessions.abandonOpen(sessionID, generation)
-		return protocol.Thread{}, fmt.Errorf("resuming codex thread %q: %w", sessionID, err)
+		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, err)
 	}
 	thread := response.Thread
 	if includeHistory {
@@ -353,14 +409,63 @@ func (a *Agent) openExistingSession(
 			ThreadID: sessionID, IncludeTurns: &includeTurns,
 		})
 		if readErr != nil {
-			return protocol.Thread{}, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, readErr)
+			return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, readErr)
 		}
 		thread = readResponse.Thread
 	}
-	if _, installed := a.sessions.install(sessionID, cwd, generation); !installed {
-		return protocol.Thread{}, a.closeStaleOpen(ctx, sessionID, generation)
+	configuration, err := a.configurationForSession(ctx, response.Model, response.ReasoningEffort)
+	if err != nil {
+		return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, err)
 	}
-	return thread, nil
+	state, installed := a.sessions.install(sessionID, cwd, generation, configuration)
+	if !installed {
+		return protocol.Thread{}, nil, a.closeStaleOpen(ctx, sessionID, generation)
+	}
+	return thread, state, nil
+}
+
+// configurationForSession 复用 model/list 与 sessionConfiguration 组装真实 session 配置。
+// app-server 响应缺失 schema-required model 时显式失败，避免向 ACP 客户端静默降级能力。
+func (a *Agent) configurationForSession(
+	ctx context.Context,
+	model string,
+	effort *string,
+) (*sessionConfiguration, error) {
+	if model == "" {
+		return nil, errors.New("Codex session response did not include a model")
+	}
+	models, err := a.client.ListModels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing Codex models: %w", err)
+	}
+	if len(models) == 0 {
+		return nil, errors.New("Codex did not return any models")
+	}
+	currentEffort := ""
+	if effort != nil {
+		currentEffort = *effort
+	}
+	configuration, err := newSessionConfiguration(models, model, currentEffort, "agent")
+	if err != nil {
+		return nil, fmt.Errorf("building session configuration: %w", err)
+	}
+	return configuration, nil
+}
+
+// sessionConfigurationResponse 在 session 锁内生成 ACP mode/config 快照。
+func sessionConfigurationResponse(
+	state *sessionState,
+) (*acp.SessionModeState, []acp.SessionConfigOption) {
+	if state == nil {
+		return nil, nil
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.configuration == nil {
+		return nil, nil
+	}
+	modes := state.configuration.ModeState()
+	return &modes, state.configuration.Options()
 }
 
 // cleanupFailedSubscribedOpen 释放已订阅但后续 read/配置失败的 thread。
@@ -467,11 +572,27 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		err error
 	}
 	resultChannel := make(chan turnResult, 1)
+	turnParams := protocol.TurnStartParams{
+		ThreadID:            state.id,
+		Input:               input,
+		ClientUserMessageID: request.MessageId,
+		Cwd:                 &state.cwd,
+	}
+	state.mu.Lock()
+	if state.configuration != nil {
+		selection := state.configuration.Selection()
+		mode := state.configuration.ModeDefinition()
+		turnParams.Model = &selection.Model
+		if selection.Effort != "" {
+			turnParams.Effort = &selection.Effort
+		}
+		turnParams.ApprovalPolicy = &mode.ApprovalPolicy
+		turnParams.SandboxPolicy = &mode.SandboxPolicy
+	}
+	state.mu.Unlock()
 	go func() {
 		defer a.finishPromptBackground(prompt)
-		completion, runErr := a.client.RunTurn(prompt.runCtx, protocol.TurnStartParams{
-			ThreadID: state.id, Input: input, ClientUserMessageID: request.MessageId,
-		}, func(turnID string) {
+		completion, runErr := a.client.RunTurn(prompt.runCtx, turnParams, func(turnID string) {
 			a.onTurnStarted(state, prompt, turnID)
 		})
 		prompt.cancelRun()
@@ -615,8 +736,8 @@ func (a *Agent) onTurnStarted(state *sessionState, prompt *activePrompt, turnID 
 		a.requestPromptInterrupt(state, prompt, turnID, true)
 		return
 	}
-	if connection := a.currentConnection(); connection != nil {
-		prompt.setEventRouter(newEventRouter(connection, turnGeneration{
+	if updater := a.currentSessionUpdater(); updater != nil {
+		prompt.setEventRouter(newEventRouter(updater, turnGeneration{
 			SessionID:  acp.SessionId(state.id),
 			ThreadID:   state.id,
 			TurnID:     turnID,
@@ -687,17 +808,62 @@ func (a *Agent) ListSessions(context.Context, acp.ListSessionsRequest) (acp.List
 	return acp.ListSessionsResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionList)
 }
 
-// SetSessionConfigOption 由 codex-events-config 子变更实现。
+// SetSessionConfigOption 校验 SDK union，并把选择写入精确当前 session 的现有配置组件。
 func (a *Agent) SetSessionConfigOption(
-	context.Context,
-	acp.SetSessionConfigOptionRequest,
+	_ context.Context,
+	request acp.SetSessionConfigOptionRequest,
 ) (acp.SetSessionConfigOptionResponse, error) {
-	return acp.SetSessionConfigOptionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetConfigOption)
+	if request.ValueId == nil || request.Boolean != nil {
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{
+			"error": "session config requires a string value",
+		})
+	}
+	value := request.ValueId
+	state, ok := a.sessions.get(string(value.SessionId))
+	if !ok || !a.sessions.isCurrent(state) {
+		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf(
+			"setting config for session %q: %w",
+			value.SessionId,
+			ErrSessionNotFound,
+		)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.configuration == nil {
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{
+			"error": "session configuration is unavailable",
+		})
+	}
+	if err := state.configuration.Select(value.ConfigId, string(value.Value)); err != nil {
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
+	}
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: state.configuration.Options()}, nil
 }
 
-// SetSessionMode 由 codex-events-config 子变更实现。
-func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
+// SetSessionMode 复用 mode 配置选择；未知模式绝不回退到更宽松权限。
+func (a *Agent) SetSessionMode(
+	_ context.Context,
+	request acp.SetSessionModeRequest,
+) (acp.SetSessionModeResponse, error) {
+	state, ok := a.sessions.get(string(request.SessionId))
+	if !ok || !a.sessions.isCurrent(state) {
+		return acp.SetSessionModeResponse{}, fmt.Errorf(
+			"setting mode for session %q: %w",
+			request.SessionId,
+			ErrSessionNotFound,
+		)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.configuration == nil {
+		return acp.SetSessionModeResponse{}, acp.NewInvalidParams(map[string]any{
+			"error": "session configuration is unavailable",
+		})
+	}
+	if err := state.configuration.Select(modeConfigID, string(request.ModeId)); err != nil {
+		return acp.SetSessionModeResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
+	}
+	return acp.SetSessionModeResponse{}, nil
 }
 
 // HandleExtensionMethod 把唯一 V1 steering extension 交给有界 FIFO manager；其余使用 SDK 标准错误。
