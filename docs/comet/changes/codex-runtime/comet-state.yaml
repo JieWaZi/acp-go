@@ -1,9 +1,9 @@
 schema: comet.native.v4
 name: codex-runtime
 language: zh-CN
-phase: build
+phase: archive
 status: active
-state_version: 5
+state_version: 12
 brief: brief.md
 spec_changes:
   - capability: codex-runtime
@@ -15,33 +15,23 @@ workspace:
   target_branch: main
   finish: null
 loop:
-  stage: repairing
+  stage: archive-ready
   goal_cycle: 1
-  iteration: 2
-  attempt: 0
+  iteration: 3
+  attempt: 1
   retry_epoch: 0
-  failed_iteration_count: 1
+  failed_iteration_count: 2
   no_progress_count: 0
   execution_failure_count: 0
-  previous_unresolved_ids:
-    - A4
-    - A6
-    - A8
-    - A13
-    - A23
-    - A25
-    - A31
-    - A32
-    - A33
-    - A34
-  next_action: repair-failed-acceptance
+  previous_unresolved_ids: []
+  next_action: archive
 acceptance:
   - id: A1
     source: brief.md
     text: A1：显式无效 `CODEX_PATH` 不回退，PATH 缺失返回诊断；非 0.148.0 只警告并继续，stdout 不受污染。
     result: passed
     reason:
-      text: CODEX_PATH、PATH、版本警告与 stdout 隔离通过。
+      text: CODEX_PATH/PATH、版本警告与 stdout 隔离正确。
       truncated: false
   - id: A2
     source: brief.md
@@ -49,7 +39,7 @@ acceptance:
       session。
     result: passed
     reason:
-      text: initialize once 及 session 初始化顺序通过。
+      text: initialize once 与 new/resume/load 顺序正确。
       truncated: false
   - id: A3
     source: brief.md
@@ -57,43 +47,43 @@ acceptance:
       事件不会错误结束当前 prompt。
     result: passed
     reason:
-      text: 多轮、early/stale/cross-session completion 通过。
+      text: 多轮及 early/stale/cross-session completion 正确。
       truncated: false
   - id: A4
     source: brief.md
     text: A4：cancel-before-start 不留下 turn；迟到 turn/start 被标记 stale 并 interrupt；重复取消幂等。
-    result: failed
+    result: passed
     reason:
-      text: cancel-before-start 后 activePrompt 直到 RunTurn 返回才释放，可永久阻塞后续 turn。
+      text: cancel-before-start 的迟到 turn stale 且 interrupt-once。
       truncated: false
   - id: A5
     source: brief.md
     text: A5：并发 steering 严格 FIFO，无活动 turn 时启动新 turn，单项失败后队列继续且不产生 rival turn。
     result: passed
     reason:
-      text: FIFO steering、失败继续与无 rival turn 通过。
+      text: steering FIFO、失败隔离与单 control turn 正确。
       truncated: false
   - id: A6
     source: brief.md
     text: A6：app-server EOF/exit、session close 与 Adapter close 会解除 pending
       request/waiter/queue，无 goroutine 泄漏。
-    result: failed
+    result: passed
     reason:
-      text: CloseSession 无法解除未知 turn ID 阶段的 pending RunTurn/goroutine。
+      text: close/fatal 解除本地 owner；迟到 observer 有 transport owner 并清理 server turn。
       truncated: false
   - id: A7
     source: brief.md
     text: A7：`go test ./...`、`go test -race ./...`、`go vet ./...` 与目标构建通过。
     result: passed
     reason:
-      text: fresh test/race/vet/protocol/build 通过。
+      text: test/race/vet/freshness/build 通过。
       truncated: false
   - id: A8
     source: brief.md
     text: A8：全部手写 Go 类型、字段和函数有中文注释，关键并发逻辑注明固定 codex-acp symbol/test 来源。
-    result: failed
+    result: passed
     reason:
-      text: UPSTREAM.md 未记录 cancel-before-start 实质时序差异。
+      text: 中文注释和 UPSTREAM 并发差异追踪完整。
       truncated: false
   - id: A9
     source: specs/codex-runtime/spec.md
@@ -101,7 +91,7 @@ acceptance:
       PATH 查找。显式路径无效或 PATH 不存在 Codex 时返回清晰启动错误，不下载或静默回退。
     result: passed
     reason:
-      text: 显式路径/PATH 策略正确。
+      text: 显式路径失败不回退，PATH 诊断清晰。
       truncated: false
   - id: A10
     source: specs/codex-runtime/spec.md
@@ -109,7 +99,7 @@ acceptance:
       ACP JSON-RPC 内容。
     result: passed
     reason:
-      text: 基线版本探测和兼容警告正确。
+      text: 0.148.0 基线与非基线告警正确。
       truncated: false
   - id: A11
     source: specs/codex-runtime/spec.md
@@ -117,112 +107,112 @@ acceptance:
       JSON-RPC；V1 不增加 HTTP、WebSocket 或 Unix Socket 传输。
     result: passed
     reason:
-      text: 单一 app-server 与 stdin/stdout NDJSON 通过。
+      text: 唯一 app-server 与 stdio 无 jsonrpc NDJSON 正确。
       truncated: false
   - id: A12
     source: specs/codex-runtime/spec.md
     text: 启动后执行 app-server initialize，再允许 thread/turn 请求。
     result: passed
     reason:
-      text: initialize 完成后才开放 thread/turn。
+      text: initialize 后才开放 thread/turn。
       truncated: false
   - id: A13
     source: specs/codex-runtime/spec.md
     text: stdout 只承载协议消息；stderr 进入结构化/关联日志，不能污染 JSON-RPC。
-    result: failed
+    result: passed
     reason:
-      text: app-server stderr 仅进入 tailBuffer，正常运行/正常退出不进入结构化 Logger。
+      text: stderr 实时结构化记录且不污染 stdout。
       truncated: false
   - id: A14
     source: specs/codex-runtime/spec.md
     text: 子进程退出、stdin/stdout 断开或 Adapter 关闭时，dispose 连接、取消活动请求并向 ACP 返回稳定错误；清理必须幂等。
     result: passed
     reason:
-      text: EOF/exit/close fatal fanout 与幂等清理通过。
+      text: EOF/exit/Close fatal fanout 与幂等清理正确。
       truncated: false
   - id: A15
     source: specs/codex-runtime/spec.md
     text: new session 映射到 Codex thread/start，建立 ACP SessionID 与 Codex ThreadID 的内部关系。
     result: passed
     reason:
-      text: new session 到 thread/start 映射通过。
+      text: session/new 映射 thread/start。
       truncated: false
   - id: A16
     source: specs/codex-runtime/spec.md
     text: load/resume 使用固定上游基线的恢复流程，恢复必要历史与配置后才安装 session 状态。
     result: passed
     reason:
-      text: resume/read/install 顺序通过。
+      text: resume/load 使用 resume→read→install。
       truncated: false
   - id: A17
     source: specs/codex-runtime/spec.md
     text: session open/close 使用 generation 或等价身份保护：迟到的 open 结果不能覆盖已关闭或重新打开的 session。
     result: passed
     reason:
-      text: generation open/close fence 通过。
+      text: generation fence 阻止迟到安装。
       truncated: false
   - id: A18
     source: specs/codex-runtime/spec.md
     text: 一个 session 的失败、关闭或恢复错误不得污染其他 session。
     result: passed
     reason:
-      text: session 隔离通过。
+      text: session 与 completion 隔离正确。
       truncated: false
   - id: A19
     source: specs/codex-runtime/spec.md
     text: prompt 将 Text/Image/Resource 转换后的输入提交到 turn/start，并从对应 thread/turn 路由流式事件。
     result: passed
     reason:
-      text: 输入转换与基础流式路由通过。
+      text: Text/Image/Resource 与当前 turn 路由正确。
       truncated: false
   - id: A20
     source: specs/codex-runtime/spec.md
     text: 同一 session 可连续多轮；每个 prompt 只由自己 turn 的 completion 结束一次。
     result: passed
     reason:
-      text: 多轮 turn completion exactly-once 通过。
+      text: 每轮由自身 completion exactly-once 结束。
       truncated: false
   - id: A21
     source: specs/codex-runtime/spec.md
     text: completion 可能早于等待器建立；实现必须捕获并匹配 early completion。
     result: passed
     reason:
-      text: notification-before-response capture 通过。
+      text: response 前 completion 可捕获。
       truncated: false
   - id: A22
     source: specs/codex-runtime/spec.md
     text: stale turn notification 不得完成当前 prompt；旧 turn 的等待器和状态在确定完成/取消后清理。
     result: passed
     reason:
-      text: 旧/跨 session completion 隔离通过。
+      text: 旧 turn/stale 通知不结束当前 prompt。
       truncated: false
   - id: A23
     source: specs/codex-runtime/spec.md
     text: prompt 请求在 turn 启动前取消时不得留下后台 rival turn；若 turn 已活动，使用 Codex turn interrupt。
-    result: failed
+    result: passed
     reason:
-      text: 取消返回后仍保留 pending RunTurn/活动槽，不能保证及时恢复后续 turn。
+      text: 启动前取消立即释放前台且迟到服务端 turn 不 orphan。
       truncated: false
   - id: A24
     source: specs/codex-runtime/spec.md
     text: interrupt 后等待对应 completion/cancelled 语义完成清理；重复取消幂等。
     result: passed
     reason:
-      text: active turn interrupt completion 与重复取消幂等通过。
+      text: active interrupt、completion-first 与重复取消正确。
       truncated: false
   - id: A25
     source: specs/codex-runtime/spec.md
     text: session/进程结束会解除所有取消等待，不允许 goroutine 泄漏。
-    result: failed
+    result: passed
     reason:
-      text: session close 不解除尚无 turn ID 的 RunTurn 等待。
+      text: session/process/Adapter 清理有明确 owner 与终点。
       truncated: false
   - id: A26
     source: specs/codex-runtime/spec.md
     text: 每个 session 一个 FIFO steering queue，同一时间只处理一个 steering 请求。
     result: passed
     reason:
-      text: 每 session 单 consumer FIFO 通过。
+      text: 每 session 单 consumer FIFO。
       truncated: false
   - id: A27
     source: specs/codex-runtime/spec.md
@@ -230,214 +220,210 @@ acceptance:
       内容启动新 turn。
     result: passed
     reason:
-      text: active steer/no-active start 语义通过。
+      text: active steer 与 no-active fallback 正确。
       truncated: false
   - id: A28
     source: specs/codex-runtime/spec.md
     text: 并发 steering 不得启动 rival turn；请求在“注入活动 turn”或“新 turn 已被接受”后返回成功。
     result: passed
     reason:
-      text: steering 串行和单 control turn 通过。
+      text: 并发 steering 无 rival turn。
       truncated: false
   - id: A29
     source: specs/codex-runtime/spec.md
     text: 一个 steering 的解析、发送、启动或取消失败只拒绝该请求，队列继续处理后续请求。
     result: passed
     reason:
-      text: 单项 steering 失败后队列继续。
+      text: 单项失败不阻塞后续请求。
       truncated: false
   - id: A30
     source: specs/codex-runtime/spec.md
     text: session 关闭时拒绝/清理未完成请求并移除空闲队列。
     result: passed
     reason:
-      text: session close 拒绝并清理 steering。
+      text: session close 清理 pending steering。
       truncated: false
   - id: A31
     source: specs/codex-runtime/spec.md
     text: thread、turn、session generation/identity 必须参与
       completion、notification、approval 和 control 路由。
-    result: failed
+    result: passed
     reason:
-      text: formal child spec 要求 approval identity routing，但 brief 将完整 approval mapper
-        列为 sibling non-goal；当前 handler 未安装。
+      text: notification/approval/completion/control 校验完整 generation identity。
       truncated: false
   - id: A32
     source: specs/codex-runtime/spec.md
     text: early completion、stale completion、stale approval、close/open race 和
       app-server 异常退出均有固定测试。
-    result: failed
+    result: passed
     reason:
-      text: formal child spec 要求 stale approval 固定测试，但该能力归 sibling，当前分支缺少。
+      text: early/stale approval、close/open、process exit 均有固定测试。
       truncated: false
   - id: A33
     source: specs/codex-runtime/spec.md
     text: A3：进程与 JSON-RPC 生命周期。
-    result: failed
+    result: passed
     reason:
-      text: 进程生命周期因 stderr 实时日志缺口不完整。
+      text: 进程与内层 JSON-RPC 生命周期完整。
       truncated: false
   - id: A34
     source: specs/codex-runtime/spec.md
     text: A4-A7：session、prompt、cancel 和 steering。
-    result: failed
+    result: passed
     reason:
-      text: cancel/session close pending-start 生命周期不完整。
+      text: session/prompt/cancel/steering 主链路完整。
       truncated: false
   - id: A35
     source: specs/codex-runtime/spec.md
     text: A13：early/stale/exit 竞态保护。
     result: passed
     reason:
-      text: early/stale completion 与 process exit 竞态测试通过。
+      text: early/stale/exit 竞态保护完整。
       truncated: false
 builder_handoff:
-  candidate_id: 67d381f8-d447-443f-a5d5-0248eafc2a5b
+  candidate_id: 2a6316d2-3b1f-47ee-b2cf-30be58535073
   identity_provider: skill-coordinated
-  builder_execution_ref: skill-coordinated:builder:4658a749-7830-4fa9-a0ed-ef793b9e22a9
-  iteration: 1
+  builder_execution_ref: skill-coordinated:builder:a94d7e1b-e190-45fd-b64b-716e617d565b
+  iteration: 3
   summary:
-    text: 基于固定 codex-acp ba5bcc3 与 acp-go-sdk v0.13.5 完成 Codex V1
-      runtime：用户预装可执行文件与版本探测、唯一 app-server、有界无 jsonrpc
-      NDJSON、initialize、thread/session generation 与 close
-      fence、prompt/early/stale completion、cancel/late interrupt、每 session FIFO
-      steering、process fatal fan-out、connection ready barrier，并接入 cmd
-      组合根。全部状态机与关键失败路径已用中文注释和确定性回归测试约束，UPSTREAM.md 记录直接映射与 Go 边界差异。提交
-      b5673e9e7f5ece1f64b9a3d3cb72a874a9381f7c。
+    text: iteration3 提交 8a7e2af：严格对照 fixed codex-acp ba5bcc3 session-close delayed
+      turn/start 语义，将 transport response waiter 与 one-shot late observer
+      拆分。CloseSession 取消并回收本地 RunTurn waiter/goroutine 后，真实 NDJSON wire 的迟到
+      turn/start response 仍同步安装 identity、标记 stale，并由 Agent 自有 goroutine发出恰好一次
+      turn/interrupt；重复/未知 response 安全忽略，fatal 或 Adapter Close 清空
+      observer，普通取消不残留 pending。新增真实 transport fake app-server wire 测试与 detached
+      observer 的 cancel/duplicate/fatal 所有权测试，UPSTREAM.md 记录 Go 可取消调用与
+      TypeScript Promise 的薄边界差异。
     truncated: false
   addressed_acceptance_ids:
-    - A1
-    - A2
-    - A3
-    - A4
-    - A5
     - A6
-    - A7
     - A8
-    - A9
-    - A10
-    - A11
-    - A12
-    - A13
-    - A14
-    - A15
-    - A16
-    - A17
-    - A18
-    - A19
-    - A20
-    - A21
-    - A22
-    - A23
-    - A24
-    - A25
-    - A26
-    - A27
-    - A28
-    - A29
-    - A30
-    - A31
     - A32
-    - A33
     - A34
-    - A35
   checks:
     - name:
-        text: gofmt + git diff --check
+        text: real wire delayed turn/start RED-GREEN
         truncated: false
       result: passed
       note:
-        text: 全部修改 Go 文件已格式化，工作树差异无 whitespace 错误
+        text: 修复前确定性失败：迟到 response 后 turn identity 为空；修复后 CloseSession/prompt 先返回、late
+          stale+interrupt-once 测试通过。
         truncated: false
     - name:
-        text: go test ./... -count=1 -timeout=120s
+        text: targeted activation/cancel/stale/ownership suite
         truncated: false
       result: passed
       note:
-        text: 全部 6 个 package 通过
+        text: 12 项 targeted 测试全部通过；覆盖 activation barrier、ordinary cancel、duplicate
+          response、fatal cleanup、early completion stale cleanup 与 close/Adapter
+          join。
         truncated: false
     - name:
-        text: go test -race ./... -count=1 -timeout=240s
+        text: go test ./internal/codex -count=1 -timeout=120s
         truncated: false
       result: passed
       note:
-        text: 全部 6 个 package 通过且无 data race
+        text: 外层 timeout 150s；internal/codex 2.813s 通过。
         truncated: false
     - name:
-        text: go vet ./...
+        text: go test -race ./internal/codex -count=1 -timeout=210s
         truncated: false
       result: passed
-      note: null
+      note:
+        text: 外层 timeout 240s；internal/codex 4.449s 通过，无 data race。
+        truncated: false
+    - name:
+        text: go test ./... -count=1 -timeout=240s
+        truncated: false
+      result: passed
+      note:
+        text: 外层 timeout 270s；全部 package 通过，protocolgen 84.951s。
+        truncated: false
+    - name:
+        text: go test -race ./... -count=1 -timeout=420s
+        truncated: false
+      result: passed
+      note:
+        text: 外层 timeout 450s；全部 package 通过，无 data race。
+        truncated: false
+    - name:
+        text: gofmt + git diff --check + go vet ./...
+        truncated: false
+      result: passed
+      note:
+        text: 修改文件已 gofmt，diff 无 whitespace 错误，vet 退出码 0。
+        truncated: false
     - name:
         text: go run ./tools/protocolgen --check
         truncated: false
       result: passed
       note:
-        text: 已合并协议生成快照未被 runtime 手写绕过或改写
+        text: 固定协议生成快照无漂移，退出码 0。
         truncated: false
     - name:
-        text: go build ./cmd/acp-agent
-        truncated: false
-      result: passed
-      note: null
-    - name:
-        text: GOOS=linux GOARCH=amd64 go build ./cmd/acp-agent
+        text: native/Linux/Windows builds
         truncated: false
       result: passed
       note:
-        text: best-effort 交叉构建
+        text: macOS native、linux/amd64、windows/amd64 均构建到 /tmp 并通过；工作树无构建产物。
         truncated: false
     - name:
-        text: GOOS=windows GOARCH=amd64 go build ./cmd/acp-agent
+        text: upstream and SDK pins
         truncated: false
       result: passed
       note:
-        text: best-effort 交叉构建
+        text: codex-acp HEAD
+          ba5bcc3d7759250dde9d4d2286a1bec11b363208；github.com/coder/acp-go-sdk
+          v0.13.5。
         truncated: false
   checks_truncated: false
   known_limits:
-    - text: 按 child brief 的明确 Non-goal，完整 events/tool/approval/config/auth mapper 留给
-        codex-events-config；本 runtime 仅路由 agent message/reasoning 文本，未安装
-        approval handler 时 app-server server request 会有界 fail-closed。
-      truncated: false
-    - text: 固定 TS initialize 的 experimentalApi 字段已被父协议阶段有意从稳定 V1 生成类型隐藏；runtime 不手写重复
-        DTO，差异已记录于 UPSTREAM.md。
+    - text: 未执行需要真实账号/凭据的可选 Codex 端到端；本轮进程、NDJSON、迟到 start 与 interrupt 由真实 transport
+        和可控 fake app-server wire 覆盖。
       truncated: false
   known_limits_truncated: false
-  submitted_at: 2026-08-23T15:14:46.707Z
+  submitted_at: 2026-08-23T19:05:23.173Z
 blockers: []
 verification:
-  candidate_id: 67d381f8-d447-443f-a5d5-0248eafc2a5b
+  candidate_id: 2a6316d2-3b1f-47ee-b2cf-30be58535073
   identity_provider: skill-coordinated
-  verifier_execution_ref: skill-coordinated:verifier:37ff4a52-c67e-409f-8b9c-714242401f49
-  iteration: 1
+  verifier_execution_ref: skill-coordinated:verifier:e97b054f-a6ef-44e2-ba9b-d5037d78c88c
+  iteration: 3
   attempt: 1
   assurance: skill-coordinated
-  verdict: fail
+  verdict: pass
   checks:
-    - id: go-test
+    - id: go-test-v3
       name:
-        text: Runtime unit and integration tests
+        text: Runtime full tests with hard timeout
         truncated: false
       argv_display:
+        - text: 240s
+          truncated: false
+        - text: go
+          truncated: false
         - text: test
           truncated: false
         - text: ./...
           truncated: false
         - text: -count=1
           truncated: false
-        - text: -timeout=180s
+        - text: -timeout=210s
           truncated: false
       argv_truncated: false
       cwd_ref: .
       status: passed
       exit_code: 0
-      duration_ms: 19677
-    - id: go-race
+      duration_ms: 25742
+    - id: go-race-v3
       name:
-        text: Runtime race tests
+        text: Runtime full race tests with hard timeout
         truncated: false
       argv_display:
+        - text: 450s
+          truncated: false
+        - text: go
+          truncated: false
         - text: test
           truncated: false
         - text: -race
@@ -446,18 +432,22 @@ verification:
           truncated: false
         - text: -count=1
           truncated: false
-        - text: -timeout=300s
+        - text: -timeout=420s
           truncated: false
       argv_truncated: false
       cwd_ref: .
       status: passed
       exit_code: 0
-      duration_ms: 25113
-    - id: go-vet
+      duration_ms: 31327
+    - id: go-vet-v3
       name:
         text: Go vet
         truncated: false
       argv_display:
+        - text: 120s
+          truncated: false
+        - text: go
+          truncated: false
         - text: vet
           truncated: false
         - text: ./...
@@ -466,12 +456,16 @@ verification:
       cwd_ref: .
       status: passed
       exit_code: 0
-      duration_ms: 404
-    - id: protocol-freshness
+      duration_ms: 650
+    - id: protocol-freshness-v3
       name:
         text: Protocol freshness
         truncated: false
       argv_display:
+        - text: 180s
+          truncated: false
+        - text: go
+          truncated: false
         - text: run
           truncated: false
         - text: ./tools/protocolgen
@@ -482,13 +476,21 @@ verification:
       cwd_ref: .
       status: passed
       exit_code: 0
-      duration_ms: 2387
-    - id: go-build
+      duration_ms: 3390
+    - id: go-build-v3
       name:
-        text: Build ACP agent
+        text: Build ACP agent without worktree artifact
         truncated: false
       argv_display:
+        - text: 120s
+          truncated: false
+        - text: go
+          truncated: false
         - text: build
+          truncated: false
+        - text: -o
+          truncated: false
+        - text: /tmp/acp-agent-runtime-v3
           truncated: false
         - text: ./cmd/acp-agent
           truncated: false
@@ -496,20 +498,17 @@ verification:
       cwd_ref: .
       status: passed
       exit_code: 0
-      duration_ms: 520
+      duration_ms: 744
   summary:
-    text: FAIL：stderr 未实时进入结构化日志；cancel-before-start/session close 对卡住的 turn/start
-      不能释放 active slot/pending RPC；A31/A32 与 sibling approval non-goal 存在合同冲突。其余
-      fresh checks 与主要 runtime 行为通过。
+    text: PASS：A1-A35 全部通过。真实 delayed turn/start
+      count=50、observer/cancel/fatal/duplicate race count=20、串行 full
+      test/race、vet、protocol freshness 和跨平台构建均通过。
     truncated: false
   risks:
-    - text: A31/A32 是 formal child contract 与 sibling non-goal 冲突；不得在 runtime 重造
-        approval，应在复用 sibling 组件的最终 wiring 中满足。
-      truncated: false
-    - text: Comet 运行检查产生未跟踪 acp-agent 构建物，归档前需清理。
+    - text: 未执行需要真实账号/凭据的可选 Codex E2E；真实 NDJSON 主链路由 fake app-server wire 覆盖。
       truncated: false
   risks_truncated: false
-  completed_at: 2026-08-23T15:35:58.078Z
+  completed_at: 2026-08-23T19:21:53.438Z
 history:
   - goal_cycle: 1
     iteration: 1
@@ -532,6 +531,32 @@ history:
         存在合同冲突。其余 fresh checks 与主要 runtime 行为通过。
       truncated: false
     completed_at: 2026-08-23T15:35:58.078Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A6
+      - A8
+      - A32
+      - A34
+    summary:
+      text: FAIL：CloseSession 取消本地 pending call 时删除真实 wire observer，迟到 turn/start 无法按
+        fixed upstream stale+interrupt，可能留下 app-server orphan turn；其余 fresh
+        checks 与 A1-A35 项通过。
+      truncated: false
+    completed_at: 2026-08-23T18:50:34.970Z
+  - goal_cycle: 1
+    iteration: 3
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: PASS：A1-A35 全部通过。真实 delayed turn/start
+        count=50、observer/cancel/fatal/duplicate race count=20、串行 full
+        test/race、vet、protocol freshness 和跨平台构建均通过。
+      truncated: false
+    completed_at: 2026-08-23T19:21:53.438Z
 history_overflow:
   dropped_entries: 0
   first_dropped_at: null
@@ -542,7 +567,7 @@ history_overflow:
     blocked: 0
     execution-error: 0
     recovery: 0
-verification_result: fail
+verification_result: pass
 verification_report: verification.md
 archived: false
 created_at: 2026-08-23T14:08:47.340Z
