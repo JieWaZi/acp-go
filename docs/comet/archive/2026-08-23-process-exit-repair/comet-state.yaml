@@ -1,0 +1,199 @@
+schema: comet.native.v4
+name: process-exit-repair
+language: zh-CN
+phase: archive
+status: done
+state_version: 8
+brief: brief.md
+spec_changes: []
+workspace:
+  isolation: worktree
+  change_branch: codex/process-exit-repair
+  target_branch: main
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：当 Codex app-server 以非零状态退出且 stdout 同时关闭时，所有 pending 请求稳定返回可由
+      `errors.Is(..., ErrAppServerExited)` 识别的错误，并保留退出码与有界 stderr。
+    result: passed
+    reason:
+      text: closed-pipe 仅在 FinalError 可识别 ErrAppServerExited 时升级；first-fatal 向双
+        pending 广播同一错误实例。确定性压力及真实进程 normal/race 各 100 次均保留
+        ErrAppServerExited、code 7 和 stderr。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：超长帧、普通 reader I/O error、clean EOF 与主动关闭仍保留原有优先级；主动关闭不会等待自身或造成
+      goroutine/process 泄漏。
+    result: passed
+    reason:
+      text: ErrFrameTooLarge 在 os.ErrClosed 仲裁前处理，普通 I/O 与 clean EOF 保持原语义；主动 Close
+        先建立关闭 fatal。Go Wait/FinalError 路径无锁环，真实主动关闭 normal/race 各 100 次通过。
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：确定性 fatal 仲裁测试与真实进程 `TestAgentSurfacesProcessExitToPendingInitialize`
+      并行压力重复通过，不依赖长 sleep。
+    result: passed
+    reason:
+      text: 五项确定性仲裁 normal count=500、race count=100；真实进程退出 normal/race 各 count=100
+        parallel=16；父 15-test critical regex count=20 parallel=16 全部通过。
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：默认 `go test ./...`、默认 `go test -race ./...`、`go vet ./...`、protocol
+      freshness、gofmt/diff、native/Linux/Windows 构建通过。
+    result: passed
+    reason:
+      text: 默认全仓 test/race、vet、protocol freshness、gofmt、diff checks 与
+        native/Linux/Windows 构建均新鲜 exit 0。
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: A5：修复可追溯到固定 upstream，手写 Go 声明/字段/函数与关键竞态逻辑有清晰中文注释，且未引入重复 SDK/JSON-RPC/DTO
+      或无消费方抽象。
+    result: passed
+    reason:
+      text: 直接核对 clean upstream ba5bcc3 的
+        runWithProcessCheck/process-exit-error.test.ts；UPSTREAM
+        与中文竞态注释完整，未新增协议、DTO 或无消费方抽象，SDK 固定 v0.13.5。
+      truncated: false
+builder_handoff:
+  candidate_id: d00e2a7a-72e9-44ca-bcb0-0d7b11b0ebed
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:544965b7-a3ce-4933-8797-0328c45f613c
+  iteration: 1
+  summary:
+    text: candidate 3905c81 按固定 codex-acp ba5bcc3 的
+      CodexAcpServer.runWithProcessCheck/process-exit-error.test.ts 修复 Go
+      Wait/StdoutPipe 竞态：scanner 仅在 os.ErrClosed 且 process.FinalError 确认
+      ErrAppServerExited 时升级为含 exit code/有界 stderr 的稳定 fatal；补齐双 pending 确定性仲裁及
+      frame/I/O/EOF/主动 Close 优先级测试，并更新 UPSTREAM.md。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+  checks:
+    - name:
+        text: deterministic RED before production change
+        truncated: false
+      result: passed
+      note:
+        text: "旧实现稳定失败：两个 pending 均收到 reading stdout: file already closed，未保留
+          ErrAppServerExited。"
+        truncated: false
+    - name:
+        text: deterministic fatal arbitration normal/race stress
+        truncated: false
+      result: passed
+      note:
+        text: normal count=500 parallel=16；race count=100 parallel=16。
+        truncated: false
+    - name:
+        text: real helper process exit normal/race stress
+        truncated: false
+      result: passed
+      note:
+        text: TestAgentSurfacesProcessExitToPendingInitialize normal 与 race 各 count=100
+          parallel=16，均保留 ErrAppServerExited/code 7/stderr。
+        truncated: false
+    - name:
+        text: parent critical runtime stress
+        truncated: false
+      result: passed
+      note:
+        text: 父 Verifier 原 15-test 精确组合 count=20 parallel=16 timeout=300s 通过。
+        truncated: false
+    - name:
+        text: default full and default race suites
+        truncated: false
+      result: passed
+      note:
+        text: go test ./... -count=1 -timeout=300s；go test -race ./... -count=1
+          -timeout=600s。
+        truncated: false
+    - name:
+        text: vet protocol freshness format and diff
+        truncated: false
+      result: passed
+      note:
+        text: go vet ./...；go run ./tools/protocolgen --check；tracked gofmt clean；git
+          diff --check。
+        truncated: false
+    - name:
+        text: fixed upstream SDK and platform builds
+        truncated: false
+      result: passed
+      note:
+        text: codex-acp HEAD ba5bcc3d7759250dde9d4d2286a1bec11b363208 clean，acp-go-sdk
+          v0.13.5；native/Linux amd64/Windows amd64 acp-agent builds passed。
+        truncated: false
+    - name:
+        text: focused read-only code review
+        truncated: false
+      result: passed
+      note:
+        text: 独立 reviewer 未发现 Critical/Important/Minor issue，确认 first-fatal、单一 Wait
+          owner 与 Agent Close 无锁反转或环等。
+        truncated: false
+  checks_truncated: false
+  known_limits: []
+  known_limits_truncated: false
+  submitted_at: 2026-08-23T22:35:49.958Z
+blockers: []
+verification:
+  candidate_id: d00e2a7a-72e9-44ca-bcb0-0d7b11b0ebed
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:8b023b9c-121a-47af-90e1-cf9719bf0b37
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks: []
+  summary:
+    text: candidate d00e2a7a-72e9-44ca-bcb0-0d7b11b0ebed / HEAD 3905c81
+      通过独立只读验证；fatal 仲裁、错误优先级、主动关闭和 first-fatal 均符合固定 upstream。
+    truncated: false
+  risks: []
+  risks_truncated: false
+  completed_at: 2026-08-23T22:47:55.000Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: candidate d00e2a7a-72e9-44ca-bcb0-0d7b11b0ebed / HEAD 3905c81
+        通过独立只读验证；fatal 仲裁、错误优先级、主动关闭和 first-fatal 均符合固定 upstream。
+      truncated: false
+    completed_at: 2026-08-23T22:47:55.000Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-08-23T22:16:59.905Z
