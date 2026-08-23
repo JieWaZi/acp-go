@@ -43,33 +43,35 @@ go generate ./agents/codex/protocol
 go run ./tools/protocolgen --check
 ```
 
-生成器通过 `npm ci --ignore-scripts` 使用 `tools/protocol/package-lock.json` 中的精确工具版本。输出经 `go/format` 规范化，不写入时间和临时路径。`generated_protocol.go` 带 `Code generated` 标记和 Codex 0.148.0 默认稳定 schema 来源，禁止手工修改。
+生成器通过 `npm ci --ignore-scripts` 使用 `tools/protocol/package-lock.json` 中的精确工具版本；复用现有 `node_modules` 前还会校验 `quicktype --version` 与 `codex --version` 的首行完全匹配固定版本。输出经 `go/format` 规范化，不写入时间和临时路径。`generated_protocol.go` 带 `Code generated` 标记和 Codex 0.148.0 默认稳定 schema 来源，禁止手工修改。
 
 生成或刷新协议需要本机提供 Node.js/npm；Agent 运行时只编译和使用已提交的 Go 快照，不依赖 Node.js、npm、quicktype 或 TypeScript。
 
 ## V1 roots 与协议范围
 
-完整默认稳定 bundle 随仓库提交；`protocol.root.json` 只为 V1 运行时需要直接构造或接收的类型增加具名 Go root，并让 envelope 继续传递默认稳定通知/请求：
+完整默认稳定 bundle 随仓库提交；`protocol.root.json` 只为 V1 运行时需要直接构造或接收的 DTO 增加具名 Go root，不再把完整上游 envelope 交给 quicktype：
 
-- envelope：`ClientRequest`、`ClientNotification`、`ServerRequest`、`ServerNotification`；
 - 初始化：`InitializeParams`、`InitializeResponse`；
 - thread：start、resume、read、unsubscribe 的 Params/Response；
 - turn：start、steer、interrupt 的 Params/Response；
 - model/auth/config：`ModelList*`、`ConfigRead*`、`GetAccount*`、`LoginAccount*`、`CancelLoginAccount*`、`LogoutAccountResponse`；
 - 审批：Command Execution、File Change、Permissions 的 Params/Response。
+- 通知：turn/item 生命周期、消息/reasoning/plan/usage、command/file/MCP 进度、request resolved、compaction、model reroute、warning/error，以及登录流程依赖的 `AccountLoginCompletedNotification`。
 
-根清单来自固定 clone 中 `CodexAppServerClient.ts` 的实际 imports 与 V1 Specs，而不是重新设计协议。运行时、事件或审批后续需要新的稳定类型时，先把对应 `$ref` 加入 `protocol.root.json`，再生成类型并更新 mapper/test；不能在手写 Go 文件重复声明 DTO。
+根清单来自固定 clone 中 `CodexAppServerClient.ts`、`CodexAcpClient.ts`、`CodexEventHandler.ts` 的实际 imports/dispatcher 与 V1 Specs，而不是重新设计协议。运行时、事件或审批后续需要新的稳定类型时，先把对应 `$ref` 加入 `protocol.root.json`，再生成类型并更新 dispatcher/mapper/test；不能在手写 Go 文件重复声明 DTO。
 
-默认稳定 schema 中上游仍有文字标为 `EXPERIMENTAL` 的历史注释；是否属于生成范围以 Codex 0.148.0 `generate-json-schema` 默认输出为唯一机械边界。本项目没有传 `--experimental`，也没有引入仅在该开关下出现的定义、方法或字段。
+默认稳定 schema 仍收录少量上游标记为 experimental/unstable 的声明，因此“未传 `--experimental`”不是 V1 public surface 的充分条件。生成器除检查仅由开关产生的哨兵定义外，还通过确定性、逐片段计数的薄适配隐藏 V1 不支持的 experimental capability、Bedrock login 构造项和 plan item 构造常量；完整输入 bundle 保持原样，便于后续升级审计。
 
 ## TypeScript → Go 职责映射
 
 | codex-acp 源码或 symbol | Go 文件/职责 | 本次直接核对内容 |
 | --- | --- | --- |
 | `package.json` 的 `generate-types` | `tools/protocolgen/main.go`、`generate.go` | 上游调用 `codex app-server generate-ts --out src/app-server`；Go 侧改用同版本默认稳定 JSON Schema 再交给固定 quicktype |
-| `src/app-server/ClientRequest.ts` | `generated_protocol.go` 的 `ClientRequest`、`ClientRequestMethod` 与具名 V1 Params | initialize、thread、turn、model、account 的 method discriminator 与 wire 字段 |
-| `src/app-server/ServerRequest.ts` | `ServerRequest` 和三类 approval Params/Response | command/file/permissions requestApproval 的 method、id、params |
-| `src/app-server/ServerNotification.ts` | `ServerNotification`、`NotificationMethod`、通知 Params | turn/item/message/reasoning/plan/usage/tool/unknown-event 路由的 wire 输入 |
+| `src/app-server/ClientRequest.ts` | `envelope.go` 的 `ClientRequest` 变体/`Method*` 常量与生成的 V1 Params | initialize、thread、turn、model、account 的 method discriminator 与 wire 字段 |
+| `src/app-server/ClientNotification.ts` | `InitializedNotification` | 无 params 的 `initialized` 客户端通知 |
+| `src/app-server/ServerRequest.ts` | `envelope.go` 的 `ServerRequest` dispatcher 和生成的三类 approval Params/Response | command/file/permissions requestApproval 的 method、id、params |
+| `src/app-server/ServerNotification.ts`、`ServerNotificationEnvelope.ts` | `ServerNotification` dispatcher、具名 Envelope、`UnknownServerNotification` 与生成的通知 Params | turn/item/message/reasoning/plan/usage/tool/unknown-event 路由及 `emittedAtMs` |
+| `src/app-server/v2/AccountLoginCompletedNotification.ts`、`src/CodexAcpClient.ts` 登录订阅 | `AccountLoginCompletedNotification`、`AccountLoginCompletedEnvelope` | ChatGPT/API Key login 在 `account/login/start` 前订阅完成通知 |
 | `src/app-server/v2/ThreadStartParams.ts`、`ThreadResumeParams.ts` | `ThreadStartParams`、`ThreadResumeParams` | model、cwd、approval、sandbox、config 与恢复参数 |
 | `src/app-server/v2/TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` | 对应生成类型 | required thread/turn identity、输入数组和 steering precondition |
 | `src/app-server/v2/ThreadItem.ts`、`UserInput.ts` | `ThreadItem`、`UserInput` 及 discriminator enum | 消息、reasoning、command、file、MCP、Text/Image/Resource 相关 wire union |
@@ -82,27 +84,29 @@ go run ./tools/protocolgen --check
 
 | codex-acp fixture | 约束的 Go surface/后续测试 |
 | --- | --- |
-| `src/__tests__/CodexACPAgent/data/input-server-events.json` | JSON-RPC request/response envelope 与 method/params 保真 |
 | `src/__tests__/CodexACPAgent/data/send-attachments-turn-start.json` | `TurnStartParams`、`UserInput` 的 text、URL image、data URL 与 resource 转换 wire |
 | `src/__tests__/CodexACPAgent/data/load-session-history.json` | `ThreadReadResponse`、`ThreadItem` 历史消息/tool item；后续 load mapper fixture |
 | `src/__tests__/CodexACPAgent/data/approval-command-allow-once.json` | Command approval decision union 与 raw params |
 | `src/__tests__/CodexACPAgent/data/approval-file-change.json` | File Change approval Params/Response 与 grantRoot nullable |
 | `src/__tests__/CodexACPAgent/data/approval-permissions-request.json` | Permissions profile、session/turn grant 与 reject decision |
 | `src/__tests__/CodexACPAgent/data/agent-message-phases.json` | notification/item discriminator 与 commentary/final phase 字段 |
+| `src/__tests__/CodexACPAgent/data/terminal-full-flow.json` | item/commandExecution lifecycle、output delta 与 typed `ThreadItem` |
+| `src/__tests__/CodexACPAgent/data/reasoning-deltas-and-section-break.json` | reasoning 三类 delta 通知与 method/params 分派 |
 
-当前 `protocol_test.go` 先锁住生成层的 optional/required、tagged discriminator 和审批 union 往返。运行时子变更应直接移植上表 fixture 的完整行为断言，而不是在协议生成层重复 mapper 逻辑。
+固定 clone 中 `input-server-events.json` 是 0 字节占位文件，不作为回归证据。当前 `protocol_test.go` 锁住 envelope method/params 耦合、typed Item、optional+nullable 三态、tagged discriminator、登录完成通知和审批 union 往返。运行时子变更应直接移植上表非空 fixture 的完整行为断言，而不是在协议生成层重复 mapper 逻辑。
 
 ## Go 等价改写与已知边界
 
-- JSON Schema 的 wire 名由 `json` tag 原样保留；可选字段使用指针/`omitempty`，required 字段不加 `omitempty`，nullable 标量或 union 使用指针或 quicktype union wrapper。
-- quicktype 会把对象型 tagged union 的公共 envelope 表示为 discriminator enum 加字段并集；method/type 及各变体 wire 字段可以无损往返。为了保持运行时可读和可构造，V1 实际使用的 Params/Response 另以直接 `$ref` 生成具名强类型。此差异由 round-trip 测试约束，不在手写代码中重造通用 union 生成器。
-- 任意 JSON Schema 值保持为 `interface{}`/map；这对应上游 `JsonValue` 或开放 schema，不擅自收窄。
-- 空 object response 生成 `map[string]interface{}`；JSON-RPC 层仍按对应 method 的具名响应职责配对。
-- 生成代码保留上游 schema 英文原始文档，不增加逐字段中文翻译；中文注释规范仅适用于手写 Go。
+- JSON Schema 的 wire 名由 `json` tag 原样保留；一般可选字段使用指针/`omitempty`，required 字段不加 `omitempty`。V1 实际依赖的 optional+nullable `grantRoot`、`strictAutoReview` 使用 `OptionalNullable[T]` 保持 absent/null/value 三态，并以行为测试约束逐字节往返。
+- quicktype 仍负责成熟的 schema→Go DTO/枚举/标量 union 生成。它无法忠实表达对象型 envelope union，因此完整 `ClientRequest`/`ServerRequest`/`ServerNotification` 不进入 root；薄 `envelope.go` 只复用生成 Params，提供封闭变体、集中 `Method*` 常量和 method-first dispatcher。已知方法不会退化到字段并集，未知通知才以 `json.RawMessage` 前向保留。
+- 上游本来定义为开放 `JsonValue`/开放 schema 的 DTO 字段使用 `json.RawMessage`（以及对应 map/slice），不让 `interface{}` 在解码时把整数改写成浮点数；`ItemStartedNotification.Item` 和 `ItemCompletedNotification.Item` 明确为 `ThreadItem`，核心通知 payload 不退化。
+- 空 object response 生成 `map[string]json.RawMessage`；JSON-RPC 层仍按对应 method 的具名响应职责配对。
+- JSON-RPC framing、request correlation、取消和 transport 继续由 `github.com/coder/acp-go-sdk`/后续 runtime 使用，本层没有重写 JSON-RPC。
+- 生成代码保留纳入 V1 声明的上游英文文档；被明确排除的 experimental 构造项及其专属说明由可审计薄适配一并移除，不增加逐字段中文翻译。中文注释规范仅适用于手写 Go。
 
 ## 明确跳过
 
-- 任何只有 `--experimental` 才出现的 schema 定义、方法和字段；
+- 任何只有 `--experimental` 才出现的 schema 定义、方法和字段，以及默认 bundle 中 V1 不支持的 experimental capability/variant 构造项；
 - codex-acp 的 Review、Goal、Session List 管理扩展、client-provided MCP server、Gateway Auth、Audio/realtime、多 Agent 协作 UI 等父 V1 Non-goals；父 V1 runtime 不实现也不宣告这些行为，即使默认稳定 envelope 为前向兼容带出了部分 DTO；
 - 完整 codex-acp vendoring、TypeScript 构建产物和 ACP SDK 内部协议实现；
 - 本子变更不实现子进程、session/turn 状态、event mapper、approval handler 或配置逻辑，这些由后续子变更消费本协议包。
@@ -112,10 +116,11 @@ go run ./tools/protocolgen --check
 1. 在独立变更中更新 `.upstream/codex-acp`，记录新 tag/commit，并直接阅读受影响 source、symbol、test 和 fixture。
 2. 更新 `tools/protocol/package.json` 中 `@openai/codex` 精确版本，重新生成 lockfile；同时更新本文版本表。
 3. 运行 `go run ./tools/protocolgen --refresh-schema`。另生成一次带 `--experimental` 的临时 bundle，审查默认/实验边界，不把实验差异合入 V1。
-4. 对照 `CodexAppServerClient.ts` 实际 imports 更新 `protocol.root.json`；运行 `go generate ./agents/codex/protocol`。
+4. 对照 `CodexAppServerClient.ts`、`CodexAcpClient.ts`、`CodexEventHandler.ts` 实际 imports/dispatcher 更新 `protocol.root.json` 和 `envelope.go` 的集中方法清单；运行 `go generate ./agents/codex/protocol`。
 5. 先修协议 round-trip/freshness 测试，再修改 runtime、mapper、state 与移植 fixture；记录每个有意 Go 差异。
 6. 运行两次生成差异检查、`go run ./tools/protocolgen --check`、`go test ./...` 与 `go vet ./...` 后再提交。
 
 ## 同步记录
 
 - 2026-08-23：建立 V1 初始固定点：acp-go-sdk v0.13.5、codex-acp 1.6.2、ACP TS SDK 1.4.0、Codex 0.148.0、quicktype 26.0.0；固定默认稳定 schema 与 Go 快照，并完成关键 generated TS、source imports 和 fixture 的直接对照。
+- 2026-08-23：收窄 V1 roots，移除 quicktype 完整 envelope 字段并集；加入封闭 typed envelope dispatcher、集中方法常量、approval nullable 三态、typed Item 和登录完成通知，同时把 0 字节占位 fixture 从回归证据中移除。

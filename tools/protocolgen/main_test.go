@@ -54,6 +54,72 @@ func TestGenerateMarksExactSource(t *testing.T) {
 	}
 }
 
+// TestGenerateExcludesExperimentalPublicSurface 防止完整上游 envelope 把实验方法和类型带入 V1 包。
+func TestGenerateExcludesExperimentalPublicSurface(t *testing.T) {
+	cfg := defaultConfig(testRepositoryRoot(t))
+
+	generated, err := generate(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("生成协议代码失败：%v", err)
+	}
+	text := string(generated)
+
+	for _, forbidden := range []string{
+		"EXPERIMENTAL",
+		"ExperimentalFeature",
+		"ThreadRealtime",
+		"type AppListUpdatedNotification",
+		"type PlanDeltaNotification",
+		"type ToolRequestUserInput",
+		"ExperimentalAPI",
+		"AmazonBedrock",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("V1 生成结果包含实验 surface %q", forbidden)
+		}
+	}
+}
+
+// TestGeneratePreservesOptionalNullableFields 防止 optional+nullable 被指针压成无法区分缺省和 null 的二态值。
+func TestGeneratePreservesOptionalNullableFields(t *testing.T) {
+	cfg := defaultConfig(testRepositoryRoot(t))
+
+	generated, err := generate(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("生成协议代码失败：%v", err)
+	}
+	text := string(generated)
+
+	for _, expected := range []string{
+		"GrantRoot OptionalNullable[string] `json:\"grantRoot,omitzero\"`",
+		"StrictAutoReview OptionalNullable[bool] `json:\"strictAutoReview,omitzero\"`",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("生成结果缺少 optional+nullable 适配 %q", expected)
+		}
+	}
+}
+
+// TestGenerateAvoidsOpaqueCoreDTOFields 防止生成 DTO 字段重新退化为 interface{}。
+func TestGenerateAvoidsOpaqueCoreDTOFields(t *testing.T) {
+	cfg := defaultConfig(testRepositoryRoot(t))
+
+	generated, err := generate(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("生成协议代码失败：%v", err)
+	}
+	text := string(generated)
+
+	for _, forbidden := range []string{
+		"interface{} `json:",
+		"]interface{} `json:",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("生成 DTO 仍包含不透明字段 %q", forbidden)
+		}
+	}
+}
+
 // TestCheckFreshnessRejectsModifiedOutput 防止 freshness 检查把被手改的生成快照误判为最新。
 func TestCheckFreshnessRejectsModifiedOutput(t *testing.T) {
 	cfg := defaultConfig(testRepositoryRoot(t))
@@ -107,6 +173,33 @@ func TestValidateStableSchemaRejectsNestedExperimentalDefinition(t *testing.T) {
 	err := validateStableSchemaBytes(raw)
 	if err == nil || !strings.Contains(err.Error(), "MockExperimentalMethodParams") {
 		t.Fatalf("嵌套 experimental 定义错误 = %v，期望明确拒绝", err)
+	}
+}
+
+// TestToolsMatchLockedVersionsRejectsStaleInstall 防止仅凭可执行文件存在就复用错误版本。
+func TestToolsMatchLockedVersionsRejectsStaleInstall(t *testing.T) {
+	toolsPath := t.TempDir()
+	binPath := filepath.Join(toolsPath, "node_modules", ".bin")
+	if err := os.MkdirAll(binPath, 0o755); err != nil {
+		t.Fatalf("创建伪工具目录失败：%v", err)
+	}
+	writeFakeTool := func(name string, output string) {
+		t.Helper()
+		path := filepath.Join(binPath, name)
+		content := "#!/bin/sh\nprintf '%s\\n' '" + output + "'\n"
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatalf("写入伪工具 %s 失败：%v", name, err)
+		}
+	}
+	writeFakeTool("quicktype", "quicktype version 25.0.0")
+	writeFakeTool("codex", "codex-cli 0.148.0")
+
+	matched, err := toolsMatchLockedVersions(context.Background(), generatorConfig{toolsPath: toolsPath})
+	if err != nil {
+		t.Fatalf("校验伪工具版本失败：%v", err)
+	}
+	if matched {
+		t.Fatal("错误 quicktype 版本被当作 lockfile 固定版本复用")
 	}
 }
 

@@ -18,6 +18,11 @@ import (
 
 const generationTimeout = 2 * time.Minute
 
+const (
+	quicktypeVersionLine = "quicktype version 26.0.0"
+	codexVersionLine     = "codex-cli 0.148.0"
+)
+
 var errGeneratedFileStale = errors.New("generated protocol snapshot is stale")
 
 // generatorConfig 保存一次协议生成所需的显式路径，避免依赖进程级全局状态。
@@ -187,14 +192,195 @@ func generate(ctx context.Context, cfg generatorConfig) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("formatting generated protocol: %w", err)
 	}
+	formatted, err = preserveOptionalNullableFields(formatted)
+	if err != nil {
+		return nil, err
+	}
+	formatted, err = restrictExperimentalV1Variants(formatted)
+	if err != nil {
+		return nil, err
+	}
+	formatted, err = preserveOpenJSONFields(formatted)
+	if err != nil {
+		return nil, err
+	}
+	// 薄适配会改变类型长度；必须再次格式化，避免生成快照携带未对齐的机械差异。
+	formatted, err = format.Source(formatted)
+	if err != nil {
+		return nil, fmt.Errorf("formatting adapted protocol: %w", err)
+	}
 	// 在写入仓库前执行最后的 generated 标记和 experimental-only 哨兵检查。
 	if !bytes.HasPrefix(formatted, []byte("// Code generated")) {
 		return nil, errors.New("generated protocol is missing the Code generated marker")
 	}
-	if bytes.Contains(formatted, []byte("MockExperimentalMethod")) {
-		return nil, errors.New("generated protocol contains experimental-only definitions")
+	for _, forbidden := range []string{
+		"MockExperimentalMethod",
+		"EXPERIMENTAL",
+		"ExperimentalFeature",
+		"ExperimentalAPI",
+		"ThreadRealtime",
+		"AmazonBedrock",
+	} {
+		if bytes.Contains(formatted, []byte(forbidden)) {
+			return nil, fmt.Errorf("generated protocol contains forbidden V1 surface %q", forbidden)
+		}
 	}
 	return formatted, nil
+}
+
+// preserveOpenJSONFields 将 V1 DTO 中上游开放 JsonValue 收窄为不丢字节语义的 json.RawMessage。
+func preserveOpenJSONFields(generated []byte) ([]byte, error) {
+	replacements := []struct {
+		// source 是 quicktype 为开放 JSON 字段生成的 interface{} 类型。
+		source string
+		// replacement 使用 RawMessage 保持数字精度和未知字段。
+		replacement string
+	}{
+		{
+			source:      "LogoutAccountResponse                   map[string]interface{}",
+			replacement: "LogoutAccountResponse                   map[string]json.RawMessage",
+		},
+		{
+			source:      "TurnInterruptResponse                   map[string]interface{}",
+			replacement: "TurnInterruptResponse                   map[string]json.RawMessage",
+		},
+		{
+			source:      "Desktop                         map[string]interface{}",
+			replacement: "Desktop                         map[string]json.RawMessage",
+		},
+		{source: "Config         interface{}", replacement: "Config         json.RawMessage"},
+		{
+			source:      "Extensions map[string]interface{}",
+			replacement: "Extensions map[string]json.RawMessage",
+		},
+		{source: "Arguments  interface{}", replacement: "Arguments  json.RawMessage"},
+		{
+			source:      "Results               []interface{}",
+			replacement: "Results               []json.RawMessage",
+		},
+		{source: "Meta              interface{}", replacement: "Meta              json.RawMessage"},
+		{
+			source:      "Content           []interface{}",
+			replacement: "Content           []json.RawMessage",
+		},
+		{
+			source:      "StructuredContent interface{}",
+			replacement: "StructuredContent json.RawMessage",
+		},
+		{
+			source:      "Config                map[string]interface{} `json:\"config,omitempty\"`",
+			replacement: "Config                map[string]json.RawMessage `json:\"config,omitempty\"`",
+		},
+		{
+			source:      "Config                map[string]interface{}  `json:\"config,omitempty\"`",
+			replacement: "Config                map[string]json.RawMessage  `json:\"config,omitempty\"`",
+		},
+		{
+			source:      "OutputSchema interface{}",
+			replacement: "OutputSchema json.RawMessage",
+		},
+	}
+
+	result := generated
+	for _, replacement := range replacements {
+		oldValue := []byte(replacement.source)
+		if count := bytes.Count(result, oldValue); count != 1 {
+			return nil, fmt.Errorf(
+				"open JSON source field %q occurred %d times, want exactly once",
+				replacement.source,
+				count,
+			)
+		}
+		result = bytes.Replace(result, oldValue, []byte(replacement.replacement), 1)
+	}
+	return result, nil
+}
+
+// restrictExperimentalV1Variants 隐藏 V1 不支持的 plan item 构造常量，同时保持未知字符串可前向解码。
+func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
+	replacements := []struct {
+		// source 是固定 quicktype 输出中的一个实验 surface 片段。
+		source string
+		// replacement 保留同一 DTO 上的稳定说明或删除实验构造常量。
+		replacement string
+	}{
+		{
+			source: "// EXPERIMENTAL - proposed plan item content. The completed plan item is authoritative and\n" +
+				"// may not match the concatenation of `PlanDelta` text.\n//\n",
+			replacement: "",
+		},
+		{
+			source:      "\tPlan                ThreadItemType = \"plan\"\n",
+			replacement: "",
+		},
+		{
+			source: "\t// Opt into receiving experimental API methods and fields.\n" +
+				"\tExperimentalAPI *bool `json:\"experimentalApi,omitempty\"`\n",
+			replacement: "",
+		},
+		{
+			source:      "//\n// [UNSTABLE] Managed Amazon Bedrock login is experimental.\n",
+			replacement: "",
+		},
+		{
+			source:      "\tRegion          *string `json:\"region,omitempty\"`\n",
+			replacement: "",
+		},
+		{
+			source:      "\tAccountTypeAmazonBedrock AccountType = \"amazonBedrock\"\n",
+			replacement: "",
+		},
+		{
+			source:      "\tTypeAmazonBedrock Type = \"amazonBedrock\"\n",
+			replacement: "",
+		},
+	}
+
+	result := generated
+	for _, replacement := range replacements {
+		oldValue := []byte(replacement.source)
+		if count := bytes.Count(result, oldValue); count != 1 {
+			return nil, fmt.Errorf(
+				"experimental V1 source fragment occurred %d times, want exactly once",
+				count,
+			)
+		}
+		result = bytes.Replace(result, oldValue, []byte(replacement.replacement), 1)
+	}
+	return result, nil
+}
+
+// preserveOptionalNullableFields 对 quicktype 无法表达的两个 V1 三态字段做最薄的确定性适配。
+func preserveOptionalNullableFields(generated []byte) ([]byte, error) {
+	replacements := []struct {
+		// field 是 quicktype 对 optional+nullable 的固定退化输出。
+		field string
+		// replacement 使用支持 absent/null/value 的仓库内通用值类型。
+		replacement string
+	}{
+		{
+			field:       "GrantRoot *string `json:\"grantRoot,omitempty\"`",
+			replacement: "GrantRoot OptionalNullable[string] `json:\"grantRoot,omitzero\"`",
+		},
+		{
+			field:       "StrictAutoReview *bool `json:\"strictAutoReview,omitempty\"`",
+			replacement: "StrictAutoReview OptionalNullable[bool] `json:\"strictAutoReview,omitzero\"`",
+		},
+	}
+
+	result := generated
+	for _, replacement := range replacements {
+		oldValue := []byte(replacement.field)
+		if count := bytes.Count(result, oldValue); count != 1 {
+			return nil, fmt.Errorf(
+				"optional+nullable source field %q occurred %d times, want exactly once",
+				replacement.field,
+				count,
+			)
+		}
+		result = bytes.Replace(result, oldValue, []byte(replacement.replacement), 1)
+	}
+	return result, nil
 }
 
 // checkFreshness 重新生成到内存，并与目标文件逐字节比较而不修改工作树。
@@ -302,13 +488,10 @@ func definitionExists(definitions map[string]json.RawMessage, name string) (bool
 	return exists, nil
 }
 
-// ensureTools 通过 package-lock 安装精确版本工具；已存在完整工具集时不重复安装。
+// ensureTools 通过 package-lock 安装精确版本工具；仅复用版本输出完全匹配的现有工具集。
 func ensureTools(ctx context.Context, cfg generatorConfig) error {
-	quicktypePath := filepath.Join(cfg.toolsPath, "node_modules", ".bin", "quicktype")
-	codexPath := filepath.Join(cfg.toolsPath, "node_modules", ".bin", "codex")
-	quicktypeReady := isExecutable(quicktypePath)
-	codexReady := isExecutable(codexPath)
-	if quicktypeReady && codexReady {
+	matched, _ := toolsMatchLockedVersions(ctx, cfg)
+	if matched {
 		return nil
 	}
 
@@ -323,10 +506,48 @@ func ensureTools(ctx context.Context, cfg generatorConfig) error {
 	); err != nil {
 		return fmt.Errorf("installing locked protocol tools: %w", err)
 	}
-	if !isExecutable(quicktypePath) || !isExecutable(codexPath) {
-		return errors.New("locked protocol tools are incomplete after npm ci")
+	matched, err := toolsMatchLockedVersions(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("checking protocol tool versions after npm ci: %w", err)
+	}
+	if !matched {
+		return errors.New("locked protocol tool versions do not match after npm ci")
 	}
 	return nil
+}
+
+// toolsMatchLockedVersions 同时校验工具存在性和 `--version` 首行，避免陈旧 node_modules 绕过 lockfile。
+func toolsMatchLockedVersions(ctx context.Context, cfg generatorConfig) (bool, error) {
+	checks := []struct {
+		// path 是 lockfile 安装后的本地可执行文件。
+		path string
+		// expected 是该固定版本的规范版本输出首行。
+		expected string
+	}{
+		{
+			path:     filepath.Join(cfg.toolsPath, "node_modules", ".bin", "quicktype"),
+			expected: quicktypeVersionLine,
+		},
+		{
+			path:     filepath.Join(cfg.toolsPath, "node_modules", ".bin", "codex"),
+			expected: codexVersionLine,
+		},
+	}
+
+	for _, check := range checks {
+		if !isExecutable(check.path) {
+			return false, nil
+		}
+		output, err := executeOutput(ctx, cfg.repoRoot, check.path, "--version")
+		if err != nil {
+			return false, err
+		}
+		firstLine, _, _ := strings.Cut(strings.TrimSpace(output), "\n")
+		if firstLine != check.expected {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // isExecutable 判断生成工具路径是否存在且不是目录。
@@ -337,17 +558,23 @@ func isExecutable(path string) bool {
 
 // execute 在指定目录运行外部工具，并把失败输出包装进单一错误链供上层处理。
 func execute(ctx context.Context, directory string, name string, arguments ...string) error {
+	_, err := executeOutput(ctx, directory, name, arguments...)
+	return err
+}
+
+// executeOutput 在指定目录运行外部工具，并保留成功输出供版本等只读校验使用。
+func executeOutput(ctx context.Context, directory string, name string, arguments ...string) (string, error) {
 	command := exec.CommandContext(ctx, name, arguments...)
 	command.Dir = directory
 	output, err := command.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
 		if message == "" {
-			return err
+			return "", err
 		}
-		return fmt.Errorf("%w: %s", err, message)
+		return "", fmt.Errorf("%w: %s", err, message)
 	}
-	return nil
+	return string(output), nil
 }
 
 // writeFileAtomically 先在目标目录完整写入临时文件，再替换目标，避免留下半成品快照。

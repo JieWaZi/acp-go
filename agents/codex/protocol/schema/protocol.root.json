@@ -4,10 +4,7 @@
   "description": "Source: Codex 0.148.0 default stable app-server schema (codex_app_server_protocol.schemas.json, generated without --experimental).",
   "type": "object",
   "properties": {
-    "clientNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/ClientNotification" },
-    "clientRequest": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/ClientRequest" },
-    "serverNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/ServerNotification" },
-    "serverRequest": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/ServerRequest" },
+    "accountLoginCompletedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/AccountLoginCompletedNotification" },
     "initializeParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/InitializeParams" },
     "initializeResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/InitializeResponse" },
     "threadStartParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadStartParams" },
@@ -40,6 +37,25 @@
     "fileChangeRequestApprovalParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/FileChangeRequestApprovalParams" },
     "fileChangeRequestApprovalResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/FileChangeRequestApprovalResponse" },
     "permissionsRequestApprovalParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/PermissionsRequestApprovalParams" },
-    "permissionsRequestApprovalResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/PermissionsRequestApprovalResponse" }
+    "permissionsRequestApprovalResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/PermissionsRequestApprovalResponse" },
+    "turnStartedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TurnStartedNotification" },
+    "turnCompletedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TurnCompletedNotification" },
+    "itemStartedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ItemStartedNotification" },
+    "itemCompletedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ItemCompletedNotification" },
+    "agentMessageDeltaNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/AgentMessageDeltaNotification" },
+    "reasoningSummaryTextDeltaNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ReasoningSummaryTextDeltaNotification" },
+    "reasoningSummaryPartAddedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ReasoningSummaryPartAddedNotification" },
+    "reasoningTextDeltaNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ReasoningTextDeltaNotification" },
+    "turnPlanUpdatedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TurnPlanUpdatedNotification" },
+    "threadTokenUsageUpdatedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadTokenUsageUpdatedNotification" },
+    "commandExecutionOutputDeltaNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/CommandExecutionOutputDeltaNotification" },
+    "terminalInteractionNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TerminalInteractionNotification" },
+    "mcpToolCallProgressNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/McpToolCallProgressNotification" },
+    "fileChangePatchUpdatedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/FileChangePatchUpdatedNotification" },
+    "serverRequestResolvedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ServerRequestResolvedNotification" },
+    "contextCompactedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ContextCompactedNotification" },
+    "modelReroutedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ModelReroutedNotification" },
+    "errorNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ErrorNotification" },
+    "warningNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/WarningNotification" }
   }
 }
