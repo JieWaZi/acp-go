@@ -1,0 +1,110 @@
+schema: comet.native.v4
+name: framework-foundation
+language: zh-CN
+phase: build
+status: active
+state_version: 2
+brief: brief.md
+spec_changes:
+  - capability: framework
+    operation: create
+    source: specs/framework/spec.md
+workspace:
+  isolation: worktree
+  change_branch: codex/framework-foundation
+  target_branch: main
+  finish: null
+loop:
+  stage: building
+  goal_cycle: 1
+  iteration: 1
+  attempt: 0
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：运行 `acp-agent` 或 `acp-agent --adapter codex` 都能完成组合根选择并进入由 acp-go-sdk
+      承载的 ACP stdio 服务；未知 Adapter 在写协议前返回可诊断错误。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：Core 能注册并选择 Adapter，公开类型不包含 Codex Thread、Turn、Sandbox 或
+      Approval；可选能力由小接口按需发现，构造函数返回具体类型。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：`go test ./...`、`go vet ./...` 和目标二进制构建通过，框架选择、重复注册、未知选择和 SDK 边界有自动化测试。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：本子变更新增的全部手写 Go 类型、结构体字段和函数有清晰中文注释，关键选择/失败逻辑说明原因。
+    result: pending
+    reason: null
+  - id: A5
+    source: specs/framework/spec.md
+    text: "`acp-agent` 必须直接使用 acp-go-sdk v0.13.5 的 `AgentSideConnection`、Agent 类型和可选
+      Loader，不实现自己的 ACP JSON-RPC 连接层。"
+    result: pending
+    reason: null
+  - id: A6
+    source: specs/framework/spec.md
+    text: 协议服务的 stdout 只写 ACP 帧，启动和诊断错误写 stderr。
+    result: pending
+    reason: null
+  - id: A7
+    source: specs/framework/spec.md
+    text: Core 只定义 Adapter 元数据、工厂、注册/选择和通用生命周期边界，不包含任何 Codex
+      thread/turn/sandbox/approval 类型。
+    result: pending
+    reason: null
+  - id: A8
+    source: specs/framework/spec.md
+    text: 默认选择名是 `codex`；显式 `--adapter codex` 等价，未知名称 fail fast。
+    result: pending
+    reason: null
+  - id: A9
+    source: specs/framework/spec.md
+    text: composition root 显式构造依赖；禁止 `init()` 注册、全局 service locator 和 DI 容器。
+    result: pending
+    reason: null
+  - id: A10
+    source: specs/framework/spec.md
+    text: 可选能力使用消费方小接口；构造函数返回具体类型，避免提前建立超大 Runtime 接口。
+    result: pending
+    reason: null
+  - id: A11
+    source: specs/framework/spec.md
+    text: 手写 Go 类型、字段和函数使用清晰中文注释；关键注册冲突、选择和协议启动失败解释原因。
+    result: pending
+    reason: null
+  - id: A12
+    source: specs/framework/spec.md
+    text: 表驱动测试覆盖注册、重复注册、默认/显式/未知选择和协议边界。
+    result: pending
+    reason: null
+builder_handoff: null
+blockers: []
+verification: null
+history: []
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pending
+verification_report: null
+archived: false
+created_at: 2026-08-23T12:17:27.393Z
