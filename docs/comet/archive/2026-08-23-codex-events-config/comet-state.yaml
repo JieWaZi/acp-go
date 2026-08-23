@@ -1,0 +1,809 @@
+schema: comet.native.v4
+name: codex-events-config
+language: zh-CN
+phase: archive
+status: done
+state_version: 11
+brief: brief.md
+spec_changes:
+  - capability: codex-config
+    operation: create
+    source: specs/codex-config/spec.md
+  - capability: codex-events
+    operation: create
+    source: specs/codex-events/spec.md
+  - capability: codex-events-config
+    operation: create
+    source: specs/codex-events-config/spec.md
+workspace:
+  isolation: worktree
+  change_branch: codex/codex-events-config
+  target_branch: main
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 1
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：agent message/reasoning 增量按 item ID 关联，completed/fallback 不重复正文。
+    result: passed
+    reason:
+      text: 消息/reasoning item ID、fallback 与重放幂等通过。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：plan checklist 和 token usage 映射正确，turn 之间 usage 不泄漏。
+    result: passed
+    reason:
+      text: plan 与 usage turn 隔离通过。
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：Command/File/MCP 使用稳定 ToolCallID，保留 V1 可表达的标题、位置、diff、raw input/output。
+    result: passed
+    reason:
+      text: Command/File/MCP 稳定 ID 与 rich payload 通过。
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：三类审批只接受本次有效 option；取消、未知、错误、缺 handler、stale generation 一律 fail closed。
+    result: passed
+    reason:
+      text: 三类审批 option 校验、stale 与 fail-closed 通过。
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: A5：read-only/agent/full-access 映射保持权限边界；未知 mode/model/effort 返回明确错误。
+    result: passed
+    reason:
+      text: mode/model/effort 权限边界与错误处理通过。
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: A6：Text/Image/Resource 转换与上游一致；Audio/非法 union 明确拒绝。
+    result: passed
+    reason:
+      text: Text/Image/Resource 转换及 Audio 拒绝通过。
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: A7：只声明 api-key/chat-gpt；登录完成通知先订阅后 start，取消会 cancel login，secret
+      不进入日志/fixture。
+    result: passed
+    reason:
+      text: API Key/ChatGPT 订阅、取消与 secret-safe 通过。
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: A8：unknown method/item 安全忽略并记录安全摘要，进程和 session 不崩溃。
+    result: passed
+    reason:
+      text: unknown method/item 安全 identity 摘要通过。
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: A9：全量 test/race/vet/build 通过，手写 Go 声明和关键逻辑有中文注释。
+    result: passed
+    reason:
+      text: fresh checks 与中文注释审查通过。
+      truncated: false
+  - id: A10
+    source: specs/codex-config/spec.md
+    text: initialize/session 创建时声明并接受固定基线支持的 model、reasoning effort 与 sandbox/agent
+      mode 选项。
+    result: passed
+    reason:
+      text: 配置声明组件完整。
+      truncated: false
+  - id: A11
+    source: specs/codex-config/spec.md
+    text: Adapter 将 ACP config option/mode 映射为 Codex app-server
+      参数；未知、失效或不兼容值返回可诊断错误，不静默使用危险权限。
+    result: passed
+    reason:
+      text: 配置精确校验且不扩大权限。
+      truncated: false
+  - id: A12
+    source: specs/codex-config/spec.md
+    text: sandbox/agent mode 映射遵循固定上游语义，尤其保持 read-only、workspace-write/agent 和
+      full-access 的权限边界。
+    result: passed
+    reason:
+      text: 三种 sandbox/mode 边界等价 upstream。
+      truncated: false
+  - id: A13
+    source: specs/codex-config/spec.md
+    text: load/resume 对配置的恢复/覆盖顺序与固定上游基线一致。
+    result: passed
+    reason:
+      text: 恢复值与覆盖顺序组件契约通过。
+      truncated: false
+  - id: A14
+    source: specs/codex-config/spec.md
+    text: V1 接受 ACP Text、Image 和 Resource input，并转换为固定 app-server schema 的 turn
+      input。
+    result: passed
+    reason:
+      text: 三类 V1 内容转换为生成 InputElement。
+      truncated: false
+  - id: A15
+    source: specs/codex-config/spec.md
+    text: Image 保留可用 MIME/URL/base64 信息；Resource 支持固定基线可转换的 resource link 与 embedded
+      resource。
+    result: passed
+    reason:
+      text: Image/Resource 信息保留通过。
+      truncated: false
+  - id: A16
+    source: specs/codex-config/spec.md
+    text: 不支持的 content block 类型以明确请求错误处理，不丢弃后继续；Audio 不在 V1。
+    result: passed
+    reason:
+      text: 不支持内容明确失败。
+      truncated: false
+  - id: A17
+    source: specs/codex-config/spec.md
+    text: initialize 声明 ChatGPT 与 API Key 两种基础认证方式。
+    result: passed
+    reason:
+      text: 只声明 API Key 与 ChatGPT。
+      truncated: false
+  - id: A18
+    source: specs/codex-config/spec.md
+    text: ChatGPT 登录和 API Key 环境/请求的选择、成功、取消和失败按固定上游基线映射。
+    result: passed
+    reason:
+      text: 认证成功、取消、失败路径等价 upstream。
+      truncated: false
+  - id: A19
+    source: specs/codex-config/spec.md
+    text: V1 不支持 client-provided custom gateway/Gateway Auth；不得误宣告该能力。
+    result: passed
+    reason:
+      text: 未声明 Gateway/custom gateway/device-code。
+      truncated: false
+  - id: A20
+    source: specs/codex-config/spec.md
+    text: 凭据不得写入日志、UPSTREAM.md、fixture 或错误详情。
+    result: passed
+    reason:
+      text: 凭据安全审查通过。
+      truncated: false
+  - id: A21
+    source: specs/codex-config/spec.md
+    text: A11：model/reasoning/sandbox/mode。
+    result: passed
+    reason:
+      text: 配置自动化覆盖通过。
+      truncated: false
+  - id: A22
+    source: specs/codex-config/spec.md
+    text: A12：Text/Image/Resource 与 ChatGPT/API Key。
+    result: passed
+    reason:
+      text: 内容与认证自动化覆盖通过。
+      truncated: false
+  - id: A23
+    source: specs/codex-events/spec.md
+    text: 事件先按 thread/turn 与当前 session 状态关联，再由专用 handler/mapper 转换为 ACP session
+      updates。
+    result: passed
+    reason:
+      text: 通知先校验 identity/generation 再路由。
+      truncated: false
+  - id: A24
+    source: specs/codex-events/spec.md
+    text: 核心事件使用生成的强类型协议类型；未知事件记录 method/type、相关 identity 与安全摘要后忽略。
+    result: passed
+    reason:
+      text: 核心通知强类型且 unknown 日志含安全 identity。
+      truncated: false
+  - id: A25
+    source: specs/codex-events/spec.md
+    text: handler 的完成/清理幂等；增量和 completed/fallback 路径不得重复输出最终内容。
+    result: passed
+    reason:
+      text: 完成与 fallback 幂等。
+      truncated: false
+  - id: A26
+    source: specs/codex-events/spec.md
+    text: Agent Message 映射为 ACP agent message chunk。
+    result: passed
+    reason:
+      text: Agent Message 映射正确。
+      truncated: false
+  - id: A27
+    source: specs/codex-events/spec.md
+    text: Reasoning 映射为 ACP thought/reasoning chunk，并保留固定基线支持的 section
+      break/completed fallback 语义。
+    result: passed
+    reason:
+      text: Reasoning delta/section/fallback 正确。
+      truncated: false
+  - id: A28
+    source: specs/codex-events/spec.md
+    text: 基础 Plan 映射为 ACP plan update；不实现 Review/Goal 的扩展状态机。
+    result: passed
+    reason:
+      text: 基础 Plan 映射正确且无 Review/Goal 扩展。
+      truncated: false
+  - id: A29
+    source: specs/codex-events/spec.md
+    text: Token Usage 映射为 V1 约定的 ACP update/meta；空值、累计更新和 turn 完成按固定基线处理。
+    result: passed
+    reason:
+      text: usage latest/total/context window 正确。
+      truncated: false
+  - id: A30
+    source: specs/codex-events/spec.md
+    text: Command、File Change、MCP tool 的开始/进度/完成更新使用稳定 ToolCallID 关联。
+    result: passed
+    reason:
+      text: 工具生命周期 ToolCallID 稳定。
+      truncated: false
+  - id: A31
+    source: specs/codex-events/spec.md
+    text: Command 尽可能保留标题、命令、路径、状态、终端/输出和原始输入。
+    result: passed
+    reason:
+      text: terminal_exit、delta 与 aggregatedOutput fallback 顺序/幂等通过。
+      truncated: false
+  - id: A32
+    source: specs/codex-events/spec.md
+    text: File Change 尽可能保留增加/修改/删除位置、diff 与 raw content；多文件事件不得串线。
+    result: passed
+    reason:
+      text: File Change rich diff/raw 边界正确。
+      truncated: false
+  - id: A33
+    source: specs/codex-events/spec.md
+    text: MCP 范围仅为 Codex 已执行 MCP tool event 的 ACP ToolCall 映射，不负责 client-provided
+      MCP server 配置或传输。
+    result: passed
+    reason:
+      text: MCP 范围未扩展 transport/config。
+      truncated: false
+  - id: A34
+    source: specs/codex-events/spec.md
+    text: Command、File Change、Permissions 三类 app-server request 映射为 ACP
+      `session/requestPermission`。
+    result: passed
+    reason:
+      text: 三类 SDK permission request 通过。
+      truncated: false
+  - id: A35
+    source: specs/codex-events/spec.md
+    text: 仅暴露固定基线对该请求有效的 allow-once/allow-for-scope/reject/cancel 选项；ACP
+      选择被严格校验后转换为对应 Codex response。
+    result: passed
+    reason:
+      text: 只接受本次 offered option。
+      truncated: false
+  - id: A36
+    source: specs/codex-events/spec.md
+    text: ACP 取消、未知选项、超时、handler 缺失、映射异常或 connection 失败均 fail closed：command/file 返回
+      cancel，permissions 返回无授权/拒绝语义。
+    result: passed
+    reason:
+      text: 全部异常路径 fail closed。
+      truncated: false
+  - id: A37
+    source: specs/codex-events/spec.md
+    text: Approval 与 thread/turn/session generation 关联；旧 turn 请求即使迟到也不得批准当前活动。
+    result: passed
+    reason:
+      text: 审批前后 generation 双检与并发 barrier 通过。
+      truncated: false
+  - id: A38
+    source: specs/codex-events/spec.md
+    text: cancel/session close/process exit 会解除等待中的 permission 请求并回传关闭语义。
+    result: passed
+    reason:
+      text: permission context 取消契约通过。
+      truncated: false
+  - id: A39
+    source: specs/codex-events/spec.md
+    text: A8：消息、reasoning、plan、usage。
+    result: passed
+    reason:
+      text: 消息/reasoning/plan/usage 覆盖通过。
+      truncated: false
+  - id: A40
+    source: specs/codex-events/spec.md
+    text: A9：command/file/MCP tool call。
+    result: passed
+    reason:
+      text: command/file/MCP 覆盖含 terminal 修复。
+      truncated: false
+  - id: A41
+    source: specs/codex-events/spec.md
+    text: A10：三类审批、fail closed 与 stale 防护。
+    result: passed
+    reason:
+      text: 三类审批与 stale 防护覆盖通过。
+      truncated: false
+  - id: A42
+    source: specs/codex-events/spec.md
+    text: A14：未知事件兼容。
+    result: passed
+    reason:
+      text: 未知事件兼容覆盖通过。
+      truncated: false
+  - id: A43
+    source: specs/codex-events-config/spec.md
+    text: 事件先按 thread/turn 与当前 session 状态关联，再由专用 handler/mapper 转换为 ACP session
+      updates。
+    result: passed
+    reason:
+      text: 事件 identity/generation 关联通过。
+      truncated: false
+  - id: A44
+    source: specs/codex-events-config/spec.md
+    text: 核心事件使用生成的强类型协议类型；未知事件记录 method/type、相关 identity 与安全摘要后忽略。
+    result: passed
+    reason:
+      text: typed 通知与 safe unknown 摘要通过。
+      truncated: false
+  - id: A45
+    source: specs/codex-events-config/spec.md
+    text: handler 的完成/清理幂等；增量和 completed/fallback 路径不得重复输出最终内容。
+    result: passed
+    reason:
+      text: 完成清理幂等。
+      truncated: false
+  - id: A46
+    source: specs/codex-events-config/spec.md
+    text: Agent Message 映射为 ACP agent message chunk。
+    result: passed
+    reason:
+      text: Agent Message 映射通过。
+      truncated: false
+  - id: A47
+    source: specs/codex-events-config/spec.md
+    text: Reasoning 映射为 ACP thought/reasoning chunk，并保留固定基线支持的 section
+      break/completed fallback 语义。
+    result: passed
+    reason:
+      text: Reasoning 映射通过。
+      truncated: false
+  - id: A48
+    source: specs/codex-events-config/spec.md
+    text: 基础 Plan 映射为 ACP plan update；不实现 Review/Goal 的扩展状态机。
+    result: passed
+    reason:
+      text: Plan 映射通过。
+      truncated: false
+  - id: A49
+    source: specs/codex-events-config/spec.md
+    text: Token Usage 映射为 V1 约定的 ACP update/meta；空值、累计更新和 turn 完成按固定基线处理。
+    result: passed
+    reason:
+      text: usage 映射与 turn 隔离通过。
+      truncated: false
+  - id: A50
+    source: specs/codex-events-config/spec.md
+    text: Command、File Change、MCP tool 的开始/进度/完成更新使用稳定 ToolCallID 关联。
+    result: passed
+    reason:
+      text: 工具 ID 稳定。
+      truncated: false
+  - id: A51
+    source: specs/codex-events-config/spec.md
+    text: Command 尽可能保留标题、命令、路径、状态、终端/输出和原始输入。
+    result: passed
+    reason:
+      text: terminal fallback/exit/raw output/exactly-once 通过。
+      truncated: false
+  - id: A52
+    source: specs/codex-events-config/spec.md
+    text: File Change 尽可能保留增加/修改/删除位置、diff 与 raw content；多文件事件不得串线。
+    result: passed
+    reason:
+      text: File Change 多文件隔离通过。
+      truncated: false
+  - id: A53
+    source: specs/codex-events-config/spec.md
+    text: MCP 范围仅为 Codex 已执行 MCP tool event 的 ACP ToolCall 映射，不负责 client-provided
+      MCP server 配置或传输。
+    result: passed
+    reason:
+      text: MCP 范围正确。
+      truncated: false
+  - id: A54
+    source: specs/codex-events-config/spec.md
+    text: Command、File Change、Permissions 三类 app-server request 映射为 ACP
+      `session/requestPermission`。
+    result: passed
+    reason:
+      text: 三类 permission request 通过。
+      truncated: false
+  - id: A55
+    source: specs/codex-events-config/spec.md
+    text: 仅暴露固定基线对该请求有效的 allow-once/allow-for-scope/reject/cancel 选项；ACP
+      选择被严格校验后转换为对应 Codex response。
+    result: passed
+    reason:
+      text: option 校验与 response 映射通过。
+      truncated: false
+  - id: A56
+    source: specs/codex-events-config/spec.md
+    text: ACP 取消、未知选项、超时、handler 缺失、映射异常或 connection 失败均 fail closed：command/file 返回
+      cancel，permissions 返回无授权/拒绝语义。
+    result: passed
+    reason:
+      text: 错误、panic、取消与连接失败均 fail closed。
+      truncated: false
+  - id: A57
+    source: specs/codex-events-config/spec.md
+    text: Approval 与 thread/turn/session generation 关联；旧 turn 请求即使迟到也不得批准当前活动。
+    result: passed
+    reason:
+      text: generation 双检竞态证据通过。
+      truncated: false
+  - id: A58
+    source: specs/codex-events-config/spec.md
+    text: cancel/session close/process exit 会解除等待中的 permission 请求并回传关闭语义。
+    result: passed
+    reason:
+      text: permission 取消契约通过。
+      truncated: false
+  - id: A59
+    source: specs/codex-events-config/spec.md
+    text: A8：消息、reasoning、plan、usage。
+    result: passed
+    reason:
+      text: 事件内容映射通过。
+      truncated: false
+  - id: A60
+    source: specs/codex-events-config/spec.md
+    text: A9：command/file/MCP tool call。
+    result: passed
+    reason:
+      text: 工具映射回归通过。
+      truncated: false
+  - id: A61
+    source: specs/codex-events-config/spec.md
+    text: A10：三类审批、fail closed 与 stale 防护。
+    result: passed
+    reason:
+      text: 审批安全回归通过。
+      truncated: false
+  - id: A62
+    source: specs/codex-events-config/spec.md
+    text: A14：未知事件兼容。
+    result: passed
+    reason:
+      text: unknown method/item 回归通过。
+      truncated: false
+  - id: A63
+    source: specs/codex-events-config/spec.md
+    text: initialize/session 创建时声明并接受固定基线支持的 model、reasoning effort 与 sandbox/agent
+      mode 选项。
+    result: passed
+    reason:
+      text: 配置声明完整。
+      truncated: false
+  - id: A64
+    source: specs/codex-events-config/spec.md
+    text: Adapter 将 ACP config option/mode 映射为 Codex app-server
+      参数；未知、失效或不兼容值返回可诊断错误，不静默使用危险权限。
+    result: passed
+    reason:
+      text: 未知配置可诊断且不扩大权限。
+      truncated: false
+  - id: A65
+    source: specs/codex-events-config/spec.md
+    text: sandbox/agent mode 映射遵循固定上游语义，尤其保持 read-only、workspace-write/agent 和
+      full-access 的权限边界。
+    result: passed
+    reason:
+      text: 安全模式与 upstream 一致。
+      truncated: false
+  - id: A66
+    source: specs/codex-events-config/spec.md
+    text: load/resume 对配置的恢复/覆盖顺序与固定上游基线一致。
+    result: passed
+    reason:
+      text: 恢复配置组件契约通过。
+      truncated: false
+  - id: A67
+    source: specs/codex-events-config/spec.md
+    text: V1 接受 ACP Text、Image 和 Resource input，并转换为固定 app-server schema 的 turn
+      input。
+    result: passed
+    reason:
+      text: V1 内容转换正确。
+      truncated: false
+  - id: A68
+    source: specs/codex-events-config/spec.md
+    text: Image 保留可用 MIME/URL/base64 信息；Resource 支持固定基线可转换的 resource link 与 embedded
+      resource。
+    result: passed
+    reason:
+      text: 图片与 Resource 信息正确。
+      truncated: false
+  - id: A69
+    source: specs/codex-events-config/spec.md
+    text: 不支持的 content block 类型以明确请求错误处理，不丢弃后继续；Audio 不在 V1。
+    result: passed
+    reason:
+      text: 不支持内容明确拒绝。
+      truncated: false
+  - id: A70
+    source: specs/codex-events-config/spec.md
+    text: initialize 声明 ChatGPT 与 API Key 两种基础认证方式。
+    result: passed
+    reason:
+      text: 只声明两类认证。
+      truncated: false
+  - id: A71
+    source: specs/codex-events-config/spec.md
+    text: ChatGPT 登录和 API Key 环境/请求的选择、成功、取消和失败按固定上游基线映射。
+    result: passed
+    reason:
+      text: 认证完成订阅与取消路径正确。
+      truncated: false
+  - id: A72
+    source: specs/codex-events-config/spec.md
+    text: V1 不支持 client-provided custom gateway/Gateway Auth；不得误宣告该能力。
+    result: passed
+    reason:
+      text: 未误宣告 Gateway。
+      truncated: false
+  - id: A73
+    source: specs/codex-events-config/spec.md
+    text: 凭据不得写入日志、UPSTREAM.md、fixture 或错误详情。
+    result: passed
+    reason:
+      text: secret-safe 通过。
+      truncated: false
+  - id: A74
+    source: specs/codex-events-config/spec.md
+    text: A11：model/reasoning/sandbox/mode。
+    result: passed
+    reason:
+      text: 配置与模式覆盖通过。
+      truncated: false
+  - id: A75
+    source: specs/codex-events-config/spec.md
+    text: A12：Text/Image/Resource 与 ChatGPT/API Key。
+    result: passed
+    reason:
+      text: 内容与认证覆盖通过。
+      truncated: false
+builder_handoff:
+  candidate_id: 4c38fd02-ef24-4548-be44-87262598d135
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:c344e8d0-6902-44be-833e-370f649d29ec
+  iteration: 2
+  summary:
+    text: Iteration 2 对照 codex-acp ba5bcc3 的
+      CodexEventHandler.completeCommandExecutionEvent 与
+      terminal-output-completion-fallback fixture：为 terminal command 保存
+      started/output 状态，completed 必发 terminal_exit，且仅在没有非空 delta 时把
+      aggregatedOutput 回退为 terminal_output，完成重放仍 exactly-once；unknown method
+      现在以隔离测试约束 method、payload bytes、当前 session 和可用 thread/turn identity，且不记录其他
+      payload。同步更新 canonical/testdata UPSTREAM 映射；另按 verifier 风险补齐空 changes 省略
+      permission meta 和显式并发 barrier stale approval 证据。
+    truncated: false
+  addressed_acceptance_ids:
+    - A8
+    - A24
+    - A31
+    - A40
+    - A42
+    - A44
+    - A51
+    - A60
+    - A62
+  checks:
+    - name:
+        text: go test ./... -count=1
+        truncated: false
+      result: passed
+      note:
+        text: fresh 实际运行通过，exit 0；tools/protocolgen 20.654s
+        truncated: false
+    - name:
+        text: go test -race ./... -count=1
+        truncated: false
+      result: passed
+      note:
+        text: fresh 实际运行通过，exit 0；tools/protocolgen 25.950s
+        truncated: false
+    - name:
+        text: go vet ./...
+        truncated: false
+      result: passed
+      note:
+        text: fresh 实际运行通过，exit 0
+        truncated: false
+    - name:
+        text: go build ./...
+        truncated: false
+      result: passed
+      note:
+        text: fresh 实际运行通过，exit 0
+        truncated: false
+    - name:
+        text: go run ./tools/protocolgen --check
+        truncated: false
+      result: passed
+      note:
+        text: fresh 实际运行通过，exit 0
+        truncated: false
+    - name:
+        text: gofmt and git diff --check
+        truncated: false
+      result: passed
+      note:
+        text: 所有本轮 Go 文件已 gofmt；提交前 diff check 通过
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 本 child 仍只交付独立 event/tool/approval/config/content/auth 组件；最终 agent/runtime
+        wiring 属 stabilization。
+      truncated: false
+    - text: File update/move 与 patchUpdated 继续按已接受边界保留 typed raw changes，不自写 patch
+        parser。
+      truncated: false
+  known_limits_truncated: false
+  submitted_at: 2026-08-23T15:30:06.312Z
+blockers: []
+verification:
+  candidate_id: 4c38fd02-ef24-4548-be44-87262598d135
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:e392fa88-c170-4fee-ad32-6c90edef40ad
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: go-test
+      name:
+        text: Events/config tests
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: ./...
+          truncated: false
+        - text: -count=1
+          truncated: false
+        - text: -timeout=180s
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 22757
+    - id: go-race
+      name:
+        text: Events/config race tests
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: -race
+          truncated: false
+        - text: ./...
+          truncated: false
+        - text: -count=1
+          truncated: false
+        - text: -timeout=300s
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 28848
+    - id: go-vet
+      name:
+        text: Go vet
+        truncated: false
+      argv_display:
+        - text: vet
+          truncated: false
+        - text: ./...
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 512
+    - id: protocol-freshness
+      name:
+        text: Protocol freshness
+        truncated: false
+      argv_display:
+        - text: run
+          truncated: false
+        - text: ./tools/protocolgen
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3015
+    - id: go-build
+      name:
+        text: Build all packages
+        truncated: false
+      argv_display:
+        - text: build
+          truncated: false
+        - text: ./...
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 769
+  summary:
+    text: PASS：上一轮 terminal completion、unknown identity、空 permission meta 与 stale
+      approval barrier 缺口均修复；A1-A75 通过，fresh
+      test/race/vet/build/protocolgen/cross/重复探针全部通过。
+    truncated: false
+  risks:
+    - text: 最终 Agent/runtime wiring、真实 app-server 集成与 client capability 驱动 terminal
+        mode 由 stabilization 总体验收。
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-08-23T15:40:37.473Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A8
+      - A24
+      - A31
+      - A40
+      - A42
+      - A44
+      - A51
+      - A60
+      - A62
+    summary:
+      text: FAIL：命令完成缺 upstream terminal_exit/aggregatedOutput fallback；unknown method
+        日志缺 identity；根 UPSTREAM.md 追溯入口过期。其余组件行为与 fresh
+        test/race/vet/build/protocol freshness 通过。
+      truncated: false
+    completed_at: 2026-08-23T15:19:39.429Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: PASS：上一轮 terminal completion、unknown identity、空 permission meta 与 stale
+        approval barrier 缺口均修复；A1-A75 通过，fresh
+        test/race/vet/build/protocolgen/cross/重复探针全部通过。
+      truncated: false
+    completed_at: 2026-08-23T15:40:37.473Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-08-23T14:08:53.749Z
