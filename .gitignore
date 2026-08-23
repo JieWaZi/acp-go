@@ -3,6 +3,7 @@
 skills-lock.json
 .comet
 .upstream/
+node_modules/
 # >>> Comet managed project state >>>
 !/.comet/
 /.comet/*
