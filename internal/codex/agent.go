@@ -112,10 +112,12 @@ type Agent struct {
 	steering *steeringManager
 	// auth 复用已验证的 API Key 与 ChatGPT 认证组件。
 	auth *authenticator
-	// initializeMu 保护 initialized。
+	// initializeMu 保护 initialized 与 terminalOutputMode。
 	initializeMu sync.RWMutex
 	// initialized 表示 app-server initialize/initialized 已成功完成。
 	initialized bool
+	// terminalOutputMode 是最近一次成功 initialize 协商的 session 输出模式。
+	terminalOutputMode terminalOutputMode
 	// connectionMu 保护外层 SDK connection。
 	connectionMu sync.RWMutex
 	// connection 是 acp-go-sdk 创建的唯一 AgentSideConnection。
@@ -271,6 +273,7 @@ func (a *Agent) Authenticate(
 
 // Initialize 先完成唯一 app-server 握手，再声明真实可用的 session/prompt 能力。
 func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
+	terminalMode := resolveTerminalOutputMode(request.ClientCapabilities)
 	clientInfo := protocol.ClientInfo{Name: "acp-client", Title: stringPointer("ACP Client"), Version: "unknown"}
 	if request.ClientInfo != nil {
 		clientInfo.Name = request.ClientInfo.Name
@@ -280,8 +283,10 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	if _, err := a.client.Initialize(ctx, clientInfo); err != nil {
 		return acp.InitializeResponse{}, fmt.Errorf("initializing codex app-server: %w", err)
 	}
+	// 只有 app-server 握手成功后才发布能力快照，失败重试不能污染后续 session。
 	a.initializeMu.Lock()
 	a.initialized = true
+	a.terminalOutputMode = terminalMode
 	a.initializeMu.Unlock()
 	title := agentTitle
 	return acp.InitializeResponse{
@@ -297,7 +302,10 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 			},
 		},
 		AgentInfo:   &acp.Implementation{Name: agentName, Title: &title, Version: agentVersion},
-		AuthMethods: codexAuthMethods(true),
+		AuthMethods: codexAuthMethods(a.auth.browserAuthEnabled()),
+		Meta: map[string]any{
+			"steering": map[string]any{"supported": true},
+		},
 	}, nil
 }
 
@@ -347,7 +355,13 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 		defer cancelCleanup()
 		return acp.NewSessionResponse{}, errors.Join(err, a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID))
 	}
-	state, installed := a.sessions.install(response.Thread.ID, request.Cwd, generation, configuration)
+	state, installed := a.sessions.install(
+		response.Thread.ID,
+		request.Cwd,
+		generation,
+		configuration,
+		a.currentTerminalOutputMode(),
+	)
 	if !installed {
 		return acp.NewSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
 	}
@@ -426,7 +440,13 @@ func (a *Agent) openExistingSession(
 	if err != nil {
 		return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, err)
 	}
-	state, installed := a.sessions.install(sessionID, cwd, generation, configuration)
+	state, installed := a.sessions.install(
+		sessionID,
+		cwd,
+		generation,
+		configuration,
+		a.currentTerminalOutputMode(),
+	)
 	if !installed {
 		return protocol.Thread{}, nil, a.closeStaleOpen(ctx, sessionID, generation)
 	}
@@ -773,8 +793,18 @@ func (a *Agent) onTurnStarted(state *sessionState, prompt *activePrompt, turnID 
 			ThreadID:   state.id,
 			TurnID:     turnID,
 			Generation: prompt.generation,
-		}, a, a.logger))
+		}, a, a.logger, state.terminalOutputMode))
 	}
+}
+
+// currentTerminalOutputMode 返回最近一次成功 initialize 的协商结果。
+func (a *Agent) currentTerminalOutputMode() terminalOutputMode {
+	a.initializeMu.RLock()
+	defer a.initializeMu.RUnlock()
+	if a.terminalOutputMode == terminalOutputModeFull {
+		return terminalOutputModeFull
+	}
+	return terminalOutputModeDelta
 }
 
 // requestPromptInterrupt 使用 activePrompt 的 Once 保证所有取消来源合计只请求一次。

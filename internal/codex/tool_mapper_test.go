@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"testing"
 
@@ -17,13 +18,14 @@ func TestEventRouterMapsCommandLifecycle(t *testing.T) {
 	for _, raw := range []string{
 		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"commandExecution","id":"command-1","command":"/bin/zsh -c 'echo hello'","cwd":"/work","status":"inProgress","commandActions":[]}}}`,
 		`{"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"command-1","delta":"hello\n"}}`,
+		`{"method":"item/commandExecution/terminalInteraction","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"command-1","processId":"process-1","stdin":"yes"}}`,
 		`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"commandExecution","id":"command-1","command":"/bin/zsh -c 'echo hello'","cwd":"/work","status":"completed","commandActions":[],"aggregatedOutput":"hello\n","exitCode":0}}}`,
 	} {
 		if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
 			t.Fatalf("HandleJSON 返回错误: %v", err)
 		}
 	}
-	if got, want := len(updater.notifications), 3; got != want {
+	if got, want := len(updater.notifications), 4; got != want {
 		t.Fatalf("command update 数 = %d，期望 %d", got, want)
 	}
 	started := updater.notifications[0].Update.ToolCall
@@ -40,7 +42,13 @@ func TestEventRouterMapsCommandLifecycle(t *testing.T) {
 	if delta == nil || delta.ToolCallId != "command-1" || delta.Meta["terminal_output_delta"].(map[string]any)["data"] != "hello\n" {
 		t.Fatalf("command delta = %#v", delta)
 	}
-	completed := updater.notifications[2].Update.ToolCallUpdate
+	assertMetaWire(t, delta.Meta, `{"terminal_output_delta":{"data":"hello\n","terminal_id":"command-1"}}`)
+	interaction := updater.notifications[2].Update.ToolCallUpdate
+	if interaction == nil || interaction.ToolCallId != "command-1" {
+		t.Fatalf("terminal interaction = %#v", interaction)
+	}
+	assertMetaWire(t, interaction.Meta, `{"terminal_output_delta":{"data":"\nyes\n","terminal_id":"command-1"}}`)
+	completed := updater.notifications[3].Update.ToolCallUpdate
 	if completed == nil || completed.ToolCallId != "command-1" || completed.Status == nil || *completed.Status != acp.ToolCallStatusCompleted {
 		t.Fatalf("command completed = %#v", completed)
 	}
@@ -80,22 +88,35 @@ func TestEventRouterFallsBackToTerminalOutputOnCommandCompletion(t *testing.T) {
 	if update == nil {
 		t.Fatal("缺少 command completion update")
 	}
-	output, ok := update.Meta["terminal_output"].(map[string]any)
+	output, ok := update.Meta["terminal_output_delta"].(map[string]any)
 	if !ok {
-		t.Fatalf("command completion 缺 terminal_output fallback: %#v", update.Meta)
+		t.Fatalf("默认客户端的 command completion 缺 terminal_output_delta fallback: %#v", update.Meta)
 	}
 	if output["data"] != "M src/CodexEventHandler.ts\n" || output["terminal_id"] != "command-terminal-output-completion" {
 		t.Fatalf("terminal output fallback = %#v", output)
 	}
-	if update.Meta["terminal_output_delta"] != nil {
-		t.Fatalf("completion fallback 不应伪装成 delta: %#v", update.Meta)
+	if update.Meta["terminal_output"] != nil {
+		t.Fatalf("默认客户端不应收到 terminal_output: %#v", update.Meta)
 	}
+	assertMetaWire(t, update.Meta, `{"terminal_exit":{"exit_code":0,"signal":null,"terminal_id":"command-terminal-output-completion"},"terminal_output_delta":{"data":"M src/CodexEventHandler.ts\n","terminal_id":"command-terminal-output-completion"}}`)
 	exit, ok := update.Meta["terminal_exit"].(map[string]any)
 	if !ok {
 		t.Fatalf("command completion 缺 terminal_exit: %#v", update.Meta)
 	}
 	if exit["exit_code"] != int64(0) || exit["signal"] != nil || exit["terminal_id"] != "command-terminal-output-completion" {
 		t.Fatalf("terminal exit = %#v", exit)
+	}
+}
+
+// assertMetaWire 把 SDK 扩展元数据编码为真实 JSON，并与手工 upstream fixture 精确比较。
+func assertMetaWire(t *testing.T, meta map[string]any, want string) {
+	t.Helper()
+	got, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("编码扩展元数据失败: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("扩展元数据 wire = %s，期望 %s", got, want)
 	}
 }
 

@@ -20,7 +20,7 @@ func (a *Agent) replayThreadHistory(ctx context.Context, state *sessionState, th
 	if updater == nil {
 		return ErrConnectionNotReady
 	}
-	handler := newEventHandler(updater, acp.SessionId(state.id), a.logger)
+	handler := newEventHandler(updater, acp.SessionId(state.id), a.logger, state.terminalOutputMode)
 	seenUserMessages := make(map[string]struct{})
 	for _, turn := range thread.Turns {
 		for _, item := range turn.Items {

@@ -403,6 +403,14 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 		}
 	}
 	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		ClientCapabilities: acp.ClientCapabilities{
+			Meta: map[string]any{"terminal_output": true},
+		},
+	}); err != nil {
+		t.Fatalf("以 terminal_output 能力重新初始化 Agent 失败: %v", err)
+	}
 	updater := &recordingHistoryUpdater{}
 	agent.connectionMu.Lock()
 	agent.sessionUpdater = updater
@@ -431,6 +439,7 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 		*commandComplete.Status != acp.ToolCallStatusCompleted || commandComplete.Meta == nil {
 		t.Fatalf("命令历史更新为 %#v / %#v", updater.notifications[2], updater.notifications[3])
 	}
+	assertMetaWire(t, commandComplete.Meta, `{"terminal_exit":{"exit_code":0,"signal":null,"terminal_id":"command-1"},"terminal_output":{"data":"README.md\n","terminal_id":"command-1"}}`)
 	fileStart := updater.notifications[4].Update.ToolCall
 	if fileStart == nil || fileStart.Title != "Editing files" || fileStart.Kind != acp.ToolKindEdit ||
 		fileStart.Status != acp.ToolCallStatusCompleted || len(fileStart.Content) != 1 {

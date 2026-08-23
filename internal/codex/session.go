@@ -29,6 +29,8 @@ type sessionState struct {
 	activePrompt *activePrompt
 	// configuration 是 config 子组件维护的 model、effort 与安全模式状态。
 	configuration *sessionConfiguration
+	// terminalOutputMode 保存 session 创建时的客户端输出能力快照。
+	terminalOutputMode terminalOutputMode
 	// promptClosed 阻止 close fence 建立后仍持有旧 state 的并发请求安装 prompt。
 	promptClosed bool
 }
@@ -76,6 +78,7 @@ func (s *sessionStore) install(
 	cwd string,
 	generation uint64,
 	configuration *sessionConfiguration,
+	terminalMode terminalOutputMode,
 ) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -84,10 +87,11 @@ func (s *sessionStore) install(
 		return nil, false
 	}
 	state := &sessionState{
-		id:            sessionID,
-		cwd:           cwd,
-		generation:    generation,
-		configuration: configuration,
+		id:                 sessionID,
+		cwd:                cwd,
+		generation:         generation,
+		configuration:      configuration,
+		terminalOutputMode: terminalMode,
 	}
 	s.sessions[sessionID] = state
 	delete(s.opening, sessionID)

@@ -104,6 +104,11 @@ func codexAuthMethods(browserEnabled bool) []acp.AuthMethod {
 	return methods
 }
 
+// browserAuthEnabled 等价 fixed upstream 对 NO_BROWSER 的非空判断。
+func (a *authenticator) browserAuthEnabled() bool {
+	return a != nil && a.getenv != nil && a.getenv("NO_BROWSER") == ""
+}
+
 // Authenticate 按 methodId 选择固定 V1 认证流程，未知方法立即失败。
 func (a *authenticator) Authenticate(ctx context.Context, request acp.AuthenticateRequest) error {
 	if a.server == nil || a.subscriber == nil {

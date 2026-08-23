@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 
 	"acp-go/agents/codex/protocol"
@@ -34,6 +35,31 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 		response.AuthMethods[0].Agent.Id != "api-key" || response.AuthMethods[1].Agent == nil ||
 		response.AuthMethods[1].Agent.Id != "chat-gpt" {
 		t.Fatalf("认证方法为 %#v，期望仅 API Key 与 ChatGPT", response.AuthMethods)
+	}
+	wantMeta := map[string]any{
+		"steering": map[string]any{"supported": true},
+	}
+	if !reflect.DeepEqual(response.Meta, wantMeta) {
+		t.Fatalf("initialize meta 为 %#v，期望 %#v", response.Meta, wantMeta)
+	}
+}
+
+// TestAgentInitializeHidesChatGPTWhenBrowserIsDisabled 锁定 upstream NO_BROWSER 的非空判定。
+// 若 Initialize 绕过 authenticator 的环境边界并继续宣告浏览器登录，本测试应失败。
+func TestAgentInitializeHidesChatGPTWhenBrowserIsDisabled(t *testing.T) {
+	t.Parallel()
+
+	agent := newTestAgent(t)
+	agent.auth.getenv = func(name string) string {
+		if name == "NO_BROWSER" {
+			return "1"
+		}
+		return ""
+	}
+	response := initializeTestAgent(t, agent)
+	if len(response.AuthMethods) != 1 || response.AuthMethods[0].Agent == nil ||
+		response.AuthMethods[0].Agent.Id != "api-key" {
+		t.Fatalf("NO_BROWSER 下认证方法为 %#v，期望仅 API Key", response.AuthMethods)
 	}
 }
 

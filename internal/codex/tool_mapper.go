@@ -155,17 +155,23 @@ func mapCommandCompleted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	), nil
 }
 
-// mapCommandOutputDelta 使用 upstream terminal_output_delta 元数据流式传递原始增量。
-func mapCommandOutputDelta(params protocol.CommandExecutionOutputDeltaNotification) acp.SessionUpdate {
+// mapCommandOutputDelta 使用协商的 upstream terminal output 元数据流式传递原始增量。
+func mapCommandOutputDelta(
+	params protocol.CommandExecutionOutputDeltaNotification,
+	mode terminalOutputMode,
+) acp.SessionUpdate {
 	update := acp.UpdateToolCall(acp.ToolCallId(params.ItemID))
-	update.ToolCallUpdate.Meta = terminalOutputMeta(params.ItemID, params.Delta)
+	update.ToolCallUpdate.Meta = createTerminalOutputMeta(mode, params.ItemID, params.Delta)
 	return update
 }
 
 // mapTerminalInteraction 将 stdin 作为带换行的终端输出增量回显。
-func mapTerminalInteraction(params protocol.TerminalInteractionNotification) acp.SessionUpdate {
+func mapTerminalInteraction(
+	params protocol.TerminalInteractionNotification,
+	mode terminalOutputMode,
+) acp.SessionUpdate {
 	update := acp.UpdateToolCall(acp.ToolCallId(params.ItemID))
-	update.ToolCallUpdate.Meta = terminalOutputMeta(params.ItemID, "\n"+params.Stdin+"\n")
+	update.ToolCallUpdate.Meta = createTerminalOutputMeta(mode, params.ItemID, "\n"+params.Stdin+"\n")
 	return update
 }
 
@@ -315,15 +321,9 @@ func terminalInfoMeta(terminalID, cwd string) map[string]any {
 	}
 }
 
-// terminalOutputMeta 生成 upstream terminal_output_delta 扩展元数据。
-func terminalOutputMeta(terminalID, data string) map[string]any {
-	return map[string]any{
-		"terminal_output_delta": map[string]any{"data": data, "terminal_id": terminalID},
-	}
-}
-
 // terminalCompletionMeta 等价生成 upstream command completion 的输出回退和退出元数据。
 func terminalCompletionMeta(
+	mode terminalOutputMode,
 	terminalID string,
 	aggregatedOutput string,
 	exitCode *int64,
@@ -341,8 +341,8 @@ func terminalCompletionMeta(
 		},
 	}
 	if !hadOutput && aggregatedOutput != "" {
-		meta["terminal_output"] = map[string]any{
-			"data": aggregatedOutput, "terminal_id": terminalID,
+		for key, value := range createTerminalOutputMeta(mode, terminalID, aggregatedOutput) {
+			meta[key] = value
 		}
 	}
 	return meta
