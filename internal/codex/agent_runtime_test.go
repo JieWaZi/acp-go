@@ -64,6 +64,28 @@ func writeRuntimeWireResult(
 // newRuntimeTestAgent 使用 fake typed client 创建已完成 connection barrier 的 Agent。
 func newRuntimeTestAgent(t *testing.T, rpc *fakeAppServerRPC) *Agent {
 	t.Helper()
+	originalHandler := rpc.handleCall
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		// 通用 fixture 补齐 upstream schema-required model，并为会话配置提供稳定目录。
+		if request.Method() == protocol.MethodModelList {
+			result.(*protocol.ModelListResponse).Data = testModels()
+			return nil
+		}
+		if err := originalHandler(ctx, request, result); err != nil {
+			return err
+		}
+		switch response := result.(type) {
+		case *protocol.ThreadStartResponse:
+			if response.Model == "" {
+				response.Model = "fast-model"
+			}
+		case *protocol.ThreadResumeResponse:
+			if response.Model == "" {
+				response.Model = "fast-model"
+			}
+		}
+		return nil
+	}
 	runtimeCtx, cancel := context.WithCancel(context.Background())
 	client := newAppServerClient(runtimeCtx, rpc)
 	agent := newAgentWithClient(
@@ -118,8 +140,9 @@ func TestAgentNewAndLoadSessionUseUpstreamThreadFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载 session 失败: %v", err)
 	}
-	if got := rpc.calls; len(got) != 4 || got[1] != protocol.MethodThreadStart ||
-		got[2] != protocol.MethodThreadResume || got[3] != protocol.MethodThreadRead {
+	if got := rpc.calls; len(got) != 6 || got[1] != protocol.MethodThreadStart ||
+		got[2] != protocol.MethodModelList || got[3] != protocol.MethodThreadResume ||
+		got[4] != protocol.MethodThreadRead || got[5] != protocol.MethodModelList {
 		t.Fatalf("请求顺序为 %v", got)
 	}
 }
@@ -183,7 +206,12 @@ func TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce(t *testing.T) {
 		case protocol.MethodInitialize:
 			return nil
 		case protocol.MethodThreadStart:
-			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "thread-1"
+			response.Model = "fast-model"
+			return nil
+		case protocol.MethodModelList:
+			result.(*protocol.ModelListResponse).Data = testModels()
 			return nil
 		case protocol.MethodTurnStart:
 			turnMu.Lock()
@@ -404,7 +432,13 @@ func TestAgentCloseSessionObservesLateTurnStartOverRealTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建立 wire session open 身份失败: %v", err)
 	}
-	state, installed := agent.sessions.install("thread-wire-close", "/tmp", generation)
+	state, installed := agent.sessions.install(
+		"thread-wire-close",
+		"/tmp",
+		generation,
+		nil,
+		terminalOutputModeDelta,
+	)
 	if !installed {
 		t.Fatal("安装 wire session 状态失败")
 	}
@@ -702,7 +736,12 @@ func TestAgentPromptWaitsForConnectionBinder(t *testing.T) {
 		case protocol.MethodInitialize:
 			return nil
 		case protocol.MethodThreadStart:
-			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "thread-1"
+			response.Model = "fast-model"
+			return nil
+		case protocol.MethodModelList:
+			result.(*protocol.ModelListResponse).Data = testModels()
 			return nil
 		case protocol.MethodTurnStart:
 			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
@@ -854,7 +893,13 @@ func TestAgentNotificationUsesVerifiedEventRouter(t *testing.T) {
 		t.Fatal("事件测试当前 turn generation 不存在")
 	}
 	updater := &recordingSessionUpdater{}
-	prompt.setEventRouter(newEventRouter(updater, generation, agent, agent.logger))
+	prompt.setEventRouter(newEventRouter(
+		updater,
+		generation,
+		agent,
+		agent.logger,
+		state.terminalOutputMode,
+	))
 
 	current, err := protocol.DecodeServerNotification([]byte(
 		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-events","turnId":"turn-events","itemId":"message-1","delta":"hello"}}`,
@@ -890,6 +935,99 @@ func TestAgentNotificationUsesVerifiedEventRouter(t *testing.T) {
 	if response := <-promptResponse; response.StopReason != acp.StopReasonEndTurn {
 		t.Fatalf("事件测试 prompt 响应为 %#v", response)
 	}
+}
+
+// TestAgentSnapshotsAdvertisedTerminalOutputModeIntoLiveEvents 验证 session 保存 initialize 时的输出模式。
+// 若后续 initialize 覆盖既有 session，或 live delta/interaction/completion 仍硬编码 legacy key，本测试应失败。
+func TestAgentSnapshotsAdvertisedTerminalOutputModeIntoLiveEvents(t *testing.T) {
+	t.Parallel()
+
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "terminal-mode-thread"
+			response.Model = "fast-model"
+			return nil
+		case protocol.MethodModelList:
+			result.(*protocol.ModelListResponse).Data = testModels()
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	agent := newAgentWithClient(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		runtimeCtx,
+		cancel,
+		newAppServerClient(runtimeCtx, rpc),
+	)
+	updater := &recordingSessionUpdater{}
+	agent.connectionMu.Lock()
+	agent.sessionUpdater = updater
+	agent.connectionMu.Unlock()
+
+	if _, err := agent.Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		ClientCapabilities: acp.ClientCapabilities{Meta: map[string]any{
+			"terminal_output": true,
+		}},
+	}); err != nil {
+		t.Fatalf("初始化 terminal_output 客户端失败: %v", err)
+	}
+	created, err := agent.NewSession(context.Background(), acp.NewSessionRequest{
+		Cwd: "/workspace", McpServers: []acp.McpServer{},
+	})
+	if err != nil {
+		t.Fatalf("创建 terminal_output session 失败: %v", err)
+	}
+	// 固定 upstream 在 session 安装时保存快照；后续 initialize 只影响新 session。
+	if _, err = agent.Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	}); err != nil {
+		t.Fatalf("重新初始化默认客户端失败: %v", err)
+	}
+	state, ok := agent.sessions.get(string(created.SessionId))
+	if !ok {
+		t.Fatal("terminal_output session 未安装")
+	}
+	prompt := newActivePrompt(agent.runtimeCtx, agent.nextTurnGeneration.Add(1))
+	t.Cleanup(prompt.cancelRun)
+	if err = agent.installActivePrompt(state, prompt); err != nil {
+		t.Fatalf("安装 terminal_output prompt 失败: %v", err)
+	}
+	agent.onTurnStarted(state, prompt, "terminal-mode-turn")
+	router := prompt.currentEventRouter()
+	if router == nil {
+		t.Fatal("terminal_output event router 未安装")
+	}
+
+	for _, raw := range []string{
+		`{"method":"item/started","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","startedAtMs":0,"item":{"type":"commandExecution","id":"command-modern","command":"echo live","cwd":"/workspace","status":"inProgress","commandActions":[]}}}`,
+		`{"method":"item/commandExecution/outputDelta","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","itemId":"command-modern","delta":"live\n"}}`,
+		`{"method":"item/commandExecution/terminalInteraction","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","itemId":"command-modern","processId":"process-modern","stdin":"yes"}}`,
+		`{"method":"item/completed","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","completedAtMs":1,"item":{"type":"commandExecution","id":"command-modern","command":"echo live","cwd":"/workspace","status":"completed","commandActions":[],"aggregatedOutput":"live\n","exitCode":0}}}`,
+		`{"method":"item/started","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","startedAtMs":2,"item":{"type":"commandExecution","id":"command-modern-fallback","command":"echo fallback","cwd":"/workspace","status":"inProgress","commandActions":[]}}}`,
+		`{"method":"item/completed","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","completedAtMs":3,"item":{"type":"commandExecution","id":"command-modern-fallback","command":"echo fallback","cwd":"/workspace","status":"completed","commandActions":[],"aggregatedOutput":"fallback\n","exitCode":0}}}`,
+		`{"method":"item/started","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","startedAtMs":4,"item":{"type":"commandExecution","id":"read-modern","command":"cat README.md","cwd":"/workspace","status":"inProgress","commandActions":[{"type":"read","command":"cat README.md","name":"cat","path":"/workspace/README.md"}]}}}`,
+		`{"method":"item/commandExecution/outputDelta","params":{"threadId":"terminal-mode-thread","turnId":"terminal-mode-turn","itemId":"read-modern","delta":"parsed\n"}}`,
+	} {
+		if err = router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+			t.Fatalf("处理 terminal_output fixture 失败: %v", err)
+		}
+	}
+	if got, want := len(updater.notifications), 8; got != want {
+		t.Fatalf("terminal_output update 数 = %d，期望 %d", got, want)
+	}
+	assertMetaWire(t, updater.notifications[1].Update.ToolCallUpdate.Meta, `{"terminal_output":{"data":"live\n","terminal_id":"command-modern"}}`)
+	assertMetaWire(t, updater.notifications[2].Update.ToolCallUpdate.Meta, `{"terminal_output":{"data":"\nyes\n","terminal_id":"command-modern"}}`)
+	assertMetaWire(t, updater.notifications[5].Update.ToolCallUpdate.Meta, `{"terminal_exit":{"exit_code":0,"signal":null,"terminal_id":"command-modern-fallback"},"terminal_output":{"data":"fallback\n","terminal_id":"command-modern-fallback"}}`)
+	assertMetaWire(t, updater.notifications[7].Update.ToolCallUpdate.Meta, `{"terminal_output_delta":{"data":"parsed\n","terminal_id":"read-modern"}}`)
 }
 
 // TestAgentApprovalFailsClosedWhenTurnGenerationChanges 验证 permission 回调期间完成旧 turn 后，旧审批不会授权新 turn。

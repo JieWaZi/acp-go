@@ -64,6 +64,13 @@ func (a *Agent) currentConnection() *acp.AgentSideConnection {
 	return a.connection
 }
 
+// currentSessionUpdater 返回 event/history 当前可用的 SDK session/update 窄接口。
+func (a *Agent) currentSessionUpdater() sessionUpdater {
+	a.connectionMu.RLock()
+	defer a.connectionMu.RUnlock()
+	return a.sessionUpdater
+}
+
 // currentTurnGeneration 在 session、活动槽位、turn ID 与取消状态都匹配时构造不可变身份。
 func (a *Agent) currentTurnGeneration(threadID, turnID string) (turnGeneration, bool) {
 	state, ok := a.sessions.get(threadID)

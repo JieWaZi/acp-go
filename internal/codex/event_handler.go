@@ -38,6 +38,8 @@ type eventHandler struct {
 	logger *slog.Logger
 	// tools 负责 Command、File 与 MCP 的纯 DTO 映射。
 	tools toolMapper
+	// terminalOutputMode 是 session 安装时保存的客户端能力快照。
+	terminalOutputMode terminalOutputMode
 	// messagePhases 保存 item/started 宣告的消息阶段。
 	messagePhases map[string]protocol.PhaseEnum
 	// streamedMessages 标记已通过 delta 发出的 agent message，完成项不再重复。
@@ -55,7 +57,12 @@ type eventHandler struct {
 }
 
 // newEventHandler 创建只绑定一个 session/generation 的事件处理器。
-func newEventHandler(updater sessionUpdater, sessionID acp.SessionId, logger *slog.Logger) *eventHandler {
+func newEventHandler(
+	updater sessionUpdater,
+	sessionID acp.SessionId,
+	logger *slog.Logger,
+	terminalMode terminalOutputMode,
+) *eventHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -63,6 +70,7 @@ func newEventHandler(updater sessionUpdater, sessionID acp.SessionId, logger *sl
 		updater:                updater,
 		sessionID:              sessionID,
 		logger:                 logger,
+		terminalOutputMode:     terminalMode,
 		messagePhases:          make(map[string]protocol.PhaseEnum),
 		streamedMessages:       make(map[string]struct{}),
 		streamedReasoning:      make(map[string]struct{}),
@@ -113,7 +121,7 @@ func (h *eventHandler) handleItemStarted(ctx context.Context, params protocol.It
 	return nil
 }
 
-// handleCommandOutputDelta 记录 terminal 输出状态并发出 upstream terminal_output_delta。
+// handleCommandOutputDelta 记录 terminal 输出状态并按 session 协商键发送增量。
 func (h *eventHandler) handleCommandOutputDelta(
 	ctx context.Context,
 	params protocol.CommandExecutionOutputDeltaNotification,
@@ -121,7 +129,7 @@ func (h *eventHandler) handleCommandOutputDelta(
 	if _, terminal := h.terminalCommands[params.ItemID]; terminal && params.Delta != "" {
 		h.terminalCommandOutputs[params.ItemID] = struct{}{}
 	}
-	return h.emit(ctx, mapCommandOutputDelta(params))
+	return h.emit(ctx, mapCommandOutputDelta(params, h.commandOutputMode(params.ItemID)))
 }
 
 // handleTerminalInteraction 按 upstream 将 stdin 回显视为 terminal 命令的非空输出。
@@ -132,7 +140,7 @@ func (h *eventHandler) handleTerminalInteraction(
 	if _, terminal := h.terminalCommands[params.ItemID]; terminal {
 		h.terminalCommandOutputs[params.ItemID] = struct{}{}
 	}
-	return h.emit(ctx, mapTerminalInteraction(params))
+	return h.emit(ctx, mapTerminalInteraction(params, h.commandOutputMode(params.ItemID)))
 }
 
 // handleAgentMessageDelta 将 agent 文本 delta 映射为带 messageId 和 phase 的 ACP chunk。
@@ -192,6 +200,53 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 	return err
 }
 
+// handleHistoryItem 精确复制 upstream createHistoryUpdates 的 V1 工具形状。
+// command 先发完整 tool_call 再发终态 update；file/MCP 只发一条 completed tool_call。
+func (h *eventHandler) handleHistoryItem(
+	ctx context.Context,
+	params protocol.ItemCompletedNotification,
+) error {
+	item := params.Item
+	if _, completed := h.completedItems[item.ID]; completed {
+		return nil
+	}
+	switch item.Type {
+	case protocol.CommandExecution:
+		if err := h.handleItemStarted(ctx, protocol.ItemStartedNotification{
+			ThreadID: params.ThreadID,
+			TurnID:   params.TurnID,
+			Item:     item,
+		}); err != nil {
+			return err
+		}
+		return h.handleItemCompleted(ctx, params)
+	case protocol.FileChange:
+		update, err := h.tools.mapStarted(item)
+		if err != nil {
+			return err
+		}
+		if update != nil {
+			if err = h.emit(ctx, *update); err != nil {
+				return err
+			}
+		}
+		h.completedItems[item.ID] = struct{}{}
+		return nil
+	case protocol.MCPToolCall:
+		update, err := mapMCPHistory(item)
+		if err != nil {
+			return err
+		}
+		if err = h.emit(ctx, update); err != nil {
+			return err
+		}
+		h.completedItems[item.ID] = struct{}{}
+		return nil
+	default:
+		return h.handleItemCompleted(ctx, params)
+	}
+}
+
 // decorateCommandCompletion 为 terminal 命令补齐 exit，并仅在缺少 delta 时回退聚合输出。
 func (h *eventHandler) decorateCommandCompletion(item protocol.ThreadItem, update *acp.SessionUpdate) {
 	if _, terminal := h.terminalCommands[item.ID]; !terminal || update.ToolCallUpdate == nil {
@@ -199,11 +254,23 @@ func (h *eventHandler) decorateCommandCompletion(item protocol.ThreadItem, updat
 	}
 	_, hadOutput := h.terminalCommandOutputs[item.ID]
 	update.ToolCallUpdate.Meta = terminalCompletionMeta(
+		h.terminalOutputMode,
 		item.ID,
 		stringValue(item.AggregatedOutput),
 		item.ExitCode,
 		hadOutput,
 	)
+}
+
+// commandOutputMode 等价 upstream CodexEventHandler.commandOutputMode。
+// 已解析为 read/search 的命令没有 terminal content，即使现代客户端也继续使用 delta 键。
+func (h *eventHandler) commandOutputMode(itemID string) terminalOutputMode {
+	if h.terminalOutputMode == terminalOutputModeFull {
+		if _, terminal := h.terminalCommands[itemID]; terminal {
+			return terminalOutputModeFull
+		}
+	}
+	return terminalOutputModeDelta
 }
 
 // handleCompletedAgentMessage 在未流式发送 delta 时补发完整消息，否则仅完成去重状态。

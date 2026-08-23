@@ -27,6 +27,10 @@ type sessionState struct {
 	mu sync.Mutex
 	// activePrompt 是该 session 唯一 pending/active turn。
 	activePrompt *activePrompt
+	// configuration 是 config 子组件维护的 model、effort 与安全模式状态。
+	configuration *sessionConfiguration
+	// terminalOutputMode 保存 session 创建时的客户端输出能力快照。
+	terminalOutputMode terminalOutputMode
 	// promptClosed 阻止 close fence 建立后仍持有旧 state 的并发请求安装 prompt。
 	promptClosed bool
 }
@@ -69,14 +73,26 @@ func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
 }
 
 // install 仅在 generation、最新 open 身份与 close fence 全部匹配时安装状态。
-func (s *sessionStore) install(sessionID, cwd string, generation uint64) (*sessionState, bool) {
+func (s *sessionStore) install(
+	sessionID string,
+	cwd string,
+	generation uint64,
+	configuration *sessionConfiguration,
+	terminalMode terminalOutputMode,
+) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	openGeneration, opening := s.opening[sessionID]
 	if s.closing[sessionID] > 0 || s.generations[sessionID] != generation || !opening || openGeneration != generation {
 		return nil, false
 	}
-	state := &sessionState{id: sessionID, cwd: cwd, generation: generation}
+	state := &sessionState{
+		id:                 sessionID,
+		cwd:                cwd,
+		generation:         generation,
+		configuration:      configuration,
+		terminalOutputMode: terminalMode,
+	}
 	s.sessions[sessionID] = state
 	delete(s.opening, sessionID)
 	return state, true
@@ -148,6 +164,20 @@ func (s *sessionStore) isCurrent(state *sessionState) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closing[state.id] == 0 && s.generations[state.id] == state.generation && s.sessions[state.id] == state
+}
+
+// withCurrent 在 store→state 统一锁序下验证当前身份并执行一次短变更。
+// callback 不得调用 sessionStore；持有 store 锁直到变更结束，使 close 与配置更新形成全序。
+func (s *sessionStore) withCurrent(sessionID string, callback func(*sessionState) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[sessionID]
+	if state == nil || s.closing[sessionID] > 0 || s.generations[sessionID] != state.generation {
+		return ErrSessionNotFound
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return callback(state)
 }
 
 // closeAll 提升所有 generation、移除 session，并返回需要取消的状态快照。

@@ -27,6 +27,10 @@ type recordingAuthServer struct {
 	err error
 	// cancelled 保存收到的登录取消参数。
 	cancelled []protocol.CancelLoginAccountParams
+	// cancelContextErr 记录登录取消调用进入时的 context 状态。
+	cancelContextErr error
+	// cancelHasDeadline 记录独立清理 context 是否有界。
+	cancelHasDeadline bool
 }
 
 // AccountRead 返回测试指定的当前账号。
@@ -43,9 +47,11 @@ func (s *recordingAuthServer) AccountLogin(_ context.Context, params protocol.Lo
 }
 
 // AccountLoginCancel 记录 ChatGPT 登录取消请求。
-func (s *recordingAuthServer) AccountLoginCancel(_ context.Context, params protocol.CancelLoginAccountParams) (protocol.CancelLoginAccountResponse, error) {
+func (s *recordingAuthServer) AccountLoginCancel(ctx context.Context, params protocol.CancelLoginAccountParams) (protocol.CancelLoginAccountResponse, error) {
 	*s.events = append(*s.events, "cancel")
 	s.cancelled = append(s.cancelled, params)
+	s.cancelContextErr = ctx.Err()
+	_, s.cancelHasDeadline = ctx.Deadline()
 	return protocol.CancelLoginAccountResponse{Status: protocol.Canceled}, s.err
 }
 
@@ -246,6 +252,9 @@ func TestAuthenticatorCancelsChatGPTLoginWhenWaitIsCancelled(t *testing.T) {
 	}
 	if len(server.cancelled) != 1 || server.cancelled[0].LoginID != loginID {
 		t.Fatalf("cancel params = %#v", server.cancelled)
+	}
+	if server.cancelContextErr != nil || !server.cancelHasDeadline {
+		t.Fatalf("cancel cleanup context: err=%v deadline=%v", server.cancelContextErr, server.cancelHasDeadline)
 	}
 }
 

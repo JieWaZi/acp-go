@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
 	"acp-go/agents/codex/protocol"
+
+	acp "github.com/coder/acp-go-sdk"
 )
 
 // fakeAppServerRPC 为 typed client 测试提供可编排的请求/通知边界。
@@ -340,5 +343,119 @@ func TestRunTurnFatalUnblocksCompletion(t *testing.T) {
 	close(rpc.done)
 	if err := <-errResult; !errors.Is(err, ErrAppServerUnavailable) {
 		t.Fatalf("fatal 后 RunTurn 错误为 %v", err)
+	}
+}
+
+// TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal 验证共享认证通知不会跨代串线。
+// 若已关闭订阅仍接收后继通知、重复通知被下一代消费或 fatal 未解除 waiter，本测试应失败。
+func TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("release and duplicate", func(t *testing.T) {
+		t.Parallel()
+		rpc := newFakeAppServerRPC()
+		runtimeCtx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		client := newAppServerClient(runtimeCtx, rpc)
+
+		closed, err := client.SubscribeLoginCompleted()
+		if err != nil {
+			t.Fatalf("创建首个登录订阅失败: %v", err)
+		}
+		closed.Close()
+		if _, err = closed.Wait(context.Background()); !errors.Is(err, context.Canceled) {
+			t.Fatalf("已释放订阅错误为 %v，期望 context.Canceled", err)
+		}
+
+		first, err := client.SubscribeLoginCompleted()
+		if err != nil {
+			t.Fatalf("创建第一代登录订阅失败: %v", err)
+		}
+		client.HandleNotification(context.Background(), decodeTestNotification(
+			t,
+			protocol.MethodAccountLoginCompleted,
+			protocol.AccountLoginCompletedNotification{Success: true, LoginID: acp.Ptr("first")},
+		))
+		client.HandleNotification(context.Background(), decodeTestNotification(
+			t,
+			protocol.MethodAccountLoginCompleted,
+			protocol.AccountLoginCompletedNotification{Success: false, LoginID: acp.Ptr("duplicate")},
+		))
+		firstResult, err := first.Wait(context.Background())
+		first.Close()
+		if err != nil || firstResult.LoginID == nil || *firstResult.LoginID != "first" {
+			t.Fatalf("第一代通知为 %#v, %v", firstResult, err)
+		}
+
+		second, err := client.SubscribeLoginCompleted()
+		if err != nil {
+			t.Fatalf("创建第二代登录订阅失败: %v", err)
+		}
+		client.HandleNotification(context.Background(), decodeTestNotification(
+			t,
+			protocol.MethodAccountLoginCompleted,
+			protocol.AccountLoginCompletedNotification{Success: true, LoginID: acp.Ptr("second")},
+		))
+		secondResult, err := second.Wait(context.Background())
+		second.Close()
+		if err != nil || secondResult.LoginID == nil || *secondResult.LoginID != "second" {
+			t.Fatalf("第二代通知为 %#v, %v", secondResult, err)
+		}
+	})
+
+	t.Run("transport fatal", func(t *testing.T) {
+		t.Parallel()
+		rpc := newFakeAppServerRPC()
+		runtimeCtx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		client := newAppServerClient(runtimeCtx, rpc)
+		login, err := client.SubscribeLoginCompleted()
+		if err != nil {
+			t.Fatalf("创建登录订阅失败: %v", err)
+		}
+		account := client.SubscribeAccountUpdated()
+		fatalErr := errors.New("fake app-server exited")
+		rpc.err = fatalErr
+		close(rpc.done)
+		if _, err = login.Wait(context.Background()); !errors.Is(err, fatalErr) {
+			t.Fatalf("登录 fatal 错误为 %v", err)
+		}
+		if err = account.Wait(context.Background()); !errors.Is(err, fatalErr) {
+			t.Fatalf("logout fatal 错误为 %v", err)
+		}
+		login.Close()
+		account.Close()
+	})
+}
+
+// TestAppServerClientRejectsRepeatedModelCursor 验证破损分页不会无界请求和累积模型。
+func TestAppServerClientRejectsRepeatedModelCursor(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	calls := 0
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if request.Method() != protocol.MethodModelList {
+			return errors.New("unexpected call: " + request.Method())
+		}
+		calls++
+		if calls > 2 {
+			return errors.New("model/list pagination was not bounded")
+		}
+		cursor := "same-cursor"
+		response := result.(*protocol.ModelListResponse)
+		response.Data = testModels()[:1]
+		response.NextCursor = &cursor
+		return nil
+	}
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := newAppServerClient(runtimeCtx, rpc)
+
+	_, err := client.ListModels(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "repeated model/list cursor") {
+		t.Fatalf("重复 cursor 错误为 %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("model/list 调用了 %d 次，期望在第二页停止", calls)
 	}
 }

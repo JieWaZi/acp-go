@@ -253,5 +253,5 @@ func TestEventRouterLogsSafeUnknownStartedItem(t *testing.T) {
 func newTestEventRouter(updater sessionUpdater, guard generationGuard, logger *slog.Logger) *eventRouter {
 	return newEventRouter(updater, turnGeneration{
 		SessionID: "session-1", ThreadID: "thread-1", TurnID: "turn-1", Generation: 7,
-	}, guard, logger)
+	}, guard, logger, terminalOutputModeDelta)
 }

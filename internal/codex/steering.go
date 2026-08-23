@@ -310,14 +310,13 @@ func (m *steeringManager) perform(
 		}
 	}
 
-	return m.startNewTurn(ctx, state, params, input, generation)
+	return m.startNewTurn(ctx, state, input, generation)
 }
 
 // startNewTurn 等待旧 prompt 完整释放后启动控制 turn，并在 onTurnStarted 时立即接受 steering。
 func (m *steeringManager) startNewTurn(
 	ctx context.Context,
 	state *sessionState,
-	params steeringParams,
 	input []protocol.InputElement,
 	generation uint64,
 ) (steeringResponse, error) {
@@ -339,11 +338,10 @@ func (m *steeringManager) startNewTurn(
 	defer m.agent.finishPromptForeground(prompt)
 
 	result := make(chan error, 1)
+	turnParams := turnParamsForSession(state, input, nil)
 	go func() {
 		defer m.agent.finishPromptBackground(prompt)
-		_, runErr := m.agent.client.RunTurn(prompt.runCtx, protocol.TurnStartParams{
-			ThreadID: params.SessionID, Input: input,
-		}, func(turnID string) {
+		_, runErr := m.agent.client.RunTurn(prompt.runCtx, turnParams, func(turnID string) {
 			m.agent.onTurnStarted(state, prompt, turnID)
 		})
 		prompt.cancelRun()

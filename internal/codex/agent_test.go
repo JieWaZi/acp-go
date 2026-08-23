@@ -5,13 +5,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 
 	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 
-// TestAgentInitializeAdvertisesRuntimeCapabilities 验证握手成功后只声明本子变更真实实现的能力。
+// TestAgentInitializeAdvertisesRuntimeCapabilities 验证握手成功后声明 V1 已接线的真实能力。
 func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 	t.Parallel()
 
@@ -27,8 +28,38 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 		response.AgentCapabilities.SessionCapabilities.Resume == nil {
 		t.Fatalf("runtime session 能力为 %#v", response.AgentCapabilities)
 	}
-	if len(response.AuthMethods) != 0 {
-		t.Fatalf("foundation Agent 声明了 %d 个认证方法，期望 0", len(response.AuthMethods))
+	if response.AgentCapabilities.Auth.Logout == nil {
+		t.Fatal("initialize 未声明已实现的 logout 能力")
+	}
+	if len(response.AuthMethods) != 2 || response.AuthMethods[0].Agent == nil ||
+		response.AuthMethods[0].Agent.Id != "api-key" || response.AuthMethods[1].Agent == nil ||
+		response.AuthMethods[1].Agent.Id != "chat-gpt" {
+		t.Fatalf("认证方法为 %#v，期望仅 API Key 与 ChatGPT", response.AuthMethods)
+	}
+	wantMeta := map[string]any{
+		"steering": map[string]any{"supported": true},
+	}
+	if !reflect.DeepEqual(response.Meta, wantMeta) {
+		t.Fatalf("initialize meta 为 %#v，期望 %#v", response.Meta, wantMeta)
+	}
+}
+
+// TestAgentInitializeHidesChatGPTWhenBrowserIsDisabled 锁定 upstream NO_BROWSER 的非空判定。
+// 若 Initialize 绕过 authenticator 的环境边界并继续宣告浏览器登录，本测试应失败。
+func TestAgentInitializeHidesChatGPTWhenBrowserIsDisabled(t *testing.T) {
+	t.Parallel()
+
+	agent := newTestAgent(t)
+	agent.auth.getenv = func(name string) string {
+		if name == "NO_BROWSER" {
+			return "1"
+		}
+		return ""
+	}
+	response := initializeTestAgent(t, agent)
+	if len(response.AuthMethods) != 1 || response.AuthMethods[0].Agent == nil ||
+		response.AuthMethods[0].Agent.Id != "api-key" {
+		t.Fatalf("NO_BROWSER 下认证方法为 %#v，期望仅 API Key", response.AuthMethods)
 	}
 }
 
@@ -45,37 +76,9 @@ func TestAgentReturnsMethodNotFoundForUnadvertisedOperations(t *testing.T) {
 		call func() error
 	}{
 		{
-			name: "authenticate",
-			call: func() error {
-				_, err := agent.Authenticate(context.Background(), acp.AuthenticateRequest{})
-				return err
-			},
-		},
-		{
-			name: "logout",
-			call: func() error {
-				_, err := agent.Logout(context.Background(), acp.LogoutRequest{})
-				return err
-			},
-		},
-		{
 			name: "session list",
 			call: func() error {
 				_, err := agent.ListSessions(context.Background(), acp.ListSessionsRequest{})
-				return err
-			},
-		},
-		{
-			name: "session config",
-			call: func() error {
-				_, err := agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{})
-				return err
-			},
-		},
-		{
-			name: "session mode",
-			call: func() error {
-				_, err := agent.SetSessionMode(context.Background(), acp.SetSessionModeRequest{})
 				return err
 			},
 		},

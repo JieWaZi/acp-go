@@ -2,13 +2,22 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 
 	"acp-go/agents/codex/protocol"
 )
 
-const maxCapturedCompletionsPerTurnStart = 64
+const (
+	// maxCapturedCompletionsPerTurnStart 限制 turn/start 响应前捕获的 completion 数。
+	maxCapturedCompletionsPerTurnStart = 64
+	// maxModelListPages 限制单次配置加载的 app-server 分页数。
+	maxModelListPages = 128
+	// maxListedModels 限制单次配置加载累积的模型数。
+	maxListedModels = 4096
+)
 
 // appServerRPC 是 typed client 消费的最小传输接口，不泄漏进程或 ACP 生命周期。
 type appServerRPC interface {
@@ -44,6 +53,90 @@ type completionResult struct {
 	notification protocol.TurnCompletedNotification
 	// err 是 context、进程或 transport 失败。
 	err error
+}
+
+// loginCompletionState 表示 upstream awaitNextLoginCompleted 的共享单次通知。
+// 并发认证订阅复用同一个状态，避免为同一 app-server 通知创建无界 waiter。
+type loginCompletionState struct {
+	// done 在通知到达、transport 失败或最后一个订阅关闭时关闭。
+	done chan struct{}
+	// notification 保存生成协议解码后的登录结果。
+	notification protocol.AccountLoginCompletedNotification
+	// err 保存 transport 或提前关闭错误。
+	err error
+	// references 是仍拥有该共享状态的订阅数。
+	references int
+	// completed 防止多个终止来源重复关闭 done。
+	completed bool
+}
+
+// clientLoginCompletionSubscription 把共享通知状态适配为 authenticator 消费的小接口。
+type clientLoginCompletionSubscription struct {
+	// client 拥有 pendingLogin 的生命周期。
+	client *appServerClient
+	// state 是本订阅创建时绑定的精确共享状态。
+	state *loginCompletionState
+	// closeOnce 保证重复 Close 不会重复减少引用。
+	closeOnce sync.Once
+}
+
+// Wait 等待一次 account/login/completed 或调用方取消。
+func (s *clientLoginCompletionSubscription) Wait(
+	ctx context.Context,
+) (protocol.AccountLoginCompletedNotification, error) {
+	select {
+	case <-s.state.done:
+		return s.state.notification, s.state.err
+	case <-ctx.Done():
+		return protocol.AccountLoginCompletedNotification{}, ctx.Err()
+	}
+}
+
+// Close 释放订阅；最后一个订阅会丢弃尚未完成的旧通知身份。
+func (s *clientLoginCompletionSubscription) Close() {
+	s.closeOnce.Do(func() {
+		s.client.releaseLoginSubscription(s.state)
+	})
+}
+
+// accountUpdateState 表示 logout 前安装的共享 account/updated 信号。
+// V1 不消费该通知 payload，因此不为它重复定义 app-server DTO。
+type accountUpdateState struct {
+	// done 在通知、fatal 或最后一个订阅关闭时关闭。
+	done chan struct{}
+	// err 保存 transport 或提前关闭错误。
+	err error
+	// references 是仍等待该信号的订阅数。
+	references int
+	// completed 防止重复关闭 done。
+	completed bool
+}
+
+// accountUpdateSubscription 对应 upstream logout 的 awaitNextAccountUpdated。
+type accountUpdateSubscription struct {
+	// client 拥有 pendingAccountUpdate。
+	client *appServerClient
+	// state 是本订阅绑定的精确信号状态。
+	state *accountUpdateState
+	// closeOnce 保证引用只释放一次。
+	closeOnce sync.Once
+}
+
+// Wait 等待 account/updated 或调用方取消。
+func (s *accountUpdateSubscription) Wait(ctx context.Context) error {
+	select {
+	case <-s.state.done:
+		return s.state.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close 释放 logout 通知订阅。
+func (s *accountUpdateSubscription) Close() {
+	s.closeOnce.Do(func() {
+		s.client.releaseAccountUpdateSubscription(s.state)
+	})
 }
 
 // completionCapture 保存 turn/start 响应前同 thread 到达的有界 completion。
@@ -223,6 +316,12 @@ type appServerClient struct {
 	handler notificationHandler
 	// staleTurns 按 thread/turn 标记取消后只用于清理、不再路由的旧 turn。
 	staleTurns map[string]map[string]struct{}
+	// authMu 保护登录与 logout 的共享单次通知状态。
+	authMu sync.Mutex
+	// pendingLogin 对应 upstream CodexAcpClient.pendingLoginCompleted。
+	pendingLogin *loginCompletionState
+	// pendingAccountUpdate 对应 upstream CodexAcpClient.pendingAccountUpdated。
+	pendingAccountUpdate *accountUpdateState
 }
 
 // newAppServerClient 创建 typed client 并监听 transport fatal。
@@ -233,12 +332,15 @@ func newAppServerClient(runtimeCtx context.Context, rpc appServerRPC) *appServer
 		staleTurns:  make(map[string]map[string]struct{}),
 	}
 	go func() {
+		var err error
 		select {
 		case <-rpc.Done():
-			client.completions.fail(rpc.Err())
+			err = rpc.Err()
 		case <-runtimeCtx.Done():
-			client.completions.fail(runtimeCtx.Err())
+			err = runtimeCtx.Err()
 		}
+		client.completions.fail(err)
+		client.failAuthSubscriptions(err)
 	}()
 	return client
 }
@@ -298,6 +400,102 @@ func (c *appServerClient) ThreadUnsubscribe(ctx context.Context, threadID string
 	return c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
 		return protocol.NewThreadUnsubscribeRequest(id, protocol.ThreadUnsubscribeParams{ThreadID: threadID})
 	}, &response)
+}
+
+// ListModels 按 upstream fetchAvailableModels 顺序遍历 model/list 游标。
+func (c *appServerClient) ListModels(ctx context.Context) ([]protocol.DatumElement, error) {
+	models := []protocol.DatumElement{}
+	var cursor *string
+	seenCursors := make(map[string]struct{})
+	for page := 0; page < maxModelListPages; page++ {
+		var response protocol.ModelListResponse
+		err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+			return protocol.NewModelListRequest(id, protocol.ModelListParams{Cursor: cursor})
+		}, &response)
+		if err != nil {
+			return nil, err
+		}
+		if len(models)+len(response.Data) > maxListedModels {
+			return nil, fmt.Errorf("model/list exceeded %d models", maxListedModels)
+		}
+		models = append(models, response.Data...)
+		if response.NextCursor == nil || *response.NextCursor == "" {
+			return models, nil
+		}
+		nextCursor := *response.NextCursor
+		if _, repeated := seenCursors[nextCursor]; repeated {
+			return nil, fmt.Errorf("repeated model/list cursor %q", nextCursor)
+		}
+		seenCursors[nextCursor] = struct{}{}
+		cursor = &nextCursor
+	}
+	return nil, fmt.Errorf("model/list exceeded %d pages", maxModelListPages)
+}
+
+// AccountRead 直接发送生成协议的 account/read 请求。
+func (c *appServerClient) AccountRead(
+	ctx context.Context,
+	params protocol.GetAccountParams,
+) (protocol.GetAccountResponse, error) {
+	var response protocol.GetAccountResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewAccountReadRequest(id, params)
+	}, &response)
+	return response, err
+}
+
+// AccountLogin 直接发送生成协议的 account/login/start 请求。
+func (c *appServerClient) AccountLogin(
+	ctx context.Context,
+	params protocol.LoginAccountParams,
+) (protocol.LoginAccountResponse, error) {
+	var response protocol.LoginAccountResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewAccountLoginStartRequest(id, params)
+	}, &response)
+	return response, err
+}
+
+// AccountLoginCancel 直接发送生成协议的 account/login/cancel 请求。
+func (c *appServerClient) AccountLoginCancel(
+	ctx context.Context,
+	params protocol.CancelLoginAccountParams,
+) (protocol.CancelLoginAccountResponse, error) {
+	var response protocol.CancelLoginAccountResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewAccountLoginCancelRequest(id, params)
+	}, &response)
+	return response, err
+}
+
+// AccountLogout 直接发送 upstream 定义为无 params 的 account/logout 请求。
+func (c *appServerClient) AccountLogout(ctx context.Context) error {
+	var response map[string]json.RawMessage
+	return c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewAccountLogoutRequest(id)
+	}, &response)
+}
+
+// SubscribeLoginCompleted 在登录请求前安装共享的单次完成订阅。
+func (c *appServerClient) SubscribeLoginCompleted() (loginCompletionSubscription, error) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if c.pendingLogin == nil {
+		c.pendingLogin = &loginCompletionState{done: make(chan struct{})}
+	}
+	c.pendingLogin.references++
+	return &clientLoginCompletionSubscription{client: c, state: c.pendingLogin}, nil
+}
+
+// SubscribeAccountUpdated 在 logout 请求前安装共享的单次账号更新订阅。
+func (c *appServerClient) SubscribeAccountUpdated() *accountUpdateSubscription {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if c.pendingAccountUpdate == nil {
+		c.pendingAccountUpdate = &accountUpdateState{done: make(chan struct{})}
+	}
+	c.pendingAccountUpdate.references++
+	return &accountUpdateSubscription{client: c, state: c.pendingAccountUpdate}
 }
 
 // RunTurn 在 turn/start 前安装 completion 捕获，并等待精确 thread/turn 完成。
@@ -400,6 +598,15 @@ func (c *appServerClient) ResolveTurnInterrupted(threadID, turnID string) {
 
 // HandleNotification 先记录 completion，再过滤 stale，保持 upstream 构造器的因果顺序。
 func (c *appServerClient) HandleNotification(ctx context.Context, notification protocol.ServerNotification) {
+	if completed, ok := notification.(*protocol.AccountLoginCompletedEnvelope); ok {
+		c.completeLoginSubscription(completed.Params)
+		return
+	}
+	if unknown, ok := notification.(*protocol.UnknownServerNotification); ok && unknown.Method() == protocol.MethodAccountUpdated {
+		c.completeAccountUpdateSubscription()
+		return
+	}
+
 	threadID, turnID := notificationRouting(notification)
 	if completed, ok := notification.(*protocol.TurnCompletedEnvelope); ok {
 		c.completions.record(completed.Params)
@@ -416,6 +623,90 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 		return
 	}
 	handler(ctx, notification)
+}
+
+// completeLoginSubscription 完成当前共享登录通知，并为下一次登录释放身份。
+func (c *appServerClient) completeLoginSubscription(notification protocol.AccountLoginCompletedNotification) {
+	c.authMu.Lock()
+	state := c.pendingLogin
+	c.pendingLogin = nil
+	if state != nil && !state.completed {
+		state.notification = notification
+		state.completed = true
+		close(state.done)
+	}
+	c.authMu.Unlock()
+}
+
+// completeAccountUpdateSubscription 完成 logout 前安装的账号更新信号。
+func (c *appServerClient) completeAccountUpdateSubscription() {
+	c.authMu.Lock()
+	state := c.pendingAccountUpdate
+	c.pendingAccountUpdate = nil
+	if state != nil && !state.completed {
+		state.completed = true
+		close(state.done)
+	}
+	c.authMu.Unlock()
+}
+
+// releaseLoginSubscription 释放一个引用，并在无人等待时取消旧通知身份。
+func (c *appServerClient) releaseLoginSubscription(state *loginCompletionState) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if state.references > 0 {
+		state.references--
+	}
+	if state.references != 0 || c.pendingLogin != state {
+		return
+	}
+	c.pendingLogin = nil
+	if !state.completed {
+		state.err = context.Canceled
+		state.completed = true
+		close(state.done)
+	}
+}
+
+// releaseAccountUpdateSubscription 释放一个 logout 通知引用。
+func (c *appServerClient) releaseAccountUpdateSubscription(state *accountUpdateState) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if state.references > 0 {
+		state.references--
+	}
+	if state.references != 0 || c.pendingAccountUpdate != state {
+		return
+	}
+	c.pendingAccountUpdate = nil
+	if !state.completed {
+		state.err = context.Canceled
+		state.completed = true
+		close(state.done)
+	}
+}
+
+// failAuthSubscriptions 用 transport fatal 同时解除认证与 logout 等待者。
+func (c *appServerClient) failAuthSubscriptions(err error) {
+	if err == nil {
+		err = ErrAppServerUnavailable
+	}
+	c.authMu.Lock()
+	login := c.pendingLogin
+	account := c.pendingAccountUpdate
+	c.pendingLogin = nil
+	c.pendingAccountUpdate = nil
+	if login != nil && !login.completed {
+		login.err = err
+		login.completed = true
+		close(login.done)
+	}
+	if account != nil && !account.completed {
+		account.err = err
+		account.completed = true
+		close(account.done)
+	}
+	c.authMu.Unlock()
 }
 
 // clearTurnStaleLocked 删除一个 stale identity，并回收已经为空的 thread 容器。

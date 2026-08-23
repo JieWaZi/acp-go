@@ -104,6 +104,11 @@ func codexAuthMethods(browserEnabled bool) []acp.AuthMethod {
 	return methods
 }
 
+// browserAuthEnabled 等价 fixed upstream 对 NO_BROWSER 的非空判断。
+func (a *authenticator) browserAuthEnabled() bool {
+	return a != nil && a.getenv != nil && a.getenv("NO_BROWSER") == ""
+}
+
 // Authenticate 按 methodId 选择固定 V1 认证流程，未知方法立即失败。
 func (a *authenticator) Authenticate(ctx context.Context, request acp.AuthenticateRequest) error {
 	if a.server == nil || a.subscriber == nil {
@@ -181,9 +186,11 @@ func (a *authenticator) authenticateChatGPT(ctx context.Context) error {
 	completion, waitErr := subscription.Wait(ctx)
 	if waitErr != nil {
 		if (errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded)) && login.LoginID != nil {
-			// 取消请求不能复用已取消的 ctx，否则 app-server 无法收到清理信号。
+			// 取消请求不能复用已取消的 ctx，且独立清理必须有界。
+			cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
+			defer cancelCleanup()
 			if _, cancelErr := a.server.AccountLoginCancel(
-				context.WithoutCancel(ctx),
+				cleanupCtx,
 				protocol.CancelLoginAccountParams{LoginID: *login.LoginID},
 			); cancelErr != nil {
 				a.logger.Error("取消 ChatGPT 登录失败")

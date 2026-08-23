@@ -47,6 +47,7 @@ func newEventRouter(
 	generation turnGeneration,
 	guard generationGuard,
 	logger *slog.Logger,
+	terminalMode terminalOutputMode,
 ) *eventRouter {
 	if logger == nil {
 		logger = slog.Default()
@@ -54,7 +55,7 @@ func newEventRouter(
 	return &eventRouter{
 		generation: generation,
 		guard:      guard,
-		handler:    newEventHandler(updater, generation.SessionID, logger),
+		handler:    newEventHandler(updater, generation.SessionID, logger, terminalMode),
 		logger:     logger,
 	}
 }
