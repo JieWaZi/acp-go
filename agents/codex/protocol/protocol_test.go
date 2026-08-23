@@ -206,6 +206,85 @@ func TestClientRequestKeepsMethodParamsCoupled(t *testing.T) {
 	}
 }
 
+// TestClientRequestIDRoundTrip 锁住客户端请求整数和字符串 RequestID 的标量 wire 语义。
+func TestClientRequestIDRoundTrip(t *testing.T) {
+	integerID := int64(9)
+	stringID := "request-9"
+	testCases := []struct {
+		name string
+		id   RequestID
+		wire string
+	}{
+		{name: "integer", id: RequestID{Integer: &integerID}, wire: `9`},
+		{name: "string", id: RequestID{String: &stringID}, wire: `"request-9"`},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := NewThreadStartRequest(testCase.id, ThreadStartParams{})
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatalf("序列化客户端请求失败：%v", err)
+			}
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &wire); err != nil {
+				t.Fatalf("解析客户端请求 wire 失败：%v", err)
+			}
+			if string(wire["id"]) != testCase.wire {
+				t.Fatalf("客户端 RequestID wire = %s，期望 %s", wire["id"], testCase.wire)
+			}
+
+			decoded, err := DecodeClientRequest(encoded)
+			if err != nil {
+				t.Fatalf("往返解码客户端请求失败：%v", err)
+			}
+			if _, ok := decoded.(*ThreadStartRequest); !ok {
+				t.Fatalf("客户端请求类型 = %T，期望 *ThreadStartRequest", decoded)
+			}
+		})
+	}
+}
+
+// TestServerRequestIDRoundTrip 锁住服务端请求整数和字符串 RequestID 的标量 wire 语义。
+func TestServerRequestIDRoundTrip(t *testing.T) {
+	testCases := []struct {
+		name string
+		id   string
+	}{
+		{name: "integer", id: `9`},
+		{name: "string", id: `"request-9"`},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			raw := []byte(`{"id":` + testCase.id + `,"method":"item/fileChange/requestApproval","params":{"itemId":"item-1","startedAtMs":1,"threadId":"thread-1","turnId":"turn-1"}}`)
+			request, err := DecodeServerRequest(raw)
+			if err != nil {
+				t.Fatalf("初次解码服务端请求失败：%v", err)
+			}
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatalf("序列化服务端请求失败：%v", err)
+			}
+			var wire map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &wire); err != nil {
+				t.Fatalf("解析服务端请求 wire 失败：%v", err)
+			}
+			if string(wire["id"]) != testCase.id {
+				t.Fatalf("服务端 RequestID wire = %s，期望 %s", wire["id"], testCase.id)
+			}
+
+			decoded, err := DecodeServerRequest(encoded)
+			if err != nil {
+				t.Fatalf("往返解码服务端请求失败：%v", err)
+			}
+			if _, ok := decoded.(*FileChangeApprovalRequest); !ok {
+				t.Fatalf("服务端请求类型 = %T，期望 *FileChangeApprovalRequest", decoded)
+			}
+		})
+	}
+}
+
 // TestApprovalOptionalNullableFieldsRoundTrip 用实际 DTO 锁住 grantRoot 与 strictAutoReview 三态。
 func TestApprovalOptionalNullableFieldsRoundTrip(t *testing.T) {
 	fileRaw := []byte(`{"grantRoot":null,"itemId":"item-1","startedAtMs":1,"threadId":"thread-1","turnId":"turn-1"}`)

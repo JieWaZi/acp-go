@@ -85,20 +85,20 @@ func (r clientRequestEnvelope[P]) MarshalJSON() ([]byte, error) {
 	}
 	if !r.includeParams {
 		return json.Marshal(struct {
-			// ID 是写入 wire 的请求标识。
-			ID RequestID `json:"id"`
+			// ID 使用指针以显式触发生成的 RequestID union marshaler。
+			ID *RequestID `json:"id"`
 			// Method 是该具体变体固定的方法名。
 			Method string `json:"method"`
-		}{ID: r.ID, Method: r.method})
+		}{ID: &r.ID, Method: r.method})
 	}
 	return json.Marshal(struct {
-		// ID 是写入 wire 的请求标识。
-		ID RequestID `json:"id"`
+		// ID 使用指针以显式触发生成的 RequestID union marshaler。
+		ID *RequestID `json:"id"`
 		// Method 是该具体变体固定的方法名。
 		Method string `json:"method"`
 		// Params 是与 Method 静态绑定的具名参数。
 		Params P `json:"params"`
-	}{ID: r.ID, Method: r.method, Params: r.Params})
+	}{ID: &r.ID, Method: r.method, Params: r.Params})
 }
 
 // newClientRequest 创建一个携带强类型 Params 的固定方法请求。
@@ -413,13 +413,13 @@ func (r serverRequestEnvelope[P]) MarshalJSON() ([]byte, error) {
 		return nil, fmt.Errorf("%w: server request has no method", ErrInvalidEnvelope)
 	}
 	return json.Marshal(struct {
-		// ID 是写入 wire 的请求标识。
-		ID RequestID `json:"id"`
+		// ID 使用指针以显式触发生成的 RequestID union marshaler。
+		ID *RequestID `json:"id"`
 		// Method 是该具体变体固定的方法名。
 		Method string `json:"method"`
 		// Params 是与 Method 静态绑定的具名参数。
 		Params P `json:"params"`
-	}{ID: r.ID, Method: r.method, Params: r.Params})
+	}{ID: &r.ID, Method: r.method, Params: r.Params})
 }
 
 // newServerRequest 创建固定方法的强类型服务端请求。
