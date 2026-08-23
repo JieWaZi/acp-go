@@ -133,6 +133,7 @@ func (p *appServerProcess) Err() error {
 }
 
 // FinalError 等待唯一 Wait owner，并返回包含 exit/stderr 的最终结果。
+// transport 用它仲裁 clean EOF 及 Wait 提前关闭 StdoutPipe 产生的 os.ErrClosed；调用方不得自行 Wait。
 func (p *appServerProcess) FinalError() error {
 	<-p.done
 	return p.Err()

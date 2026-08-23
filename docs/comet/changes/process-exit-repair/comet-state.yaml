@@ -1,0 +1,73 @@
+schema: comet.native.v4
+name: process-exit-repair
+language: zh-CN
+phase: build
+status: active
+state_version: 2
+brief: brief.md
+spec_changes: []
+workspace:
+  isolation: worktree
+  change_branch: codex/process-exit-repair
+  target_branch: main
+  finish: null
+loop:
+  stage: building
+  goal_cycle: 1
+  iteration: 1
+  attempt: 0
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：当 Codex app-server 以非零状态退出且 stdout 同时关闭时，所有 pending 请求稳定返回可由
+      `errors.Is(..., ErrAppServerExited)` 识别的错误，并保留退出码与有界 stderr。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：超长帧、普通 reader I/O error、clean EOF 与主动关闭仍保留原有优先级；主动关闭不会等待自身或造成
+      goroutine/process 泄漏。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：确定性 fatal 仲裁测试与真实进程 `TestAgentSurfacesProcessExitToPendingInitialize`
+      并行压力重复通过，不依赖长 sleep。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：默认 `go test ./...`、默认 `go test -race ./...`、`go vet ./...`、protocol
+      freshness、gofmt/diff、native/Linux/Windows 构建通过。
+    result: pending
+    reason: null
+  - id: A5
+    source: brief.md
+    text: A5：修复可追溯到固定 upstream，手写 Go 声明/字段/函数与关键竞态逻辑有清晰中文注释，且未引入重复 SDK/JSON-RPC/DTO
+      或无消费方抽象。
+    result: pending
+    reason: null
+builder_handoff: null
+blockers: []
+verification: null
+history: []
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pending
+verification_report: null
+archived: false
+created_at: 2026-08-23T22:16:59.905Z

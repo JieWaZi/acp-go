@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -299,6 +300,15 @@ func (t *appServerTransport) readLoop() {
 		if errors.Is(err, bufio.ErrTooLong) || len(scanner.Bytes()) >= t.options.MaxLineBytes {
 			t.fail(ErrAppServerFrameTooLarge)
 			return
+		}
+		if errors.Is(err, os.ErrClosed) && t.options.EOFError != nil {
+			// Go exec.Cmd.Wait 会在返回前关闭 StdoutPipe，scanner 可能先观察到 os.ErrClosed；
+			// 仅当唯一 Wait owner 随后确认异常退出时，才按 upstream runWithProcessCheck
+			// 用 exit code/stderr 覆盖这个运行时竞态，普通 reader I/O 错误仍保持原因。
+			if processErr := t.options.EOFError(); errors.Is(processErr, ErrAppServerExited) {
+				t.fail(processErr)
+				return
+			}
 		}
 		t.fail(fmt.Errorf("reading codex app-server stdout: %w", err))
 		return
