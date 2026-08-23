@@ -7,71 +7,28 @@ import (
 	"log/slog"
 	"testing"
 
+	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 
-// TestAgentInitializeAdvertisesOnlyFoundationCapabilities 验证占位 Agent 只声明稳定协议身份。
-// 若 foundation 阶段误报认证、加载或其他尚未实现能力，本测试应失败。
-func TestAgentInitializeAdvertisesOnlyFoundationCapabilities(t *testing.T) {
+// TestAgentInitializeAdvertisesRuntimeCapabilities 验证握手成功后只声明本子变更真实实现的能力。
+func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 	t.Parallel()
 
 	agent := newTestAgent(t)
-	response, err := agent.Initialize(context.Background(), acp.InitializeRequest{
-		ProtocolVersion: acp.ProtocolVersionNumber,
-	})
-	if err != nil {
-		t.Fatalf("initialize 返回错误: %v", err)
-	}
+	response := initializeTestAgent(t, agent)
 	if response.ProtocolVersion != acp.ProtocolVersionNumber {
 		t.Fatalf("协议版本为 %d，期望 %d", response.ProtocolVersion, acp.ProtocolVersionNumber)
 	}
 	if response.AgentInfo == nil || response.AgentInfo.Name != "codex" {
 		t.Fatalf("Agent 信息为 %#v，期望 codex", response.AgentInfo)
 	}
-	if response.AgentCapabilities.LoadSession {
-		t.Fatal("foundation Agent 不应声明 session/load")
+	if !response.AgentCapabilities.LoadSession || response.AgentCapabilities.SessionCapabilities.Close == nil ||
+		response.AgentCapabilities.SessionCapabilities.Resume == nil {
+		t.Fatalf("runtime session 能力为 %#v", response.AgentCapabilities)
 	}
 	if len(response.AuthMethods) != 0 {
 		t.Fatalf("foundation Agent 声明了 %d 个认证方法，期望 0", len(response.AuthMethods))
-	}
-}
-
-// TestAgentReportsUnavailableRuntimeForRequiredOperations 验证必选会话操作不会伪装成功。
-// 若 app-server 尚未实现时 new 或 prompt 返回零值成功，本测试应失败。
-func TestAgentReportsUnavailableRuntimeForRequiredOperations(t *testing.T) {
-	t.Parallel()
-
-	agent := newTestAgent(t)
-	tests := []struct {
-		// name 描述当前必选会话操作。
-		name string
-		// call 执行操作并只返回待检查的错误链。
-		call func() error
-	}{
-		{
-			name: "session new",
-			call: func() error {
-				_, err := agent.NewSession(context.Background(), acp.NewSessionRequest{})
-				return err
-			},
-		},
-		{
-			name: "session prompt",
-			call: func() error {
-				_, err := agent.Prompt(context.Background(), acp.PromptRequest{})
-				return err
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if err := tt.call(); !errors.Is(err, ErrRuntimeUnavailable) {
-				t.Fatalf("操作错误为 %v，期望匹配 %v", err, ErrRuntimeUnavailable)
-			}
-		})
 	}
 }
 
@@ -102,23 +59,9 @@ func TestAgentReturnsMethodNotFoundForUnadvertisedOperations(t *testing.T) {
 			},
 		},
 		{
-			name: "session close",
-			call: func() error {
-				_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{})
-				return err
-			},
-		},
-		{
 			name: "session list",
 			call: func() error {
 				_, err := agent.ListSessions(context.Background(), acp.ListSessionsRequest{})
-				return err
-			},
-		},
-		{
-			name: "session resume",
-			call: func() error {
-				_, err := agent.ResumeSession(context.Background(), acp.ResumeSessionRequest{})
 				return err
 			},
 		},
@@ -169,7 +112,7 @@ func TestAgentCancelIsIdempotentWithoutRuntime(t *testing.T) {
 func TestNewAgentRejectsNilLogger(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewAgent(nil); !errors.Is(err, ErrInvalidLogger) {
+	if _, err := NewAgent(context.Background(), Config{}); !errors.Is(err, ErrInvalidLogger) {
 		t.Fatalf("构造错误为 %v，期望匹配 %v", err, ErrInvalidLogger)
 	}
 }
@@ -178,9 +121,21 @@ func TestNewAgentRejectsNilLogger(t *testing.T) {
 func newTestAgent(t *testing.T) *Agent {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	agent, err := NewAgent(logger)
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(context.Context, protocol.ClientRequest, any) error { return nil }
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return newAgentWithClient(logger, runtimeCtx, cancel, newAppServerClient(runtimeCtx, rpc))
+}
+
+// initializeTestAgent 完成测试 Agent 的 app-server/ACP initialize。
+func initializeTestAgent(t *testing.T, agent *Agent) acp.InitializeResponse {
+	t.Helper()
+	response, err := agent.Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	})
 	if err != nil {
-		t.Fatalf("创建测试 Agent 失败: %v", err)
+		t.Fatalf("initialize 返回错误: %v", err)
 	}
-	return agent
+	return response
 }

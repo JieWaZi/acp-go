@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +20,6 @@ import (
 // TestRunStartsDefaultAndExplicitCodex 验证默认选择与显式 codex 都进入真实 SDK stdio 服务。
 // 若默认值改变、显式选择走不同实现或 composition root 未启动 SDK，本测试应失败。
 func TestRunStartsDefaultAndExplicitCodex(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
 		// name 描述 Adapter 参数形式。
 		name string
@@ -31,8 +32,7 @@ func TestRunStartsDefaultAndExplicitCodex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
+			t.Setenv("CODEX_PATH", writeFakeCodex(t))
 			response := runInitializeExchange(t, tt.args)
 			if response.ProtocolVersion != acp.ProtocolVersionNumber {
 				t.Fatalf("协议版本为 %d，期望 %d", response.ProtocolVersion, acp.ProtocolVersionNumber)
@@ -41,6 +41,25 @@ func TestRunStartsDefaultAndExplicitCodex(t *testing.T) {
 				t.Fatalf("Agent 信息为 %#v，期望 codex", response.AgentInfo)
 			}
 		})
+	}
+}
+
+// TestRunRejectsInvalidCodexPathBeforeProtocolOutput 验证显式 CODEX_PATH 启动失败不会回退或污染 stdout。
+func TestRunRejectsInvalidCodexPathBeforeProtocolOutput(t *testing.T) {
+	t.Setenv("CODEX_PATH", filepath.Join(t.TempDir(), "missing-codex"))
+	var protocolOutput bytes.Buffer
+	var diagnostics bytes.Buffer
+	exitCode := run(context.Background(), nil, processIO{
+		input: bytes.NewReader(nil), output: &protocolOutput, diagnostics: &diagnostics,
+	})
+	if exitCode == 0 {
+		t.Fatal("无效 CODEX_PATH 返回成功")
+	}
+	if protocolOutput.Len() != 0 {
+		t.Fatalf("启动失败污染 stdout: %q", protocolOutput.String())
+	}
+	if !strings.Contains(diagnostics.String(), "missing-codex") {
+		t.Fatalf("启动诊断为 %q", diagnostics.String())
 	}
 }
 
@@ -171,4 +190,33 @@ func closeTestPipe(t *testing.T, closer io.Closer) {
 	if err := closer.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 		t.Errorf("关闭测试管道失败: %v", err)
 	}
+}
+
+// writeFakeCodex 创建支持 --version 与 app-server initialize 的本地 fake 可执行文件。
+func writeFakeCodex(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake Codex 仅用于 Unix composition 测试；Windows 由交叉构建覆盖")
+	}
+	path := filepath.Join(t.TempDir(), "codex")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.148.0"
+  exit 0
+fi
+if [ "$1" != "app-server" ]; then
+  exit 2
+fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"test","userAgent":"fake"}}'
+      ;;
+  esac
+done
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("写 fake Codex 失败: %v", err)
+	}
+	return path
 }
