@@ -3,7 +3,7 @@ name: codex-runtime
 language: zh-CN
 phase: archive
 status: active
-state_version: 12
+state_version: 13
 brief: brief.md
 spec_changes:
   - capability: codex-runtime
@@ -13,7 +13,7 @@ workspace:
   isolation: worktree
   change_branch: codex/codex-runtime
   target_branch: main
-  finish: null
+  finish: merge
 loop:
   stage: archive-ready
   goal_cycle: 1
