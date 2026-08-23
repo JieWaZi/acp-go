@@ -27,6 +27,8 @@ type sessionState struct {
 	mu sync.Mutex
 	// activePrompt 是该 session 唯一 pending/active turn。
 	activePrompt *activePrompt
+	// promptClosed 阻止 close fence 建立后仍持有旧 state 的并发请求安装 prompt。
+	promptClosed bool
 }
 
 // sessionStore 管理 session generation、open identity 与可重入 close fence。

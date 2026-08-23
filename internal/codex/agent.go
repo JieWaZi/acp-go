@@ -97,6 +97,12 @@ type Agent struct {
 	connectionReady chan struct{}
 	// connectionReadyOnce 保证 binder 重复调用不会 panic。
 	connectionReadyOnce sync.Once
+	// promptMu 保护所有前台已结束但仍在观察迟到 start 的 prompt 身份。
+	promptMu sync.Mutex
+	// prompts 把每个尚未完全结束的 prompt 关联到精确 session generation 状态。
+	prompts map[*activePrompt]*sessionState
+	// promptsClosing 阻止 Adapter Close 开始后安装新的 prompt 后台任务。
+	promptsClosing bool
 	// closeOnce 保证 transport/process 只释放一次。
 	closeOnce sync.Once
 	// closeErr 保存首次 Close 的结果。
@@ -121,7 +127,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	// construction/Serve context 只约束启动；成功后 runtime 由 Agent.Close 单独拥有，
 	// 否则信号取消会让 exec.CommandContext 抢在 acpserver 的有界清理窗口前杀死子进程。
 	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
-	process, err := startAppServer(runtimeCtx, executable.Path, processOptions{})
+	process, err := startAppServer(runtimeCtx, executable.Path, processOptions{Logger: config.Logger})
 	if err != nil {
 		runtimeCancel()
 		return nil, fmt.Errorf("creating codex agent: %w", err)
@@ -161,6 +167,7 @@ func newAgentWithClient(
 		client:          client,
 		sessions:        newSessionStore(),
 		connectionReady: make(chan struct{}),
+		prompts:         make(map[*activePrompt]*sessionState),
 	}
 	agent.steering = newSteeringManager(agent, defaultSteeringQueueCapacity)
 	client.SetNotificationHandler(agent.handleNotification)
@@ -347,28 +354,43 @@ func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionReques
 	_, state := a.sessions.beginClose(sessionID)
 	defer a.sessions.endClose(sessionID)
 	a.steering.CloseSession(sessionID, ErrSessionClosing)
-	if state != nil {
-		state.mu.Lock()
-		prompt := state.activePrompt
-		state.mu.Unlock()
-		if prompt != nil {
-			turnID := prompt.requestCancel()
-			prompt.markForegroundFinished()
-			if turnID != "" {
-				a.client.MarkTurnStale(sessionID, turnID)
-				a.requestPromptInterrupt(state, prompt, turnID, false)
-				select {
-				case <-prompt.interruptDone:
-				case <-ctx.Done():
-				}
-				a.client.ResolveTurnInterrupted(sessionID, turnID)
+	var cleanupErr error
+	prompts := a.closeSessionPrompts(state)
+	for _, prompt := range prompts {
+		turnID := prompt.requestCancel()
+		prompt.markForegroundFinished()
+		a.releaseActivePrompt(state, prompt)
+		if turnID != "" {
+			a.client.MarkTurnStale(sessionID, turnID)
+			a.requestPromptInterrupt(state, prompt, turnID, false)
+			select {
+			case <-prompt.interruptDone:
+			case <-ctx.Done():
 			}
+			a.client.ResolveTurnInterrupted(sessionID, turnID)
+		}
+		// TS Promise 无法主动取消 pending turn/start；Go transport 的 context 必须显式解除请求和 goroutine。
+		prompt.cancelRun()
+	}
+	for _, prompt := range prompts {
+		select {
+		case <-prompt.backgroundDone:
+		case <-ctx.Done():
+			cleanupErr = fmt.Errorf("waiting for pending codex turn in session %q: %w", sessionID, ctx.Err())
+		}
+		select {
+		case <-prompt.foregroundDone:
+		case <-ctx.Done():
+			cleanupErr = errors.Join(
+				cleanupErr,
+				fmt.Errorf("waiting for active ACP prompt in session %q: %w", sessionID, ctx.Err()),
+			)
 		}
 	}
 	if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
-		return acp.CloseSessionResponse{}, fmt.Errorf("unsubscribing codex thread %q: %w", sessionID, err)
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("unsubscribing codex thread %q: %w", sessionID, err))
 	}
-	return acp.CloseSessionResponse{}, nil
+	return acp.CloseSessionResponse{}, cleanupErr
 }
 
 // Prompt 提交 turn/start，并按精确 completion 产生 ACP stop reason。
@@ -387,14 +409,18 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
-	prompt := newActivePrompt(state.generation)
-	state.mu.Lock()
-	if state.activePrompt != nil {
-		state.mu.Unlock()
-		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, ErrPromptActive)
+	prompt := newActivePrompt(a.runtimeCtx, state.generation)
+	if err := a.installActivePrompt(state, prompt); err != nil {
+		prompt.cancelRun()
+		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, err)
 	}
-	state.activePrompt = prompt
-	state.mu.Unlock()
+	// 对应 upstream prompt 的 finally/activePrompt.complete：前台返回立即释放槽位，
+	// 而普通提前取消时 RunTurn 观察者继续等待迟到 turn/start 并执行 stale interrupt。
+	defer func() {
+		prompt.markForegroundFinished()
+		a.releaseActivePrompt(state, prompt)
+		a.finishPromptForeground(prompt)
+	}()
 
 	// turnResult 在后台 runtime 生命周期与前台 ACP 请求之间传递一次精确 turn 结果。
 	type turnResult struct {
@@ -405,12 +431,13 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	}
 	resultChannel := make(chan turnResult, 1)
 	go func() {
-		completion, runErr := a.client.RunTurn(a.runtimeCtx, protocol.TurnStartParams{
+		defer a.finishPromptBackground(prompt)
+		completion, runErr := a.client.RunTurn(prompt.runCtx, protocol.TurnStartParams{
 			ThreadID: state.id, Input: input, ClientUserMessageID: request.MessageId,
 		}, func(turnID string) {
 			a.onTurnStarted(state, prompt, turnID)
 		})
-		a.clearActivePrompt(state, prompt)
+		prompt.cancelRun()
 		resultChannel <- turnResult{completion: completion, err: runErr}
 	}()
 
@@ -419,7 +446,6 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	for {
 		select {
 		case result := <-resultChannel:
-			prompt.markForegroundFinished()
 			if result.err != nil {
 				if errors.Is(result.err, context.Canceled) {
 					_, cancelled := prompt.currentTurn()
@@ -446,7 +472,6 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		case <-requestDone:
 			turnID := prompt.requestCancel()
 			if turnID == "" {
-				prompt.markForegroundFinished()
 				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 			}
 			a.requestPromptInterrupt(state, prompt, turnID, false)
@@ -455,17 +480,95 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		case <-cancelSignal:
 			turnID, _ := prompt.currentTurn()
 			if turnID == "" {
-				prompt.markForegroundFinished()
 				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 			}
 			a.requestPromptInterrupt(state, prompt, turnID, false)
 			requestDone = nil
 			cancelSignal = nil
 		case <-a.runtimeCtx.Done():
-			prompt.markForegroundFinished()
 			return acp.PromptResponse{}, fmt.Errorf("running codex turn: %w", ErrRuntimeUnavailable)
 		}
 	}
+}
+
+// installActivePrompt 在统一锁序下同时安装 session 活动槽位与后台 registry 身份。
+func (a *Agent) installActivePrompt(state *sessionState, prompt *activePrompt) error {
+	a.promptMu.Lock()
+	defer a.promptMu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if a.promptsClosing {
+		return ErrRuntimeUnavailable
+	}
+	if state.promptClosed {
+		return ErrSessionClosing
+	}
+	if state.activePrompt != nil {
+		return ErrPromptActive
+	}
+	state.activePrompt = prompt
+	a.prompts[prompt] = state
+	return nil
+}
+
+// closeSessionPrompts 原子关闭旧 session state 的 prompt 安装入口，并返回其所有前台/后台身份。
+func (a *Agent) closeSessionPrompts(state *sessionState) []*activePrompt {
+	if state == nil {
+		return nil
+	}
+	a.promptMu.Lock()
+	defer a.promptMu.Unlock()
+	state.mu.Lock()
+	state.promptClosed = true
+	state.mu.Unlock()
+	prompts := make([]*activePrompt, 0)
+	for prompt, owner := range a.prompts {
+		if owner == state {
+			prompts = append(prompts, prompt)
+		}
+	}
+	return prompts
+}
+
+// closeAllPrompts 关闭 Adapter 级安装入口，并返回所有尚未完全结束的 prompt。
+func (a *Agent) closeAllPrompts() []*activePrompt {
+	a.promptMu.Lock()
+	defer a.promptMu.Unlock()
+	a.promptsClosing = true
+	prompts := make([]*activePrompt, 0, len(a.prompts))
+	for prompt := range a.prompts {
+		prompts = append(prompts, prompt)
+	}
+	return prompts
+}
+
+// finishPromptForeground 标记前台 finally 完成，并在后台也结束后移除 registry 身份。
+func (a *Agent) finishPromptForeground(prompt *activePrompt) {
+	prompt.markForegroundDone()
+	a.untrackPromptIfDone(prompt)
+}
+
+// finishPromptBackground 标记 RunTurn goroutine 完成，并在前台也结束后移除 registry 身份。
+func (a *Agent) finishPromptBackground(prompt *activePrompt) {
+	prompt.markBackgroundDone()
+	a.untrackPromptIfDone(prompt)
+}
+
+// untrackPromptIfDone 仅在前台与后台信号都关闭后删除精确 prompt 身份。
+func (a *Agent) untrackPromptIfDone(prompt *activePrompt) {
+	select {
+	case <-prompt.foregroundDone:
+	default:
+		return
+	}
+	select {
+	case <-prompt.backgroundDone:
+	default:
+		return
+	}
+	a.promptMu.Lock()
+	delete(a.prompts, prompt)
+	a.promptMu.Unlock()
 }
 
 // onTurnStarted 处理正常或取消后迟到的 turn identity，并触发一次 interrupt。
@@ -500,14 +603,18 @@ func (a *Agent) requestPromptInterrupt(
 	})
 }
 
-// clearActivePrompt 只清理仍指向当前 background turn 的 session 槽位。
-func (a *Agent) clearActivePrompt(state *sessionState, prompt *activePrompt) {
+// releaseActivePrompt 只清理仍指向当前身份的前台活动槽位，绝不影响已安装的后继 prompt。
+func (a *Agent) releaseActivePrompt(state *sessionState, prompt *activePrompt) {
 	state.mu.Lock()
 	if state.activePrompt == prompt {
 		state.activePrompt = nil
 	}
 	state.mu.Unlock()
-	prompt.markBackgroundDone()
+}
+
+// clearActivePrompt 释放无独立 ACP Prompt 所有者的 steering 活动槽位；后台 registry 由 defer 回收。
+func (a *Agent) clearActivePrompt(state *sessionState, prompt *activePrompt) {
+	a.releaseActivePrompt(state, prompt)
 }
 
 // Cancel 幂等取消 session 的 pending/active prompt；turn 未知时不发送 interrupt。
@@ -559,17 +666,27 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 func (a *Agent) Close(ctx context.Context) error {
 	a.closeOnce.Do(func() {
 		a.steering.Close(ErrRuntimeUnavailable)
-		for _, state := range a.sessions.closeAll() {
-			state.mu.Lock()
-			prompt := state.activePrompt
-			state.mu.Unlock()
-			if prompt != nil {
-				prompt.requestCancel()
-				prompt.markForegroundFinished()
+		prompts := a.closeAllPrompts()
+		a.sessions.closeAll()
+		for _, prompt := range prompts {
+			prompt.requestCancel()
+			prompt.markForegroundFinished()
+			prompt.cancelRun()
+		}
+		for _, prompt := range prompts {
+			select {
+			case <-prompt.backgroundDone:
+			case <-ctx.Done():
+				a.closeErr = errors.Join(a.closeErr, ctx.Err())
+			}
+			select {
+			case <-prompt.foregroundDone:
+			case <-ctx.Done():
+				a.closeErr = errors.Join(a.closeErr, ctx.Err())
 			}
 		}
 		if a.transport != nil {
-			a.closeErr = a.transport.Close()
+			a.closeErr = errors.Join(a.closeErr, a.transport.Close())
 		}
 		if a.process != nil {
 			a.closeErr = errors.Join(a.closeErr, a.process.Close(ctx))

@@ -331,22 +331,22 @@ func (m *steeringManager) startNewTurn(
 	if !m.agent.sessions.isCurrent(state) || state.generation != generation {
 		return steeringResponse{}, acp.NewInvalidRequest("session is closing")
 	}
-	prompt := newActivePrompt(generation)
-	state.mu.Lock()
-	if state.activePrompt != nil {
-		state.mu.Unlock()
-		return steeringResponse{}, ErrPromptActive
+	prompt := newActivePrompt(m.agent.runtimeCtx, generation)
+	if err := m.agent.installActivePrompt(state, prompt); err != nil {
+		prompt.cancelRun()
+		return steeringResponse{}, err
 	}
-	state.activePrompt = prompt
-	state.mu.Unlock()
+	defer m.agent.finishPromptForeground(prompt)
 
 	result := make(chan error, 1)
 	go func() {
-		_, runErr := m.agent.client.RunTurn(m.agent.runtimeCtx, protocol.TurnStartParams{
+		defer m.agent.finishPromptBackground(prompt)
+		_, runErr := m.agent.client.RunTurn(prompt.runCtx, protocol.TurnStartParams{
 			ThreadID: params.SessionID, Input: input,
 		}, func(turnID string) {
 			m.agent.onTurnStarted(state, prompt, turnID)
 		})
+		prompt.cancelRun()
 		m.agent.clearActivePrompt(state, prompt)
 		result <- runErr
 	}()
@@ -362,6 +362,7 @@ func (m *steeringManager) startNewTurn(
 	case <-ctx.Done():
 		prompt.requestCancel()
 		prompt.markForegroundFinished()
+		m.agent.releaseActivePrompt(state, prompt)
 		return steeringResponse{}, ctx.Err()
 	}
 }

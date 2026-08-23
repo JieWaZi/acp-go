@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -24,6 +25,10 @@ type activePrompt struct {
 	mu sync.Mutex
 	// generation 是 prompt 启动时的 session generation。
 	generation uint64
+	// runCtx 只约束当前 RunTurn；普通 ACP 取消保留它以观察迟到 start，session close 则显式终止它。
+	runCtx context.Context
+	// runCancel 在 session/Adapter close 时解除 pending turn/start 或 completion waiter。
+	runCancel context.CancelFunc
 	// turnID 在 turn/start 响应前为空，迟到响应仍会填入以便 interrupt。
 	turnID string
 	// cancelRequested 表示 ACP cancel、请求 context 或 close 已到达。
@@ -42,21 +47,39 @@ type activePrompt struct {
 	turnStarted chan struct{}
 	// turnStartedOnce 保证迟到回调或异常重复回调不会重复关闭。
 	turnStartedOnce sync.Once
-	// backgroundDone 在 RunTurn 完整结束并释放 session 槽位后关闭。
+	// foregroundDone 在 ACP Prompt 或 steering 启动调用完成其前台返回后关闭。
+	foregroundDone chan struct{}
+	// foregroundDoneOnce 保证前台返回信号只关闭一次。
+	foregroundDoneOnce sync.Once
+	// backgroundDone 在 RunTurn 完整结束、迟到身份已处理后关闭。
 	backgroundDone chan struct{}
 	// backgroundDoneOnce 保证清理路径幂等。
 	backgroundDoneOnce sync.Once
 }
 
-// newActivePrompt 创建尚未取消、尚无 turn ID 的 prompt 身份。
-func newActivePrompt(generation uint64) *activePrompt {
+// newActivePrompt 创建尚未取消、尚无 turn ID 的 prompt 身份与独立 RunTurn 生命周期。
+func newActivePrompt(parent context.Context, generation uint64) *activePrompt {
+	runCtx, runCancel := context.WithCancel(parent)
 	return &activePrompt{
 		generation:     generation,
+		runCtx:         runCtx,
+		runCancel:      runCancel,
 		cancelSignal:   make(chan struct{}),
 		interruptDone:  make(chan struct{}),
 		turnStarted:    make(chan struct{}),
+		foregroundDone: make(chan struct{}),
 		backgroundDone: make(chan struct{}),
 	}
+}
+
+// markForegroundDone 通知 close 路径前台调用已执行完 finally 清理。
+func (p *activePrompt) markForegroundDone() {
+	p.foregroundDoneOnce.Do(func() { close(p.foregroundDone) })
+}
+
+// cancelRun 终止底层 pending turn/start 或 completion waiter；普通请求取消不会调用它，以保留迟到观察者。
+func (p *activePrompt) cancelRun() {
+	p.runCancel()
 }
 
 // requestCancel 幂等记录取消，并返回当前已知 turn ID。
