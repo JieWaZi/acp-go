@@ -80,10 +80,10 @@ children:
     depends_on: []
     covers: [A15, A16]
   - name: codex-runtime
-    depends_on: [framework-foundation]
+    depends_on: [framework-foundation, protocol-generation]
     covers: [A3, A4, A5, A6, A7, A13]
   - name: codex-events-config
-    depends_on: [framework-foundation]
+    depends_on: [framework-foundation, protocol-generation]
     covers: [A8, A9, A10, A11, A12, A14]
   - name: stabilization
     depends_on: [codex-events-config, codex-runtime]
