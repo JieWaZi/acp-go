@@ -1,0 +1,878 @@
+schema: comet.native.v4
+name: acp-multi-agent-codex-go-v1
+language: zh-CN
+phase: build
+status: active
+state_version: 2
+brief: brief.md
+children_contract_hash: e1df2cfd01de6670de7bd392b02d2f1c7c9cc246e4f5b9e0aa1502b4762831ed
+spec_changes:
+  - capability: codex-config
+    operation: create
+    source: specs/codex-config/spec.md
+  - capability: codex-events
+    operation: create
+    source: specs/codex-events/spec.md
+  - capability: codex-runtime
+    operation: create
+    source: specs/codex-runtime/spec.md
+  - capability: framework
+    operation: create
+    source: specs/framework/spec.md
+  - capability: protocol-upstream
+    operation: create
+    source: specs/protocol-upstream/spec.md
+  - capability: verification
+    operation: create
+    source: specs/verification/spec.md
+workspace:
+  isolation: current
+  change_branch: main
+  target_branch: main
+  finish: null
+loop:
+  stage: building
+  goal_cycle: 1
+  iteration: 1
+  attempt: 0
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：运行 `acp-agent` 或 `acp-agent --adapter codex` 均启动 Codex Adapter，ACP
+      Client 通过 stdio 完成 initialize 并收到与 V1 实际能力一致的 Agent capability/auth/config
+      声明；未知 Adapter 在写出协议内容前返回可诊断启动错误；协议连接、分发、取消与扩展基础由固定版本 acp-go-sdk 提供。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：Core 能注册并选择 Codex Adapter，且 Core 的公开状态/API 不出现 Codex
+      Thread、Turn、Sandbox、Approval 类型；可选能力通过小接口按需发现。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：`acp-agent` 按 `CODEX_PATH` → PATH 解析 Codex；找不到或显式路径无效时以可诊断错误退出；非
+      0.148.0 版本在 stderr 警告后继续。启动 Agent 后只生成一个受管的 `codex app-server` stdio
+      JSON-RPC 连接；初始化成功后可请求；进程退出或关闭时连接和活动请求被释放/取消。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：ACP new session 创建 Codex thread；load/resume 恢复已有 thread
+      和必要历史/配置；不存在、失效或并发关闭的 session 返回稳定错误而不污染其他 session。
+    result: pending
+    reason: null
+  - id: A5
+    source: brief.md
+    text: A5：同一 session 可连续完成多轮 prompt；Agent Message 与 Reasoning 流式到达，turn
+      completion 恰好结束对应 prompt。
+    result: pending
+    reason: null
+  - id: A6
+    source: brief.md
+    text: A6：prompt 启动前或活动 turn 中收到 cancel/interrupt 时，不再启动无效 turn，或调用 Codex turn
+      interrupt；最终返回 ACP cancelled 语义且不影响后续 turn。
+    result: pending
+    reason: null
+  - id: A7
+    source: brief.md
+    text: A7：同一 session 的并发 steering 严格按到达顺序执行；活动 turn 使用 steer，无活动 turn 时按上游规则启动新
+      turn；任何单个请求失败后队列继续，竞态不会产生 rival turn。
+    result: pending
+    reason: null
+  - id: A8
+    source: brief.md
+    text: A8：Agent Message、Reasoning、基础 Plan 和 Token Usage 核心事件稳定转换为对应 ACP session
+      update，增量/完成事件不产生重复最终内容。
+    result: pending
+    reason: null
+  - id: A9
+    source: brief.md
+    text: A9：Command、File Change 与 MCP Tool Call 的开始、增量/更新和完成状态映射为关联一致的 ACP
+      ToolCall；必要位置、diff、原始输入和输出在 V1 可表达范围内保留。
+    result: pending
+    reason: null
+  - id: A10
+    source: brief.md
+    text: A10：Command、File Change、Permissions 三类 Codex 审批映射为 ACP
+      `session/requestPermission` 并把有效选择回传；取消、异常、handler 缺失或 stale approval 均
+      fail closed，且不会作用于新 turn。
+    result: pending
+    reason: null
+  - id: A11
+    source: brief.md
+    text: A11：新建/恢复 session 可按 V1 暴露的选项设置 model、reasoning effort 与 sandbox/agent
+      mode；值校验和模式映射与固定上游基线一致。
+    result: pending
+    reason: null
+  - id: A12
+    source: brief.md
+    text: A12：Text、Image、Resource 输入能转换到 Codex turn input；ChatGPT 与 API Key
+      两种基础认证能被声明、触发并返回成功或可诊断失败。
+    result: pending
+    reason: null
+  - id: A13
+    source: brief.md
+    text: A13：turn completion 先于等待器注册、旧 turn 事件晚到、旧审批晚到或 app-server 异常退出时，当前活动
+      session/turn 不被错误完成、批准或卡死。
+    result: pending
+    reason: null
+  - id: A14
+    source: brief.md
+    text: A14：遇到固定基线之外的 Codex event 时记录可诊断日志并安全忽略，不导致 ACP session 或进程崩溃。
+    result: pending
+    reason: null
+  - id: A15
+    source: brief.md
+    text: A15：固定 Codex 版本的稳定 app-server schema 可通过受控命令重复生成 Go
+      类型；生成文件带来源且禁止手改，手写运行时代码只依赖生成类型。
+    result: pending
+    reason: null
+  - id: A16
+    source: brief.md
+    text: A16：`UPSTREAM.md` 固定 SDK/codex-acp/Codex schema 版本，列出纳入与跳过能力、TS→Go 映射、Go
+      等价改写和同步历史；关键并发/异常代码可追溯到上游行为或测试。
+    result: pending
+    reason: null
+  - id: A17
+    source: brief.md
+    text: A17：自动化验证至少覆盖 macOS 与 Linux 的构建、单元、竞态/取消/队列、JSON-RPC 进程模拟、核心事件与审批
+      fixture、以及可控的关键路径 app-server 集成；Windows 尽力保持可编译但不阻断发布；每项 V1 验收都有可重复证据。
+    result: pending
+    reason: null
+  - id: A18
+    source: brief.md
+    text: A18：所有手写 Go
+      类型、结构体字段和函数具有清晰中文注释；函数内部的关键状态转换、并发、异常兜底和复杂映射说明“为什么”以及对应上游逻辑，简单自明语句不堆叠逐行注释。
+    result: pending
+    reason: null
+  - id: A19
+    source: specs/codex-config/spec.md
+    text: initialize/session 创建时声明并接受固定基线支持的 model、reasoning effort 与 sandbox/agent
+      mode 选项。
+    result: pending
+    reason: null
+  - id: A20
+    source: specs/codex-config/spec.md
+    text: Adapter 将 ACP config option/mode 映射为 Codex app-server
+      参数；未知、失效或不兼容值返回可诊断错误，不静默使用危险权限。
+    result: pending
+    reason: null
+  - id: A21
+    source: specs/codex-config/spec.md
+    text: sandbox/agent mode 映射遵循固定上游语义，尤其保持 read-only、workspace-write/agent 和
+      full-access 的权限边界。
+    result: pending
+    reason: null
+  - id: A22
+    source: specs/codex-config/spec.md
+    text: load/resume 对配置的恢复/覆盖顺序与固定上游基线一致。
+    result: pending
+    reason: null
+  - id: A23
+    source: specs/codex-config/spec.md
+    text: V1 接受 ACP Text、Image 和 Resource input，并转换为固定 app-server schema 的 turn
+      input。
+    result: pending
+    reason: null
+  - id: A24
+    source: specs/codex-config/spec.md
+    text: Image 保留可用 MIME/URL/base64 信息；Resource 支持固定基线可转换的 resource link 与 embedded
+      resource。
+    result: pending
+    reason: null
+  - id: A25
+    source: specs/codex-config/spec.md
+    text: 不支持的 content block 类型以明确请求错误处理，不丢弃后继续；Audio 不在 V1。
+    result: pending
+    reason: null
+  - id: A26
+    source: specs/codex-config/spec.md
+    text: initialize 声明 ChatGPT 与 API Key 两种基础认证方式。
+    result: pending
+    reason: null
+  - id: A27
+    source: specs/codex-config/spec.md
+    text: ChatGPT 登录和 API Key 环境/请求的选择、成功、取消和失败按固定上游基线映射。
+    result: pending
+    reason: null
+  - id: A28
+    source: specs/codex-config/spec.md
+    text: V1 不支持 client-provided custom gateway/Gateway Auth；不得误宣告该能力。
+    result: pending
+    reason: null
+  - id: A29
+    source: specs/codex-config/spec.md
+    text: 凭据不得写入日志、UPSTREAM.md、fixture 或错误详情。
+    result: pending
+    reason: null
+  - id: A30
+    source: specs/codex-config/spec.md
+    text: A11：model/reasoning/sandbox/mode。
+    result: pending
+    reason: null
+  - id: A31
+    source: specs/codex-config/spec.md
+    text: A12：Text/Image/Resource 与 ChatGPT/API Key。
+    result: pending
+    reason: null
+  - id: A32
+    source: specs/codex-events/spec.md
+    text: 事件先按 thread/turn 与当前 session 状态关联，再由专用 handler/mapper 转换为 ACP session
+      updates。
+    result: pending
+    reason: null
+  - id: A33
+    source: specs/codex-events/spec.md
+    text: 核心事件使用生成的强类型协议类型；未知事件记录 method/type、相关 identity 与安全摘要后忽略。
+    result: pending
+    reason: null
+  - id: A34
+    source: specs/codex-events/spec.md
+    text: handler 的完成/清理幂等；增量和 completed/fallback 路径不得重复输出最终内容。
+    result: pending
+    reason: null
+  - id: A35
+    source: specs/codex-events/spec.md
+    text: Agent Message 映射为 ACP agent message chunk。
+    result: pending
+    reason: null
+  - id: A36
+    source: specs/codex-events/spec.md
+    text: Reasoning 映射为 ACP thought/reasoning chunk，并保留固定基线支持的 section
+      break/completed fallback 语义。
+    result: pending
+    reason: null
+  - id: A37
+    source: specs/codex-events/spec.md
+    text: 基础 Plan 映射为 ACP plan update；不实现 Review/Goal 的扩展状态机。
+    result: pending
+    reason: null
+  - id: A38
+    source: specs/codex-events/spec.md
+    text: Token Usage 映射为 V1 约定的 ACP update/meta；空值、累计更新和 turn 完成按固定基线处理。
+    result: pending
+    reason: null
+  - id: A39
+    source: specs/codex-events/spec.md
+    text: Command、File Change、MCP tool 的开始/进度/完成更新使用稳定 ToolCallID 关联。
+    result: pending
+    reason: null
+  - id: A40
+    source: specs/codex-events/spec.md
+    text: Command 尽可能保留标题、命令、路径、状态、终端/输出和原始输入。
+    result: pending
+    reason: null
+  - id: A41
+    source: specs/codex-events/spec.md
+    text: File Change 尽可能保留增加/修改/删除位置、diff 与 raw content；多文件事件不得串线。
+    result: pending
+    reason: null
+  - id: A42
+    source: specs/codex-events/spec.md
+    text: MCP 范围仅为 Codex 已执行 MCP tool event 的 ACP ToolCall 映射，不负责 client-provided
+      MCP server 配置或传输。
+    result: pending
+    reason: null
+  - id: A43
+    source: specs/codex-events/spec.md
+    text: Command、File Change、Permissions 三类 app-server request 映射为 ACP
+      `session/requestPermission`。
+    result: pending
+    reason: null
+  - id: A44
+    source: specs/codex-events/spec.md
+    text: 仅暴露固定基线对该请求有效的 allow-once/allow-for-scope/reject/cancel 选项；ACP
+      选择被严格校验后转换为对应 Codex response。
+    result: pending
+    reason: null
+  - id: A45
+    source: specs/codex-events/spec.md
+    text: ACP 取消、未知选项、超时、handler 缺失、映射异常或 connection 失败均 fail closed：command/file 返回
+      cancel，permissions 返回无授权/拒绝语义。
+    result: pending
+    reason: null
+  - id: A46
+    source: specs/codex-events/spec.md
+    text: Approval 与 thread/turn/session generation 关联；旧 turn 请求即使迟到也不得批准当前活动。
+    result: pending
+    reason: null
+  - id: A47
+    source: specs/codex-events/spec.md
+    text: cancel/session close/process exit 会解除等待中的 permission 请求并回传关闭语义。
+    result: pending
+    reason: null
+  - id: A48
+    source: specs/codex-events/spec.md
+    text: A8：消息、reasoning、plan、usage。
+    result: pending
+    reason: null
+  - id: A49
+    source: specs/codex-events/spec.md
+    text: A9：command/file/MCP tool call。
+    result: pending
+    reason: null
+  - id: A50
+    source: specs/codex-events/spec.md
+    text: A10：三类审批、fail closed 与 stale 防护。
+    result: pending
+    reason: null
+  - id: A51
+    source: specs/codex-events/spec.md
+    text: A14：未知事件兼容。
+    result: pending
+    reason: null
+  - id: A52
+    source: specs/codex-runtime/spec.md
+    text: Codex 可执行文件由用户预装；若 `CODEX_PATH` 非空则只使用该显式路径，否则使用 `exec.LookPath` 或等价机制从
+      PATH 查找。显式路径无效或 PATH 不存在 Codex 时返回清晰启动错误，不下载或静默回退。
+    result: pending
+    reason: null
+  - id: A53
+    source: specs/codex-runtime/spec.md
+    text: 启动前获取 Codex 版本；0.148.0 是已验证基线。其他版本在 stderr/结构化日志输出兼容性警告后继续尝试，stdout 不得出现非
+      ACP JSON-RPC 内容。
+    result: pending
+    reason: null
+  - id: A54
+    source: specs/codex-runtime/spec.md
+    text: Codex Adapter 使用解析到的 Codex 启动 `codex app-server` 子进程，只使用 stdin/stdout
+      JSON-RPC；V1 不增加 HTTP、WebSocket 或 Unix Socket 传输。
+    result: pending
+    reason: null
+  - id: A55
+    source: specs/codex-runtime/spec.md
+    text: 启动后执行 app-server initialize，再允许 thread/turn 请求。
+    result: pending
+    reason: null
+  - id: A56
+    source: specs/codex-runtime/spec.md
+    text: stdout 只承载协议消息；stderr 进入结构化/关联日志，不能污染 JSON-RPC。
+    result: pending
+    reason: null
+  - id: A57
+    source: specs/codex-runtime/spec.md
+    text: 子进程退出、stdin/stdout 断开或 Adapter 关闭时，dispose 连接、取消活动请求并向 ACP 返回稳定错误；清理必须幂等。
+    result: pending
+    reason: null
+  - id: A58
+    source: specs/codex-runtime/spec.md
+    text: new session 映射到 Codex thread/start，建立 ACP SessionID 与 Codex ThreadID 的内部关系。
+    result: pending
+    reason: null
+  - id: A59
+    source: specs/codex-runtime/spec.md
+    text: load/resume 使用固定上游基线的恢复流程，恢复必要历史与配置后才安装 session 状态。
+    result: pending
+    reason: null
+  - id: A60
+    source: specs/codex-runtime/spec.md
+    text: session open/close 使用 generation 或等价身份保护：迟到的 open 结果不能覆盖已关闭或重新打开的 session。
+    result: pending
+    reason: null
+  - id: A61
+    source: specs/codex-runtime/spec.md
+    text: 一个 session 的失败、关闭或恢复错误不得污染其他 session。
+    result: pending
+    reason: null
+  - id: A62
+    source: specs/codex-runtime/spec.md
+    text: prompt 将 Text/Image/Resource 转换后的输入提交到 turn/start，并从对应 thread/turn 路由流式事件。
+    result: pending
+    reason: null
+  - id: A63
+    source: specs/codex-runtime/spec.md
+    text: 同一 session 可连续多轮；每个 prompt 只由自己 turn 的 completion 结束一次。
+    result: pending
+    reason: null
+  - id: A64
+    source: specs/codex-runtime/spec.md
+    text: completion 可能早于等待器建立；实现必须捕获并匹配 early completion。
+    result: pending
+    reason: null
+  - id: A65
+    source: specs/codex-runtime/spec.md
+    text: stale turn notification 不得完成当前 prompt；旧 turn 的等待器和状态在确定完成/取消后清理。
+    result: pending
+    reason: null
+  - id: A66
+    source: specs/codex-runtime/spec.md
+    text: prompt 请求在 turn 启动前取消时不得留下后台 rival turn；若 turn 已活动，使用 Codex turn interrupt。
+    result: pending
+    reason: null
+  - id: A67
+    source: specs/codex-runtime/spec.md
+    text: interrupt 后等待对应 completion/cancelled 语义完成清理；重复取消幂等。
+    result: pending
+    reason: null
+  - id: A68
+    source: specs/codex-runtime/spec.md
+    text: session/进程结束会解除所有取消等待，不允许 goroutine 泄漏。
+    result: pending
+    reason: null
+  - id: A69
+    source: specs/codex-runtime/spec.md
+    text: 每个 session 一个 FIFO steering queue，同一时间只处理一个 steering 请求。
+    result: pending
+    reason: null
+  - id: A70
+    source: specs/codex-runtime/spec.md
+    text: 有活动 turn 时发送 turn/steer；若上游返回“无活动 turn”竞态或 session 本来空闲，则按固定基线规则以 steering
+      内容启动新 turn。
+    result: pending
+    reason: null
+  - id: A71
+    source: specs/codex-runtime/spec.md
+    text: 并发 steering 不得启动 rival turn；请求在“注入活动 turn”或“新 turn 已被接受”后返回成功。
+    result: pending
+    reason: null
+  - id: A72
+    source: specs/codex-runtime/spec.md
+    text: 一个 steering 的解析、发送、启动或取消失败只拒绝该请求，队列继续处理后续请求。
+    result: pending
+    reason: null
+  - id: A73
+    source: specs/codex-runtime/spec.md
+    text: session 关闭时拒绝/清理未完成请求并移除空闲队列。
+    result: pending
+    reason: null
+  - id: A74
+    source: specs/codex-runtime/spec.md
+    text: thread、turn、session generation/identity 必须参与
+      completion、notification、approval 和 control 路由。
+    result: pending
+    reason: null
+  - id: A75
+    source: specs/codex-runtime/spec.md
+    text: early completion、stale completion、stale approval、close/open race 和
+      app-server 异常退出均有固定测试。
+    result: pending
+    reason: null
+  - id: A76
+    source: specs/codex-runtime/spec.md
+    text: A3：进程与 JSON-RPC 生命周期。
+    result: pending
+    reason: null
+  - id: A77
+    source: specs/codex-runtime/spec.md
+    text: A4-A7：session、prompt、cancel 和 steering。
+    result: pending
+    reason: null
+  - id: A78
+    source: specs/codex-runtime/spec.md
+    text: A13：early/stale/exit 竞态保护。
+    result: pending
+    reason: null
+  - id: A79
+    source: specs/framework/spec.md
+    text: 系统是一个 stdio ACP Agent 进程。V1 提供 Agent-neutral 的 ACP Core 和首个 Codex
+      Adapter；未来 Adapter 可以拥有不同的原生状态与可选能力，但必须通过同一核心生命周期接入。
+    result: pending
+    reason: null
+  - id: A80
+    source: specs/framework/spec.md
+    text: 采用轻量 Ports-and-Adapters：Core contracts 定义 ACP 生命周期和必要的 Adapter 端口，Codex
+      package 实现首个适配器，protocol package 隔离生成类型，`cmd/acp-agent` 负责显式组装。
+    result: pending
+    reason: null
+  - id: A81
+    source: specs/framework/spec.md
+    text: 不建立独立 use-case、repository、domain entity、aggregate 或框架式 application/service
+      层；没有当前职责的层和接口不得创建。
+    result: pending
+    reason: null
+  - id: A82
+    source: specs/framework/spec.md
+    text: Codex Adapter 内部文件和职责尽量保持与固定 codex-acp 模块对应，Core 只抽取已经由 ACP 生命周期证明通用的边界。
+    result: pending
+    reason: null
+  - id: A83
+    source: specs/framework/spec.md
+    text: 使用固定版本 `github.com/coder/acp-go-sdk` 的 Agent-side connection 实现 ACP
+      JSON-RPC 连接、请求分发、取消通知和扩展方法。
+    result: pending
+    reason: null
+  - id: A84
+    source: specs/framework/spec.md
+    text: Agent 启动后接收 ACP Client 的 initialize、session 和 prompt/control 请求，并将
+      connection 能力注入所选 Adapter。
+    result: pending
+    reason: null
+  - id: A85
+    source: specs/framework/spec.md
+    text: Core 直接组合 SDK 的类型、Agent-side connection 和扩展接口，不复制或重新包装 SDK 已经提供的
+      JSON-RPC、dispatch、cancel、extension 协议栈；只有 Adapter 选择与生命周期编排属于本项目职责。
+    result: pending
+    reason: null
+  - id: A86
+    source: specs/framework/spec.md
+    text: "`go.mod` 在本地开发阶段使用模块名 `acp-go`；本变更不绑定尚未确定的远端仓库路径，也不执行 push、PR
+      或发布。未来确定发布地址后以独立变更迁移 module path。"
+    result: pending
+    reason: null
+  - id: A87
+    source: specs/framework/spec.md
+    text: 进程 composition root 显式构造 logger、ACP connection、Adapter registry/selector 和
+      Codex Adapter；不使用隐式 `init()` 注册、全局 service locator 或 DI 容器。
+    result: pending
+    reason: null
+  - id: A88
+    source: specs/framework/spec.md
+    text: Registry 保存具体 Adapter 工厂及其元数据；选择结果在建立 session 前确定。
+    result: pending
+    reason: null
+  - id: A89
+    source: specs/framework/spec.md
+    text: V1 交付单一 `acp-agent`：未提供 `--adapter` 时选择 Codex，`--adapter codex`
+      显式选择同一实现；未来新增 Adapter 时默认值仍为 Codex，其他 Adapter 必须显式选择。
+    result: pending
+    reason: null
+  - id: A90
+    source: specs/framework/spec.md
+    text: 未知或不可用 Adapter 在 ACP 协议开始前返回可诊断启动错误，不回退到任意实现；V1 不为 Codex 另建独立二进制。
+    result: pending
+    reason: null
+  - id: A91
+    source: specs/framework/spec.md
+    text: 构造参数较少时使用普通显式构造；只有可选配置确实会独立演进时使用可返回校验错误的 functional options，不引入 builder
+      或框架化容器。
+    result: pending
+    reason: null
+  - id: A92
+    source: specs/framework/spec.md
+    text: 核心合同只包含 initialize/session/prompt/cancel 所需的最小生命周期。
+    result: pending
+    reason: null
+  - id: A93
+    source: specs/framework/spec.md
+    text: Load/Resume、Steering、Authentication、Configuration
+      等能力通过消费方定义的小接口按需检测，不进入一个超大 Runtime 接口。
+    result: pending
+    reason: null
+  - id: A94
+    source: specs/framework/spec.md
+    text: 构造函数接收接口并返回具体类型；只有真实第二实现或测试替身需要时才定义接口。
+    result: pending
+    reason: null
+  - id: A95
+    source: specs/framework/spec.md
+    text: Core 只保存通用 ACP session 标识、Adapter 归属、context/cancel 与日志关联信息。
+    result: pending
+    reason: null
+  - id: A96
+    source: specs/framework/spec.md
+    text: Codex ThreadID、TurnID、Sandbox、Approval、Token Usage、MCP 和 SteeringQueue
+      状态不得进入 Core 的公共模型。
+    result: pending
+    reason: null
+  - id: A97
+    source: specs/framework/spec.md
+    text: 必要扩展点仅包含 Adapter 注册/选择、可选能力以及外部进程/协议边界；没有第二个真实需求或测试边界时不得新增抽象。
+    result: pending
+    reason: null
+  - id: A98
+    source: specs/framework/spec.md
+    text: 每个外部活动都由 context 约束；连接关闭时取消全部 session 活动并关闭 Adapter 资源。
+    result: pending
+    reason: null
+  - id: A99
+    source: specs/framework/spec.md
+    text: Adapter/session 注册、替换和关闭必须是并发安全的，不允许关闭后的异步 open 覆盖新 generation。
+    result: pending
+    reason: null
+  - id: A100
+    source: specs/framework/spec.md
+    text: 资源上限和清理责任必须显式；不得启动无所有者 goroutine 或无界队列。
+    result: pending
+    reason: null
+  - id: A101
+    source: specs/framework/spec.md
+    text: 所有手写 Go 类型、结构体字段和函数具有清晰中文注释；exported 声明同时符合 Go doc comment 的标识符开头习惯。
+    result: pending
+    reason: null
+  - id: A102
+    source: specs/framework/spec.md
+    text: 函数内部只在关键状态转换、并发顺序、异常兜底和复杂映射处解释原因及不变量，不为自明赋值堆叠噪声注释。
+    result: pending
+    reason: null
+  - id: A103
+    source: specs/framework/spec.md
+    text: Protocol Generator 输出不适用中文注释强制要求；生成文件只保留标准生成标记与上游 schema 原始文档，并由 freshness
+      检查保证无人手工修改。
+    result: pending
+    reason: null
+  - id: A104
+    source: specs/framework/spec.md
+    text: 错误分支优先返回，主路径保持扁平；预期的协议、进程、输入和环境失败返回 error，不 panic。
+    result: pending
+    reason: null
+  - id: A105
+    source: specs/framework/spec.md
+    text: A1：ACP SDK boundary 与 initialize。
+    result: pending
+    reason: null
+  - id: A106
+    source: specs/framework/spec.md
+    text: A2：Core/Adapter 中立性、注册选择和可选能力。
+    result: pending
+    reason: null
+  - id: A107
+    source: specs/framework/spec.md
+    text: A16：架构与上游可追溯性。
+    result: pending
+    reason: null
+  - id: A108
+    source: specs/framework/spec.md
+    text: A18：中文注释和关键逻辑可读性。
+    result: pending
+    reason: null
+  - id: A109
+    source: specs/protocol-upstream/spec.md
+    text: V1 在 `UPSTREAM.md` 固定 acp-go-sdk
+      v0.13.5/`0845a3bb9eddda5bfc22a94dd3598c90cb842451`、codex-acp
+      1.6.2/`ba5bcc3d7759250dde9d4d2286a1bec11b363208`，以及 codex-acp lockfile 解析的
+      `@agentclientprotocol/sdk` 1.4.0 和 `@openai/codex` 0.148.0。
+    result: pending
+    reason: null
+  - id: A110
+    source: specs/protocol-upstream/spec.md
+    text: 开发和验收期间不使用 moving main 作为行为真值；后续上游修复或版本升级通过独立变更更新版本、映射、生成类型和回归证据。
+    result: pending
+    reason: null
+  - id: A111
+    source: specs/protocol-upstream/spec.md
+    text: V1 固定使用 Codex 0.148.0 的默认稳定 app-server schema；不传
+      `--experimental`，不生成、不宣告也不调用实验 surface。
+    result: pending
+    reason: null
+  - id: A112
+    source: specs/protocol-upstream/spec.md
+    text: 固定基线之后，纳入范围的行为、异常兜底、顺序和竞态测试优先于 Go 风格重设计。
+    result: pending
+    reason: null
+  - id: A113
+    source: specs/protocol-upstream/spec.md
+    text: acp-go-sdk 已提供的 ACP 连接、分发、取消和扩展能力直接复用其公共实现；除适配所必需的薄边界外，不复制内部协议逻辑。
+    result: pending
+    reason: null
+  - id: A114
+    source: specs/protocol-upstream/spec.md
+    text: 候选默认是固定 Codex app-server 的稳定 JSON Schema，由 `codex app-server
+      generate-json-schema --out <dir>` 产生输入；实验 surface 仅在明确纳入时使用。
+    result: pending
+    reason: null
+  - id: A115
+    source: specs/protocol-upstream/spec.md
+    text: 生成流程输出 `agents/codex/protocol/generated_*.go` 或等价独立 package，保持 wire field
+      名、nullable/optional、union/tag 和 request/response/notification 类型。
+    result: pending
+    reason: null
+  - id: A116
+    source: specs/protocol-upstream/spec.md
+    text: generated 文件带生成来源和禁止手改标记；手写 Adapter 只依赖生成类型，不复制大批 DTO。
+    result: pending
+    reason: null
+  - id: A117
+    source: specs/protocol-upstream/spec.md
+    text: generated 文件保留上游 schema 原始注释，不维护逐类型/字段的中文翻译元数据；中文注释规范仅检查手写 Go 代码。
+    result: pending
+    reason: null
+  - id: A118
+    source: specs/protocol-upstream/spec.md
+    text: 仓库提供一个可重复命令和 freshness 验证；相同输入产生稳定输出，schema 变化先更新类型再修 mapper/state/tests。
+    result: pending
+    reason: null
+  - id: A119
+    source: specs/protocol-upstream/spec.md
+    text: Protocol Generator、固定输入、提交的 Go 生成快照和 freshness 检查均为 V1 发布硬门槛；任何一项缺失都不能把
+      A15 标记为通过。
+    result: pending
+    reason: null
+  - id: A120
+    source: specs/protocol-upstream/spec.md
+    text: 开发工作区必须存在 `.upstream/codex-acp` 本地 Git clone，且 HEAD 精确等于
+      `ba5bcc3d7759250dde9d4d2286a1bec11b363208`；该目录由 `.gitignore` 排除，不把完整
+      TypeScript 上游仓库 vendoring 到本项目提交中。
+    result: pending
+    reason: null
+  - id: A121
+    source: specs/protocol-upstream/spec.md
+    text: Builder 在实现 Codex 模块或移植测试前直接读取对应 clone 中的源文件、symbol 和 fixture；README
+      或摘要只能辅助定位，不能替代源码对照。
+    result: pending
+    reason: null
+  - id: A122
+    source: specs/protocol-upstream/spec.md
+    text: "`UPSTREAM.md` 列出主要 TypeScript→Go 职责映射、明确跳过的模块/事件、Go 等价改写说明和每次同步记录。"
+    result: pending
+    reason: null
+  - id: A123
+    source: specs/protocol-upstream/spec.md
+    text: 关键 concurrency/failure 代码注释指出对应 upstream symbol/test 或记录有意差异，不要求逐行翻译。
+    result: pending
+    reason: null
+  - id: A124
+    source: specs/protocol-upstream/spec.md
+    text: codex-acp 中存在对应行为、状态机、mapper 或 fixture 时，Go 代码保持可识别的文件/职责映射并优先等价移植；不得在没有
+      Spec 决策的情况下另造替代语义。
+    result: pending
+    reason: null
+  - id: A125
+    source: specs/protocol-upstream/spec.md
+    text: 未纳入 V1 的上游模块整体排除，不修改相邻核心语义来制造简化版本。
+    result: pending
+    reason: null
+  - id: A126
+    source: specs/protocol-upstream/spec.md
+    text: "`UPSTREAM.md` 的映射结构和关键中文注释应让维护者可以从新的 codex-acp 修复定位受影响 Go 文件和测试。"
+    result: pending
+    reason: null
+  - id: A127
+    source: specs/protocol-upstream/spec.md
+    text: A15：可重复类型生成与 freshness。
+    result: pending
+    reason: null
+  - id: A128
+    source: specs/protocol-upstream/spec.md
+    text: A16：版本、模块、差异和同步可追溯。
+    result: pending
+    reason: null
+  - id: A129
+    source: specs/protocol-upstream/spec.md
+    text: A13：竞态语义来源。
+    result: pending
+    reason: null
+  - id: A130
+    source: specs/protocol-upstream/spec.md
+    text: A18：中文注释中的上游来源和复杂逻辑说明。
+    result: pending
+    reason: null
+  - id: A131
+    source: specs/verification/spec.md
+    text: 单元测试验证 Core registry/capability、session state、content/event/tool
+      mapping、approval decision 和 SteeringQueue。
+    result: pending
+    reason: null
+  - id: A132
+    source: specs/verification/spec.md
+    text: 并发测试用显式同步点覆盖 concurrent steering、cancel-before-start、interrupt、early
+      completion、stale event/approval、session close/open generation 和 process
+      exit；不得以长 sleep 作为正确性依据。
+    result: pending
+    reason: null
+  - id: A133
+    source: specs/verification/spec.md
+    text: JSON-RPC fake app-server 集成测试覆盖 initialize、thread start/resume、turn
+      stream/completion、server request/response、stderr/exit 和协议错误。
+    result: pending
+    reason: null
+  - id: A134
+    source: specs/verification/spec.md
+    text: 从固定 codex-acp 基线移植纳入 V1 的关键 fixture/测试语义；记录未移植测试及其对应非目标。
+    result: pending
+    reason: null
+  - id: A135
+    source: specs/verification/spec.md
+    text: 对照 acp-go-sdk 公共 API 审查协议边界，发现重复 connection/dispatch/cancel/extension
+      实现即视为失败。
+    result: pending
+    reason: null
+  - id: A136
+    source: specs/verification/spec.md
+    text: 可控环境下运行固定版本真实 `codex app-server` 的关键路径 smoke/integration；认证或平台前置条件缺失时明确记为
+      not-run/blocked，不伪造通过。
+    result: pending
+    reason: null
+  - id: A137
+    source: specs/verification/spec.md
+    text: 完成全部本地检查后，把实现、测试、生成快照与文档提交到本地 Git；本变更不要求 remote、push 或 PR 证据。
+    result: pending
+    reason: null
+  - id: A138
+    source: specs/verification/spec.md
+    text: macOS 与 Linux 运行 Go 格式化与生成文件 freshness 检查。
+    result: pending
+    reason: null
+  - id: A139
+    source: specs/verification/spec.md
+    text: 从固定 Codex 0.148.0 稳定 schema 重新运行 Protocol Generator，确认工作树无生成差异。
+    result: pending
+    reason: null
+  - id: A140
+    source: specs/verification/spec.md
+    text: macOS 与 Linux 运行 `go test ./...`、`go test -race ./...`、`go vet ./...`
+      并构建目标 ACP Agent 二进制。
+    result: pending
+    reason: null
+  - id: A141
+    source: specs/verification/spec.md
+    text: Windows 仅运行可行的交叉编译或编译检查；其专项运行和真实 app-server 集成不属于 V1 门槛。
+    result: pending
+    reason: null
+  - id: A142
+    source: specs/verification/spec.md
+    text: 每个 A1-A17 验收项都有至少一个自动化检查或明确的人工/环境验证证据。
+    result: pending
+    reason: null
+  - id: A143
+    source: specs/verification/spec.md
+    text: unknown event、fail-closed、child process exit 和 stale/early completion
+      是发布门槛，不得仅测试成功路径。
+    result: pending
+    reason: null
+  - id: A144
+    source: specs/verification/spec.md
+    text: “完整 E2E/跨平台专项不在 V1”不等于不做真实关键路径验证：macOS 与 Linux
+      是正式支持平台，任何一个平台的必需检查失败都会阻止发布；Windows 是 best-effort 编译兼容，结果作为证据或已知限制记录。
+    result: pending
+    reason: null
+  - id: A145
+    source: specs/verification/spec.md
+    text: 代码审阅检查所有手写类型、结构体字段和函数的中文注释，以及关键状态/并发/异常逻辑的上游来源说明；生成代码仅检查生成标记、上游原始文档和
+      freshness，不检查中文覆盖。
+    result: pending
+    reason: null
+  - id: A146
+    source: specs/verification/spec.md
+    text: 代码审阅检查每个抽象是否存在当前消费方、第二实现或明确测试边界；仅服务假想未来的抽象视为超范围。
+    result: pending
+    reason: null
+  - id: A147
+    source: specs/verification/spec.md
+    text: A17：完整验证分层与发布证据。
+    result: pending
+    reason: null
+  - id: A148
+    source: specs/verification/spec.md
+    text: A1-A16：各 capability 的具体验证载体。
+    result: pending
+    reason: null
+  - id: A149
+    source: specs/verification/spec.md
+    text: A18：中文注释、增量同步可维护性和必要扩展性审查。
+    result: pending
+    reason: null
+builder_handoff: null
+blockers: []
+verification: null
+history: []
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pending
+verification_report: null
+archived: false
+created_at: 2026-08-23T09:30:24.085Z

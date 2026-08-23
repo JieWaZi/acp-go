@@ -1,0 +1,90 @@
+schema: comet.native.children.v2
+acceptance_index:
+  A1:
+    source: brief.md
+    text: >-
+      A1：运行 `acp-agent` 或 `acp-agent --adapter codex` 均启动 Codex Adapter，ACP Client 通过 stdio 完成 initialize 并收到与 V1 实际能力一致的 Agent capability/auth/config 声明；未知 Adapter 在写出协议内容前返回可诊断启动错误；协议连接、分发、取消与扩展基础由固定版本 acp-go-sdk 提供。
+  A2:
+    source: brief.md
+    text: >-
+      A2：Core 能注册并选择 Codex Adapter，且 Core 的公开状态/API 不出现 Codex Thread、Turn、Sandbox、Approval 类型；可选能力通过小接口按需发现。
+  A3:
+    source: brief.md
+    text: >-
+      A3：`acp-agent` 按 `CODEX_PATH` → PATH 解析 Codex；找不到或显式路径无效时以可诊断错误退出；非 0.148.0 版本在 stderr 警告后继续。启动 Agent 后只生成一个受管的 `codex app-server` stdio JSON-RPC 连接；初始化成功后可请求；进程退出或关闭时连接和活动请求被释放/取消。
+  A4:
+    source: brief.md
+    text: >-
+      A4：ACP new session 创建 Codex thread；load/resume 恢复已有 thread 和必要历史/配置；不存在、失效或并发关闭的 session 返回稳定错误而不污染其他 session。
+  A5:
+    source: brief.md
+    text: >-
+      A5：同一 session 可连续完成多轮 prompt；Agent Message 与 Reasoning 流式到达，turn completion 恰好结束对应 prompt。
+  A6:
+    source: brief.md
+    text: >-
+      A6：prompt 启动前或活动 turn 中收到 cancel/interrupt 时，不再启动无效 turn，或调用 Codex turn interrupt；最终返回 ACP cancelled 语义且不影响后续 turn。
+  A7:
+    source: brief.md
+    text: >-
+      A7：同一 session 的并发 steering 严格按到达顺序执行；活动 turn 使用 steer，无活动 turn 时按上游规则启动新 turn；任何单个请求失败后队列继续，竞态不会产生 rival turn。
+  A8:
+    source: brief.md
+    text: >-
+      A8：Agent Message、Reasoning、基础 Plan 和 Token Usage 核心事件稳定转换为对应 ACP session update，增量/完成事件不产生重复最终内容。
+  A9:
+    source: brief.md
+    text: >-
+      A9：Command、File Change 与 MCP Tool Call 的开始、增量/更新和完成状态映射为关联一致的 ACP ToolCall；必要位置、diff、原始输入和输出在 V1 可表达范围内保留。
+  A10:
+    source: brief.md
+    text: >-
+      A10：Command、File Change、Permissions 三类 Codex 审批映射为 ACP `session/requestPermission` 并把有效选择回传；取消、异常、handler 缺失或 stale approval 均 fail closed，且不会作用于新 turn。
+  A11:
+    source: brief.md
+    text: >-
+      A11：新建/恢复 session 可按 V1 暴露的选项设置 model、reasoning effort 与 sandbox/agent mode；值校验和模式映射与固定上游基线一致。
+  A12:
+    source: brief.md
+    text: >-
+      A12：Text、Image、Resource 输入能转换到 Codex turn input；ChatGPT 与 API Key 两种基础认证能被声明、触发并返回成功或可诊断失败。
+  A13:
+    source: brief.md
+    text: >-
+      A13：turn completion 先于等待器注册、旧 turn 事件晚到、旧审批晚到或 app-server 异常退出时，当前活动 session/turn 不被错误完成、批准或卡死。
+  A14:
+    source: brief.md
+    text: >-
+      A14：遇到固定基线之外的 Codex event 时记录可诊断日志并安全忽略，不导致 ACP session 或进程崩溃。
+  A15:
+    source: brief.md
+    text: >-
+      A15：固定 Codex 版本的稳定 app-server schema 可通过受控命令重复生成 Go 类型；生成文件带来源且禁止手改，手写运行时代码只依赖生成类型。
+  A16:
+    source: brief.md
+    text: >-
+      A16：`UPSTREAM.md` 固定 SDK/codex-acp/Codex schema 版本，列出纳入与跳过能力、TS→Go 映射、Go 等价改写和同步历史；关键并发/异常代码可追溯到上游行为或测试。
+  A17:
+    source: brief.md
+    text: >-
+      A17：自动化验证至少覆盖 macOS 与 Linux 的构建、单元、竞态/取消/队列、JSON-RPC 进程模拟、核心事件与审批 fixture、以及可控的关键路径 app-server 集成；Windows 尽力保持可编译但不阻断发布；每项 V1 验收都有可重复证据。
+  A18:
+    source: brief.md
+    text: >-
+      A18：所有手写 Go 类型、结构体字段和函数具有清晰中文注释；函数内部的关键状态转换、并发、异常兜底和复杂映射说明“为什么”以及对应上游逻辑，简单自明语句不堆叠逐行注释。
+children:
+  - name: framework-foundation
+    depends_on: []
+    covers: [A1, A2]
+  - name: protocol-generation
+    depends_on: []
+    covers: [A15, A16]
+  - name: codex-runtime
+    depends_on: [framework-foundation, protocol-generation]
+    covers: [A3, A4, A5, A6, A7, A13]
+  - name: codex-events-config
+    depends_on: [framework-foundation, protocol-generation]
+    covers: [A8, A9, A10, A11, A12, A14]
+  - name: stabilization
+    depends_on: [codex-events-config, codex-runtime]
+    covers: [A17, A18]
