@@ -3,14 +3,14 @@ name: process-exit-repair
 language: zh-CN
 phase: archive
 status: active
-state_version: 6
+state_version: 7
 brief: brief.md
 spec_changes: []
 workspace:
   isolation: worktree
   change_branch: codex/process-exit-repair
   target_branch: main
-  finish: null
+  finish: merge
 loop:
   stage: archive-ready
   goal_cycle: 1
