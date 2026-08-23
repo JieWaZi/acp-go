@@ -91,3 +91,6 @@ children:
   - name: process-exit-repair
     depends_on: [stabilization]
     covers: [A3, A17]
+  - name: comment-audit-repair
+    depends_on: [process-exit-repair]
+    covers: [A18]

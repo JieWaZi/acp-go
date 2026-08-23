@@ -20,6 +20,7 @@ import (
 
 // processLogHandler 捕获进程层写入结构化日志的记录，并仅启用告警及以上级别。
 type processLogHandler struct {
+	// records 保存进程层告警日志，供测试在有界通道上做确定性断言。
 	records chan slog.Record
 }
 
