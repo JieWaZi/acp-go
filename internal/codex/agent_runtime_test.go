@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,52 @@ import (
 	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
+
+// runtimeWireRequest 保存真实 transport 写向 fake app-server 的请求 envelope。
+type runtimeWireRequest struct {
+	// ID 是 fake app-server 回应时必须原样回显的请求标识。
+	ID json.RawMessage `json:"id"`
+	// Method 是生成协议请求的固定 discriminator。
+	Method string `json:"method"`
+	// Params 保留测试需要核对的完整请求参数。
+	Params json.RawMessage `json:"params"`
+}
+
+// readRuntimeWireRequest 从真实 NDJSON writer 读取并解码一条 app-server 请求。
+func readRuntimeWireRequest(t *testing.T, harness *transportHarness) runtimeWireRequest {
+	t.Helper()
+	line, err := harness.requests.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("读取 fake app-server 请求失败: %v", err)
+	}
+	var request runtimeWireRequest
+	if err = json.Unmarshal(line, &request); err != nil {
+		t.Fatalf("解码 fake app-server 请求失败: %v", err)
+	}
+	return request
+}
+
+// writeRuntimeWireResult 向真实 NDJSON reader 写入与请求 ID 匹配的 result。
+func writeRuntimeWireResult(
+	t *testing.T,
+	harness *transportHarness,
+	id json.RawMessage,
+	result json.RawMessage,
+) {
+	t.Helper()
+	line, err := json.Marshal(struct {
+		// ID 原样回显 fake app-server 收到的请求标识。
+		ID json.RawMessage `json:"id"`
+		// Result 是由测试手工给出的上游响应 fixture。
+		Result json.RawMessage `json:"result"`
+	}{ID: id, Result: result})
+	if err != nil {
+		t.Fatalf("编码 fake app-server 响应失败: %v", err)
+	}
+	if _, err = harness.responses.Write(append(line, '\n')); err != nil {
+		t.Fatalf("写 fake app-server 响应失败: %v", err)
+	}
+}
 
 // newRuntimeTestAgent 使用 fake typed client 创建已完成 connection barrier 的 Agent。
 func newRuntimeTestAgent(t *testing.T, rpc *fakeAppServerRPC) *Agent {
@@ -335,6 +382,129 @@ func TestAgentCloseSessionCancelsPendingTurnStartAndReapsBackground(t *testing.T
 	}
 	if response := <-promptResult; response.StopReason != acp.StopReasonCancelled {
 		t.Fatalf("session close 后 Prompt 响应为 %#v", response)
+	}
+}
+
+// TestAgentCloseSessionObservesLateTurnStartOverRealTransport 等价移植固定 upstream
+// session-close.test.ts 的 delayed turn/start：close/prompt 先返回，迟到 response 仍被 stale 并 interrupt 一次。
+func TestAgentCloseSessionObservesLateTurnStartOverRealTransport(t *testing.T) {
+	harness := newTransportHarness(t, 4096, nil, nil)
+	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
+	t.Cleanup(cancelRuntime)
+	client := newAppServerClient(runtimeCtx, harness.transport)
+	agent := newAgentWithClient(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeCtx, cancelRuntime, client,
+	)
+	agent.transport = harness.transport
+	agent.markConnectionReady()
+	agent.initializeMu.Lock()
+	agent.initialized = true
+	agent.initializeMu.Unlock()
+	generation, err := agent.sessions.beginOpen("thread-wire-close")
+	if err != nil {
+		t.Fatalf("建立 wire session open 身份失败: %v", err)
+	}
+	state, installed := agent.sessions.install("thread-wire-close", "/tmp", generation)
+	if !installed {
+		t.Fatal("安装 wire session 状态失败")
+	}
+
+	promptResult := make(chan acp.PromptResponse, 1)
+	promptErr := make(chan error, 1)
+	go func() {
+		response, promptRunErr := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: "thread-wire-close",
+			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "late start"}}},
+		})
+		promptResult <- response
+		promptErr <- promptRunErr
+	}()
+	turnStart := readRuntimeWireRequest(t, harness)
+	if turnStart.Method != protocol.MethodTurnStart {
+		t.Fatalf("首个 wire 请求为 %q，期望 turn/start", turnStart.Method)
+	}
+	prompt := sessionActivePrompt(state)
+	if prompt == nil {
+		t.Fatal("turn/start pending 时没有活动 prompt")
+	}
+
+	closeResult := make(chan error, 1)
+	go func() {
+		_, closeErr := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: "thread-wire-close"})
+		closeResult <- closeErr
+	}()
+	unsubscribe := readRuntimeWireRequest(t, harness)
+	if unsubscribe.Method != protocol.MethodThreadUnsubscribe {
+		t.Fatalf("close wire 请求为 %q，期望 thread/unsubscribe", unsubscribe.Method)
+	}
+	writeRuntimeWireResult(t, harness, unsubscribe.ID, json.RawMessage(`{"status":"unsubscribed"}`))
+	if err = <-closeResult; err != nil {
+		t.Fatalf("迟到 turn/start 前 CloseSession 返回错误: %v", err)
+	}
+	if err = <-promptErr; err != nil {
+		t.Fatalf("迟到 turn/start 前 Prompt 返回错误: %v", err)
+	}
+	if response := <-promptResult; response.StopReason != acp.StopReasonCancelled {
+		t.Fatalf("session close 后 Prompt 响应为 %#v", response)
+	}
+
+	writeRuntimeWireResult(t, harness, turnStart.ID, json.RawMessage(
+		`{"turn":{"id":"turn-wire-late","items":[],"status":"inProgress"}}`,
+	))
+	sentinelResult := make(chan error, 1)
+	go func() {
+		_, readErr := client.ThreadRead(context.Background(), protocol.ThreadReadParams{ThreadID: "thread-wire-close"})
+		sentinelResult <- readErr
+	}()
+	interruptCount := 0
+	for {
+		request := readRuntimeWireRequest(t, harness)
+		switch request.Method {
+		case protocol.MethodTurnInterrupt:
+			interruptCount++
+			var params protocol.TurnInterruptParams
+			if err = json.Unmarshal(request.Params, &params); err != nil {
+				t.Fatalf("解码迟到 interrupt 参数失败: %v", err)
+			}
+			if params.ThreadID != "thread-wire-close" || params.TurnID != "turn-wire-late" {
+				t.Fatalf("迟到 interrupt identity 为 %#v", params)
+			}
+			client.handlerMu.Lock()
+			_, markedStale := client.staleTurns[params.ThreadID][params.TurnID]
+			client.handlerMu.Unlock()
+			if !markedStale {
+				t.Fatal("迟到 turn/start 未在 interrupt 前标记 stale")
+			}
+			writeRuntimeWireResult(t, harness, request.ID, json.RawMessage(`{}`))
+		case protocol.MethodThreadRead:
+			writeRuntimeWireResult(t, harness, request.ID, json.RawMessage(
+				`{"thread":{"id":"thread-wire-close","turns":[]}}`,
+			))
+			goto sentinelWritten
+		default:
+			t.Fatalf("迟到 response 后出现意外 wire 请求 %q", request.Method)
+		}
+	}
+
+sentinelWritten:
+	if err = <-sentinelResult; err != nil {
+		t.Fatalf("readLoop sentinel 返回错误: %v", err)
+	}
+	turnID, _ := prompt.currentTurn()
+	if turnID != "turn-wire-late" {
+		t.Fatalf("迟到 turn/start observer 未安装 identity，当前 turn=%q", turnID)
+	}
+	if interruptCount == 0 {
+		request := readRuntimeWireRequest(t, harness)
+		if request.Method != protocol.MethodTurnInterrupt {
+			t.Fatalf("sentinel 后请求为 %q，期望 turn/interrupt", request.Method)
+		}
+		interruptCount++
+		writeRuntimeWireResult(t, harness, request.ID, json.RawMessage(`{}`))
+	}
+	<-prompt.interruptDone
+	if interruptCount != 1 {
+		t.Fatalf("迟到 turn/start interrupt 次数为 %d", interruptCount)
 	}
 }
 

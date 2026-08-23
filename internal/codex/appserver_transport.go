@@ -64,8 +64,8 @@ type pendingResponse struct {
 // pendingCall 保存等待通道和可选的同步 response observer。
 // observer 只用于 turn/start 激活屏障，必须在 readLoop 继续读取下一帧前返回。
 type pendingCall struct {
-	// response 接收唯一一次响应或 transport fatal。
-	response chan pendingResponse
+	// waiter 接收唯一一次响应或 transport fatal；调用方取消后可置空而不丢 observer。
+	waiter chan pendingResponse
 	// observe 在 result 解码后同步安装依赖该响应的 runtime 身份；普通调用为 nil。
 	observe func(result json.RawMessage) error
 }
@@ -210,7 +210,7 @@ func (t *appServerTransport) call(
 		t.pendingMu.Unlock()
 		return err
 	}
-	t.pending[key] = pendingCall{response: responseChannel, observe: observer}
+	t.pending[key] = pendingCall{waiter: responseChannel, observe: observer}
 	t.pendingMu.Unlock()
 
 	request := build(id)
@@ -236,7 +236,8 @@ func (t *appServerTransport) call(
 		}
 		return nil
 	case <-ctx.Done():
-		t.removePending(key)
+		// 普通调用可直接删除；turn/start 必须仅分离本地 waiter，保留 server 迟到响应的一次 observer。
+		t.detachPendingWaiter(key, responseChannel)
 		return ctx.Err()
 	case <-t.done:
 		t.pendingMu.Lock()
@@ -362,9 +363,12 @@ func (t *appServerTransport) handleResponse(line []byte) {
 		responseErr = response.Error
 	}
 	if responseErr == nil && call.observe != nil {
+		// observer 只同步安装 identity；迟到 turn 的 interrupt 由 Agent 交给自有 goroutine，绝不在 readLoop 内等待新 RPC。
 		responseErr = call.observe(response.Result)
 	}
-	call.response <- pendingResponse{result: response.Result, err: responseErr}
+	if call.waiter != nil {
+		call.waiter <- pendingResponse{result: response.Result, err: responseErr}
+	}
 }
 
 // handleNotification 使用 protocol 的 discriminator-first union 解码已知通知。
@@ -451,6 +455,23 @@ func (t *appServerTransport) removePending(key string) {
 	t.pendingMu.Unlock()
 }
 
+// detachPendingWaiter 仅分离仍属于当前调用方的 waiter。
+// 带 observer 的 turn/start 继续由 transport 拥有，直到迟到 response、fatal 或 Adapter Close 形成有界终点。
+func (t *appServerTransport) detachPendingWaiter(key string, waiter chan pendingResponse) {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	call, ok := t.pending[key]
+	if !ok || call.waiter != waiter {
+		return
+	}
+	if call.observe == nil {
+		delete(t.pending, key)
+		return
+	}
+	call.waiter = nil
+	t.pending[key] = call
+}
+
 // fail 只接受首次 fatal，并把同一错误实例广播给全部 pending。
 func (t *appServerTransport) fail(cause error) {
 	t.pendingMu.Lock()
@@ -474,7 +495,9 @@ func (t *appServerTransport) fail(cause error) {
 
 	// 不持锁投递，避免等待者恢复后立刻查询 transport 状态造成锁反转。
 	for _, call := range pending {
-		call.response <- pendingResponse{err: stableError}
+		if call.waiter != nil {
+			call.waiter <- pendingResponse{err: stableError}
+		}
 	}
 	t.cancel()
 }

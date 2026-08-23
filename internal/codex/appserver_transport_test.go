@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,6 +171,147 @@ func TestAppServerTransportObservedResponseBlocksFollowingFrames(t *testing.T) {
 	<-dispatchReturned
 	if err = <-callResult; err != nil {
 		t.Fatalf("观察 turn/start response 失败: %v", err)
+	}
+}
+
+// TestAppServerTransportObservedCancellationRetainsOneShotObserver 验证调用方取消只分离 waiter，
+// 迟到 response 仍执行一次 observer，重复 response 不会重复执行或重新占用 pending。
+func TestAppServerTransportObservedCancellationRetainsOneShotObserver(t *testing.T) {
+	harness := newTransportHarness(t, 4096, nil, nil)
+	callCtx, cancelCall := context.WithCancel(context.Background())
+	callResult := make(chan error, 1)
+	var observed atomic.Int64
+	go func() {
+		var response protocol.TurnStartResponse
+		callResult <- harness.transport.CallObserved(
+			callCtx,
+			func(id protocol.RequestID) protocol.ClientRequest {
+				return protocol.NewTurnStartRequest(id, protocol.TurnStartParams{
+					ThreadID: "thread-observed-cancel",
+					Input:    []protocol.InputElement{},
+				})
+			},
+			&response,
+			func() error {
+				observed.Add(1)
+				return nil
+			},
+		)
+	}()
+	line, err := harness.requests.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("读取 observed 请求失败: %v", err)
+	}
+	var request runtimeWireRequest
+	if err = json.Unmarshal(line, &request); err != nil {
+		t.Fatalf("解码 observed 请求失败: %v", err)
+	}
+	cancelCall()
+	if err = <-callResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("observed 调用取消错误为 %v", err)
+	}
+
+	response := []byte(
+		`{"id":` + string(request.ID) + `,"result":{"turn":{"id":"turn-late","items":[],"status":"inProgress"}}}` + "\n",
+	)
+	if _, err = harness.responses.Write(response); err != nil {
+		t.Fatalf("写迟到 observed response 失败: %v", err)
+	}
+	if _, err = harness.responses.Write(response); err != nil {
+		t.Fatalf("写重复 observed response 失败: %v", err)
+	}
+
+	sentinelResult := make(chan error, 1)
+	go func() {
+		var result protocol.ThreadReadResponse
+		sentinelResult <- harness.transport.Call(context.Background(), func(id protocol.RequestID) protocol.ClientRequest {
+			return protocol.NewThreadReadRequest(id, protocol.ThreadReadParams{ThreadID: "thread-observed-cancel"})
+		}, &result)
+	}()
+	sentinel := readRuntimeWireRequest(t, harness)
+	writeRuntimeWireResult(t, harness, sentinel.ID, json.RawMessage(
+		`{"thread":{"id":"thread-observed-cancel","turns":[]}}`,
+	))
+	if err = <-sentinelResult; err != nil {
+		t.Fatalf("observed 顺序 sentinel 返回错误: %v", err)
+	}
+	if count := observed.Load(); count != 1 {
+		t.Fatalf("迟到/重复 response 执行 observer 次数为 %d", count)
+	}
+	harness.transport.pendingMu.Lock()
+	pendingCount := len(harness.transport.pending)
+	harness.transport.pendingMu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("one-shot observer 完成后 pending 数为 %d", pendingCount)
+	}
+}
+
+// TestAppServerTransportFatalClearsDetachedObserver 验证 caller 已取消后，transport fatal 会回收 observer 且不执行它。
+func TestAppServerTransportFatalClearsDetachedObserver(t *testing.T) {
+	harness := newTransportHarness(t, 4096, nil, nil)
+	callCtx, cancelCall := context.WithCancel(context.Background())
+	callResult := make(chan error, 1)
+	var observed atomic.Int64
+	go func() {
+		var response protocol.TurnStartResponse
+		callResult <- harness.transport.CallObserved(
+			callCtx,
+			func(id protocol.RequestID) protocol.ClientRequest {
+				return protocol.NewTurnStartRequest(id, protocol.TurnStartParams{
+					ThreadID: "thread-observed-fatal",
+					Input:    []protocol.InputElement{},
+				})
+			},
+			&response,
+			func() error {
+				observed.Add(1)
+				return nil
+			},
+		)
+	}()
+	request := readRuntimeWireRequest(t, harness)
+	cancelCall()
+	if err := <-callResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("fatal 前 observed 调用取消错误为 %v", err)
+	}
+	if err := harness.transport.Close(); err != nil {
+		t.Fatalf("关闭含 detached observer 的 transport 失败: %v", err)
+	}
+	harness.transport.dispatchLine([]byte(
+		`{"id":` + string(request.ID) + `,"result":{"turn":{"id":"turn-ignored","items":[],"status":"inProgress"}}}`,
+	))
+	if count := observed.Load(); count != 0 {
+		t.Fatalf("transport fatal 后 observer 执行次数为 %d", count)
+	}
+	harness.transport.pendingMu.Lock()
+	pendingCount := len(harness.transport.pending)
+	harness.transport.pendingMu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("transport fatal 后 pending 数为 %d", pendingCount)
+	}
+}
+
+// TestAppServerTransportOrdinaryCancellationRemovesPending 验证无 observer 的普通调用取消后不会占用 pending。
+func TestAppServerTransportOrdinaryCancellationRemovesPending(t *testing.T) {
+	harness := newTransportHarness(t, 4096, nil, nil)
+	callCtx, cancelCall := context.WithCancel(context.Background())
+	callResult := make(chan error, 1)
+	go func() {
+		var response protocol.ThreadReadResponse
+		callResult <- harness.transport.Call(callCtx, func(id protocol.RequestID) protocol.ClientRequest {
+			return protocol.NewThreadReadRequest(id, protocol.ThreadReadParams{ThreadID: "thread-ordinary-cancel"})
+		}, &response)
+	}()
+	_ = readRuntimeWireRequest(t, harness)
+	cancelCall()
+	if err := <-callResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("普通调用取消错误为 %v", err)
+	}
+	harness.transport.pendingMu.Lock()
+	pendingCount := len(harness.transport.pending)
+	harness.transport.pendingMu.Unlock()
+	if pendingCount != 0 {
+		t.Fatalf("普通调用取消后 pending 数为 %d", pendingCount)
 	}
 }
 

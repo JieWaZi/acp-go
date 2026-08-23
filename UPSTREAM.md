@@ -106,7 +106,7 @@ go run ./tools/protocolgen --check
 | `session-config-options.test.ts` | `config_test.go` 的三模式安全边界、model/effort 保留/回退与未知选择错误 |
 | `initialize.test.ts` 和 `CodexAcpClient.test.ts` API Key/ChatGPT cases | `auth_test.go` 的 V1 method 声明、凭据优先级、subscribe-before-start、取消 login 与 secret-safe 失败 |
 | `CodexAcpClient.test.ts` 的 concurrent prompt、early completion、cancel/late-start 用例 | `appserver_client_test.go`、`agent_runtime_test.go` | 跨 session/旧 turn 隔离、response 前 completion、cancel-before-start 后新 Prompt、late interrupt-once、completion-first |
-| `session-close.test.ts` 的 stale resume/reopen 与 delayed turn start 用例 | `session_test.go`、`agent_runtime_test.go` | close generation、迟到 open、取消 pending turn/start 与后台 goroutine 回收 |
+| `session-close.test.ts` 的 stale resume/reopen 与 delayed turn start 用例 | `session_test.go`、`agent_runtime_test.go` 的 `TestAgentCloseSessionObservesLateTurnStartOverRealTransport` | close generation、迟到 open；真实 NDJSON wire 上 close/prompt 先返回，迟到 turn/start 仍被 stale 并 interrupt-once |
 | `steer-events.test.ts` | `steering_test.go` | startedNewTurn→injected FIFO、unexpected failure 后继续、malformed、bounded close cleanup |
 | `process-exit-error.test.ts`、`CodexJsonRpcConnection.attachLogs` | `process_test.go`、`appserver_transport_test.go` | exit code/stderr 尾部、pending fatal fan-out，以及运行中/干净退出的实时 stderr 结构化日志 |
 | `approval-events.test.ts` 的 delayed/stale approval 场景 | `agent_runtime_test.go`、`process_test.go` | transport handler 组合根接线、缺少 connection/session/turn 时 fail closed，以及 permission barrier 内切换 turn generation 后拒绝旧审批 |
@@ -128,13 +128,13 @@ go run ./tools/protocolgen --check
 - acp-go-sdk v0.13.5 的 `NewAgentSideConnection` 会立即启动 receive goroutine，之后调用可选 `SetLogger` 存在并发读写；本项目保持 SDK 默认 stderr logger，绝不调用 setter。`connectionBinder` 使用 ready channel 作为 prompt/event barrier。
 - Go runtime context 在启动成功后由 `Agent.Close` 单独拥有，不继续继承 construction/Serve context 的取消；这样 acpserver 可在其独立有界清理窗口内先关闭 stdin、回收唯一进程，避免 `exec.CommandContext` 把正常信号退出误报为 app-server 异常。
 - 固定 upstream `attachLogs` 会记录 stdin、stdout 与 stderr 数据块；Go 只等价移植 stderr 诊断，并同时写入有界崩溃尾部与组合根注入的结构化 Logger。stdin/stdout 是协议流，可能包含 prompt、响应和认证数据，故有意不记录，也绝不污染外层 ACP stdout。
-- 固定 upstream 在 prompt `finally` 中执行 `activePrompt.complete()`，所以 cancel-before-start 返回后立即允许后续 prompt；底层 `sendPromptPromise` 仍继续观察迟到 turn/start 并只中断一次。Go 把前台活动槽位与 `RunTurn` 后台身份分离来保持同一语义；session/Adapter close 另以独立 context 取消 pending RPC 并等待 goroutine，因为 Go 请求可取消且必须显式回收，而 TypeScript Promise 本身不可取消。
+- 固定 upstream 在 prompt `finally` 中执行 `activePrompt.complete()`，所以 cancel-before-start 返回后立即允许后续 prompt；底层 `sendPromptPromise` 仍继续观察迟到 turn/start 并只中断一次。Go 把前台活动槽位与 `RunTurn` 后台身份分离；session close 取消并回收本地 `RunTurn` waiter/goroutine，但 transport 继续拥有 one-shot late observer，直到 response、fatal 或 Adapter Close，避免服务端 orphan turn。TypeScript Promise 本身不可取消，因此不需要这层 waiter/observer 所有权拆分。
 - event/config/auth/approval 组件直接使用生成协议 method/Params 和 `github.com/coder/acp-go-sdk@v0.13.5` 的 ContentBlock、SessionUpdate、ToolCall、PermissionOption、AuthMethod、ConfigOption DTO；没有复制 ACP 或 Codex wire DTO。
 - 上游 file update/move 依赖 npm `diff` 与文件读取重建 rich diff。Go V1 不自写 patch parser：add/delete 直接使用 SDK diff DTO，update/move 与 patchUpdated 保留生成协议 typed raw changes。
 - 上游静默过滤 Audio；V1 未声明 Audio，因此 `content.go` 明确返回请求错误。固定 schema 没有历史 completed plan 的生成常量，兼容分支只识别其 discriminator，稳定计划仍消费 `turn/plan/updated`。
 - Go approval 在外部 permission callback 前后读取 runtime generation，并把 error/panic/取消/非法 option/缺 handler 统一 fail closed；空 common permission changes 与上游一致，省略 `permission` meta。
 - runtime 为每个 prompt/steering turn 分配单调 generation，并把生成的 `ServerRequest` 变体直接交给 `approvalHandler`；生产 `permissionRequester` 只绑定 acp-go-sdk `AgentSideConnection.RequestPermission`，缺少 connection/session/turn 或回调期间身份变化均返回对应 typed 拒绝值。
-- Go transport 的 response waiter 与 readLoop 位于不同 goroutine；仅 `turn/start` 通过可选 `CallObserved` 在 result 解码后同步执行 `onTurnStarted`，再读取下一帧，等价保留上游 `await turnStart` 后立即安装 identity 的因果顺序，不缓存或重放通知/审批。
+- Go transport 的 response waiter 与 readLoop 位于不同 goroutine；仅 `turn/start` 通过可选 `CallObserved` 在 result 解码后同步执行 `onTurnStarted`，再读取下一帧，等价保留上游 `await turnStart` 后立即安装 identity 的因果顺序。caller context 取消只分离 waiter，one-shot observer 仍由 transport 持有并在迟到 response 上执行；重复/未知 response 忽略，fatal/Adapter Close 清空 observer。observer 只同步安装 identity，interrupt RPC 交给 Agent 自有 goroutine，避免 readLoop 自等待。
 - 合成 `ResolveTurnInterrupted` 被视为 stale turn 的终止边界并同时回收 stale identity；这是 Go 主动取消/回收 pending 请求所需的薄差异，避免真实 completion 已早到时等待不存在的第二条完成通知。
 - unknown method 只从 raw params 提取 string thread/turn identity，并连同当前 ACP session、method、payload bytes 记录安全摘要；其他 payload 不进入日志。认证错误同样不包装可能回显凭据的上游详情。
 
@@ -162,3 +162,4 @@ go run ./tools/protocolgen --check
 - 2026-08-23：补齐固定 upstream 的实时 stderr 与 pending-start 生命周期：stderr 同时进入有界崩溃尾部和结构化 Logger；cancel-before-start 立即释放前台槽位但保留迟到 observer；session/Adapter close 取消并回收 pending `RunTurn`。
 - 2026-08-23：按 codex-acp `ba5bcc3` 等价移植 event/tool/approval/config/content/auth 组件；补齐 terminal completion fallback/exit、unknown identity 安全摘要、空 permission meta 和并发 stale approval 证据，明确最终 runtime wiring 与 file update/move raw fallback 边界。
 - 2026-08-24：runtime composition root 直接复用已验证 event/approval/content 组件：typed 通知按当前 turn generation 路由，三类生成 ServerRequest 通过 SDK connection 请求权限并在缺失/迟到身份时 fail closed；删除 runtime 临时内容 mapper；补足 turn/start response activation barrier 与合成 completion 的 stale identity 回收。
+- 2026-08-24：按 `session-close.test.ts` delayed turn/start 修正 Go 可取消调用差异：本地 waiter 与 transport late observer 分离，CloseSession 无需等待 response，迟到 turn 仍经真实 wire stale+interrupt-once；补 ordinary cancel、duplicate response 与 fatal observer 回收测试。
