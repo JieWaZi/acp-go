@@ -1,0 +1,450 @@
+schema: comet.native.v4
+name: codex-events-config
+language: zh-CN
+phase: build
+status: active
+state_version: 2
+brief: brief.md
+spec_changes:
+  - capability: codex-config
+    operation: create
+    source: specs/codex-config/spec.md
+  - capability: codex-events
+    operation: create
+    source: specs/codex-events/spec.md
+  - capability: codex-events-config
+    operation: create
+    source: specs/codex-events-config/spec.md
+workspace:
+  isolation: worktree
+  change_branch: codex/codex-events-config
+  target_branch: main
+  finish: null
+loop:
+  stage: building
+  goal_cycle: 1
+  iteration: 1
+  attempt: 0
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：agent message/reasoning 增量按 item ID 关联，completed/fallback 不重复正文。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：plan checklist 和 token usage 映射正确，turn 之间 usage 不泄漏。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：Command/File/MCP 使用稳定 ToolCallID，保留 V1 可表达的标题、位置、diff、raw input/output。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：三类审批只接受本次有效 option；取消、未知、错误、缺 handler、stale generation 一律 fail closed。
+    result: pending
+    reason: null
+  - id: A5
+    source: brief.md
+    text: A5：read-only/agent/full-access 映射保持权限边界；未知 mode/model/effort 返回明确错误。
+    result: pending
+    reason: null
+  - id: A6
+    source: brief.md
+    text: A6：Text/Image/Resource 转换与上游一致；Audio/非法 union 明确拒绝。
+    result: pending
+    reason: null
+  - id: A7
+    source: brief.md
+    text: A7：只声明 api-key/chat-gpt；登录完成通知先订阅后 start，取消会 cancel login，secret
+      不进入日志/fixture。
+    result: pending
+    reason: null
+  - id: A8
+    source: brief.md
+    text: A8：unknown method/item 安全忽略并记录安全摘要，进程和 session 不崩溃。
+    result: pending
+    reason: null
+  - id: A9
+    source: brief.md
+    text: A9：全量 test/race/vet/build 通过，手写 Go 声明和关键逻辑有中文注释。
+    result: pending
+    reason: null
+  - id: A10
+    source: specs/codex-config/spec.md
+    text: initialize/session 创建时声明并接受固定基线支持的 model、reasoning effort 与 sandbox/agent
+      mode 选项。
+    result: pending
+    reason: null
+  - id: A11
+    source: specs/codex-config/spec.md
+    text: Adapter 将 ACP config option/mode 映射为 Codex app-server
+      参数；未知、失效或不兼容值返回可诊断错误，不静默使用危险权限。
+    result: pending
+    reason: null
+  - id: A12
+    source: specs/codex-config/spec.md
+    text: sandbox/agent mode 映射遵循固定上游语义，尤其保持 read-only、workspace-write/agent 和
+      full-access 的权限边界。
+    result: pending
+    reason: null
+  - id: A13
+    source: specs/codex-config/spec.md
+    text: load/resume 对配置的恢复/覆盖顺序与固定上游基线一致。
+    result: pending
+    reason: null
+  - id: A14
+    source: specs/codex-config/spec.md
+    text: V1 接受 ACP Text、Image 和 Resource input，并转换为固定 app-server schema 的 turn
+      input。
+    result: pending
+    reason: null
+  - id: A15
+    source: specs/codex-config/spec.md
+    text: Image 保留可用 MIME/URL/base64 信息；Resource 支持固定基线可转换的 resource link 与 embedded
+      resource。
+    result: pending
+    reason: null
+  - id: A16
+    source: specs/codex-config/spec.md
+    text: 不支持的 content block 类型以明确请求错误处理，不丢弃后继续；Audio 不在 V1。
+    result: pending
+    reason: null
+  - id: A17
+    source: specs/codex-config/spec.md
+    text: initialize 声明 ChatGPT 与 API Key 两种基础认证方式。
+    result: pending
+    reason: null
+  - id: A18
+    source: specs/codex-config/spec.md
+    text: ChatGPT 登录和 API Key 环境/请求的选择、成功、取消和失败按固定上游基线映射。
+    result: pending
+    reason: null
+  - id: A19
+    source: specs/codex-config/spec.md
+    text: V1 不支持 client-provided custom gateway/Gateway Auth；不得误宣告该能力。
+    result: pending
+    reason: null
+  - id: A20
+    source: specs/codex-config/spec.md
+    text: 凭据不得写入日志、UPSTREAM.md、fixture 或错误详情。
+    result: pending
+    reason: null
+  - id: A21
+    source: specs/codex-config/spec.md
+    text: A11：model/reasoning/sandbox/mode。
+    result: pending
+    reason: null
+  - id: A22
+    source: specs/codex-config/spec.md
+    text: A12：Text/Image/Resource 与 ChatGPT/API Key。
+    result: pending
+    reason: null
+  - id: A23
+    source: specs/codex-events/spec.md
+    text: 事件先按 thread/turn 与当前 session 状态关联，再由专用 handler/mapper 转换为 ACP session
+      updates。
+    result: pending
+    reason: null
+  - id: A24
+    source: specs/codex-events/spec.md
+    text: 核心事件使用生成的强类型协议类型；未知事件记录 method/type、相关 identity 与安全摘要后忽略。
+    result: pending
+    reason: null
+  - id: A25
+    source: specs/codex-events/spec.md
+    text: handler 的完成/清理幂等；增量和 completed/fallback 路径不得重复输出最终内容。
+    result: pending
+    reason: null
+  - id: A26
+    source: specs/codex-events/spec.md
+    text: Agent Message 映射为 ACP agent message chunk。
+    result: pending
+    reason: null
+  - id: A27
+    source: specs/codex-events/spec.md
+    text: Reasoning 映射为 ACP thought/reasoning chunk，并保留固定基线支持的 section
+      break/completed fallback 语义。
+    result: pending
+    reason: null
+  - id: A28
+    source: specs/codex-events/spec.md
+    text: 基础 Plan 映射为 ACP plan update；不实现 Review/Goal 的扩展状态机。
+    result: pending
+    reason: null
+  - id: A29
+    source: specs/codex-events/spec.md
+    text: Token Usage 映射为 V1 约定的 ACP update/meta；空值、累计更新和 turn 完成按固定基线处理。
+    result: pending
+    reason: null
+  - id: A30
+    source: specs/codex-events/spec.md
+    text: Command、File Change、MCP tool 的开始/进度/完成更新使用稳定 ToolCallID 关联。
+    result: pending
+    reason: null
+  - id: A31
+    source: specs/codex-events/spec.md
+    text: Command 尽可能保留标题、命令、路径、状态、终端/输出和原始输入。
+    result: pending
+    reason: null
+  - id: A32
+    source: specs/codex-events/spec.md
+    text: File Change 尽可能保留增加/修改/删除位置、diff 与 raw content；多文件事件不得串线。
+    result: pending
+    reason: null
+  - id: A33
+    source: specs/codex-events/spec.md
+    text: MCP 范围仅为 Codex 已执行 MCP tool event 的 ACP ToolCall 映射，不负责 client-provided
+      MCP server 配置或传输。
+    result: pending
+    reason: null
+  - id: A34
+    source: specs/codex-events/spec.md
+    text: Command、File Change、Permissions 三类 app-server request 映射为 ACP
+      `session/requestPermission`。
+    result: pending
+    reason: null
+  - id: A35
+    source: specs/codex-events/spec.md
+    text: 仅暴露固定基线对该请求有效的 allow-once/allow-for-scope/reject/cancel 选项；ACP
+      选择被严格校验后转换为对应 Codex response。
+    result: pending
+    reason: null
+  - id: A36
+    source: specs/codex-events/spec.md
+    text: ACP 取消、未知选项、超时、handler 缺失、映射异常或 connection 失败均 fail closed：command/file 返回
+      cancel，permissions 返回无授权/拒绝语义。
+    result: pending
+    reason: null
+  - id: A37
+    source: specs/codex-events/spec.md
+    text: Approval 与 thread/turn/session generation 关联；旧 turn 请求即使迟到也不得批准当前活动。
+    result: pending
+    reason: null
+  - id: A38
+    source: specs/codex-events/spec.md
+    text: cancel/session close/process exit 会解除等待中的 permission 请求并回传关闭语义。
+    result: pending
+    reason: null
+  - id: A39
+    source: specs/codex-events/spec.md
+    text: A8：消息、reasoning、plan、usage。
+    result: pending
+    reason: null
+  - id: A40
+    source: specs/codex-events/spec.md
+    text: A9：command/file/MCP tool call。
+    result: pending
+    reason: null
+  - id: A41
+    source: specs/codex-events/spec.md
+    text: A10：三类审批、fail closed 与 stale 防护。
+    result: pending
+    reason: null
+  - id: A42
+    source: specs/codex-events/spec.md
+    text: A14：未知事件兼容。
+    result: pending
+    reason: null
+  - id: A43
+    source: specs/codex-events-config/spec.md
+    text: 事件先按 thread/turn 与当前 session 状态关联，再由专用 handler/mapper 转换为 ACP session
+      updates。
+    result: pending
+    reason: null
+  - id: A44
+    source: specs/codex-events-config/spec.md
+    text: 核心事件使用生成的强类型协议类型；未知事件记录 method/type、相关 identity 与安全摘要后忽略。
+    result: pending
+    reason: null
+  - id: A45
+    source: specs/codex-events-config/spec.md
+    text: handler 的完成/清理幂等；增量和 completed/fallback 路径不得重复输出最终内容。
+    result: pending
+    reason: null
+  - id: A46
+    source: specs/codex-events-config/spec.md
+    text: Agent Message 映射为 ACP agent message chunk。
+    result: pending
+    reason: null
+  - id: A47
+    source: specs/codex-events-config/spec.md
+    text: Reasoning 映射为 ACP thought/reasoning chunk，并保留固定基线支持的 section
+      break/completed fallback 语义。
+    result: pending
+    reason: null
+  - id: A48
+    source: specs/codex-events-config/spec.md
+    text: 基础 Plan 映射为 ACP plan update；不实现 Review/Goal 的扩展状态机。
+    result: pending
+    reason: null
+  - id: A49
+    source: specs/codex-events-config/spec.md
+    text: Token Usage 映射为 V1 约定的 ACP update/meta；空值、累计更新和 turn 完成按固定基线处理。
+    result: pending
+    reason: null
+  - id: A50
+    source: specs/codex-events-config/spec.md
+    text: Command、File Change、MCP tool 的开始/进度/完成更新使用稳定 ToolCallID 关联。
+    result: pending
+    reason: null
+  - id: A51
+    source: specs/codex-events-config/spec.md
+    text: Command 尽可能保留标题、命令、路径、状态、终端/输出和原始输入。
+    result: pending
+    reason: null
+  - id: A52
+    source: specs/codex-events-config/spec.md
+    text: File Change 尽可能保留增加/修改/删除位置、diff 与 raw content；多文件事件不得串线。
+    result: pending
+    reason: null
+  - id: A53
+    source: specs/codex-events-config/spec.md
+    text: MCP 范围仅为 Codex 已执行 MCP tool event 的 ACP ToolCall 映射，不负责 client-provided
+      MCP server 配置或传输。
+    result: pending
+    reason: null
+  - id: A54
+    source: specs/codex-events-config/spec.md
+    text: Command、File Change、Permissions 三类 app-server request 映射为 ACP
+      `session/requestPermission`。
+    result: pending
+    reason: null
+  - id: A55
+    source: specs/codex-events-config/spec.md
+    text: 仅暴露固定基线对该请求有效的 allow-once/allow-for-scope/reject/cancel 选项；ACP
+      选择被严格校验后转换为对应 Codex response。
+    result: pending
+    reason: null
+  - id: A56
+    source: specs/codex-events-config/spec.md
+    text: ACP 取消、未知选项、超时、handler 缺失、映射异常或 connection 失败均 fail closed：command/file 返回
+      cancel，permissions 返回无授权/拒绝语义。
+    result: pending
+    reason: null
+  - id: A57
+    source: specs/codex-events-config/spec.md
+    text: Approval 与 thread/turn/session generation 关联；旧 turn 请求即使迟到也不得批准当前活动。
+    result: pending
+    reason: null
+  - id: A58
+    source: specs/codex-events-config/spec.md
+    text: cancel/session close/process exit 会解除等待中的 permission 请求并回传关闭语义。
+    result: pending
+    reason: null
+  - id: A59
+    source: specs/codex-events-config/spec.md
+    text: A8：消息、reasoning、plan、usage。
+    result: pending
+    reason: null
+  - id: A60
+    source: specs/codex-events-config/spec.md
+    text: A9：command/file/MCP tool call。
+    result: pending
+    reason: null
+  - id: A61
+    source: specs/codex-events-config/spec.md
+    text: A10：三类审批、fail closed 与 stale 防护。
+    result: pending
+    reason: null
+  - id: A62
+    source: specs/codex-events-config/spec.md
+    text: A14：未知事件兼容。
+    result: pending
+    reason: null
+  - id: A63
+    source: specs/codex-events-config/spec.md
+    text: initialize/session 创建时声明并接受固定基线支持的 model、reasoning effort 与 sandbox/agent
+      mode 选项。
+    result: pending
+    reason: null
+  - id: A64
+    source: specs/codex-events-config/spec.md
+    text: Adapter 将 ACP config option/mode 映射为 Codex app-server
+      参数；未知、失效或不兼容值返回可诊断错误，不静默使用危险权限。
+    result: pending
+    reason: null
+  - id: A65
+    source: specs/codex-events-config/spec.md
+    text: sandbox/agent mode 映射遵循固定上游语义，尤其保持 read-only、workspace-write/agent 和
+      full-access 的权限边界。
+    result: pending
+    reason: null
+  - id: A66
+    source: specs/codex-events-config/spec.md
+    text: load/resume 对配置的恢复/覆盖顺序与固定上游基线一致。
+    result: pending
+    reason: null
+  - id: A67
+    source: specs/codex-events-config/spec.md
+    text: V1 接受 ACP Text、Image 和 Resource input，并转换为固定 app-server schema 的 turn
+      input。
+    result: pending
+    reason: null
+  - id: A68
+    source: specs/codex-events-config/spec.md
+    text: Image 保留可用 MIME/URL/base64 信息；Resource 支持固定基线可转换的 resource link 与 embedded
+      resource。
+    result: pending
+    reason: null
+  - id: A69
+    source: specs/codex-events-config/spec.md
+    text: 不支持的 content block 类型以明确请求错误处理，不丢弃后继续；Audio 不在 V1。
+    result: pending
+    reason: null
+  - id: A70
+    source: specs/codex-events-config/spec.md
+    text: initialize 声明 ChatGPT 与 API Key 两种基础认证方式。
+    result: pending
+    reason: null
+  - id: A71
+    source: specs/codex-events-config/spec.md
+    text: ChatGPT 登录和 API Key 环境/请求的选择、成功、取消和失败按固定上游基线映射。
+    result: pending
+    reason: null
+  - id: A72
+    source: specs/codex-events-config/spec.md
+    text: V1 不支持 client-provided custom gateway/Gateway Auth；不得误宣告该能力。
+    result: pending
+    reason: null
+  - id: A73
+    source: specs/codex-events-config/spec.md
+    text: 凭据不得写入日志、UPSTREAM.md、fixture 或错误详情。
+    result: pending
+    reason: null
+  - id: A74
+    source: specs/codex-events-config/spec.md
+    text: A11：model/reasoning/sandbox/mode。
+    result: pending
+    reason: null
+  - id: A75
+    source: specs/codex-events-config/spec.md
+    text: A12：Text/Image/Resource 与 ChatGPT/API Key。
+    result: pending
+    reason: null
+builder_handoff: null
+blockers: []
+verification: null
+history: []
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pending
+verification_report: null
+archived: false
+created_at: 2026-08-23T14:08:53.749Z
