@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -634,4 +635,196 @@ func TestAgentCancelLetsCompletedTurnWinOverInterrupt(t *testing.T) {
 		t.Fatalf("completion-first 响应为 %#v", response)
 	}
 	close(releaseInterrupt)
+}
+
+// TestAgentNotificationUsesVerifiedEventRouter 验证 runtime 只把当前 generation 的 typed 通知交给 sibling event mapper。
+func TestAgentNotificationUsesVerifiedEventRouter(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnStarted := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-events"
+			return nil
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: "turn-events", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			close(turnStarted)
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+	promptResponse := make(chan acp.PromptResponse, 1)
+	promptErr := make(chan error, 1)
+	go func() {
+		response, err := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: "thread-events",
+			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "events"}}},
+		})
+		promptResponse <- response
+		promptErr <- err
+	}()
+	<-turnStarted
+	state, ok := agent.sessions.get("thread-events")
+	if !ok {
+		t.Fatal("事件测试 session 不存在")
+	}
+	prompt := sessionActivePrompt(state)
+	generation, ok := agent.currentTurnGeneration("thread-events", "turn-events")
+	if prompt == nil || !ok {
+		t.Fatal("事件测试当前 turn generation 不存在")
+	}
+	updater := &recordingSessionUpdater{}
+	prompt.setEventRouter(newEventRouter(updater, generation, agent, agent.logger))
+
+	current, err := protocol.DecodeServerNotification([]byte(
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-events","turnId":"turn-events","itemId":"message-1","delta":"hello"}}`,
+	))
+	if err != nil {
+		t.Fatalf("解码当前事件失败: %v", err)
+	}
+	agent.client.HandleNotification(context.Background(), current)
+	if len(updater.notifications) != 1 {
+		t.Fatalf("当前事件 update 数为 %d", len(updater.notifications))
+	}
+	message := updater.notifications[0].Update.AgentMessageChunk
+	if message == nil || message.MessageId == nil || *message.MessageId != "message-1" {
+		t.Fatalf("runtime 未复用 event mapper 的 message identity: %#v", message)
+	}
+	stale, err := protocol.DecodeServerNotification([]byte(
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-events","turnId":"turn-old","itemId":"message-old","delta":"stale"}}`,
+	))
+	if err != nil {
+		t.Fatalf("解码 stale 事件失败: %v", err)
+	}
+	agent.client.HandleNotification(context.Background(), stale)
+	if len(updater.notifications) != 1 {
+		t.Fatalf("stale 事件污染当前 generation: %#v", updater.notifications)
+	}
+
+	agent.client.HandleNotification(context.Background(), completeNotification(
+		t, "thread-events", "turn-events", protocol.FluffyCompleted,
+	))
+	if err = <-promptErr; err != nil {
+		t.Fatalf("事件测试 prompt 返回错误: %v", err)
+	}
+	if response := <-promptResponse; response.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("事件测试 prompt 响应为 %#v", response)
+	}
+}
+
+// TestAgentApprovalFailsClosedWhenTurnGenerationChanges 验证 permission 回调期间完成旧 turn 后，旧审批不会授权新 turn。
+func TestAgentApprovalFailsClosedWhenTurnGenerationChanges(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnStarted := make(chan string, 2)
+	var turnMu sync.Mutex
+	turnNumber := 0
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-approval"
+			return nil
+		case protocol.MethodTurnStart:
+			turnMu.Lock()
+			turnNumber++
+			turnID := fmt.Sprintf("turn-%d", turnNumber)
+			turnMu.Unlock()
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: turnID, Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			turnStarted <- turnID
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	requester := &blockingPermissionRequester{entered: make(chan struct{}), release: make(chan struct{})}
+	agent.connectionMu.Lock()
+	agent.approvalRequester = requester
+	agent.connectionMu.Unlock()
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+
+	startPrompt := func(text string) (<-chan acp.PromptResponse, <-chan error) {
+		responses := make(chan acp.PromptResponse, 1)
+		errorsResult := make(chan error, 1)
+		go func() {
+			response, err := agent.Prompt(context.Background(), acp.PromptRequest{
+				SessionId: "thread-approval",
+				Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: text}}},
+			})
+			responses <- response
+			errorsResult <- err
+		}()
+		return responses, errorsResult
+	}
+	firstResponse, firstErr := startPrompt("first")
+	if turnID := <-turnStarted; turnID != "turn-1" {
+		t.Fatalf("第一轮 turn ID 为 %q", turnID)
+	}
+	request, err := protocol.DecodeServerRequest([]byte(
+		`{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"command":"pwd","cwd":"/tmp","itemId":"item-1","startedAtMs":1,"threadId":"thread-approval","turnId":"turn-1"}}`,
+	))
+	if err != nil {
+		t.Fatalf("解码审批请求失败: %v", err)
+	}
+	type approvalResult struct {
+		// value 是 app-server typed 审批响应。
+		value any
+		// err 是 server request 路由错误。
+		err error
+	}
+	approvalResults := make(chan approvalResult, 1)
+	go func() {
+		value, routeErr := agent.handleServerRequest(context.Background(), request)
+		approvalResults <- approvalResult{value: value, err: routeErr}
+	}()
+	<-requester.entered
+
+	agent.client.HandleNotification(context.Background(), completeNotification(
+		t, "thread-approval", "turn-1", protocol.FluffyCompleted,
+	))
+	if err = <-firstErr; err != nil {
+		t.Fatalf("第一轮 prompt 返回错误: %v", err)
+	}
+	if response := <-firstResponse; response.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("第一轮 prompt 响应为 %#v", response)
+	}
+	secondResponse, secondErr := startPrompt("second")
+	if turnID := <-turnStarted; turnID != "turn-2" {
+		t.Fatalf("第二轮 turn ID 为 %q", turnID)
+	}
+
+	close(requester.release)
+	approval := <-approvalResults
+	if approval.err != nil {
+		t.Fatalf("stale approval 路由错误: %v", approval.err)
+	}
+	command, ok := approval.value.(protocol.CommandExecutionRequestApprovalResponse)
+	if !ok || command.Decision == nil || command.Decision.Enum == nil || *command.Decision.Enum != protocol.Cancel {
+		t.Fatalf("stale approval 未 fail-closed: %#v", approval.value)
+	}
+	agent.client.HandleNotification(context.Background(), completeNotification(
+		t, "thread-approval", "turn-2", protocol.FluffyCompleted,
+	))
+	if err = <-secondErr; err != nil {
+		t.Fatalf("第二轮 prompt 返回错误: %v", err)
+	}
+	if response := <-secondResponse; response.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("第二轮 prompt 响应为 %#v", response)
+	}
 }

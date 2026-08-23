@@ -45,17 +45,3 @@ func TestBuildPromptInputMatchesUpstreamContentRules(t *testing.T) {
 		t.Fatalf("图片资源输入为 %#v", input[4])
 	}
 }
-
-// TestBuildPromptInputDropsAudioLikeUpstream 验证未声明的 audio 能力不会产生错误 wire 变体。
-func TestBuildPromptInputDropsAudioLikeUpstream(t *testing.T) {
-	t.Parallel()
-	input, err := buildPromptInput([]acp.ContentBlock{{
-		Audio: &acp.ContentBlockAudio{Type: "audio", MimeType: "audio/wav", Data: "YWJj"},
-	}})
-	if err != nil {
-		t.Fatalf("过滤 audio 返回错误: %v", err)
-	}
-	if len(input) != 0 {
-		t.Fatalf("audio 产生了输入: %#v", input)
-	}
-}

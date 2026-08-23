@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 
 	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
@@ -42,16 +43,18 @@ type Config struct {
 	CodexPath string
 }
 
-// notificationRouter 解决 transport 必须先启动 reader，而 typed client 随后才可构造的依赖环。
-type notificationRouter struct {
-	// mu 保护 client 发布。
+// appServerRouter 解决 transport 必须先启动 reader，而 typed client/Agent 随后才可构造的依赖环。
+type appServerRouter struct {
+	// mu 保护 client 与 agent 发布。
 	mu sync.RWMutex
 	// client 是接收 discriminator-first 通知的 typed client。
 	client *appServerClient
+	// agent 是消费审批 server request 的 runtime；构造窗口内可为空。
+	agent *Agent
 }
 
 // route 把通知交给已发布 client；构造窗口内到达的无请求通知安全忽略。
-func (r *notificationRouter) route(ctx context.Context, notification protocol.ServerNotification) {
+func (r *appServerRouter) route(ctx context.Context, notification protocol.ServerNotification) {
 	r.mu.RLock()
 	client := r.client
 	r.mu.RUnlock()
@@ -61,10 +64,28 @@ func (r *notificationRouter) route(ctx context.Context, notification protocol.Se
 }
 
 // publish 原子发布 typed client。
-func (r *notificationRouter) publish(client *appServerClient) {
+func (r *appServerRouter) publish(client *appServerClient) {
 	r.mu.Lock()
 	r.client = client
 	r.mu.Unlock()
+}
+
+// publishAgent 原子发布已完成依赖注入的 runtime Agent。
+func (r *appServerRouter) publishAgent(agent *Agent) {
+	r.mu.Lock()
+	r.agent = agent
+	r.mu.Unlock()
+}
+
+// routeServerRequest 把生成协议变体交给 Agent；构造窗口内按请求类型返回拒绝安全结果。
+func (r *appServerRouter) routeServerRequest(ctx context.Context, request protocol.ServerRequest) (any, error) {
+	r.mu.RLock()
+	agent := r.agent
+	r.mu.RUnlock()
+	if agent == nil {
+		return failClosedServerRequest(request)
+	}
+	return agent.handleServerRequest(ctx, request)
 }
 
 // Agent 是 Codex Adapter 的 ACP 协议入口，并拥有唯一 app-server runtime。
@@ -93,6 +114,8 @@ type Agent struct {
 	connectionMu sync.RWMutex
 	// connection 是 acp-go-sdk 创建的唯一 AgentSideConnection。
 	connection *acp.AgentSideConnection
+	// approvalRequester 是 approval 组件消费的窄接口；生产值始终与 connection 相同，测试可独立注入。
+	approvalRequester permissionRequester
 	// connectionReady 是 notification/approval 路由的启动 barrier。
 	connectionReady chan struct{}
 	// connectionReadyOnce 保证 binder 重复调用不会 panic。
@@ -103,6 +126,8 @@ type Agent struct {
 	prompts map[*activePrompt]*sessionState
 	// promptsClosing 阻止 Adapter Close 开始后安装新的 prompt 后台任务。
 	promptsClosing bool
+	// nextTurnGeneration 为每个 prompt/steering turn 分配 Adapter 内单调身份。
+	nextTurnGeneration atomic.Uint64
 	// closeOnce 保证 transport/process 只释放一次。
 	closeOnce sync.Once
 	// closeErr 保存首次 Close 的结果。
@@ -117,10 +142,19 @@ var (
 
 // NewAgent 解析用户预装 Codex、探测版本并启动唯一 app-server 进程。
 func NewAgent(ctx context.Context, config Config) (*Agent, error) {
+	return newAgentWithVersionRunner(ctx, config, runVersionCommand)
+}
+
+// newAgentWithVersionRunner 保留组合根的真实进程装配，仅允许测试隔离短生命周期版本探测。
+// 该缝直接复用 prepareExecutable 的 commandRunner，不引入覆盖 runtime 的大接口。
+func newAgentWithVersionRunner(ctx context.Context, config Config, runVersion commandRunner) (*Agent, error) {
 	if config.Logger == nil {
 		return nil, fmt.Errorf("creating codex agent: %w", ErrInvalidLogger)
 	}
-	executable, err := prepareExecutable(ctx, config.CodexPath, config.Logger, exec.LookPath, runVersionCommand)
+	if runVersion == nil {
+		return nil, errors.New("creating codex agent: version runner is nil")
+	}
+	executable, err := prepareExecutable(ctx, config.CodexPath, config.Logger, exec.LookPath, runVersion)
 	if err != nil {
 		return nil, fmt.Errorf("creating codex agent: %w", err)
 	}
@@ -133,16 +167,17 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, fmt.Errorf("creating codex agent: %w", err)
 	}
 
-	router := &notificationRouter{}
+	router := &appServerRouter{}
 	transport := newAppServerTransport(
 		runtimeCtx,
 		process.Stdout(),
 		process.Stdin(),
 		nil,
 		transportOptions{
-			Logger:              config.Logger,
-			NotificationHandler: router.route,
-			EOFError:            process.FinalError,
+			Logger:               config.Logger,
+			NotificationHandler:  router.route,
+			ServerRequestHandler: router.routeServerRequest,
+			EOFError:             process.FinalError,
 		},
 	)
 	client := newAppServerClient(runtimeCtx, transport)
@@ -150,6 +185,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	agent := newAgentWithClient(config.Logger, runtimeCtx, runtimeCancel, client)
 	agent.transport = transport
 	agent.process = process
+	router.publishAgent(agent)
 	return agent, nil
 }
 
@@ -180,6 +216,7 @@ func (a *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 	a.connectionMu.Lock()
 	if a.connection == nil {
 		a.connection = connection
+		a.approvalRequester = connection
 	}
 	a.connectionMu.Unlock()
 	a.markConnectionReady()
@@ -409,7 +446,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
-	prompt := newActivePrompt(a.runtimeCtx, state.generation)
+	prompt := newActivePrompt(a.runtimeCtx, a.nextTurnGeneration.Add(1))
 	if err := a.installActivePrompt(state, prompt); err != nil {
 		prompt.cancelRun()
 		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, err)
@@ -576,6 +613,15 @@ func (a *Agent) onTurnStarted(state *sessionState, prompt *activePrompt, turnID 
 	late := prompt.setTurn(turnID) || !a.sessions.isCurrent(state)
 	if late {
 		a.requestPromptInterrupt(state, prompt, turnID, true)
+		return
+	}
+	if connection := a.currentConnection(); connection != nil {
+		prompt.setEventRouter(newEventRouter(connection, turnGeneration{
+			SessionID:  acp.SessionId(state.id),
+			ThreadID:   state.id,
+			TurnID:     turnID,
+			Generation: prompt.generation,
+		}, a, a.logger))
 	}
 }
 

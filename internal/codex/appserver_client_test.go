@@ -26,6 +26,59 @@ type fakeAppServerRPC struct {
 	err error
 }
 
+// observedTurnStartRPC 验证 RunTurn 会消费 transport 提供的同步 response observer 小接口。
+type observedTurnStartRPC struct {
+	// done 模拟运行中的 transport。
+	done chan struct{}
+	// observed 在 turn identity observer 已执行时关闭。
+	observed chan struct{}
+}
+
+// Call 拒绝普通调用，确保被测 RunTurn 不能绕过同步 observer。
+func (f *observedTurnStartRPC) Call(
+	context.Context,
+	func(protocol.RequestID) protocol.ClientRequest,
+	any,
+) error {
+	return errors.New("RunTurn used ordinary Call instead of CallObserved")
+}
+
+// CallObserved 填充 turn/start result 后同步执行 observer。
+func (f *observedTurnStartRPC) CallObserved(
+	_ context.Context,
+	build func(protocol.RequestID) protocol.ClientRequest,
+	result any,
+	observer func() error,
+) error {
+	idNumber := int64(1)
+	if request := build(protocol.RequestID{Integer: &idNumber}); request.Method() != protocol.MethodTurnStart {
+		return errors.New("observed call was not turn/start")
+	}
+	result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+		ID: "turn-observed", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+	}
+	if err := observer(); err != nil {
+		return err
+	}
+	close(f.observed)
+	return nil
+}
+
+// Notify 满足 appServerRPC；该测试不发送客户端通知。
+func (f *observedTurnStartRPC) Notify(context.Context, protocol.ClientNotification) error {
+	return nil
+}
+
+// Done 返回模拟 transport fatal 通道。
+func (f *observedTurnStartRPC) Done() <-chan struct{} {
+	return f.done
+}
+
+// Err 返回运行中 transport 的空 fatal 错误。
+func (f *observedTurnStartRPC) Err() error {
+	return nil
+}
+
 // newFakeAppServerRPC 创建尚未 fatal 的 fake RPC。
 func newFakeAppServerRPC() *fakeAppServerRPC {
 	return &fakeAppServerRPC{done: make(chan struct{})}
@@ -151,6 +204,75 @@ func TestRunTurnCapturesCompletionBeforeStartResponse(t *testing.T) {
 	}
 	if completion.Turn.ID != "turn-fast" {
 		t.Fatalf("completion 为 %#v", completion)
+	}
+}
+
+// TestResolveTurnInterruptedClearsStaleAfterEarlyCompletion 验证真实 completion 已提前到达时，
+// 迟到 start 的合成 interrupted 清理不会永久保留 stale turn identity。
+func TestResolveTurnInterruptedClearsStaleAfterEarlyCompletion(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	client := newAppServerClient(context.Background(), rpc)
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if request.Method() != protocol.MethodTurnStart {
+			t.Fatalf("请求方法为 %q", request.Method())
+		}
+		client.HandleNotification(context.Background(), completeNotification(
+			t, "thread-early-stale", "turn-early-stale", protocol.FluffyInterrupted,
+		))
+		result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+			ID: "turn-early-stale", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+		}
+		return nil
+	}
+
+	_, err := client.RunTurn(context.Background(), protocol.TurnStartParams{
+		ThreadID: "thread-early-stale",
+		Input:    []protocol.InputElement{},
+	}, func(turnID string) {
+		client.MarkTurnStale("thread-early-stale", turnID)
+		client.ResolveTurnInterrupted("thread-early-stale", turnID)
+	})
+	if err != nil {
+		t.Fatalf("RunTurn 返回错误: %v", err)
+	}
+	client.handlerMu.Lock()
+	defer client.handlerMu.Unlock()
+	if turns := client.staleTurns["thread-early-stale"]; len(turns) != 0 {
+		t.Fatalf("合成 completion 后仍保留 stale turns: %v", turns)
+	}
+}
+
+// TestRunTurnActivatesIdentityInsideObservedResponse 验证 turn/start identity 在 transport 读取下一帧前安装。
+func TestRunTurnActivatesIdentityInsideObservedResponse(t *testing.T) {
+	t.Parallel()
+	rpc := &observedTurnStartRPC{done: make(chan struct{}), observed: make(chan struct{})}
+	client := newAppServerClient(context.Background(), rpc)
+	started := make(chan string, 1)
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.RunTurn(context.Background(), protocol.TurnStartParams{
+			ThreadID: "thread-observed",
+			Input:    []protocol.InputElement{},
+		}, func(turnID string) {
+			started <- turnID
+		})
+		result <- err
+	}()
+
+	select {
+	case <-rpc.observed:
+	case err := <-result:
+		t.Fatalf("RunTurn 未使用同步 response observer: %v", err)
+	}
+	if turnID := <-started; turnID != "turn-observed" {
+		t.Fatalf("同步 observer 收到 turn ID %q", turnID)
+	}
+	client.HandleNotification(context.Background(), completeNotification(
+		t, "thread-observed", "turn-observed", protocol.FluffyCompleted,
+	))
+	if err := <-result; err != nil {
+		t.Fatalf("RunTurn 返回错误: %v", err)
 	}
 }
 

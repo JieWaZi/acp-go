@@ -26,6 +26,18 @@ type appServerRPC interface {
 	Err() error
 }
 
+// observedResponseRPC 是真实 transport 为严格响应顺序提供的可选小接口。
+// fake RPC 不必实现；RunTurn 才需要在 turn/start 响应与下一帧之间同步安装 identity。
+type observedResponseRPC interface {
+	// CallObserved 解码 result 后同步执行 observer，再允许 transport 继续处理后续帧。
+	CallObserved(
+		ctx context.Context,
+		build func(protocol.RequestID) protocol.ClientRequest,
+		result any,
+		observer func() error,
+	) error
+}
+
 // completionResult 保存一个 turn/completed 或解除等待的 fatal 错误。
 type completionResult struct {
 	// notification 是匹配 thread/turn 的完成通知。
@@ -300,9 +312,24 @@ func (c *appServerClient) RunTurn(
 		return protocol.TurnCompletedNotification{}, err
 	}
 	var response protocol.TurnStartResponse
-	err = c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+	buildRequest := func(id protocol.RequestID) protocol.ClientRequest {
 		return protocol.NewTurnStartRequest(id, params)
-	}, &response)
+	}
+	responseObserved := false
+	if rpc, ok := c.rpc.(observedResponseRPC); ok {
+		err = rpc.CallObserved(ctx, buildRequest, &response, func() error {
+			if response.Turn.ID == "" {
+				return errors.New("codex turn/start response has empty turn id")
+			}
+			if onTurnStarted != nil {
+				onTurnStarted(response.Turn.ID)
+			}
+			responseObserved = true
+			return nil
+		})
+	} else {
+		err = c.rpc.Call(ctx, buildRequest, &response)
+	}
 	if err != nil {
 		c.completions.releaseCapture(params.ThreadID, capture)
 		return protocol.TurnCompletedNotification{}, err
@@ -311,7 +338,7 @@ func (c *appServerClient) RunTurn(
 		c.completions.releaseCapture(params.ThreadID, capture)
 		return protocol.TurnCompletedNotification{}, errors.New("codex turn/start response has empty turn id")
 	}
-	if onTurnStarted != nil {
+	if !responseObserved && onTurnStarted != nil {
 		onTurnStarted(response.Turn.ID)
 	}
 	return c.completions.waitAfterStart(ctx, params.ThreadID, response.Turn.ID, capture)
@@ -359,6 +386,10 @@ func (c *appServerClient) MarkTurnStale(threadID, turnID string) {
 // ResolveTurnInterrupted 在 close/进程清理无法依赖真实通知时解除精确 completion waiter。
 // 等价 upstream CodexAppServerClient.resolveTurnInterrupted 的合成 interrupted completion。
 func (c *appServerClient) ResolveTurnInterrupted(threadID, turnID string) {
+	// 合成 completion 是该 stale turn 的终止边界；真实 completion 已提前到达时不能等待不存在的第二条通知清理标记。
+	c.handlerMu.Lock()
+	c.clearTurnStaleLocked(threadID, turnID)
+	c.handlerMu.Unlock()
 	c.completions.record(protocol.TurnCompletedNotification{
 		ThreadID: threadID,
 		Turn: protocol.TurnElement{
@@ -377,10 +408,7 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 	c.handlerMu.Lock()
 	_, stale := c.staleTurns[threadID][turnID]
 	if stale && notification.Method() == protocol.MethodTurnCompleted {
-		delete(c.staleTurns[threadID], turnID)
-		if len(c.staleTurns[threadID]) == 0 {
-			delete(c.staleTurns, threadID)
-		}
+		c.clearTurnStaleLocked(threadID, turnID)
 	}
 	handler := c.handler
 	c.handlerMu.Unlock()
@@ -388,6 +416,16 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 		return
 	}
 	handler(ctx, notification)
+}
+
+// clearTurnStaleLocked 删除一个 stale identity，并回收已经为空的 thread 容器。
+// 调用方必须持有 handlerMu。
+func (c *appServerClient) clearTurnStaleLocked(threadID, turnID string) {
+	turns := c.staleTurns[threadID]
+	delete(turns, turnID)
+	if len(turns) == 0 {
+		delete(c.staleTurns, threadID)
+	}
 }
 
 // notificationRouting 提取当前 runtime 需要保护的 thread/turn 身份。
@@ -404,6 +442,10 @@ func notificationRouting(notification protocol.ServerNotification) (string, stri
 	case *protocol.ReasoningTextDeltaEnvelope:
 		return value.Params.ThreadID, value.Params.TurnID
 	default:
+		threadID, turnID, scoped := notificationScope(notification)
+		if scoped {
+			return threadID, turnID
+		}
 		return "", ""
 	}
 }

@@ -114,6 +114,65 @@ func TestAppServerTransportOmitsJSONRPCAndMatchesResponse(t *testing.T) {
 	}
 }
 
+// TestAppServerTransportObservedResponseBlocksFollowingFrames 验证 response observer 完成前读取循环不能继续处理后续帧。
+// 这补足 Go goroutine 调度与 upstream vscode-jsonrpc 串行消息队列之间的语言边界差异。
+func TestAppServerTransportObservedResponseBlocksFollowingFrames(t *testing.T) {
+	harness := newTransportHarness(t, 4096, nil, nil)
+
+	observerEntered := make(chan struct{})
+	releaseObserver := make(chan struct{})
+	callResult := make(chan error, 1)
+	go func() {
+		var response protocol.TurnStartResponse
+		callResult <- harness.transport.CallObserved(
+			context.Background(),
+			func(id protocol.RequestID) protocol.ClientRequest {
+				return protocol.NewTurnStartRequest(id, protocol.TurnStartParams{
+					ThreadID: "thread-1",
+					Input:    []protocol.InputElement{},
+				})
+			},
+			&response,
+			func() error {
+				if response.Turn.ID != "turn-1" {
+					return errors.New("observer saw undecoded turn/start response")
+				}
+				close(observerEntered)
+				<-releaseObserver
+				return nil
+			},
+		)
+	}()
+
+	line, err := harness.requests.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("读取 turn/start 请求失败: %v", err)
+	}
+	var request map[string]json.RawMessage
+	if err = json.Unmarshal(line, &request); err != nil {
+		t.Fatalf("解析 turn/start 请求失败: %v", err)
+	}
+
+	dispatchReturned := make(chan struct{})
+	go func() {
+		harness.transport.dispatchLine([]byte(
+			`{"id":` + string(request["id"]) + `,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}`,
+		))
+		close(dispatchReturned)
+	}()
+	<-observerEntered
+	select {
+	case <-dispatchReturned:
+		t.Fatal("response observer 返回前 dispatchLine 已继续")
+	default:
+	}
+	close(releaseObserver)
+	<-dispatchReturned
+	if err = <-callResult; err != nil {
+		t.Fatalf("观察 turn/start response 失败: %v", err)
+	}
+}
+
 // TestAppServerTransportRoutesNotificationBeforeResponse 验证通知可在对应请求响应前被路由。
 func TestAppServerTransportRoutesNotificationBeforeResponse(t *testing.T) {
 	t.Parallel()

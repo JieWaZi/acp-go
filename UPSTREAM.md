@@ -75,8 +75,8 @@ go run ./tools/protocolgen --check
 | `src/app-server/v2/ThreadStartParams.ts`、`ThreadResumeParams.ts` | `ThreadStartParams`、`ThreadResumeParams` | model、cwd、approval、sandbox、config 与恢复参数 |
 | `src/app-server/v2/TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` | 对应生成类型 | required thread/turn identity、输入数组和 steering precondition |
 | `src/app-server/v2/ThreadItem.ts`、`UserInput.ts` | `ThreadItem`、`UserInput` 及 discriminator enum | 消息、reasoning、command、file、MCP、Text/Image/Resource 相关 wire union |
-| `src/CodexAppServerClient.ts` 的 `initialize`、`turnStart`、`runTurn`、approval request handlers | 后续 JSON-RPC client/runtime；当前提供其所需具名协议类型 | 请求与响应配对、early completion 捕获、stale approval fail-closed 所需 identity 字段 |
-| `src/StdUtils.ts` 的 `createJSONRPCReader`/`createJSONRPCWriter` | `internal/codex/appserver_transport.go` | newline 拆帧、malformed 忽略、出站删除 `jsonrpc`；Go 侧额外增加帧长、pending 与 server-request 并发上限 |
+| `src/CodexAppServerClient.ts` 的 `initialize`、`turnStart`、`runTurn`、approval request handlers | `internal/codex/appserver_client.go`、`approval_runtime.go` | 请求与响应配对、early completion 捕获、生成 ServerRequest 分派，以及 SDK permission 回调前后的 stale generation fail-closed |
+| `src/StdUtils.ts` 的 `createJSONRPCReader`/`createJSONRPCWriter`、`CodexAppServerClient.runTurn` | `internal/codex/appserver_transport.go`、`appserver_client.go` | newline 拆帧、malformed 忽略、出站删除 `jsonrpc`；Go 侧额外增加帧长、pending 与 server-request 并发上限，并用同步 response observer 保留 `turn/start` identity 先于后续帧激活的上游顺序 |
 | `src/CodexJsonRpcConnection.ts` 的 `startCodexConnection`、`attachLogs` | `internal/codex/process.go`、`executable.go` | 唯一 `codex app-server` 进程、stdin/stdout、退出 dispose、实时 stderr 结构化日志与有界崩溃尾部；可执行文件来源按本项目 V1 的 `CODEX_PATH`→PATH 约束替换 bundled npm fallback |
 | `src/CodexAppServerClient.ts` 的 `initialize`、`runTurn`、`awaitTurnCompleted`、`recordTurnCompleted`、`markTurnStale` | `internal/codex/appserver_client.go` | typed request、initialized、response 前 completion 捕获、thread/turn 精确 waiter、stale 清理与 fatal fan-out |
 | `src/CodexAcpClient.ts` 的 `newSession`、`resumeSession`、`loadSession`、`closeSession`、`sendPrompt`、`buildPromptItems` | `internal/codex/agent.go`、`session.go`、`prompt.go` | thread start、resume、load 的 resume→read 顺序、unsubscribe、Text/Image/Resource 转换与多轮 prompt |
@@ -109,6 +109,7 @@ go run ./tools/protocolgen --check
 | `session-close.test.ts` 的 stale resume/reopen 与 delayed turn start 用例 | `session_test.go`、`agent_runtime_test.go` | close generation、迟到 open、取消 pending turn/start 与后台 goroutine 回收 |
 | `steer-events.test.ts` | `steering_test.go` | startedNewTurn→injected FIFO、unexpected failure 后继续、malformed、bounded close cleanup |
 | `process-exit-error.test.ts`、`CodexJsonRpcConnection.attachLogs` | `process_test.go`、`appserver_transport_test.go` | exit code/stderr 尾部、pending fatal fan-out，以及运行中/干净退出的实时 stderr 结构化日志 |
+| `approval-events.test.ts` 的 delayed/stale approval 场景 | `agent_runtime_test.go`、`process_test.go` | transport handler 组合根接线、缺少 connection/session/turn 时 fail closed，以及 permission barrier 内切换 turn generation 后拒绝旧审批 |
 
 固定 clone 中 `input-server-events.json` 是 0 字节占位文件，不作为回归证据。当前 `protocol_test.go` 锁住 envelope method/params 耦合、typed Item、optional+nullable 三态、tagged discriminator、登录完成通知和审批 union 往返。运行时子变更应直接移植上表非空 fixture 的完整行为断言，而不是在协议生成层重复 mapper 逻辑。
 
@@ -132,6 +133,9 @@ go run ./tools/protocolgen --check
 - 上游 file update/move 依赖 npm `diff` 与文件读取重建 rich diff。Go V1 不自写 patch parser：add/delete 直接使用 SDK diff DTO，update/move 与 patchUpdated 保留生成协议 typed raw changes。
 - 上游静默过滤 Audio；V1 未声明 Audio，因此 `content.go` 明确返回请求错误。固定 schema 没有历史 completed plan 的生成常量，兼容分支只识别其 discriminator，稳定计划仍消费 `turn/plan/updated`。
 - Go approval 在外部 permission callback 前后读取 runtime generation，并把 error/panic/取消/非法 option/缺 handler 统一 fail closed；空 common permission changes 与上游一致，省略 `permission` meta。
+- runtime 为每个 prompt/steering turn 分配单调 generation，并把生成的 `ServerRequest` 变体直接交给 `approvalHandler`；生产 `permissionRequester` 只绑定 acp-go-sdk `AgentSideConnection.RequestPermission`，缺少 connection/session/turn 或回调期间身份变化均返回对应 typed 拒绝值。
+- Go transport 的 response waiter 与 readLoop 位于不同 goroutine；仅 `turn/start` 通过可选 `CallObserved` 在 result 解码后同步执行 `onTurnStarted`，再读取下一帧，等价保留上游 `await turnStart` 后立即安装 identity 的因果顺序，不缓存或重放通知/审批。
+- 合成 `ResolveTurnInterrupted` 被视为 stale turn 的终止边界并同时回收 stale identity；这是 Go 主动取消/回收 pending 请求所需的薄差异，避免真实 completion 已早到时等待不存在的第二条完成通知。
 - unknown method 只从 raw params 提取 string thread/turn identity，并连同当前 ACP session、method、payload bytes 记录安全摘要；其他 payload 不进入日志。认证错误同样不包装可能回显凭据的上游详情。
 
 ## 明确跳过
@@ -157,3 +161,4 @@ go run ./tools/protocolgen --check
 - 2026-08-23：接入 Codex runtime：用户预装可执行文件与版本探测、唯一 app-server、有界无 `jsonrpc` NDJSON、initialize、session generation/close fence、multi-turn/early/stale completion、cancel/late interrupt、FIFO steering、进程 fatal fan-out 和 SDK connection ready barrier。
 - 2026-08-23：补齐固定 upstream 的实时 stderr 与 pending-start 生命周期：stderr 同时进入有界崩溃尾部和结构化 Logger；cancel-before-start 立即释放前台槽位但保留迟到 observer；session/Adapter close 取消并回收 pending `RunTurn`。
 - 2026-08-23：按 codex-acp `ba5bcc3` 等价移植 event/tool/approval/config/content/auth 组件；补齐 terminal completion fallback/exit、unknown identity 安全摘要、空 permission meta 和并发 stale approval 证据，明确最终 runtime wiring 与 file update/move raw fallback 边界。
+- 2026-08-24：runtime composition root 直接复用已验证 event/approval/content 组件：typed 通知按当前 turn generation 路由，三类生成 ServerRequest 通过 SDK connection 请求权限并在缺失/迟到身份时 fail closed；删除 runtime 临时内容 mapper；补足 turn/start response activation barrier 与合成 completion 的 stale identity 回收。

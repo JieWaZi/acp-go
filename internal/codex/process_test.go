@@ -3,6 +3,7 @@ package codex
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -51,16 +53,11 @@ func (h *processLogHandler) WithGroup(_ string) slog.Handler {
 	return h
 }
 
-// waitForProcessLog 等待进程日志并用超时守卫报告缺失事件，超时不参与并发时序判定。
+// waitForProcessLog 用结构化日志通道作为进程夹具的确定性完成屏障。
+// 测试进程的硬超时由 go test -timeout 统一提供，避免宿主拥塞误触发局部一秒期限。
 func waitForProcessLog(t *testing.T, handler *processLogHandler) slog.Record {
 	t.Helper()
-	select {
-	case record := <-handler.records:
-		return record
-	case <-time.After(time.Second):
-		t.Fatal("未收到 app-server stderr 结构化日志")
-		return slog.Record{}
-	}
+	return <-handler.records
 }
 
 // processLogStderr 返回结构化进程日志中的 stderr 字段。
@@ -86,6 +83,13 @@ func writeExecutableScript(t *testing.T, body string) string {
 		t.Fatalf("写 fake Codex 失败: %v", err)
 	}
 	return path
+}
+
+// newProcessTestAgent 跳过与进程生命周期断言无关的真实 --version 子进程，避免并行夹具争用生产探测期限。
+func newProcessTestAgent(ctx context.Context, config Config) (*Agent, error) {
+	return newAgentWithVersionRunner(ctx, config, func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("codex-cli " + verifiedCodexVersion + "\n"), nil
+	})
 }
 
 // TestStartAppServerUsesSingleProcessAndAppServerArgument 验证进程只启动一次且固定使用 app-server 子命令。
@@ -160,7 +164,7 @@ echo "running diagnostic" >&2
 cat >/dev/null
 `)
 	handler := newProcessLogHandler()
-	agent, err := NewAgent(context.Background(), Config{
+	agent, err := newProcessTestAgent(context.Background(), Config{
 		Logger: slog.New(handler), CodexPath: path,
 	})
 	if err != nil {
@@ -194,7 +198,7 @@ echo "clean-exit diagnostic" >&2
 exit 0
 `)
 	handler := newProcessLogHandler()
-	agent, err := NewAgent(context.Background(), Config{
+	agent, err := newProcessTestAgent(context.Background(), Config{
 		Logger: slog.New(handler), CodexPath: path,
 	})
 	if err != nil {
@@ -209,6 +213,50 @@ exit 0
 	<-agent.process.Done()
 	if err = agent.process.Err(); err != nil {
 		t.Fatalf("干净退出不应产生进程错误: %v", err)
+	}
+}
+
+// TestAgentFailsClosedEarlyApprovalWithoutConnection 验证组合根已安装 server request handler，连接尚未绑定时仍返回拒绝结果。
+func TestAgentFailsClosedEarlyApprovalWithoutConnection(t *testing.T) {
+	t.Parallel()
+	path := writeExecutableScript(t, `
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.148.0"
+  exit 0
+fi
+echo '{"id":"approval-early","method":"item/commandExecution/requestApproval","params":{"command":"pwd","cwd":"/tmp","itemId":"item-1","startedAtMs":1,"threadId":"thread-1","turnId":"turn-1"}}'
+IFS= read -r response
+echo "$response" >&2
+cat >/dev/null
+`)
+	handler := newProcessLogHandler()
+	agent, err := newProcessTestAgent(context.Background(), Config{
+		Logger: slog.New(handler), CodexPath: path,
+	})
+	if err != nil {
+		t.Fatalf("创建 Agent 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = agent.Close(closeCtx)
+	})
+
+	record := waitForProcessLog(t, handler)
+	var response struct {
+		// ID 是 app-server 原始审批请求标识。
+		ID string `json:"id"`
+		// Result 是缺少连接/身份时的拒绝安全结果。
+		Result protocol.CommandExecutionRequestApprovalResponse `json:"result"`
+		// Error 表示 transport 错误响应，正确接线时必须为空。
+		Error *rpcError `json:"error"`
+	}
+	if err = json.Unmarshal([]byte(processLogStderr(record)), &response); err != nil {
+		t.Fatalf("解析 approval 响应失败: %v", err)
+	}
+	if response.ID != "approval-early" || response.Error != nil || response.Result.Decision == nil ||
+		response.Result.Decision.Enum == nil || *response.Result.Decision.Enum != protocol.Cancel {
+		t.Fatalf("缺少连接时 approval 未 fail-closed: %#v", response)
 	}
 }
 
@@ -250,7 +298,7 @@ exit 7
 `)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	agent, err := NewAgent(ctx, Config{
+	agent, err := newProcessTestAgent(ctx, Config{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CodexPath: path,
 	})
 	if err != nil {
@@ -280,7 +328,7 @@ fi
 cat >/dev/null
 `)
 	constructionCtx, cancelConstruction := context.WithCancel(context.Background())
-	agent, err := NewAgent(constructionCtx, Config{
+	agent, err := newProcessTestAgent(constructionCtx, Config{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CodexPath: path,
 	})
 	if err != nil {
@@ -290,9 +338,8 @@ cat >/dev/null
 	if err = agent.runtimeCtx.Err(); err != nil {
 		t.Fatalf("construction context 抢先终止 Agent runtime: %v", err)
 	}
-	closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
-	defer cancelClose()
-	if err = agent.Close(closeCtx); err != nil {
+	// fake shell 的调度/回收可能受并行测试宿主拥塞影响；go test -timeout 统一提供死锁保护。
+	if err = agent.Close(context.Background()); err != nil {
 		t.Fatalf("显式关闭 Agent 失败: %v", err)
 	}
 }

@@ -61,6 +61,15 @@ type pendingResponse struct {
 	err error
 }
 
+// pendingCall 保存等待通道和可选的同步 response observer。
+// observer 只用于 turn/start 激活屏障，必须在 readLoop 继续读取下一帧前返回。
+type pendingCall struct {
+	// response 接收唯一一次响应或 transport fatal。
+	response chan pendingResponse
+	// observe 在 result 解码后同步安装依赖该响应的 runtime 身份；普通调用为 nil。
+	observe func(result json.RawMessage) error
+}
+
 // rpcResponseWire 是 Codex 无 jsonrpc 字段响应的最小 envelope。
 type rpcResponseWire struct {
 	// ID 与请求 ID 精确匹配。
@@ -105,8 +114,8 @@ type appServerTransport struct {
 	nextID atomic.Int64
 	// pendingMu 保护 pending、fatalErr 和 closed。
 	pendingMu sync.Mutex
-	// pending 按 JSON ID 文本保存等待响应的调用。
-	pending map[string]chan pendingResponse
+	// pending 按 JSON ID 文本保存等待响应的调用及其可选激活屏障。
+	pending map[string]pendingCall
 	// fatalErr 是首次致命失败创建的共享稳定错误实例。
 	fatalErr error
 	// writeMu 防止并发请求或服务端回复交叉写入同一 NDJSON 行。
@@ -145,7 +154,7 @@ func newAppServerTransport(
 		writer:      writer,
 		closer:      closer,
 		options:     options,
-		pending:     make(map[string]chan pendingResponse),
+		pending:     make(map[string]pendingCall),
 		serverSlots: make(chan struct{}, options.MaxServerRequests),
 		done:        make(chan struct{}),
 	}
@@ -159,6 +168,37 @@ func (t *appServerTransport) Call(
 	build func(id protocol.RequestID) protocol.ClientRequest,
 	result any,
 ) error {
+	return t.call(ctx, build, result, nil)
+}
+
+// CallObserved 在 result 解码后、readLoop 继续下一帧前同步执行 observer。
+// 该薄边界等价保留 upstream runTurn 在 turn/start 响应与后续通知之间安装 turn identity 的顺序。
+func (t *appServerTransport) CallObserved(
+	ctx context.Context,
+	build func(id protocol.RequestID) protocol.ClientRequest,
+	result any,
+	observer func() error,
+) error {
+	return t.call(ctx, build, nil, func(raw json.RawMessage) error {
+		if result != nil {
+			if err := json.Unmarshal(raw, result); err != nil {
+				return fmt.Errorf("decoding observed codex app-server response: %w", err)
+			}
+		}
+		if observer == nil {
+			return nil
+		}
+		return observer()
+	})
+}
+
+// call 实现普通响应交付与可选同步 observer 共用的 pending 生命周期。
+func (t *appServerTransport) call(
+	ctx context.Context,
+	build func(id protocol.RequestID) protocol.ClientRequest,
+	result any,
+	observer func(result json.RawMessage) error,
+) error {
 	idNumber := t.nextID.Add(1)
 	id := protocol.RequestID{Integer: &idNumber}
 	key := strconv.FormatInt(idNumber, 10)
@@ -170,7 +210,7 @@ func (t *appServerTransport) Call(
 		t.pendingMu.Unlock()
 		return err
 	}
-	t.pending[key] = responseChannel
+	t.pending[key] = pendingCall{response: responseChannel, observe: observer}
 	t.pendingMu.Unlock()
 
 	request := build(id)
@@ -309,7 +349,7 @@ func (t *appServerTransport) handleResponse(line []byte) {
 	}
 	key := normalizeJSONID(response.ID)
 	t.pendingMu.Lock()
-	channel, ok := t.pending[key]
+	call, ok := t.pending[key]
 	if ok {
 		delete(t.pending, key)
 	}
@@ -321,7 +361,10 @@ func (t *appServerTransport) handleResponse(line []byte) {
 	if response.Error != nil {
 		responseErr = response.Error
 	}
-	channel <- pendingResponse{result: response.Result, err: responseErr}
+	if responseErr == nil && call.observe != nil {
+		responseErr = call.observe(response.Result)
+	}
+	call.response <- pendingResponse{result: response.Result, err: responseErr}
 }
 
 // handleNotification 使用 protocol 的 discriminator-first union 解码已知通知。
@@ -425,13 +468,13 @@ func (t *appServerTransport) fail(cause error) {
 	}
 	stableError := t.fatalErr
 	pending := t.pending
-	t.pending = make(map[string]chan pendingResponse)
+	t.pending = make(map[string]pendingCall)
 	close(t.done)
 	t.pendingMu.Unlock()
 
 	// 不持锁投递，避免等待者恢复后立刻查询 transport 状态造成锁反转。
-	for _, channel := range pending {
-		channel <- pendingResponse{err: stableError}
+	for _, call := range pending {
+		call.response <- pendingResponse{err: stableError}
 	}
 	t.cancel()
 }

@@ -331,7 +331,7 @@ func (m *steeringManager) startNewTurn(
 	if !m.agent.sessions.isCurrent(state) || state.generation != generation {
 		return steeringResponse{}, acp.NewInvalidRequest("session is closing")
 	}
-	prompt := newActivePrompt(m.agent.runtimeCtx, generation)
+	prompt := newActivePrompt(m.agent.runtimeCtx, m.agent.nextTurnGeneration.Add(1))
 	if err := m.agent.installActivePrompt(state, prompt); err != nil {
 		prompt.cancelRun()
 		return steeringResponse{}, err
