@@ -1,101 +1,540 @@
-// Package codex 提供 Codex Adapter 的 ACP Agent 接入点。
+// Package codex 提供 Codex app-server 到 ACP Agent 的生命周期适配。
 package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
+	"sync"
 
+	"acp-go/agents/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 
 const (
-	agentName    = "codex"
-	agentTitle   = "Codex"
+	// agentName 是 ACP initialize 中的稳定实现名称。
+	agentName = "codex"
+	// agentTitle 是 ACP 客户端展示的 Adapter 名称。
+	agentTitle = "Codex"
+	// agentVersion 是当前仓库尚未注入构建版本时的显式开发标识。
 	agentVersion = "development"
 )
 
 var (
 	// ErrInvalidLogger 表示 Codex Adapter 缺少进程级诊断 logger。
 	ErrInvalidLogger = errors.New("invalid codex logger")
-	// ErrRuntimeUnavailable 表示 framework foundation 尚未接入 Codex app-server runtime。
-	// 后续 runtime 子变更会用真实 thread/turn 实现替换返回此错误的必选操作。
+	// ErrRuntimeUnavailable 兼容 foundation 的可检查错误，并用于 runtime 已关闭路径。
 	ErrRuntimeUnavailable = errors.New("codex runtime unavailable")
+	// ErrAgentNotInitialized 表示 thread/turn 请求早于 app-server initialize。
+	ErrAgentNotInitialized = errors.New("codex agent not initialized")
+	// ErrConnectionNotReady 表示事件发送前外层 SDK connection 尚未注入。
+	ErrConnectionNotReady = errors.New("ACP agent connection not ready")
 )
 
-// Agent 是 Codex Adapter 的 ACP 协议入口。
-// Foundation 阶段只提供诚实的 initialize 身份，其余业务由后续 Codex 子变更实现。
-type Agent struct {
-	// logger 是后续 app-server runtime、事件和异常路径共用的进程级诊断入口。
-	logger *slog.Logger
+// Config 保存 Codex Adapter 组合根必须显式提供的依赖与启动选项。
+type Config struct {
+	// Logger 把版本警告、stderr 和异常诊断写到进程 stderr。
+	Logger *slog.Logger
+	// CodexPath 是 CODEX_PATH 的值；空值才允许从 PATH 查询。
+	CodexPath string
 }
 
-var _ acp.Agent = (*Agent)(nil)
+// notificationRouter 解决 transport 必须先启动 reader，而 typed client 随后才可构造的依赖环。
+type notificationRouter struct {
+	// mu 保护 client 发布。
+	mu sync.RWMutex
+	// client 是接收 discriminator-first 通知的 typed client。
+	client *appServerClient
+}
 
-// NewAgent 使用显式 logger 创建一个不声明未实现能力的 Codex Agent。
-func NewAgent(logger *slog.Logger) (*Agent, error) {
-	if logger == nil {
+// route 把通知交给已发布 client；构造窗口内到达的无请求通知安全忽略。
+func (r *notificationRouter) route(ctx context.Context, notification protocol.ServerNotification) {
+	r.mu.RLock()
+	client := r.client
+	r.mu.RUnlock()
+	if client != nil {
+		client.HandleNotification(ctx, notification)
+	}
+}
+
+// publish 原子发布 typed client。
+func (r *notificationRouter) publish(client *appServerClient) {
+	r.mu.Lock()
+	r.client = client
+	r.mu.Unlock()
+}
+
+// Agent 是 Codex Adapter 的 ACP 协议入口，并拥有唯一 app-server runtime。
+type Agent struct {
+	// logger 是进程级诊断入口，绝不写外层 ACP stdout。
+	logger *slog.Logger
+	// runtimeCtx 跨单次 ACP 请求存活，直到 Adapter Close。
+	runtimeCtx context.Context
+	// runtimeCancel 终止所有后台 turn、steering 和通知任务。
+	runtimeCancel context.CancelFunc
+	// client 是 app-server 生成 DTO typed client。
+	client *appServerClient
+	// transport 是 Codex 无 jsonrpc NDJSON 边界；测试组合可为空。
+	transport *appServerTransport
+	// process 是当前 Adapter 唯一 `codex app-server` 进程；测试组合可为空。
+	process *appServerProcess
+	// sessions 管理 session generation、close fence 与 active prompt。
+	sessions *sessionStore
+	// steering 管理每 session 有界 FIFO extension 请求。
+	steering *steeringManager
+	// initializeMu 保护 initialized。
+	initializeMu sync.RWMutex
+	// initialized 表示 app-server initialize/initialized 已成功完成。
+	initialized bool
+	// connectionMu 保护外层 SDK connection。
+	connectionMu sync.RWMutex
+	// connection 是 acp-go-sdk 创建的唯一 AgentSideConnection。
+	connection *acp.AgentSideConnection
+	// connectionReady 是 notification/approval 路由的启动 barrier。
+	connectionReady chan struct{}
+	// connectionReadyOnce 保证 binder 重复调用不会 panic。
+	connectionReadyOnce sync.Once
+	// closeOnce 保证 transport/process 只释放一次。
+	closeOnce sync.Once
+	// closeErr 保存首次 Close 的结果。
+	closeErr error
+}
+
+var (
+	_ acp.Agent                  = (*Agent)(nil)
+	_ acp.AgentLoader            = (*Agent)(nil)
+	_ acp.ExtensionMethodHandler = (*Agent)(nil)
+)
+
+// NewAgent 解析用户预装 Codex、探测版本并启动唯一 app-server 进程。
+func NewAgent(ctx context.Context, config Config) (*Agent, error) {
+	if config.Logger == nil {
 		return nil, fmt.Errorf("creating codex agent: %w", ErrInvalidLogger)
 	}
-	return &Agent{logger: logger}, nil
+	executable, err := prepareExecutable(ctx, config.CodexPath, config.Logger, exec.LookPath, runVersionCommand)
+	if err != nil {
+		return nil, fmt.Errorf("creating codex agent: %w", err)
+	}
+	// construction/Serve context 只约束启动；成功后 runtime 由 Agent.Close 单独拥有，
+	// 否则信号取消会让 exec.CommandContext 抢在 acpserver 的有界清理窗口前杀死子进程。
+	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
+	process, err := startAppServer(runtimeCtx, executable.Path, processOptions{})
+	if err != nil {
+		runtimeCancel()
+		return nil, fmt.Errorf("creating codex agent: %w", err)
+	}
+
+	router := &notificationRouter{}
+	transport := newAppServerTransport(
+		runtimeCtx,
+		process.Stdout(),
+		process.Stdin(),
+		nil,
+		transportOptions{
+			Logger:              config.Logger,
+			NotificationHandler: router.route,
+			EOFError:            process.FinalError,
+		},
+	)
+	client := newAppServerClient(runtimeCtx, transport)
+	router.publish(client)
+	agent := newAgentWithClient(config.Logger, runtimeCtx, runtimeCancel, client)
+	agent.transport = transport
+	agent.process = process
+	return agent, nil
 }
 
-// Authenticate 处理认证请求；foundation 阶段未声明认证能力。
+// newAgentWithClient 通过手工依赖注入创建 Agent，测试无需伪造大 Runtime 接口或真实进程。
+func newAgentWithClient(
+	logger *slog.Logger,
+	runtimeCtx context.Context,
+	runtimeCancel context.CancelFunc,
+	client *appServerClient,
+) *Agent {
+	agent := &Agent{
+		logger:          logger,
+		runtimeCtx:      runtimeCtx,
+		runtimeCancel:   runtimeCancel,
+		client:          client,
+		sessions:        newSessionStore(),
+		connectionReady: make(chan struct{}),
+	}
+	agent.steering = newSteeringManager(agent, defaultSteeringQueueCapacity)
+	client.SetNotificationHandler(agent.handleNotification)
+	return agent
+}
+
+// SetAgentConnection 接收 acpserver 创建的 SDK connection，并释放事件路由 barrier。
+// v0.13.5 connection 构造后已启动读取 goroutine；此处绝不调用存在竞态的 SetLogger。
+func (a *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
+	a.connectionMu.Lock()
+	if a.connection == nil {
+		a.connection = connection
+	}
+	a.connectionMu.Unlock()
+	a.markConnectionReady()
+}
+
+// markConnectionReady 关闭 binder barrier；测试可在不构造 SDK connection 时复用同一同步语义。
+func (a *Agent) markConnectionReady() {
+	a.connectionReadyOnce.Do(func() { close(a.connectionReady) })
+}
+
+// waitConnection 等待 acpserver 在 SDK goroutine 启动后完成 connection 注入。
+func (a *Agent) waitConnection(ctx context.Context) (*acp.AgentSideConnection, error) {
+	select {
+	case <-a.connectionReady:
+		a.connectionMu.RLock()
+		connection := a.connection
+		a.connectionMu.RUnlock()
+		return connection, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting for ACP connection: %w", ctx.Err())
+	case <-a.runtimeCtx.Done():
+		return nil, fmt.Errorf("waiting for ACP connection: %w", ErrConnectionNotReady)
+	}
+}
+
+// Authenticate 未在 runtime 子变更声明认证能力。
 func (a *Agent) Authenticate(context.Context, acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
 	return acp.AuthenticateResponse{}, acp.NewMethodNotFound(acp.AgentMethodAuthenticate)
 }
 
-// Initialize 返回稳定协议版本和最小 Agent 身份，不提前声明后续 runtime 能力。
-func (a *Agent) Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error) {
-	a.logger.Debug("received acp initialize request")
+// Initialize 先完成唯一 app-server 握手，再声明真实可用的 session/prompt 能力。
+func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
+	clientInfo := protocol.ClientInfo{Name: "acp-client", Title: stringPointer("ACP Client"), Version: "unknown"}
+	if request.ClientInfo != nil {
+		clientInfo.Name = request.ClientInfo.Name
+		clientInfo.Title = request.ClientInfo.Title
+		clientInfo.Version = request.ClientInfo.Version
+	}
+	if _, err := a.client.Initialize(ctx, clientInfo); err != nil {
+		return acp.InitializeResponse{}, fmt.Errorf("initializing codex app-server: %w", err)
+	}
+	a.initializeMu.Lock()
+	a.initialized = true
+	a.initializeMu.Unlock()
 	title := agentTitle
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
-		AgentInfo: &acp.Implementation{
-			Name:    agentName,
-			Title:   &title,
-			Version: agentVersion,
+		AgentCapabilities: acp.AgentCapabilities{
+			LoadSession: true,
+			PromptCapabilities: acp.PromptCapabilities{
+				Image: true, EmbeddedContext: true,
+			},
+			SessionCapabilities: acp.SessionCapabilities{
+				Close: &acp.SessionCloseCapabilities{}, Resume: &acp.SessionResumeCapabilities{},
+			},
 		},
+		AgentInfo: &acp.Implementation{Name: agentName, Title: &title, Version: agentVersion},
 	}, nil
 }
 
-// Logout 处理退出认证请求；foundation 阶段未声明认证能力。
+// Logout 未在 runtime 子变更声明认证能力。
 func (a *Agent) Logout(context.Context, acp.LogoutRequest) (acp.LogoutResponse, error) {
 	return acp.LogoutResponse{}, acp.NewMethodNotFound(acp.AgentMethodLogout)
 }
 
-// Cancel 处理会话取消；没有 runtime 活动时该操作保持幂等。
-func (a *Agent) Cancel(context.Context, acp.CancelNotification) error {
+// NewSession 把 ACP session/new 映射为 Codex thread/start 并安装 generation 状态。
+func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	cwd := request.Cwd
+	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{Cwd: &cwd})
+	if err != nil {
+		return acp.NewSessionResponse{}, fmt.Errorf("starting codex thread: %w", err)
+	}
+	if response.Thread.ID == "" {
+		return acp.NewSessionResponse{}, errors.New("starting codex thread: empty thread id")
+	}
+	generation, err := a.sessions.beginOpen(response.Thread.ID)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	if _, installed := a.sessions.install(response.Thread.ID, request.Cwd, generation); !installed {
+		return acp.NewSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
+	}
+	return acp.NewSessionResponse{SessionId: acp.SessionId(response.Thread.ID)}, nil
+}
+
+// ResumeSession 使用 thread/resume 恢复订阅，并受 generation/close fence 保护。
+func (a *Agent) ResumeSession(
+	ctx context.Context,
+	request acp.ResumeSessionRequest,
+) (acp.ResumeSessionResponse, error) {
+	_, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, false)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+	return acp.ResumeSessionResponse{}, nil
+}
+
+// LoadSession 按固定 upstream 顺序执行 thread/resume→thread/read(includeTurns=true)，再安装状态。
+func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	_, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, true)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	// 历史到 ACP update 的完整 mapper 由 codex-events-config 子变更消费；runtime 已保证读取发生在安装前。
+	return acp.LoadSessionResponse{}, nil
+}
+
+// openExistingSession 复用 resume/load 的 generation 状态机，并按需在安装前读取历史。
+func (a *Agent) openExistingSession(
+	ctx context.Context,
+	sessionID string,
+	cwd string,
+	includeHistory bool,
+) (protocol.Thread, error) {
+	if err := a.requireInitialized(); err != nil {
+		return protocol.Thread{}, err
+	}
+	generation, err := a.sessions.beginOpen(sessionID)
+	if err != nil {
+		return protocol.Thread{}, err
+	}
+	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{ThreadID: sessionID, Cwd: &cwd})
+	if err != nil {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, fmt.Errorf("resuming codex thread %q: %w", sessionID, err)
+	}
+	thread := response.Thread
+	if includeHistory {
+		includeTurns := true
+		readResponse, readErr := a.client.ThreadRead(ctx, protocol.ThreadReadParams{
+			ThreadID: sessionID, IncludeTurns: &includeTurns,
+		})
+		if readErr != nil {
+			return protocol.Thread{}, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, readErr)
+		}
+		thread = readResponse.Thread
+	}
+	if _, installed := a.sessions.install(sessionID, cwd, generation); !installed {
+		return protocol.Thread{}, a.closeStaleOpen(ctx, sessionID, generation)
+	}
+	return thread, nil
+}
+
+// cleanupFailedSubscribedOpen 释放已订阅但后续 read/配置失败的 thread。
+func (a *Agent) cleanupFailedSubscribedOpen(ctx context.Context, sessionID string, generation uint64, cause error) error {
+	if a.sessions.beginStaleCleanup(sessionID, generation) {
+		defer a.sessions.endClose(sessionID)
+		if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
+			return fmt.Errorf("reading codex thread %q: %w", sessionID, errors.Join(cause, err))
+		}
+	}
+	return fmt.Errorf("reading codex thread %q: %w", sessionID, cause)
+}
+
+// closeStaleOpen 仅在旧 open 仍是最新订阅时 unsubscribe，绝不影响新 reopen。
+func (a *Agent) closeStaleOpen(ctx context.Context, sessionID string, generation uint64) error {
+	if a.sessions.beginStaleCleanup(sessionID, generation) {
+		defer a.sessions.endClose(sessionID)
+		if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
+			return fmt.Errorf("closing stale session %q: %w", sessionID, errors.Join(ErrSessionClosing, err))
+		}
+	}
+	return fmt.Errorf("opening session %q: %w", sessionID, ErrSessionClosing)
+}
+
+// CloseSession 提升 generation、取消活动 prompt，再 unsubscribe Codex thread。
+func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	sessionID := string(request.SessionId)
+	_, state := a.sessions.beginClose(sessionID)
+	defer a.sessions.endClose(sessionID)
+	a.steering.CloseSession(sessionID, ErrSessionClosing)
+	if state != nil {
+		state.mu.Lock()
+		prompt := state.activePrompt
+		state.mu.Unlock()
+		if prompt != nil {
+			turnID := prompt.requestCancel()
+			prompt.markForegroundFinished()
+			if turnID != "" {
+				a.client.MarkTurnStale(sessionID, turnID)
+				a.requestPromptInterrupt(state, prompt, turnID, false)
+				select {
+				case <-prompt.interruptDone:
+				case <-ctx.Done():
+				}
+				a.client.ResolveTurnInterrupted(sessionID, turnID)
+			}
+		}
+	}
+	if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
+		return acp.CloseSessionResponse{}, fmt.Errorf("unsubscribing codex thread %q: %w", sessionID, err)
+	}
+	return acp.CloseSessionResponse{}, nil
+}
+
+// Prompt 提交 turn/start，并按精确 completion 产生 ACP stop reason。
+func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acp.PromptResponse{}, err
+	}
+	state, ok := a.sessions.get(string(request.SessionId))
+	if !ok {
+		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, ErrSessionNotFound)
+	}
+	if _, err := a.waitConnection(ctx); err != nil {
+		return acp.PromptResponse{}, err
+	}
+	input, err := buildPromptInput(request.Prompt)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+	prompt := newActivePrompt(state.generation)
+	state.mu.Lock()
+	if state.activePrompt != nil {
+		state.mu.Unlock()
+		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, ErrPromptActive)
+	}
+	state.activePrompt = prompt
+	state.mu.Unlock()
+
+	// turnResult 在后台 runtime 生命周期与前台 ACP 请求之间传递一次精确 turn 结果。
+	type turnResult struct {
+		// completion 是精确 turn 的完成通知。
+		completion protocol.TurnCompletedNotification
+		// err 是 turn/start、completion 或 process fatal 错误。
+		err error
+	}
+	resultChannel := make(chan turnResult, 1)
+	go func() {
+		completion, runErr := a.client.RunTurn(a.runtimeCtx, protocol.TurnStartParams{
+			ThreadID: state.id, Input: input, ClientUserMessageID: request.MessageId,
+		}, func(turnID string) {
+			a.onTurnStarted(state, prompt, turnID)
+		})
+		a.clearActivePrompt(state, prompt)
+		resultChannel <- turnResult{completion: completion, err: runErr}
+	}()
+
+	requestDone := ctx.Done()
+	cancelSignal := prompt.cancelSignal
+	for {
+		select {
+		case result := <-resultChannel:
+			prompt.markForegroundFinished()
+			if result.err != nil {
+				if errors.Is(result.err, context.Canceled) {
+					_, cancelled := prompt.currentTurn()
+					if cancelled {
+						return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+					}
+				}
+				return acp.PromptResponse{}, fmt.Errorf("running codex turn: %w", result.err)
+			}
+			switch result.completion.Turn.Status {
+			case protocol.FluffyInterrupted:
+				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+			case protocol.FluffyCompleted:
+				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn, UserMessageId: request.MessageId}, nil
+			case protocol.Failed:
+				return acp.PromptResponse{}, fmt.Errorf("codex turn %q failed", result.completion.Turn.ID)
+			default:
+				return acp.PromptResponse{}, fmt.Errorf(
+					"codex turn %q completed with unexpected status %q",
+					result.completion.Turn.ID,
+					result.completion.Turn.Status,
+				)
+			}
+		case <-requestDone:
+			turnID := prompt.requestCancel()
+			if turnID == "" {
+				prompt.markForegroundFinished()
+				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+			}
+			a.requestPromptInterrupt(state, prompt, turnID, false)
+			requestDone = nil
+			cancelSignal = nil
+		case <-cancelSignal:
+			turnID, _ := prompt.currentTurn()
+			if turnID == "" {
+				prompt.markForegroundFinished()
+				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+			}
+			a.requestPromptInterrupt(state, prompt, turnID, false)
+			requestDone = nil
+			cancelSignal = nil
+		case <-a.runtimeCtx.Done():
+			prompt.markForegroundFinished()
+			return acp.PromptResponse{}, fmt.Errorf("running codex turn: %w", ErrRuntimeUnavailable)
+		}
+	}
+}
+
+// onTurnStarted 处理正常或取消后迟到的 turn identity，并触发一次 interrupt。
+func (a *Agent) onTurnStarted(state *sessionState, prompt *activePrompt, turnID string) {
+	late := prompt.setTurn(turnID) || !a.sessions.isCurrent(state)
+	if late {
+		a.requestPromptInterrupt(state, prompt, turnID, true)
+	}
+}
+
+// requestPromptInterrupt 使用 activePrompt 的 Once 保证所有取消来源合计只请求一次。
+// resolveInterrupted 对应 upstream interruptLateStartedTurn：迟到 start 无前台等待真实 completion，故 finally 合成 interrupted。
+func (a *Agent) requestPromptInterrupt(
+	state *sessionState,
+	prompt *activePrompt,
+	turnID string,
+	resolveInterrupted bool,
+) {
+	if resolveInterrupted {
+		a.client.MarkTurnStale(state.id, turnID)
+	}
+	prompt.interruptOnce.Do(func() {
+		go func() {
+			defer close(prompt.interruptDone)
+			if resolveInterrupted {
+				defer a.client.ResolveTurnInterrupted(state.id, turnID)
+			}
+			if err := a.client.TurnInterrupt(a.runtimeCtx, state.id, turnID); err != nil {
+				a.logger.Warn("Codex turn interrupt 失败", "thread_id", state.id, "turn_id", turnID, "error", err)
+			}
+		}()
+	})
+}
+
+// clearActivePrompt 只清理仍指向当前 background turn 的 session 槽位。
+func (a *Agent) clearActivePrompt(state *sessionState, prompt *activePrompt) {
+	state.mu.Lock()
+	if state.activePrompt == prompt {
+		state.activePrompt = nil
+	}
+	state.mu.Unlock()
+	prompt.markBackgroundDone()
+}
+
+// Cancel 幂等取消 session 的 pending/active prompt；turn 未知时不发送 interrupt。
+func (a *Agent) Cancel(_ context.Context, notification acp.CancelNotification) error {
+	state, ok := a.sessions.get(string(notification.SessionId))
+	if !ok {
+		return nil
+	}
+	state.mu.Lock()
+	prompt := state.activePrompt
+	state.mu.Unlock()
+	if prompt == nil {
+		return nil
+	}
+	turnID := prompt.requestCancel()
+	if turnID != "" {
+		a.requestPromptInterrupt(state, prompt, turnID, false)
+	}
 	return nil
 }
 
-// CloseSession 处理会话关闭；foundation 阶段未声明关闭能力。
-func (a *Agent) CloseSession(context.Context, acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	return acp.CloseSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionClose)
-}
-
-// ListSessions 处理会话列表请求；foundation 阶段未声明列表能力。
+// ListSessions 未在 runtime 子变更实现列表 mapper。
 func (a *Agent) ListSessions(context.Context, acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
 	return acp.ListSessionsResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionList)
 }
 
-// NewSession 拒绝在 app-server runtime 接入前创建虚假会话。
-func (a *Agent) NewSession(context.Context, acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	return acp.NewSessionResponse{}, runtimeUnavailable(acp.AgentMethodSessionNew)
-}
-
-// Prompt 拒绝在 app-server runtime 接入前伪造 prompt 成功结果。
-func (a *Agent) Prompt(context.Context, acp.PromptRequest) (acp.PromptResponse, error) {
-	return acp.PromptResponse{}, runtimeUnavailable(acp.AgentMethodSessionPrompt)
-}
-
-// ResumeSession 处理会话恢复请求；foundation 阶段未声明恢复能力。
-func (a *Agent) ResumeSession(context.Context, acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	return acp.ResumeSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionResume)
-}
-
-// SetSessionConfigOption 处理配置请求；foundation 阶段未声明会话配置能力。
+// SetSessionConfigOption 由 codex-events-config 子变更实现。
 func (a *Agent) SetSessionConfigOption(
 	context.Context,
 	acp.SetSessionConfigOptionRequest,
@@ -103,12 +542,55 @@ func (a *Agent) SetSessionConfigOption(
 	return acp.SetSessionConfigOptionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetConfigOption)
 }
 
-// SetSessionMode 处理模式请求；foundation 阶段未声明会话模式能力。
+// SetSessionMode 由 codex-events-config 子变更实现。
 func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
-// runtimeUnavailable 为必选协议操作保留可检查的根因，并附加具体方法上下文。
-func runtimeUnavailable(method string) error {
-	return fmt.Errorf("handling %s: %w", method, ErrRuntimeUnavailable)
+// HandleExtensionMethod 把唯一 V1 steering extension 交给有界 FIFO manager；其余使用 SDK 标准错误。
+func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	if method != steeringExtensionMethod {
+		return nil, acp.NewMethodNotFound(method)
+	}
+	return a.steering.Handle(ctx, params)
+}
+
+// Close 幂等终止 session、transport 与唯一 app-server 进程。
+func (a *Agent) Close(ctx context.Context) error {
+	a.closeOnce.Do(func() {
+		a.steering.Close(ErrRuntimeUnavailable)
+		for _, state := range a.sessions.closeAll() {
+			state.mu.Lock()
+			prompt := state.activePrompt
+			state.mu.Unlock()
+			if prompt != nil {
+				prompt.requestCancel()
+				prompt.markForegroundFinished()
+			}
+		}
+		if a.transport != nil {
+			a.closeErr = a.transport.Close()
+		}
+		if a.process != nil {
+			a.closeErr = errors.Join(a.closeErr, a.process.Close(ctx))
+		}
+		a.runtimeCancel()
+	})
+	return a.closeErr
+}
+
+// requireInitialized 拒绝任何早于 app-server initialize 的 thread/turn I/O。
+func (a *Agent) requireInitialized() error {
+	a.initializeMu.RLock()
+	initialized := a.initialized
+	a.initializeMu.RUnlock()
+	if !initialized {
+		return ErrAgentNotInitialized
+	}
+	return nil
+}
+
+// stringPointer 返回字段可选值指针。
+func stringPointer(value string) *string {
+	return &value
 }

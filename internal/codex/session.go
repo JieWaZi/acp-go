@@ -1,0 +1,162 @@
+package codex
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+var (
+	// ErrSessionNotFound 表示 ACP SessionID 没有当前本地 generation。
+	ErrSessionNotFound = errors.New("codex session not found")
+	// ErrSessionClosing 表示 session 正处于 close fence 或 open 结果已经过期。
+	ErrSessionClosing = errors.New("codex session is closing")
+	// ErrPromptActive 表示同 session 已有 pending/active turn，拒绝产生 rival turn。
+	ErrPromptActive = errors.New("codex session already has an active prompt")
+)
+
+// sessionState 保存一个已安装 ACP session 的最小 runtime 状态。
+type sessionState struct {
+	// id 同时是 ACP SessionID 与固定上游 Codex ThreadID。
+	id string
+	// cwd 是创建或恢复请求指定的工作目录。
+	cwd string
+	// generation 防止旧 open、notification 和 control 覆盖重开状态。
+	generation uint64
+	// mu 保护 activePrompt。
+	mu sync.Mutex
+	// activePrompt 是该 session 唯一 pending/active turn。
+	activePrompt *activePrompt
+}
+
+// sessionStore 管理 session generation、open identity 与可重入 close fence。
+// 状态机等价移植 CodexAcpServer.beginSessionOpen/sessionOpenCanInstall/cleanupStaleSessionOpen。
+type sessionStore struct {
+	// mu 保护全部 map 与 generation 变更。
+	mu sync.Mutex
+	// sessions 保存当前已安装状态。
+	sessions map[string]*sessionState
+	// generations 保存每个 SessionID 的单调 generation。
+	generations map[string]uint64
+	// opening 保存最新一次 in-flight open 的 generation 身份。
+	opening map[string]uint64
+	// closing 保存可重入 close fence 计数。
+	closing map[string]int
+}
+
+// newSessionStore 创建空 session registry。
+func newSessionStore() *sessionStore {
+	return &sessionStore{
+		sessions:    make(map[string]*sessionState),
+		generations: make(map[string]uint64),
+		opening:     make(map[string]uint64),
+		closing:     make(map[string]int),
+	}
+}
+
+// beginOpen 记录当前 generation 的 open 身份；close fence 内拒绝启动上游 I/O。
+func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing[sessionID] > 0 {
+		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionClosing)
+	}
+	generation := s.generations[sessionID]
+	s.opening[sessionID] = generation
+	return generation, nil
+}
+
+// install 仅在 generation、最新 open 身份与 close fence 全部匹配时安装状态。
+func (s *sessionStore) install(sessionID, cwd string, generation uint64) (*sessionState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	openGeneration, opening := s.opening[sessionID]
+	if s.closing[sessionID] > 0 || s.generations[sessionID] != generation || !opening || openGeneration != generation {
+		return nil, false
+	}
+	state := &sessionState{id: sessionID, cwd: cwd, generation: generation}
+	s.sessions[sessionID] = state
+	delete(s.opening, sessionID)
+	return state, true
+}
+
+// abandonOpen 删除仍属于当前 generation 的失败 open 记录。
+func (s *sessionStore) abandonOpen(sessionID string, generation uint64) {
+	s.mu.Lock()
+	if openGeneration, opening := s.opening[sessionID]; opening && openGeneration == generation {
+		delete(s.opening, sessionID)
+	}
+	s.mu.Unlock()
+}
+
+// beginStaleCleanup 为仍是最新 open 的过期结果建立 close fence。
+// 若已有更新 open 覆盖身份，则返回 false，禁止旧请求 unsubscribe 新订阅。
+func (s *sessionStore) beginStaleCleanup(sessionID string, generation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	openGeneration, opening := s.opening[sessionID]
+	if !opening || openGeneration != generation {
+		return false
+	}
+	delete(s.opening, sessionID)
+	if s.closing[sessionID] == 0 {
+		s.generations[sessionID]++
+	}
+	s.closing[sessionID]++
+	return true
+}
+
+// beginClose 提升 generation、建立 fence，并返回关闭前安装的状态。
+func (s *sessionStore) beginClose(sessionID string) (uint64, *sessionState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.generations[sessionID]++
+	generation := s.generations[sessionID]
+	s.closing[sessionID]++
+	state := s.sessions[sessionID]
+	delete(s.sessions, sessionID)
+	return generation, state
+}
+
+// endClose 释放一层 close fence，保留并发 close/cleanup 的隔离。
+func (s *sessionStore) endClose(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := s.closing[sessionID]
+	if count <= 1 {
+		delete(s.closing, sessionID)
+		return
+	}
+	s.closing[sessionID] = count - 1
+}
+
+// get 返回当前安装状态。
+func (s *sessionStore) get(sessionID string) (*sessionState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.sessions[sessionID]
+	return state, ok
+}
+
+// isCurrent 验证状态指针与 generation 仍是当前安装身份。
+func (s *sessionStore) isCurrent(state *sessionState) bool {
+	if state == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing[state.id] == 0 && s.generations[state.id] == state.generation && s.sessions[state.id] == state
+}
+
+// closeAll 提升所有 generation、移除 session，并返回需要取消的状态快照。
+func (s *sessionStore) closeAll() []*sessionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	states := make([]*sessionState, 0, len(s.sessions))
+	for sessionID, state := range s.sessions {
+		s.generations[sessionID]++
+		states = append(states, state)
+		delete(s.sessions, sessionID)
+	}
+	return states
+}

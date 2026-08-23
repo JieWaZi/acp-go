@@ -77,6 +77,12 @@ go run ./tools/protocolgen --check
 | `src/app-server/v2/ThreadItem.ts`、`UserInput.ts` | `ThreadItem`、`UserInput` 及 discriminator enum | 消息、reasoning、command、file、MCP、Text/Image/Resource 相关 wire union |
 | `src/CodexAppServerClient.ts` 的 `initialize`、`turnStart`、`runTurn`、approval request handlers | 后续 JSON-RPC client/runtime；当前提供其所需具名协议类型 | 请求与响应配对、early completion 捕获、stale approval fail-closed 所需 identity 字段 |
 | `src/CodexApprovalHandler.ts` 的 `handleCommandExecution`、`handleFileChange`、`handlePermissionsRequest` | 后续 approval mapper；当前生成三类 Params/Response | 三类有效 decision union、失败时 cancel/reject 的 wire 形状 |
+| `src/StdUtils.ts` 的 `createJSONRPCReader`/`createJSONRPCWriter` | `internal/codex/appserver_transport.go` | newline 拆帧、malformed 忽略、出站删除 `jsonrpc`；Go 侧额外增加帧长、pending 与 server-request 并发上限 |
+| `src/CodexJsonRpcConnection.ts` 的 `startCodexConnection` | `internal/codex/process.go`、`executable.go` | 唯一 `codex app-server` 进程、stdin/stdout、退出 dispose 与 stderr 诊断；可执行文件来源按本项目 V1 的 `CODEX_PATH`→PATH 约束替换 bundled npm fallback |
+| `src/CodexAppServerClient.ts` 的 `initialize`、`runTurn`、`awaitTurnCompleted`、`recordTurnCompleted`、`markTurnStale` | `internal/codex/appserver_client.go` | typed request、initialized、response 前 completion 捕获、thread/turn 精确 waiter、stale 清理与 fatal fan-out |
+| `src/CodexAcpClient.ts` 的 `newSession`、`resumeSession`、`loadSession`、`closeSession`、`sendPrompt`、`buildPromptItems` | `internal/codex/agent.go`、`session.go`、`prompt.go` | thread start、resume、load 的 resume→read 顺序、unsubscribe、Text/Image/Resource 转换与多轮 prompt |
+| `src/CodexAcpServer.ts` 的 `beginSessionOpen`、`sessionOpenCanInstall`、`cleanupStaleSessionOpen`、`trackActivePrompt`、`cancelBeforeTurnStarted`、`interruptSessionTurn` | `internal/codex/session.go`、`prompt.go`、`agent.go` | generation/close fence、cancel-before-start、late turn stale+interrupt、active completion 与 interrupt-once |
+| `src/SteeringQueue.ts` 与 `CodexAcpServer.executeOrQueueSteeringRequest`/`performSteeringRequest` | `internal/codex/steering.go` | 每 session 单 consumer FIFO、活动 turn 注入、无活动竞态 fallback 新 turn、单项失败隔离与 idle identity 删除 |
 
 使用 Codex 0.148.0 `generate-ts` 重新生成后，以下固定 clone 文件均做过逐字节对照且完全一致：`ClientRequest.ts`、`ServerRequest.ts`、`ServerNotification.ts`、`ThreadStartParams.ts`、`ThreadResumeParams.ts`、`TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` 以及三类 approval Params。
 
@@ -92,6 +98,10 @@ go run ./tools/protocolgen --check
 | `src/__tests__/CodexACPAgent/data/agent-message-phases.json` | notification/item discriminator 与 commentary/final phase 字段 |
 | `src/__tests__/CodexACPAgent/data/terminal-full-flow.json` | item/commandExecution lifecycle、output delta 与 typed `ThreadItem` |
 | `src/__tests__/CodexACPAgent/data/reasoning-deltas-and-section-break.json` | reasoning 三类 delta 通知与 method/params 分派 |
+| `src/__tests__/CodexACPAgent/CodexAcpClient.test.ts` 的 concurrent prompt、early completion、cancel/late-start 用例 | `appserver_client_test.go`、`agent_runtime_test.go` | 跨 session/旧 turn 隔离、response 前 completion、cancel-before-start、late interrupt-once、completion-first |
+| `src/__tests__/CodexACPAgent/session-close.test.ts` 的 stale resume/reopen 用例 | `session_test.go`、`agent_runtime_test.go` | close generation 提升、迟到 open 拒绝、旧 open 不得 unsubscribe 新 reopen |
+| `src/__tests__/CodexACPAgent/steer-events.test.ts` | `steering_test.go` | startedNewTurn→injected FIFO、unexpected failure 后继续、malformed、bounded close cleanup |
+| `src/__tests__/CodexACPAgent/process-exit-error.test.ts` | `process_test.go`、`appserver_transport_test.go` | exit code/stderr 尾部、pending 稳定错误 fan-out 与 EOF 清理 |
 
 固定 clone 中 `input-server-events.json` 是 0 字节占位文件，不作为回归证据。当前 `protocol_test.go` 锁住 envelope method/params 耦合、typed Item、optional+nullable 三态、tagged discriminator、登录完成通知和审批 union 往返。运行时子变更应直接移植上表非空 fixture 的完整行为断言，而不是在协议生成层重复 mapper 逻辑。
 
@@ -101,15 +111,21 @@ go run ./tools/protocolgen --check
 - quicktype 仍负责成熟的 schema→Go DTO/枚举/标量 union 生成。它无法忠实表达对象型 envelope union，因此完整 `ClientRequest`/`ServerRequest`/`ServerNotification` 不进入 root；薄 `envelope.go` 只复用生成 Params，提供封闭变体、集中 `Method*` 常量和 method-first dispatcher。已知方法不会退化到字段并集，未知通知才以 `json.RawMessage` 前向保留。
 - 上游本来定义为开放 `JsonValue`/开放 schema 的 DTO 字段使用 `json.RawMessage`（以及对应 map/slice），不让 `interface{}` 在解码时把整数改写成浮点数；`ItemStartedNotification.Item` 和 `ItemCompletedNotification.Item` 明确为 `ThreadItem`，核心通知 payload 不退化。
 - 空 object response 生成 `map[string]json.RawMessage`；JSON-RPC 层仍按对应 method 的具名响应职责配对。
-- JSON-RPC framing、request correlation、取消和 transport 继续由 `github.com/coder/acp-go-sdk`/后续 runtime 使用，本层没有重写 JSON-RPC。
+- 外层 ACP JSON-RPC framing、dispatch、prompt context cancel、loader 与 extension 继续直接使用 `github.com/coder/acp-go-sdk` v0.13.5；没有第二套 ACP RPC。Codex 内层必须按 `StdUtils.ts` 自建薄 NDJSON 边界，因为 app-server wire 不带 `jsonrpc`。
 - 生成代码保留纳入 V1 声明的上游英文文档；被明确排除的 experimental 构造项及其专属说明由可审计薄适配一并移除，不增加逐字段中文翻译。中文注释规范仅适用于手写 Go。
+- `codex-acp` npm 发布物可回退 bundled `@openai/codex`；本项目按用户和父规格只使用用户预装 Codex，显式 `CODEX_PATH` 无效时禁止 PATH 回退，空值才查询 PATH，并以 0.148.0 为告警基线。
+- TypeScript `createJSONRPCReader` 和 `SteeringQueue` 使用动态字符串/无界数组；Go 等价实现保持相同顺序与结果语义，但增加 8 MiB 单帧、16 个 server request、64 个每-session pending steering 和有界 stderr，超限按稳定 fatal/RequestError 失败。
+- TypeScript 的 early-completion 切换依赖 JavaScript 单事件循环；Go 在同一 mutex 临界区原子执行“查找捕获→安装精确 waiter”，避免 goroutine 在两步间丢通知。
+- 固定 TS `InitializeCapabilities` 发送 `experimentalApi: true`；已合并的默认稳定 Go protocol 按 V1 决策有意隐藏该 experimental 字段，因此 runtime 只用生成类型发送 `requestAttestation: false`，不手写重复 DTO 绕过 protocol 边界。
+- acp-go-sdk v0.13.5 的 `NewAgentSideConnection` 会立即启动 receive goroutine，之后调用可选 `SetLogger` 存在并发读写；本项目保持 SDK 默认 stderr logger，绝不调用 setter。`connectionBinder` 使用 ready channel 作为 prompt/event barrier。
+- Go runtime context 在启动成功后由 `Agent.Close` 单独拥有，不继续继承 construction/Serve context 的取消；这样 acpserver 可在其独立有界清理窗口内先关闭 stdin、回收唯一进程，避免 `exec.CommandContext` 把正常信号退出误报为 app-server 异常。
 
 ## 明确跳过
 
 - 任何只有 `--experimental` 才出现的 schema 定义、方法和字段，以及默认 bundle 中 V1 不支持的 experimental capability/variant 构造项；
 - codex-acp 的 Review、Goal、Session List 管理扩展、client-provided MCP server、Gateway Auth、Audio/realtime、多 Agent 协作 UI 等父 V1 Non-goals；父 V1 runtime 不实现也不宣告这些行为，即使默认稳定 envelope 为前向兼容带出了部分 DTO；
 - 完整 codex-acp vendoring、TypeScript 构建产物和 ACP SDK 内部协议实现；
-- 本子变更不实现子进程、session/turn 状态、event mapper、approval handler 或配置逻辑，这些由后续子变更消费本协议包。
+- 当前 runtime 只提供 agent message/reasoning 文本的薄事件路由；完整 history/event/tool/approval/config/auth mapper 由 `codex-events-config` 子变更消费。缺少 handler 的 app-server approval request fail-closed，不在 runtime 中伪造完整映射。
 
 ## 增量同步步骤
 
@@ -124,3 +140,4 @@ go run ./tools/protocolgen --check
 
 - 2026-08-23：建立 V1 初始固定点：acp-go-sdk v0.13.5、codex-acp 1.6.2、ACP TS SDK 1.4.0、Codex 0.148.0、quicktype 26.0.0；固定默认稳定 schema 与 Go 快照，并完成关键 generated TS、source imports 和 fixture 的直接对照。
 - 2026-08-23：收窄 V1 roots，移除 quicktype 完整 envelope 字段并集；加入封闭 typed envelope dispatcher、集中方法常量、approval nullable 三态、typed Item 和登录完成通知，同时把 0 字节占位 fixture 从回归证据中移除。
+- 2026-08-23：接入 Codex runtime：用户预装可执行文件与版本探测、唯一 app-server、有界无 `jsonrpc` NDJSON、initialize、session generation/close fence、multi-turn/early/stale completion、cancel/late interrupt、FIFO steering、进程 fatal fan-out 和 SDK connection ready barrier。

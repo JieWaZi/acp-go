@@ -1,0 +1,384 @@
+package codex
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
+
+	"acp-go/agents/codex/protocol"
+	acp "github.com/coder/acp-go-sdk"
+)
+
+// newRuntimeTestAgent 使用 fake typed client 创建已完成 connection barrier 的 Agent。
+func newRuntimeTestAgent(t *testing.T, rpc *fakeAppServerRPC) *Agent {
+	t.Helper()
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	client := newAppServerClient(runtimeCtx, rpc)
+	agent := newAgentWithClient(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		runtimeCtx,
+		cancel,
+		client,
+	)
+	agent.markConnectionReady()
+	if _, err := agent.Initialize(context.Background(), acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+	}); err != nil {
+		t.Fatalf("初始化测试 Agent 失败: %v", err)
+	}
+	t.Cleanup(func() { cancel() })
+	return agent
+}
+
+// TestAgentNewAndLoadSessionUseUpstreamThreadFlow 验证 new 与 load 的 thread/start、resume→read 顺序。
+func TestAgentNewAndLoadSessionUseUpstreamThreadFlow(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "new-thread"
+			return nil
+		case protocol.MethodThreadResume:
+			result.(*protocol.ThreadResumeResponse).Thread.ID = "saved-thread"
+			return nil
+		case protocol.MethodThreadRead:
+			result.(*protocol.ThreadReadResponse).Thread = protocol.Thread{ID: "saved-thread", Turns: []protocol.TurnElement{}}
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+
+	created, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+	if created.SessionId != "new-thread" {
+		t.Fatalf("新 SessionID 为 %q", created.SessionId)
+	}
+	_, err = agent.LoadSession(context.Background(), acp.LoadSessionRequest{
+		SessionId: "saved-thread", Cwd: "/tmp", McpServers: []acp.McpServer{},
+	})
+	if err != nil {
+		t.Fatalf("加载 session 失败: %v", err)
+	}
+	if got := rpc.calls; len(got) != 4 || got[1] != protocol.MethodThreadStart ||
+		got[2] != protocol.MethodThreadResume || got[3] != protocol.MethodThreadRead {
+		t.Fatalf("请求顺序为 %v", got)
+	}
+}
+
+// TestAgentResumeCloseGenerationFenceRejectsLateOpen 验证 close 后迟到 resume 不会重新安装 session。
+func TestAgentResumeCloseGenerationFenceRejectsLateOpen(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	resumeCalled := make(chan struct{})
+	releaseResume := make(chan struct{})
+	var resumeOnce sync.Once
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadResume:
+			resumeOnce.Do(func() { close(resumeCalled) })
+			<-releaseResume
+			result.(*protocol.ThreadResumeResponse).Thread.ID = "thread-race"
+			return nil
+		case protocol.MethodThreadUnsubscribe:
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+
+	resumeResult := make(chan error, 1)
+	go func() {
+		_, err := agent.ResumeSession(context.Background(), acp.ResumeSessionRequest{
+			SessionId: "thread-race", Cwd: "/tmp",
+		})
+		resumeResult <- err
+	}()
+	<-resumeCalled
+	if _, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: "thread-race"}); err != nil {
+		t.Fatalf("关闭 session 失败: %v", err)
+	}
+	close(releaseResume)
+	if err := <-resumeResult; !errors.Is(err, ErrSessionClosing) {
+		t.Fatalf("迟到 resume 错误为 %v", err)
+	}
+	if _, ok := agent.sessions.get("thread-race"); ok {
+		t.Fatal("迟到 resume 覆盖了已关闭 session")
+	}
+}
+
+// TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce 验证 prompt 提前返回 cancelled，迟到 turn 被 stale+interrupt 一次。
+func TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnStartCalled := make(chan struct{})
+	releaseTurnStart := make(chan struct{})
+	interruptCalled := make(chan struct{}, 2)
+	var startOnce sync.Once
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			return nil
+		case protocol.MethodTurnStart:
+			startOnce.Do(func() { close(turnStartCalled) })
+			<-releaseTurnStart
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: "late-turn", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			return nil
+		case protocol.MethodTurnInterrupt:
+			interruptCalled <- struct{}{}
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+
+	promptCtx, cancelPrompt := context.WithCancel(context.Background())
+	promptResult := make(chan acp.PromptResponse, 1)
+	promptErr := make(chan error, 1)
+	go func() {
+		response, err := agent.Prompt(promptCtx, acp.PromptRequest{
+			SessionId: "thread-1",
+			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}},
+		})
+		promptResult <- response
+		promptErr <- err
+	}()
+	<-turnStartCalled
+	cancelPrompt()
+	if err := <-promptErr; err != nil {
+		t.Fatalf("取消 prompt 返回错误: %v", err)
+	}
+	if response := <-promptResult; response.StopReason != acp.StopReasonCancelled {
+		t.Fatalf("取消 prompt 响应为 %#v", response)
+	}
+	select {
+	case <-interruptCalled:
+		t.Fatal("turn/start 返回前不应发送 interrupt")
+	default:
+	}
+	state, ok := agent.sessions.get("thread-1")
+	if !ok {
+		t.Fatal("取消前 session 状态不存在")
+	}
+	state.mu.Lock()
+	backgroundPrompt := state.activePrompt
+	state.mu.Unlock()
+	if backgroundPrompt == nil {
+		t.Fatal("迟到 turn/start 返回前应保留后台 prompt 用于清理")
+	}
+	close(releaseTurnStart)
+	<-interruptCalled
+	select {
+	case <-backgroundPrompt.backgroundDone:
+	case <-time.After(time.Second):
+		t.Fatal("迟到 turn interrupt 后未合成 completion 释放后台 prompt")
+	}
+	if err := agent.Cancel(context.Background(), acp.CancelNotification{SessionId: "thread-1"}); err != nil {
+		t.Fatalf("重复 cancel 返回错误: %v", err)
+	}
+	select {
+	case <-interruptCalled:
+		t.Fatal("重复 cancel 不应再次发送 interrupt")
+	default:
+	}
+}
+
+// TestAgentPromptSupportsMultipleTurnsAndIgnoresOldCompletion 验证同 session 多轮各由自身 completion 结束。
+func TestAgentPromptSupportsMultipleTurnsAndIgnoresOldCompletion(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnNumber := 0
+	turnStarted := make(chan string, 2)
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			return nil
+		case protocol.MethodTurnStart:
+			turnNumber++
+			turnID := "turn-1"
+			if turnNumber == 2 {
+				turnID = "turn-2"
+			}
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: turnID, Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			turnStarted <- turnID
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+
+	for index := 1; index <= 2; index++ {
+		responseResult := make(chan acp.PromptResponse, 1)
+		errResult := make(chan error, 1)
+		go func() {
+			response, err := agent.Prompt(context.Background(), acp.PromptRequest{
+				SessionId: "thread-1",
+				Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "next"}}},
+			})
+			responseResult <- response
+			errResult <- err
+		}()
+		turnID := <-turnStarted
+		if index == 2 {
+			agent.client.HandleNotification(context.Background(), completeNotification(t, "thread-1", "turn-1", protocol.FluffyCompleted))
+			select {
+			case <-responseResult:
+				t.Fatal("旧 turn completion 错误结束第二轮")
+			default:
+			}
+		}
+		agent.client.HandleNotification(context.Background(), completeNotification(t, "thread-1", turnID, protocol.FluffyCompleted))
+		if err := <-errResult; err != nil {
+			t.Fatalf("第 %d 轮 prompt 错误: %v", index, err)
+		}
+		if response := <-responseResult; response.StopReason != acp.StopReasonEndTurn {
+			t.Fatalf("第 %d 轮响应为 %#v", index, response)
+		}
+	}
+}
+
+// TestAgentPromptWaitsForConnectionBinder 验证 SDK connection 注入前不会启动可能产生事件的 turn。
+func TestAgentPromptWaitsForConnectionBinder(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnStartCalled := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			return nil
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: "turn-1", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			close(turnStartCalled)
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent := newAgentWithClient(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), runtimeCtx, cancel, newAppServerClient(runtimeCtx, rpc),
+	)
+	if _, err := agent.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
+		t.Fatalf("初始化 Agent 失败: %v", err)
+	}
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+	promptResult := make(chan error, 1)
+	go func() {
+		_, err := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: "thread-1",
+			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}},
+		})
+		promptResult <- err
+	}()
+	select {
+	case <-turnStartCalled:
+		t.Fatal("connection binder 前启动了 turn")
+	default:
+	}
+	agent.markConnectionReady()
+	<-turnStartCalled
+	agent.client.HandleNotification(context.Background(), completeNotification(
+		t, "thread-1", "turn-1", protocol.FluffyCompleted,
+	))
+	if err := <-promptResult; err != nil {
+		t.Fatalf("binder 后 prompt 错误: %v", err)
+	}
+}
+
+// TestAgentCancelLetsCompletedTurnWinOverInterrupt 验证取消竞态中 completed completion 仍返回 end_turn。
+func TestAgentCancelLetsCompletedTurnWinOverInterrupt(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnStarted := make(chan struct{})
+	interruptCalled := make(chan struct{})
+	releaseInterrupt := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			return nil
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: "turn-1", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			close(turnStarted)
+			return nil
+		case protocol.MethodTurnInterrupt:
+			close(interruptCalled)
+			<-releaseInterrupt
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+	responseResult := make(chan acp.PromptResponse, 1)
+	errResult := make(chan error, 1)
+	go func() {
+		response, err := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: "thread-1",
+			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "finish"}}},
+		})
+		responseResult <- response
+		errResult <- err
+	}()
+	<-turnStarted
+	if err := agent.Cancel(context.Background(), acp.CancelNotification{SessionId: "thread-1"}); err != nil {
+		t.Fatalf("取消 prompt 失败: %v", err)
+	}
+	<-interruptCalled
+	agent.client.HandleNotification(context.Background(), completeNotification(
+		t, "thread-1", "turn-1", protocol.FluffyCompleted,
+	))
+	if err := <-errResult; err != nil {
+		t.Fatalf("completion-first 返回错误: %v", err)
+	}
+	if response := <-responseResult; response.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("completion-first 响应为 %#v", response)
+	}
+	close(releaseInterrupt)
+}

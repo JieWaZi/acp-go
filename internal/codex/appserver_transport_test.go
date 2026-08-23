@@ -1,0 +1,242 @@
+package codex
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"acp-go/agents/codex/protocol"
+)
+
+// transportHarness 保存一对可由测试精确控制的 app-server 管道。
+type transportHarness struct {
+	// transport 是被测的 Codex 内层 NDJSON transport。
+	transport *appServerTransport
+	// requests 读取 Adapter 写向 fake app-server 的请求。
+	requests *bufio.Reader
+	// responses 向 Adapter 写入 fake app-server 的响应或通知。
+	responses *io.PipeWriter
+	// closeOnce 保证测试清理可重复调用。
+	closeOnce sync.Once
+}
+
+// newTransportHarness 创建不依赖真实进程的有界 transport 测试夹具。
+func newTransportHarness(
+	t *testing.T,
+	maxLine int,
+	notification notificationHandler,
+	serverRequest serverRequestHandler,
+) *transportHarness {
+	t.Helper()
+	adapterInput, fakeOutput := io.Pipe()
+	fakeInput, adapterOutput := io.Pipe()
+	harness := &transportHarness{
+		requests:  bufio.NewReader(fakeInput),
+		responses: fakeOutput,
+	}
+	harness.transport = newAppServerTransport(
+		context.Background(),
+		adapterInput,
+		adapterOutput,
+		io.NopCloser(strings.NewReader("")),
+		transportOptions{
+			Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MaxLineBytes:         maxLine,
+			MaxServerRequests:    2,
+			NotificationHandler:  notification,
+			ServerRequestHandler: serverRequest,
+		},
+	)
+	t.Cleanup(func() { harness.close(t) })
+	return harness
+}
+
+// close 释放测试管道与 transport。
+func (h *transportHarness) close(t *testing.T) {
+	t.Helper()
+	h.closeOnce.Do(func() {
+		_ = h.responses.Close()
+		_ = h.transport.Close()
+	})
+}
+
+// TestAppServerTransportOmitsJSONRPCAndMatchesResponse 验证固定上游 wire 不带 jsonrpc 且按 ID 回填结果。
+func TestAppServerTransportOmitsJSONRPCAndMatchesResponse(t *testing.T) {
+	t.Parallel()
+	harness := newTransportHarness(t, 4096, nil, nil)
+
+	result := make(chan protocol.ThreadReadResponse, 1)
+	errResult := make(chan error, 1)
+	go func() {
+		var response protocol.ThreadReadResponse
+		err := harness.transport.Call(context.Background(), func(id protocol.RequestID) protocol.ClientRequest {
+			return protocol.NewThreadReadRequest(id, protocol.ThreadReadParams{ThreadID: "thread-1"})
+		}, &response)
+		result <- response
+		errResult <- err
+	}()
+
+	line, err := harness.requests.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("读取请求失败: %v", err)
+	}
+	if strings.Contains(string(line), "jsonrpc") {
+		t.Fatalf("Codex app-server 请求不应包含 jsonrpc: %s", line)
+	}
+	var request struct {
+		// ID 保存 fake server 回应所需的原始请求标识。
+		ID json.RawMessage `json:"id"`
+		// Method 保存请求方法。
+		Method string `json:"method"`
+	}
+	if err = json.Unmarshal(line, &request); err != nil {
+		t.Fatalf("解析请求失败: %v", err)
+	}
+	if request.Method != protocol.MethodThreadRead {
+		t.Fatalf("请求方法为 %q", request.Method)
+	}
+	_, err = harness.responses.Write([]byte(`{"id":` + string(request.ID) + `,"result":{"thread":{"id":"thread-1"}}}` + "\n"))
+	if err != nil {
+		t.Fatalf("写响应失败: %v", err)
+	}
+	if err = <-errResult; err != nil {
+		t.Fatalf("Call 返回错误: %v", err)
+	}
+	if response := <-result; response.Thread.ID != "thread-1" {
+		t.Fatalf("响应 thread 为 %#v", response.Thread)
+	}
+}
+
+// TestAppServerTransportRoutesNotificationBeforeResponse 验证通知可在对应请求响应前被路由。
+func TestAppServerTransportRoutesNotificationBeforeResponse(t *testing.T) {
+	t.Parallel()
+	notified := make(chan protocol.ServerNotification, 1)
+	harness := newTransportHarness(t, 4096, func(_ context.Context, notification protocol.ServerNotification) {
+		notified <- notification
+	}, nil)
+
+	errResult := make(chan error, 1)
+	go func() {
+		var response protocol.TurnStartResponse
+		errResult <- harness.transport.Call(context.Background(), func(id protocol.RequestID) protocol.ClientRequest {
+			return protocol.NewTurnStartRequest(id, protocol.TurnStartParams{ThreadID: "thread-1", Input: []protocol.InputElement{}})
+		}, &response)
+	}()
+	line, err := harness.requests.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("读取请求失败: %v", err)
+	}
+	var request map[string]json.RawMessage
+	if err = json.Unmarshal(line, &request); err != nil {
+		t.Fatalf("解析请求失败: %v", err)
+	}
+	completion := `{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}` + "\n"
+	if _, err = harness.responses.Write([]byte("not-json\n" + completion)); err != nil {
+		t.Fatalf("写通知失败: %v", err)
+	}
+	select {
+	case notification := <-notified:
+		if notification.Method() != protocol.MethodTurnCompleted {
+			t.Fatalf("通知方法为 %q", notification.Method())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("通知未在响应前路由")
+	}
+	if _, err = harness.responses.Write([]byte(`{"id":` + string(request["id"]) + `,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}` + "\n")); err != nil {
+		t.Fatalf("写响应失败: %v", err)
+	}
+	if err = <-errResult; err != nil {
+		t.Fatalf("Call 返回错误: %v", err)
+	}
+}
+
+// TestAppServerTransportRepliesToTypedServerRequest 验证服务端请求按协议 discriminator 解码并原 ID 回复。
+func TestAppServerTransportRepliesToTypedServerRequest(t *testing.T) {
+	t.Parallel()
+	handled := make(chan string, 1)
+	harness := newTransportHarness(t, 4096, nil, func(_ context.Context, request protocol.ServerRequest) (any, error) {
+		handled <- request.Method()
+		return map[string]string{"decision": "decline"}, nil
+	})
+
+	request := `{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"command":"pwd","cwd":"/tmp","itemId":"item-1","startedAtMs":1,"threadId":"thread-1","turnId":"turn-1"}}` + "\n"
+	if _, err := harness.responses.Write([]byte(request)); err != nil {
+		t.Fatalf("写服务端请求失败: %v", err)
+	}
+	select {
+	case method := <-handled:
+		if method != protocol.MethodCommandExecutionRequestApproval {
+			t.Fatalf("处理方法为 %q", method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("服务端请求未处理")
+	}
+	line, err := harness.requests.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("读取服务端请求回复失败: %v", err)
+	}
+	if strings.Contains(string(line), "jsonrpc") || !strings.Contains(string(line), `"id":"approval-1"`) {
+		t.Fatalf("服务端请求回复为 %s", line)
+	}
+}
+
+// TestAppServerTransportFansOutStableFatalError 验证 EOF 会用同一稳定错误解除所有 pending 请求。
+func TestAppServerTransportFansOutStableFatalError(t *testing.T) {
+	t.Parallel()
+	harness := newTransportHarness(t, 4096, nil, nil)
+
+	errorsResult := make(chan error, 2)
+	for range 2 {
+		go func() {
+			var response protocol.ThreadReadResponse
+			errorsResult <- harness.transport.Call(context.Background(), func(id protocol.RequestID) protocol.ClientRequest {
+				return protocol.NewThreadReadRequest(id, protocol.ThreadReadParams{ThreadID: "thread"})
+			}, &response)
+		}()
+	}
+	for range 2 {
+		if _, err := harness.requests.ReadBytes('\n'); err != nil {
+			t.Fatalf("读取 pending 请求失败: %v", err)
+		}
+	}
+	if err := harness.responses.Close(); err != nil {
+		t.Fatalf("关闭 fake stdout 失败: %v", err)
+	}
+	first := <-errorsResult
+	second := <-errorsResult
+	if !errors.Is(first, ErrAppServerUnavailable) || !errors.Is(second, ErrAppServerUnavailable) {
+		t.Fatalf("pending 错误为 %v / %v", first, second)
+	}
+	if first != second {
+		t.Fatalf("fatal fan-out 应共享同一稳定错误实例: %p / %p", first, second)
+	}
+}
+
+// TestAppServerTransportRejectsOversizedLine 验证超限 NDJSON 帧会关闭 transport 而非无界分配。
+func TestAppServerTransportRejectsOversizedLine(t *testing.T) {
+	t.Parallel()
+	harness := newTransportHarness(t, 32, nil, nil)
+
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := harness.responses.Write([]byte(strings.Repeat("x", 64) + "\n"))
+		writeResult <- err
+	}()
+	select {
+	case <-harness.transport.Done():
+		if !errors.Is(harness.transport.Err(), ErrAppServerFrameTooLarge) {
+			t.Fatalf("transport 错误为 %v", harness.transport.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("超限帧未终止 transport")
+	}
+	_ = harness.responses.Close()
+	<-writeResult
+}

@@ -120,8 +120,11 @@ func newRegistry(logger *slog.Logger) (*core.Registry, error) {
 
 	err = registry.Register(core.Registration{
 		Name: defaultAdapterName,
-		Factory: func(context.Context) (acp.Agent, error) {
-			agent, factoryErr := codex.NewAgent(logger)
+		Factory: func(ctx context.Context) (acp.Agent, error) {
+			agent, factoryErr := codex.NewAgent(ctx, codex.Config{
+				Logger:    logger,
+				CodexPath: os.Getenv("CODEX_PATH"),
+			})
 			if factoryErr != nil {
 				return nil, factoryErr
 			}
