@@ -141,7 +141,9 @@ func TestSessionConfigurationRejectsUnknownSelections(t *testing.T) {
 	t.Parallel()
 
 	for name, selection := range map[string]struct {
-		id    acp.SessionConfigId
+		// id 是被设置的 session 配置项。
+		id acp.SessionConfigId
+		// value 是必须被拒绝的未知选择值。
 		value string
 	}{
 		"model":  {modelConfigID, "unknown-model"},

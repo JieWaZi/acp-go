@@ -25,7 +25,8 @@ const fakeCodexProcessEnv = "ACP_GO_TEST_FAKE_CODEX_PROCESS"
 
 // TestMain 在子进程标记存在时直接运行 fake Codex，避免 shell/sed 进程竞争污染并行全量测试。
 func TestMain(m *testing.M) {
-	if os.Getenv(fakeCodexProcessEnv) != "" {
+	switch {
+	case os.Getenv(fakeCodexProcessEnv) != "":
 		os.Exit(runFakeCodexProcess(os.Args[1:], os.Stdin, os.Stdout))
 	}
 	os.Exit(m.Run())
@@ -235,11 +236,7 @@ func TestRunProductionCompositionSessionFlow(t *testing.T) {
 		t.Fatalf("production Prompt 响应为 %#v, %v", prompt, err)
 	}
 	updates := client.snapshotUpdates()
-	if len(updates) != 1 || updates[0].Update.AgentMessageChunk == nil ||
-		updates[0].Update.AgentMessageChunk.Content.Text == nil ||
-		updates[0].Update.AgentMessageChunk.Content.Text.Text != "fake answer" {
-		t.Fatalf("production session updates 为 %#v", updates)
-	}
+	assertProductionV1Updates(t, updates)
 	if _, err = connection.Logout(ctx, acp.LogoutRequest{}); err != nil {
 		t.Fatalf("production Logout 失败: %v", err)
 	}
@@ -257,6 +254,50 @@ func TestRunProductionCompositionSessionFlow(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("等待 production composition 退出失败: %v，诊断: %s", ctx.Err(), diagnostics.String())
+	}
+}
+
+// assertProductionV1Updates 验证完整 stdio 组合链路保留 V1 核心消息、思考、计划、用量和工具生命周期。
+func assertProductionV1Updates(t *testing.T, updates []acp.SessionNotification) {
+	t.Helper()
+	if len(updates) != 8 {
+		t.Fatalf("production session update 数为 %d，期望 8：%#v", len(updates), updates)
+	}
+
+	wantMessageDeltas := []string{"fake ", "answer"}
+	for index, want := range wantMessageDeltas {
+		message := updates[index].Update.AgentMessageChunk
+		if message == nil || message.Content.Text == nil || message.Content.Text.Text != want {
+			t.Fatalf("agent message delta[%d] 为 %#v，期望 %q", index, message, want)
+		}
+	}
+	thought := updates[2].Update.AgentThoughtChunk
+	if thought == nil || thought.Content.Text == nil || thought.Content.Text.Text != "fake thought" {
+		t.Fatalf("agent thought 为 %#v", thought)
+	}
+	plan := updates[3].Update.Plan
+	if plan == nil || len(plan.Entries) != 2 || plan.Entries[0].Status != acp.PlanEntryStatusCompleted ||
+		plan.Entries[1].Status != acp.PlanEntryStatusInProgress {
+		t.Fatalf("plan update 为 %#v", plan)
+	}
+	usage := updates[4].Update.UsageUpdate
+	if usage == nil || usage.Used != 25 || usage.Size != 128000 {
+		t.Fatalf("usage update 为 %#v", usage)
+	}
+	toolStart := updates[5].Update.ToolCall
+	if toolStart == nil || toolStart.ToolCallId != "e2e-command" || toolStart.Kind != acp.ToolKindExecute ||
+		toolStart.Status != acp.ToolCallStatusInProgress {
+		t.Fatalf("tool call start 为 %#v", toolStart)
+	}
+	toolDelta := updates[6].Update.ToolCallUpdate
+	if toolDelta == nil || toolDelta.ToolCallId != toolStart.ToolCallId ||
+		toolDelta.Meta["terminal_output_delta"] == nil {
+		t.Fatalf("tool call delta 为 %#v", toolDelta)
+	}
+	toolCompleted := updates[7].Update.ToolCallUpdate
+	if toolCompleted == nil || toolCompleted.ToolCallId != toolStart.ToolCallId ||
+		toolCompleted.Status == nil || *toolCompleted.Status != acp.ToolCallStatusCompleted {
+		t.Fatalf("tool call completion 为 %#v", toolCompleted)
 	}
 }
 
@@ -602,8 +643,25 @@ func handleFakeCodexRequest(
 		if err := writeFakeResult(encoder, id, `{"turn":{"id":"e2e-turn","items":[],"status":"inProgress"}}`); err != nil {
 			return err
 		}
-		if err := writeFakeNotification(encoder, codexprotocol.MethodAgentMessageDelta, `{"delta":"fake answer","itemId":"e2e-message","threadId":"e2e-thread","turnId":"e2e-turn"}`); err != nil {
-			return err
+		fixtures := []struct {
+			// method 是 fake app-server 发出的稳定通知方法。
+			method string
+			// params 是与生成协议类型一致的原始 JSON 参数。
+			params string
+		}{
+			{codexprotocol.MethodAgentMessageDelta, `{"delta":"fake ","itemId":"e2e-message","threadId":"e2e-thread","turnId":"e2e-turn"}`},
+			{codexprotocol.MethodAgentMessageDelta, `{"delta":"answer","itemId":"e2e-message","threadId":"e2e-thread","turnId":"e2e-turn"}`},
+			{codexprotocol.MethodReasoningSummaryTextDelta, `{"delta":"fake thought","itemId":"e2e-reasoning","summaryIndex":0,"threadId":"e2e-thread","turnId":"e2e-turn"}`},
+			{codexprotocol.MethodTurnPlanUpdated, `{"explanation":"fake plan","plan":[{"status":"completed","step":"map"},{"status":"inProgress","step":"verify"}],"threadId":"e2e-thread","turnId":"e2e-turn"}`},
+			{codexprotocol.MethodThreadTokenUsageUpdated, `{"threadId":"e2e-thread","turnId":"e2e-turn","tokenUsage":{"last":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":10,"reasoningOutputTokens":5,"totalTokens":25},"modelContextWindow":128000,"total":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":10,"reasoningOutputTokens":5,"totalTokens":25}}}`},
+			{codexprotocol.MethodItemStarted, `{"item":{"command":"printf fake-tool","commandActions":[],"cwd":"/workspace","id":"e2e-command","status":"inProgress","type":"commandExecution"},"startedAtMs":1,"threadId":"e2e-thread","turnId":"e2e-turn"}`},
+			{codexprotocol.MethodCommandExecutionOutputDelta, `{"delta":"fake-tool","itemId":"e2e-command","threadId":"e2e-thread","turnId":"e2e-turn"}`},
+			{codexprotocol.MethodItemCompleted, `{"completedAtMs":2,"item":{"aggregatedOutput":"fake-tool","command":"printf fake-tool","commandActions":[],"cwd":"/workspace","exitCode":0,"id":"e2e-command","status":"completed","type":"commandExecution"},"threadId":"e2e-thread","turnId":"e2e-turn"}`},
+		}
+		for _, fixture := range fixtures {
+			if err := writeFakeNotification(encoder, fixture.method, fixture.params); err != nil {
+				return err
+			}
 		}
 		return writeFakeNotification(encoder, codexprotocol.MethodTurnCompleted, `{"threadId":"e2e-thread","turn":{"id":"e2e-turn","items":[],"status":"completed"}}`)
 	case codexprotocol.MethodAccountLogout:

@@ -55,8 +55,11 @@ const (
 
 // ClientRequest 是 V1 客户端请求的封闭变体集合；每个具体类型固定唯一 method 和 Params 类型。
 type ClientRequest interface {
+	// Marshaler 把封闭请求变体编码为 Codex app-server wire 对象。
 	json.Marshaler
+	// Method 返回与 Params 类型固定绑定的方法名。
 	Method() string
+	// isClientRequest 阻止包外实现绕过封闭变体集合。
 	isClientRequest()
 }
 
@@ -363,8 +366,11 @@ func decodeClientRequest[P any](wire requestWire, paramsRequired bool) (clientRe
 
 // ClientNotification 是 V1 客户端通知的封闭变体集合。
 type ClientNotification interface {
+	// Marshaler 把封闭通知变体编码为 Codex app-server wire 对象。
 	json.Marshaler
+	// Method 返回通知固定的方法名。
 	Method() string
+	// isClientNotification 阻止包外实现绕过封闭变体集合。
 	isClientNotification()
 }
 
@@ -386,8 +392,11 @@ func (InitializedNotification) MarshalJSON() ([]byte, error) {
 
 // ServerRequest 是 V1 服务端请求的封闭变体集合。
 type ServerRequest interface {
+	// Marshaler 把封闭审批请求变体编码为 Codex app-server wire 对象。
 	json.Marshaler
+	// Method 返回与审批 Params 类型固定绑定的方法名。
 	Method() string
+	// isServerRequest 阻止包外实现绕过封闭变体集合。
 	isServerRequest()
 }
 
@@ -494,8 +503,11 @@ func decodeServerRequest[P any](wire requestWire) (serverRequestEnvelope[P], err
 
 // ServerNotification 是 V1 服务端通知的封闭变体集合，已知 method 均绑定具名 Params。
 type ServerNotification interface {
+	// Marshaler 把已知或未知通知变体编码回 Codex app-server wire 对象。
 	json.Marshaler
+	// Method 返回通知分派使用的方法名。
 	Method() string
+	// isServerNotification 阻止包外实现绕过封闭变体集合。
 	isServerNotification()
 }
 

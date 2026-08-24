@@ -25,12 +25,14 @@ var (
 // connectionBinder 是协议服务消费的可选小接口。
 // Agent 只有在需要主动发送 session update、权限请求等客户端调用时才实现它。
 type connectionBinder interface {
+	// SetAgentConnection 注入 SDK 创建的唯一 Agent 侧连接。
 	SetAgentConnection(connection *acp.AgentSideConnection)
 }
 
 // adapterCloser 是协议服务消费的可选资源清理接口。
 // 只有拥有子进程、连接等资源的 Adapter 才需要实现，避免把关闭职责塞进统一大接口。
 type adapterCloser interface {
+	// Close 在有界上下文内释放 Adapter 拥有的进程和连接资源。
 	Close(ctx context.Context) error
 }
 

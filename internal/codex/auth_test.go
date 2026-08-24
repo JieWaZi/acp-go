@@ -134,8 +134,11 @@ func TestAuthenticatorUsesRequestThenCodexThenOpenAIKey(t *testing.T) {
 	t.Parallel()
 
 	for name, fixture := range map[string]struct {
-		meta    map[string]any
-		env     map[string]string
+		// meta 是 ACP authenticate 请求携带的候选凭据。
+		meta map[string]any
+		// env 是测试注入的 Codex/OpenAI 环境凭据。
+		env map[string]string
+		// wantKey 是按优先级最终发送给 app-server 的凭据。
 		wantKey string
 	}{
 		"request": {

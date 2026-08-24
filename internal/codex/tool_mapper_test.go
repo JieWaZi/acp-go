@@ -139,7 +139,9 @@ func TestEventRouterMapsParsedCommandActions(t *testing.T) {
 		t.Fatalf("parsed command update 数 = %d，期望 %d", got, want)
 	}
 	want := []struct {
-		kind  acp.ToolKind
+		// kind 是解析命令应映射出的 ACP 工具类别。
+		kind acp.ToolKind
+		// title 是解析命令应映射出的可读标题。
 		title string
 	}{
 		{acp.ToolKindRead, "Read file '/work/README.md'"},

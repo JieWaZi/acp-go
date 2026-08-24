@@ -89,15 +89,22 @@ func TestApprovalDecisionUnionRoundTrip(t *testing.T) {
 // TestOptionalNullableRoundTrip 锁住 optional+nullable 的 absent、null、value 三种 wire 状态。
 func TestOptionalNullableRoundTrip(t *testing.T) {
 	type fixture struct {
+		// Value 是需要验证 absent、null、value 三态的字段。
 		Value OptionalNullable[string] `json:"value,omitzero"`
 	}
 
 	testCases := []struct {
-		name       string
-		wire       string
-		present    bool
-		null       bool
-		wantValue  string
+		// name 是子测试名称。
+		name string
+		// wire 是输入和预期输出使用的 JSON。
+		wire string
+		// present 表示字段是否出现在 wire 中。
+		present bool
+		// null 表示字段是否显式为 null。
+		null bool
+		// wantValue 是 value 状态下的期望字符串。
+		wantValue string
+		// valueValid 表示本用例是否应断言具体值。
 		valueValid bool
 	}{
 		{name: "absent", wire: `{}`},
@@ -195,7 +202,9 @@ func TestClientRequestKeepsMethodParamsCoupled(t *testing.T) {
 		t.Fatalf("序列化 thread/start 请求失败：%v", err)
 	}
 	var wire struct {
-		Method string            `json:"method"`
+		// Method 是请求 envelope 的方法名。
+		Method string `json:"method"`
+		// Params 是 thread/start 的强类型参数。
 		Params ThreadStartParams `json:"params"`
 	}
 	if err := json.Unmarshal(encoded, &wire); err != nil {
@@ -211,8 +220,11 @@ func TestClientRequestIDRoundTrip(t *testing.T) {
 	integerID := int64(9)
 	stringID := "request-9"
 	testCases := []struct {
+		// name 是子测试名称。
 		name string
-		id   RequestID
+		// id 是需要往返的强类型请求标识。
+		id RequestID
+		// wire 是标识的预期 JSON 标量。
 		wire string
 	}{
 		{name: "integer", id: RequestID{Integer: &integerID}, wire: `9`},
@@ -248,8 +260,10 @@ func TestClientRequestIDRoundTrip(t *testing.T) {
 // TestServerRequestIDRoundTrip 锁住服务端请求整数和字符串 RequestID 的标量 wire 语义。
 func TestServerRequestIDRoundTrip(t *testing.T) {
 	testCases := []struct {
+		// name 是子测试名称。
 		name string
-		id   string
+		// id 是嵌入请求 envelope 的原始标识。
+		id string
 	}{
 		{name: "integer", id: `9`},
 		{name: "string", id: `"request-9"`},
@@ -402,9 +416,12 @@ func TestV1MethodConstantsMatchUpstream(t *testing.T) {
 // TestEnvelopeDecodeFailureReturnsNil 防止调用方在错误路径误用只完成部分解码的变体。
 func TestEnvelopeDecodeFailureReturnsNil(t *testing.T) {
 	testCases := []struct {
-		name   string
+		// name 是子测试名称。
+		name string
+		// decode 是当前 envelope 类别的解码入口。
 		decode func([]byte) (any, error)
-		wire   string
+		// wire 是必须失败且不能返回部分变体的输入。
+		wire string
 	}{
 		{
 			name: "client request",
