@@ -3,7 +3,7 @@ name: claude-agent-acp
 language: zh-CN
 phase: archive
 status: active
-state_version: 13
+state_version: 14
 brief: brief.md
 spec_changes:
   - capability: claude-events-config
@@ -22,7 +22,7 @@ workspace:
   isolation: worktree
   change_branch: comet/claude-agent-acp
   target_branch: main
-  finish: keep
+  finish: merge
 loop:
   stage: archive-ready
   goal_cycle: 2
