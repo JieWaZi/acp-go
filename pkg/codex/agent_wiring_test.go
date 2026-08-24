@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -154,12 +155,46 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 		client,
 	)
 	agent.markConnectionReady()
+	agent.connectionMu.Lock()
+	agent.sessionUpdater = &recordingHistoryUpdater{}
+	agent.connectionMu.Unlock()
 	var turnParams protocol.TurnStartParams
+	var threadConfig map[string]json.RawMessage
+	rpc.afterObserved = func() {
+		contextWindow := int64(128000)
+		client.HandleNotification(context.Background(), decodeTestNotification(
+			t,
+			protocol.MethodThreadTokenUsageUpdated,
+			protocol.ThreadTokenUsageUpdatedNotification{
+				ThreadID: "configured-thread",
+				TurnID:   "configured-turn",
+				TokenUsage: protocol.TokenUsage{
+					Last: protocol.Last{
+						TotalTokens: 1500, InputTokens: 1200, CachedInputTokens: 500,
+						OutputTokens: 200, ReasoningOutputTokens: 100,
+					},
+					Total:              protocol.Last{TotalTokens: 7000},
+					ModelContextWindow: &contextWindow,
+				},
+			},
+		))
+		client.HandleNotification(context.Background(), decodeTestNotification(
+			t,
+			protocol.MethodTurnCompleted,
+			protocol.TurnCompletedNotification{
+				ThreadID: "configured-thread",
+				Turn: protocol.TurnElement{
+					ID: "configured-turn", Items: []protocol.ThreadItem{}, Status: protocol.FluffyCompleted,
+				},
+			},
+		))
+	}
 	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
 		switch request.Method() {
 		case protocol.MethodInitialize:
 			return nil
 		case protocol.MethodThreadStart:
+			threadConfig = request.(protocol.ThreadStartRequest).Params.Config
 			response := result.(*protocol.ThreadStartResponse)
 			response.Thread.ID = "configured-thread"
 			response.Model = "fast-model"
@@ -186,16 +221,6 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
 				ID: "configured-turn", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
 			}
-			client.HandleNotification(context.Background(), decodeTestNotification(
-				t,
-				protocol.MethodTurnCompleted,
-				protocol.TurnCompletedNotification{
-					ThreadID: "configured-thread",
-					Turn: protocol.TurnElement{
-						ID: "configured-turn", Items: []protocol.ThreadItem{}, Status: protocol.FluffyCompleted,
-					},
-				},
-			))
 			return nil
 		default:
 			return errors.New("unexpected call: " + request.Method())
@@ -204,13 +229,20 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 	initializeTestAgent(t, agent)
 
 	created, err := agent.NewSession(context.Background(), acp.NewSessionRequest{
-		Cwd: "/workspace", McpServers: []acp.McpServer{},
+		Cwd:                   "/workspace",
+		AdditionalDirectories: []string{"/shared"},
+		McpServers:            []acp.McpServer{},
 	})
 	if err != nil {
 		t.Fatalf("NewSession 返回错误: %v", err)
 	}
 	if created.Modes == nil || created.Modes.CurrentModeId != "agent" || len(created.ConfigOptions) != 3 {
 		t.Fatalf("session 初始配置为 modes=%#v options=%#v", created.Modes, created.ConfigOptions)
+	}
+	var sandboxConfig protocol.SandboxWorkspaceWriteClass
+	if err = json.Unmarshal(threadConfig["sandbox_workspace_write"], &sandboxConfig); err != nil ||
+		!reflect.DeepEqual(sandboxConfig.WritableRoots, []string{"/shared"}) {
+		t.Fatalf("thread config writable roots = %#v, %v", sandboxConfig.WritableRoots, err)
 	}
 	if _, err = agent.SetSessionMode(context.Background(), acp.SetSessionModeRequest{
 		SessionId: created.SessionId, ModeId: "agent-full-access",
@@ -243,6 +275,12 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 	if err != nil || response.StopReason != acp.StopReasonEndTurn {
 		t.Fatalf("Prompt 响应为 %#v, %v", response, err)
 	}
+	if response.Usage == nil || response.Usage.TotalTokens != 1500 ||
+		response.Usage.InputTokens != 700 || response.Usage.CachedReadTokens == nil ||
+		*response.Usage.CachedReadTokens != 500 || response.Usage.ThoughtTokens == nil ||
+		*response.Usage.ThoughtTokens != 100 {
+		t.Fatalf("Prompt Usage = %#v", response.Usage)
+	}
 	if turnParams.Model == nil || *turnParams.Model != "slow-model" ||
 		turnParams.Effort == nil || *turnParams.Effort != "medium" ||
 		turnParams.ApprovalPolicy == nil || turnParams.ApprovalPolicy.Enum == nil ||
@@ -255,8 +293,13 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 	}
 	if _, err = agent.SetSessionMode(context.Background(), acp.SetSessionModeRequest{
 		SessionId: created.SessionId, ModeId: "agent",
-	}); !errors.Is(err, ErrSessionNotFound) {
-		t.Fatalf("已关闭 session 配置错误为 %v，期望 ErrSessionNotFound", err)
+	}); err == nil {
+		t.Fatal("已关闭 session 配置错误为空")
+	} else {
+		var requestErr *acp.RequestError
+		if !errors.As(err, &requestErr) || requestErr.Code != acpResourceNotFoundCode {
+			t.Fatalf("已关闭 session 配置错误为 %v，期望 ResourceNotFound", err)
+		}
 	}
 }
 

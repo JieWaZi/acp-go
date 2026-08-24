@@ -26,6 +26,34 @@ type turnUsage struct {
 	TotalTokens int64
 	// ContextWindow 是模型上下文窗口大小；未知时为零。
 	ContextWindow int64
+	// InputTokens 是扣除缓存读取后的本轮输入 token 数。
+	InputTokens int64
+	// CacheReadTokens 是本轮命中的缓存输入 token 数。
+	CacheReadTokens int64
+	// CacheWriteTokens 是本轮写入缓存的 token 数；nil 表示上游未报告。
+	CacheWriteTokens *int64
+	// OutputTokens 是包含 reasoning 在内的本轮输出 token 数。
+	OutputTokens int64
+	// ThoughtTokens 是本轮 reasoning 输出 token 数。
+	ThoughtTokens int64
+}
+
+// PromptUsage 把已校验的 Codex 本轮统计转换为 ACP PromptResponse Usage。
+func (u turnUsage) PromptUsage() *acp.Usage {
+	cacheRead := int(u.CacheReadTokens)
+	thought := int(u.ThoughtTokens)
+	usage := &acp.Usage{
+		CachedReadTokens: &cacheRead,
+		InputTokens:      int(u.InputTokens),
+		OutputTokens:     int(u.OutputTokens),
+		ThoughtTokens:    &thought,
+		TotalTokens:      int(u.LastTokens),
+	}
+	if u.CacheWriteTokens != nil {
+		cacheWrite := int(*u.CacheWriteTokens)
+		usage.CachedWriteTokens = &cacheWrite
+	}
+	return usage
 }
 
 // eventHandler 保存一个 turn generation 内去重所需的局部事件状态。
@@ -357,22 +385,61 @@ func (h *eventHandler) handleTokenUsage(
 	ctx context.Context,
 	params protocol.ThreadTokenUsageUpdatedNotification,
 ) error {
-	h.usage = &turnUsage{
-		LastTokens:    params.TokenUsage.Last.TotalTokens,
-		TotalTokens:   params.TokenUsage.Total.TotalTokens,
-		ContextWindow: int64Value(params.TokenUsage.ModelContextWindow),
+	usage, err := turnUsageFromTokenUsage(params.TokenUsage)
+	if err != nil {
+		return err
 	}
-	if params.TokenUsage.ModelContextWindow == nil || *params.TokenUsage.ModelContextWindow <= 0 {
+	h.usage = &usage
+	if usage.ContextWindow <= 0 {
 		return nil
 	}
-	if *params.TokenUsage.ModelContextWindow > math.MaxInt || params.TokenUsage.Last.TotalTokens > math.MaxInt {
-		return fmt.Errorf("token usage exceeds ACP integer range")
-	}
 	update := acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
-		Used: int(params.TokenUsage.Last.TotalTokens),
-		Size: int(*params.TokenUsage.ModelContextWindow),
+		Used: int(usage.LastTokens),
+		Size: int(usage.ContextWindow),
 	}}
 	return h.emit(ctx, update)
+}
+
+// turnUsageFromTokenUsage 校验 app-server 数值并保留 PromptResponse 所需的完整本轮明细。
+func turnUsageFromTokenUsage(tokenUsage protocol.TokenUsage) (turnUsage, error) {
+	last := tokenUsage.Last
+	values := []int64{
+		last.TotalTokens,
+		last.InputTokens,
+		last.CachedInputTokens,
+		last.OutputTokens,
+		last.ReasoningOutputTokens,
+		tokenUsage.Total.TotalTokens,
+	}
+	if tokenUsage.ModelContextWindow != nil {
+		values = append(values, *tokenUsage.ModelContextWindow)
+	}
+	if last.CacheWriteInputTokens != nil {
+		values = append(values, *last.CacheWriteInputTokens)
+	}
+	for _, value := range values {
+		if value < 0 || value > math.MaxInt {
+			return turnUsage{}, fmt.Errorf("token usage exceeds ACP integer range")
+		}
+	}
+	if last.InputTokens < last.CachedInputTokens {
+		return turnUsage{}, fmt.Errorf("cached input tokens exceed total input tokens")
+	}
+	var cacheWrite *int64
+	if last.CacheWriteInputTokens != nil {
+		value := *last.CacheWriteInputTokens
+		cacheWrite = &value
+	}
+	return turnUsage{
+		LastTokens:       last.TotalTokens,
+		TotalTokens:      tokenUsage.Total.TotalTokens,
+		ContextWindow:    int64Value(tokenUsage.ModelContextWindow),
+		InputTokens:      last.InputTokens - last.CachedInputTokens,
+		CacheReadTokens:  last.CachedInputTokens,
+		CacheWriteTokens: cacheWrite,
+		OutputTokens:     last.OutputTokens,
+		ThoughtTokens:    last.ReasoningOutputTokens,
+	}, nil
 }
 
 // int64Value 将可选 int64 转为快照值，nil 表示未知并返回零。

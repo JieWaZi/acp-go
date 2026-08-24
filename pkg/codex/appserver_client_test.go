@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,8 @@ type fakeAppServerRPC struct {
 	notifications []string
 	// handleCall 由测试按请求类型填充响应或插入乱序通知。
 	handleCall func(ctx context.Context, request protocol.ClientRequest, result any) error
+	// afterObserved 在同步 turn identity observer 后发送后续测试事件。
+	afterObserved func()
 	// done 模拟 transport fatal 通道。
 	done chan struct{}
 	// err 模拟 transport 稳定错误。
@@ -102,6 +105,25 @@ func (f *fakeAppServerRPC) Call(
 		return errors.New("unexpected fake app-server call")
 	}
 	return f.handleCall(ctx, request, result)
+}
+
+// CallObserved 在普通 fake 调用后同步安装 identity，再发送后续测试事件。
+func (f *fakeAppServerRPC) CallObserved(
+	ctx context.Context,
+	build func(protocol.RequestID) protocol.ClientRequest,
+	result any,
+	observer func() error,
+) error {
+	if err := f.Call(ctx, build, result); err != nil {
+		return err
+	}
+	if err := observer(); err != nil {
+		return err
+	}
+	if f.afterObserved != nil {
+		f.afterObserved()
+	}
+	return nil
 }
 
 // Notify 记录 typed client 发出的 initialized 通知。
@@ -184,6 +206,48 @@ func TestAppServerClientInitializesOnce(t *testing.T) {
 	}
 	if len(rpc.notifications) != 1 || rpc.notifications[0] != protocol.MethodInitialized {
 		t.Fatalf("initialized 通知为 %v", rpc.notifications)
+	}
+}
+
+// TestAppServerClientRefreshSkillsUpdatesRootsAndForcesReload 验证 Skill roots 缓存与扫描顺序。
+func TestAppServerClientRefreshSkillsUpdatesRootsAndForcesReload(t *testing.T) {
+	t.Parallel()
+
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch typed := request.(type) {
+		case protocol.SkillsExtraRootsSetRequest:
+			if !reflect.DeepEqual(typed.Params.ExtraRoots, []string{"/shared/.agents/skills"}) {
+				t.Fatalf("ExtraRoots = %#v", typed.Params.ExtraRoots)
+			}
+		case protocol.SkillsListRequest:
+			if !reflect.DeepEqual(typed.Params.Cwds, []string{"/workspace", "/shared"}) ||
+				typed.Params.ForceReload == nil || !*typed.Params.ForceReload {
+				t.Fatalf("SkillsListParams = %#v", typed.Params)
+			}
+			result.(*protocol.SkillsListResponse).Data = []protocol.SkillsListResponseDatum{}
+		default:
+			t.Fatalf("unexpected request type %T", request)
+		}
+		return nil
+	}
+	client := newAppServerClient(context.Background(), rpc)
+	workspace := codexWorkspace{
+		CWD:                   "/workspace",
+		AdditionalDirectories: []string{"/shared"},
+	}
+	if err := client.RefreshSkills(context.Background(), workspace); err != nil {
+		t.Fatalf("RefreshSkills 返回错误：%v", err)
+	}
+	if err := client.RefreshSkills(context.Background(), workspace); err != nil {
+		t.Fatalf("第二次 RefreshSkills 返回错误：%v", err)
+	}
+	if !reflect.DeepEqual(rpc.calls, []string{
+		protocol.MethodSkillsExtraRootsSet,
+		protocol.MethodSkillsList,
+		protocol.MethodSkillsList,
+	}) {
+		t.Fatalf("calls = %#v", rpc.calls)
 	}
 }
 

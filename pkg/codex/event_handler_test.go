@@ -141,6 +141,11 @@ func TestEventRouterMapsPlanAndLatestUsage(t *testing.T) {
 	if !ok || usage.LastTokens != 1500 || usage.TotalTokens != 7000 {
 		t.Fatalf("latest usage = %#v, %v", usage, ok)
 	}
+	promptUsage := usage.PromptUsage()
+	if promptUsage == nil || promptUsage.TotalTokens != 1500 || promptUsage.InputTokens != 1200 ||
+		promptUsage.OutputTokens != 200 || promptUsage.ThoughtTokens == nil || *promptUsage.ThoughtTokens != 100 {
+		t.Fatalf("Prompt Usage = %#v", promptUsage)
+	}
 }
 
 // TestEventRouterDoesNotLeakUsageAcrossTurns 验证新 generation 的 handler 不继承旧 turn usage。

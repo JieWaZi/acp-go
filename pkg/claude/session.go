@@ -211,7 +211,12 @@ func (s *claudeSessionStore) removeAll() []*claudeSession {
 // openSession 校验参数、完成进程握手，并在成功后原子发布 Session。
 func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*claudeSession, error) {
 	options, err := prepareLaunchOptions(
-		request.CWD, request.SessionID, request.Resume, request.AdditionalDirectories, request.MCPServers,
+		request.CWD,
+		request.SessionID,
+		request.Resume,
+		a.allowBypassPermissions,
+		request.AdditionalDirectories,
+		request.MCPServers,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("opening Claude session: %w", err)
@@ -285,7 +290,11 @@ func (s *claudeSession) initialize(ctx context.Context) error {
 		s.mu.Lock()
 		s.systemInit = *init
 		s.initialization = response
-		s.configuration = newSessionConfiguration(*init, response)
+		s.configuration = newSessionConfiguration(
+			*init,
+			response,
+			s.agent.allowBypassPermissions,
+		)
 		s.mu.Unlock()
 		return nil
 	case <-initializeCtx.Done():

@@ -215,6 +215,37 @@ func TestClientRequestKeepsMethodParamsCoupled(t *testing.T) {
 	}
 }
 
+// TestSkillRequestsKeepMethodParamsCoupled 锁住 Skill roots/list 的方法名与生成参数。
+func TestSkillRequestsKeepMethodParamsCoupled(t *testing.T) {
+	idValue := int64(11)
+	id := RequestID{Integer: &idValue}
+	forceReload := true
+	requests := []ClientRequest{
+		NewSkillsExtraRootsSetRequest(id, SkillsExtraRootsSetParams{
+			ExtraRoots: []string{"/workspace/.agents/skills"},
+		}),
+		NewSkillsListRequest(id, SkillsListParams{
+			Cwds:        []string{"/workspace"},
+			ForceReload: &forceReload,
+		}),
+	}
+	wantMethods := []string{MethodSkillsExtraRootsSet, MethodSkillsList}
+
+	for index, request := range requests {
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			t.Fatalf("序列化 Skill 请求失败：%v", err)
+		}
+		decoded, err := DecodeClientRequest(encoded)
+		if err != nil {
+			t.Fatalf("解码 Skill 请求失败：%v", err)
+		}
+		if decoded.Method() != wantMethods[index] {
+			t.Fatalf("Skill method = %q，期望 %q", decoded.Method(), wantMethods[index])
+		}
+	}
+}
+
 // TestClientRequestIDRoundTrip 锁住客户端请求整数和字符串 RequestID 的标量 wire 语义。
 func TestClientRequestIDRoundTrip(t *testing.T) {
 	integerID := int64(9)

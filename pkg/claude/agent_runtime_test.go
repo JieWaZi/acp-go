@@ -36,6 +36,23 @@ type recordingClaudeClient struct {
 	updates []acp.SessionNotification
 	// permissions 保存收到的权限请求。
 	permissions []acp.RequestPermissionRequest
+	// elicitations 保存收到的结构化用户输入请求。
+	elicitations []acp.UnstableCreateElicitationRequest
+}
+
+// TestClaudeAgentReturnsResourceNotFoundForMissingSession 锁住 Session 缺失的 ACP 标准错误码。
+func TestClaudeAgentReturnsResourceNotFoundForMissingSession(t *testing.T) {
+	t.Parallel()
+
+	agent := &Agent{sessions: newClaudeSessionStore(), initialized: true}
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: "missing-session",
+		Prompt:    []acp.ContentBlock{acp.TextBlock("continue")},
+	})
+	var requestErr *acp.RequestError
+	if !errors.As(err, &requestErr) || requestErr.Code != acpResourceNotFoundCode {
+		t.Fatalf("missing Session error = %v", err)
+	}
 }
 
 // SessionUpdate 记录一条 ACP 更新。
@@ -54,6 +71,19 @@ func (c *recordingClaudeClient) RequestPermission(_ context.Context, request acp
 	return acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
 		Selected: &acp.RequestPermissionOutcomeSelected{Outcome: "selected", OptionId: permissionAllowOnce},
 	}}, nil
+}
+
+// UnstableCreateElicitation 记录 form 请求并选择第一个问题的 Yes 选项。
+func (c *recordingClaudeClient) UnstableCreateElicitation(
+	_ context.Context,
+	request acp.UnstableCreateElicitationRequest,
+) (acp.UnstableCreateElicitationResponse, error) {
+	c.mu.Lock()
+	c.elicitations = append(c.elicitations, request)
+	c.mu.Unlock()
+	response := acp.NewUnstableCreateElicitationResponseAccept()
+	response.Accept.Content = map[string]any{"question_0": "Yes"}
+	return response, nil
 }
 
 // snapshot 返回不共享底层数组的记录快照。
@@ -76,14 +106,20 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	agent.allowBypassPermissions = true
 	t.Cleanup(func() { _ = agent.Close(context.Background()) })
 	client := &recordingClaudeClient{}
 	agent.connectionMu.Lock()
 	agent.updater = client
 	agent.permissionRequester = client
+	agent.elicitationRequester = client
 	agent.connectionMu.Unlock()
 
-	initialized, err := agent.Initialize(ctx, acp.InitializeRequest{})
+	initialized, err := agent.Initialize(ctx, acp.InitializeRequest{
+		ClientCapabilities: acp.ClientCapabilities{
+			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +181,18 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 	if len(permissions) != 1 || permissions[0].ToolCall.ToolCallId != "permission-tool" {
 		t.Fatalf("permissions = %#v", permissions)
 	}
+	questionResponse, err := agent.Prompt(ctx, acp.PromptRequest{
+		SessionId: created.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("question")},
+	})
+	if err != nil || questionResponse.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("question Prompt() = %#v, %v", questionResponse, err)
+	}
+	client.mu.Lock()
+	if len(client.elicitations) != 1 || client.elicitations[0].Form == nil {
+		t.Fatalf("elicitations = %#v", client.elicitations)
+	}
+	client.mu.Unlock()
 
 	if _, err := agent.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
 		SessionId: created.SessionId, ConfigId: modelConfigID, Value: "opus",
@@ -153,6 +201,12 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 	}
 	if _, err := agent.SetSessionMode(ctx, acp.SetSessionModeRequest{SessionId: created.SessionId, ModeId: "plan"}); err != nil {
 		t.Fatalf("SetSessionMode() = %v", err)
+	}
+	if _, err := agent.SetSessionMode(ctx, acp.SetSessionModeRequest{
+		SessionId: created.SessionId,
+		ModeId:    "bypassPermissions",
+	}); err != nil {
+		t.Fatalf("SetSessionMode(bypassPermissions) = %v", err)
 	}
 
 	promptDone := make(chan acp.PromptResponse, 1)
@@ -283,6 +337,7 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	permissionPending := false
+	pendingToolID := ""
 	ignoreInterrupt := strings.Contains(sessionID, "ignore-interrupt")
 	for scanner.Scan() {
 		var header struct {
@@ -344,6 +399,7 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 			}
 			if strings.Contains(string(message.Message.Content), "permission") {
 				permissionPending = true
+				pendingToolID = "permission-tool"
 				_ = encoder.Encode(map[string]any{
 					"type": "assistant",
 					"message": map[string]any{
@@ -361,6 +417,21 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 				})
 				continue
 			}
+			if strings.Contains(string(message.Message.Content), "question") {
+				permissionPending = true
+				pendingToolID = "question-tool"
+				_ = encoder.Encode(map[string]any{
+					"type": "control_request", "request_id": "question-request", "request": map[string]any{
+						"subtype": "can_use_tool", "tool_name": "AskUserQuestion",
+						"input": map[string]any{"questions": []map[string]any{{
+							"question": "Continue?", "header": "Decision",
+							"options": []map[string]any{{"label": "Yes", "description": "Continue"}},
+						}}},
+						"tool_use_id": "question-tool",
+					},
+				})
+				continue
+			}
 			emitFakeTurn(encoder, sessionID, message.UUID)
 		case protocol.TypeControlResponse:
 			if permissionPending {
@@ -369,12 +440,13 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 					"type": "user",
 					"message": map[string]any{
 						"role": "user", "content": []map[string]any{{
-							"type": "tool_result", "tool_use_id": "permission-tool", "content": "allowed",
+							"type": "tool_result", "tool_use_id": pendingToolID, "content": "allowed",
 						}},
 					},
 					"parent_tool_use_id": nil, "uuid": "permission-result", "session_id": sessionID,
 				})
 				emitFakeResult(encoder, sessionID, "permission-finished")
+				pendingToolID = ""
 			}
 		}
 	}

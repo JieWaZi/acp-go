@@ -220,7 +220,7 @@ func (m *steeringManager) Handle(ctx context.Context, raw json.RawMessage) (stee
 	}
 	state, ok := m.agent.sessions.get(params.SessionID)
 	if !ok {
-		return steeringResponse{}, acp.NewInvalidRequest("session not found")
+		return steeringResponse{}, codexSessionNotFoundError(params.SessionID)
 	}
 	queue, err := m.getQueue(params.SessionID)
 	if err != nil {

@@ -11,6 +11,7 @@
 - 查找并验证用户安装的 Codex CLI，持有一个 `codex app-server` 子进程。
 - 实现 initialize、认证、Session 创建/加载/恢复/关闭、Prompt、取消和 steering。
 - 维护 ACP Session、Codex Thread、Turn 与本地 generation 的一致性。
+- 校验 additional directories，配置 trusted projects、可写根并刷新标准 `.agents/skills`。
 - 映射 Agent Message、Reasoning、Plan、Token Usage、命令、文件变更与 MCP Tool Call。
 - 把命令、文件和细粒度权限请求转换为 ACP `session/requestPermission`。
 - 在关闭、进程异常、协议错误和并发取消时释放有界队列与等待请求。
@@ -26,6 +27,8 @@
 - 多轮 Prompt、Text、Image、Embedded Resource 和 Resource Link。
 - Prompt cancel/interrupt 与 `_session/steering`。
 - Command、File Change、MCP Tool、Plan、Reasoning 和 Usage 更新。
+- PromptResponse 级 Input/Cache/Output/Thought/Total Usage。
+- additional directories、trusted projects、workspace-write roots 与工作区 Skill 刷新。
 - stdio、Streamable HTTP MCP Server，以及 Form/URL Elicitation。
 - Model、Reasoning Effort 和 `read-only`、`agent`、`agent-full-access` 模式。
 
@@ -67,6 +70,9 @@ agent, err := codex.NewAgent(ctx, codex.Config{
 - `CODEX_API_KEY` 和 `OPENAI_API_KEY` 可用于 API Key 认证。
 - `NO_BROWSER` 非空时隐藏浏览器登录。
 - `DISABLE_MCP_CONFIG_FILTERING=true` 时关闭同名 MCP 配置保护。
+- `session/new`、`load`、`resume` 的 `cwd` 与 `additionalDirectories` 必须是绝对路径；重复项和 `cwd` 会被去重。
+
+工作区 Skill 使用 `<root>/.agents/skills/<skill-name>/SKILL.md`。存在标准 Skill 目录时，Adapter 会在 Session 打开和每次 Prompt 前更新 app-server extra roots，并使用 `skills/list(forceReload=true)` 重新扫描主目录及附加目录。
 
 构造成功后，调用方必须在生命周期结束时调用 `Agent.Close`；使用 `pkg/acpserver.Server` 时由 Server 负责关闭。
 
@@ -99,6 +105,7 @@ go run ./tools/protocolgen --check
 ## 已知边界
 
 - app-server 进程异常会使当前 Adapter 不可用，需要由宿主重新构造。
+- 本地 Session 缺失统一返回 ACP `ResourceNotFound`（`-32002`），宿主可据此决定恢复或重建。
 - 客户端未声明 Elicitation 能力时，交互请求按安全默认值处理。
 - 不支持的实验消息不会成为公开能力；未知通知只记录安全摘要。
 - Codex CLI 版本变化可能影响运行时兼容性，升级前必须完成协议新鲜度和回归测试。

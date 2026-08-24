@@ -25,7 +25,8 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("Agent 信息为 %#v，期望 codex", response.AgentInfo)
 	}
 	if !response.AgentCapabilities.LoadSession || response.AgentCapabilities.SessionCapabilities.Close == nil ||
-		response.AgentCapabilities.SessionCapabilities.Resume == nil {
+		response.AgentCapabilities.SessionCapabilities.Resume == nil ||
+		response.AgentCapabilities.SessionCapabilities.AdditionalDirectories == nil {
 		t.Fatalf("runtime session 能力为 %#v", response.AgentCapabilities)
 	}
 	if response.AgentCapabilities.Auth.Logout == nil {
@@ -111,6 +112,22 @@ func TestAgentCancelIsIdempotentWithoutRuntime(t *testing.T) {
 		if err := agent.Cancel(context.Background(), acp.CancelNotification{}); err != nil {
 			t.Fatalf("空 runtime 取消返回错误: %v", err)
 		}
+	}
+}
+
+// TestAgentReturnsResourceNotFoundForMissingSession 锁住 Session 缺失的 ACP 标准错误码。
+func TestAgentReturnsResourceNotFoundForMissingSession(t *testing.T) {
+	t.Parallel()
+
+	agent := newTestAgent(t)
+	initializeTestAgent(t, agent)
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: "missing-session",
+		Prompt:    []acp.ContentBlock{acp.TextBlock("continue")},
+	})
+	var requestErr *acp.RequestError
+	if !errors.As(err, &requestErr) || requestErr.Code != acpResourceNotFoundCode {
+		t.Fatalf("missing Session error = %v", err)
 	}
 }
 

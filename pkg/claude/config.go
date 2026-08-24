@@ -43,10 +43,12 @@ type sessionConfiguration struct {
 	fast bool
 	// mode 是当前权限模式。
 	mode acp.SessionModeId
+	// allowBypassPermissions 表示进程启动时已经显式允许危险 bypass 模式。
+	allowBypassPermissions bool
 }
 
-// permissionModes 返回 V1 实际允许设置的非危险权限模式。
-func permissionModes(auto bool) []permissionModeDefinition {
+// permissionModes 返回当前模型和进程安全门槛共同允许的权限模式。
+func permissionModes(auto bool, allowBypass bool) []permissionModeDefinition {
 	modes := []permissionModeDefinition{
 		{ID: "default", Name: "Default", Description: "Ask before sensitive operations."},
 		{ID: "acceptEdits", Name: "Accept edits", Description: "Allow file edits while prompting for other sensitive operations."},
@@ -58,21 +60,47 @@ func permissionModes(auto bool) []permissionModeDefinition {
 			ID: "auto", Name: "Auto", Description: "Let the active model choose safe automatic actions.",
 		})
 	}
+	if allowBypass {
+		modes = append(modes, permissionModeDefinition{
+			ID:          "bypassPermissions",
+			Name:        "Bypass permissions",
+			Description: "Accept all permissions without prompting.",
+		})
+	}
 	return modes
 }
 
 // newSessionConfiguration 从两条初始化通道建立配置真值。
-func newSessionConfiguration(init protocol.SystemInitMessage, response protocol.InitializeControlResponse) sessionConfiguration {
+func newSessionConfiguration(
+	init protocol.SystemInitMessage,
+	response protocol.InitializeControlResponse,
+	allowBypass bool,
+) sessionConfiguration {
 	mode := acp.SessionModeId(init.PermissionMode)
 	if mode == "" {
 		mode = "default"
 	}
-	return sessionConfiguration{
-		models: append([]protocol.ModelInfo(nil), response.Models...),
-		model:  init.Model,
-		fast:   init.FastModeState == "on" || init.FastModeState == "cooldown",
-		mode:   mode,
+	configuration := sessionConfiguration{
+		models:                 append([]protocol.ModelInfo(nil), response.Models...),
+		model:                  init.Model,
+		fast:                   init.FastModeState == "on" || init.FastModeState == "cooldown",
+		mode:                   mode,
+		allowBypassPermissions: allowBypass,
 	}
+	if !configuration.permissionModeAvailable(mode) {
+		configuration.mode = "default"
+	}
+	return configuration
+}
+
+// permissionModeAvailable 判断模式是否同时满足模型和进程权限门槛。
+func (c sessionConfiguration) permissionModeAvailable(mode acp.SessionModeId) bool {
+	for _, available := range permissionModes(c.currentModelSupportsAuto(), c.allowBypassPermissions) {
+		if available.ID == mode {
+			return true
+		}
+	}
+	return false
 }
 
 // configOptions 返回当前 Session 配置的 ACP 快照。
@@ -108,8 +136,9 @@ func (c sessionConfiguration) options() []acp.SessionConfigOption {
 
 // modeState 生成 ACP 模式列表。
 func (c sessionConfiguration) modeState() *acp.SessionModeState {
-	available := make([]acp.SessionMode, 0, len(permissionModes(c.currentModelSupportsAuto())))
-	for _, mode := range permissionModes(c.currentModelSupportsAuto()) {
+	modes := permissionModes(c.currentModelSupportsAuto(), c.allowBypassPermissions)
+	available := make([]acp.SessionMode, 0, len(modes))
+	for _, mode := range modes {
 		description := mode.Description
 		available = append(available, acp.SessionMode{
 			Id: mode.ID, Name: mode.Name, Description: &description,
@@ -122,7 +151,7 @@ func (c sessionConfiguration) modeState() *acp.SessionModeState {
 func (c sessionConfiguration) modeOption() acp.SessionConfigOption {
 	category := acp.SessionConfigOptionCategoryMode
 	values := make(acp.SessionConfigSelectOptionsUngrouped, 0)
-	for _, mode := range permissionModes(c.currentModelSupportsAuto()) {
+	for _, mode := range permissionModes(c.currentModelSupportsAuto(), c.allowBypassPermissions) {
 		description := mode.Description
 		values = append(values, acp.SessionConfigSelectOption{
 			Value: acp.SessionConfigValueId(mode.ID), Name: mode.Name, Description: &description,
@@ -258,14 +287,7 @@ func (s *claudeSession) applyMode(ctx context.Context, value string) error {
 	s.mu.Lock()
 	configuration := s.configuration
 	s.mu.Unlock()
-	valid := false
-	for _, mode := range permissionModes(configuration.currentModelSupportsAuto()) {
-		if string(mode.ID) == value {
-			valid = true
-			break
-		}
-	}
-	if !valid {
+	if !configuration.permissionModeAvailable(acp.SessionModeId(value)) {
 		return fmt.Errorf("setting Claude mode: invalid value %q", value)
 	}
 	if err := s.transport.Call(ctx, protocol.SetPermissionModeControlRequest{

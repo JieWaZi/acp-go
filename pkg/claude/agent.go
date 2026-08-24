@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/internal/buildinfo"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -21,8 +22,6 @@ const (
 	claudeAgentName = "claude"
 	// claudeAgentTitle 是客户端展示的 Adapter 名称。
 	claudeAgentTitle = "Claude Agent"
-	// claudeAgentVersion 是尚未注入构建版本时的开发标识。
-	claudeAgentVersion = "development"
 	// sessionCloseTimeout 限制单个 Session 的进程收尾时间。
 	sessionCloseTimeout = 5 * time.Second
 )
@@ -58,12 +57,23 @@ type permissionRequester interface {
 	RequestPermission(ctx context.Context, request acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
 }
 
+// elicitationRequester 是结构化用户输入消费的 ACP form Elicitation 窄接口。
+type elicitationRequester interface {
+	// UnstableCreateElicitation 请求客户端展示一个结构化表单。
+	UnstableCreateElicitation(
+		ctx context.Context,
+		request acp.UnstableCreateElicitationRequest,
+	) (acp.UnstableCreateElicitationResponse, error)
+}
+
 // Agent 是 Claude Adapter 的 ACP 协议入口，并拥有全部 Session 进程。
 type Agent struct {
 	// logger 是进程级诊断入口，绝不写 ACP stdout。
 	logger *slog.Logger
 	// executable 是构造时已经验证的 CLI。
 	executable executable
+	// allowBypassPermissions 保存进程身份与沙箱环境共同决定的危险模式门槛。
+	allowBypassPermissions bool
 	// runtimeCtx 跨单次 ACP 请求存活，直到 Adapter Close。
 	runtimeCtx context.Context
 	// runtimeCancel 终止全部 Session 与后台任务。
@@ -84,6 +94,10 @@ type Agent struct {
 	updater sessionUpdater
 	// permissionRequester 向客户端发起权限选择；测试可单独注入。
 	permissionRequester permissionRequester
+	// elicitationRequester 向客户端发起结构化用户输入；测试可单独注入。
+	elicitationRequester elicitationRequester
+	// elicitationCapabilities 保存 initialize 时协商的表单能力快照。
+	elicitationCapabilities *acp.ElicitationCapabilities
 	// idGenerator 为新 Session 和消息生成 UUID。
 	idGenerator func() (string, error)
 	// closeOnce 保证全部 Session 只释放一次。
@@ -109,12 +123,13 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	}
 	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &Agent{
-		logger:        config.Logger,
-		executable:    executable,
-		runtimeCtx:    runtimeCtx,
-		runtimeCancel: runtimeCancel,
-		sessions:      newClaudeSessionStore(),
-		idGenerator:   generateUUID,
+		logger:                 config.Logger,
+		executable:             executable,
+		allowBypassPermissions: bypassPermissionsAllowed(),
+		runtimeCtx:             runtimeCtx,
+		runtimeCancel:          runtimeCancel,
+		sessions:               newClaudeSessionStore(),
+		idGenerator:            generateUUID,
 	}, nil
 }
 
@@ -125,14 +140,18 @@ func (a *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 		a.connection = connection
 		a.updater = connection
 		a.permissionRequester = connection
+		a.elicitationRequester = connection
 	}
 	a.connectionMu.Unlock()
 }
 
 // Initialize 声明 Claude V1 已实现的能力，不宣告登录或其他未实现扩展。
-func (a *Agent) Initialize(_ context.Context, _ acp.InitializeRequest) (acp.InitializeResponse, error) {
+func (a *Agent) Initialize(_ context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	a.initializedMu.Lock()
 	a.initialized = true
+	a.elicitationCapabilities = cloneClaudeElicitationCapabilities(
+		request.ClientCapabilities.Elicitation,
+	)
 	a.initializedMu.Unlock()
 	title := claudeAgentTitle
 	return acp.InitializeResponse{
@@ -149,7 +168,7 @@ func (a *Agent) Initialize(_ context.Context, _ acp.InitializeRequest) (acp.Init
 				Resume:                &acp.SessionResumeCapabilities{},
 			},
 		},
-		AgentInfo:   &acp.Implementation{Name: claudeAgentName, Title: &title, Version: claudeAgentVersion},
+		AgentInfo:   &acp.Implementation{Name: claudeAgentName, Title: &title, Version: buildinfo.Current()},
 		AuthMethods: []acp.AuthMethod{},
 		Meta: map[string]any{
 			"steering": map[string]any{"supported": true},
@@ -203,7 +222,7 @@ func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequ
 		AdditionalDirectories: request.AdditionalDirectories, MCPServers: request.McpServers,
 	})
 	if err != nil {
-		return acp.ResumeSessionResponse{}, err
+		return acp.ResumeSessionResponse{}, mapClaudeSessionOpenError(string(request.SessionId), err)
 	}
 	return acp.ResumeSessionResponse{ConfigOptions: session.configOptions(), Modes: session.modeState()}, nil
 }
@@ -218,7 +237,7 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 		AdditionalDirectories: request.AdditionalDirectories, MCPServers: request.McpServers,
 	})
 	if err != nil {
-		return acp.LoadSessionResponse{}, err
+		return acp.LoadSessionResponse{}, mapClaudeSessionOpenError(string(request.SessionId), err)
 	}
 	if err := a.replaySessionHistory(ctx, session); err != nil {
 		if a.sessions.removeExact(session) {
@@ -238,7 +257,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	}
 	session, ok := a.sessions.get(string(request.SessionId))
 	if !ok {
-		return acp.PromptResponse{}, fmt.Errorf("prompting Claude session %q: %w", request.SessionId, ErrClaudeSessionNotFound)
+		return acp.PromptResponse{}, claudeSessionNotFoundError(string(request.SessionId))
 	}
 	messageID := ""
 	if request.MessageId != nil {
@@ -290,7 +309,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetSessi
 	}
 	session, ok := a.sessions.get(sessionID)
 	if !ok {
-		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("setting Claude config: %w", ErrClaudeSessionNotFound)
+		return acp.SetSessionConfigOptionResponse{}, claudeSessionNotFoundError(sessionID)
 	}
 	if err := session.setConfigOption(ctx, request); err != nil {
 		return acp.SetSessionConfigOptionResponse{}, err
@@ -302,7 +321,7 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetSessi
 func (a *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	session, ok := a.sessions.get(string(request.SessionId))
 	if !ok {
-		return acp.SetSessionModeResponse{}, fmt.Errorf("setting Claude mode: %w", ErrClaudeSessionNotFound)
+		return acp.SetSessionModeResponse{}, claudeSessionNotFoundError(string(request.SessionId))
 	}
 	if err := session.setMode(ctx, string(request.ModeId)); err != nil {
 		return acp.SetSessionModeResponse{}, err
@@ -321,7 +340,7 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 	}
 	session, ok := a.sessions.get(request.SessionID)
 	if !ok {
-		return nil, fmt.Errorf("steering Claude session: %w", ErrClaudeSessionNotFound)
+		return nil, claudeSessionNotFoundError(request.SessionID)
 	}
 	messageID, err := a.idGenerator()
 	if err != nil {

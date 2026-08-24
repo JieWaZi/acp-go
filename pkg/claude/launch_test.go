@@ -19,7 +19,7 @@ func TestPrepareLaunchOptionsAndArgs(t *testing.T) {
 	if err := os.Mkdir(additional, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	options, err := prepareLaunchOptions(cwd, "session-1", false, []string{"additional", additional}, []acp.McpServer{
+	options, err := prepareLaunchOptions(cwd, "session-1", false, true, []string{"additional", additional}, []acp.McpServer{
 		{Stdio: &acp.McpServerStdio{
 			Name: "local", Command: "server", Args: []string{"--stdio"},
 			Env: []acp.EnvVariable{{Name: "TOKEN", Value: "secret-value"}},
@@ -43,7 +43,7 @@ func TestPrepareLaunchOptionsAndArgs(t *testing.T) {
 	for _, required := range []string{
 		"--output-format\nstream-json", "--input-format\nstream-json", "--verbose",
 		"--permission-prompt-tool\nstdio", "--include-partial-messages", "--replay-user-messages",
-		"--session-id=session-1", "--add-dir\n" + additional,
+		"--session-id=session-1", "--allow-dangerously-skip-permissions", "--add-dir\n" + additional,
 	} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("args 缺少 %q：%#v", required, args)
@@ -75,7 +75,7 @@ func TestPrepareLaunchOptionsRejectsInvalidInput(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := prepareLaunchOptions(test.cwd, "s", false, test.directories, test.servers)
+			_, err := prepareLaunchOptions(test.cwd, "s", false, false, test.directories, test.servers)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
@@ -88,5 +88,18 @@ func TestClaudeLaunchArgsResume(t *testing.T) {
 	args := strings.Join(claudeLaunchArgs(launchOptions{SessionID: "existing", Resume: true}), " ")
 	if !strings.Contains(args, "--resume=existing") || strings.Contains(args, "--session-id") {
 		t.Fatalf("resume args = %q", args)
+	}
+}
+
+// TestClaudeLaunchArgsBypassPermissions 验证 bypass 只在显式允许后进入危险模式。
+func TestClaudeLaunchArgsBypassPermissions(t *testing.T) {
+	args := strings.Join(claudeLaunchArgs(launchOptions{
+		SessionID:                       "session-bypass",
+		PermissionMode:                  "bypassPermissions",
+		AllowDangerouslySkipPermissions: true,
+	}), " ")
+	if !strings.Contains(args, "--allow-dangerously-skip-permissions") ||
+		!strings.Contains(args, "--permission-mode bypassPermissions") {
+		t.Fatalf("bypass args = %q", args)
 	}
 }

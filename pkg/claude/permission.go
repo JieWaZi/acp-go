@@ -40,6 +40,10 @@ func (s *claudeSession) requestToolPermission(ctx context.Context, request proto
 	if err := s.startTool(ctx, block); err != nil && !errors.Is(err, ErrClaudeConnectionNotReady) {
 		return permissionDenied("permission request could not be displayed", request.ToolUseID), nil
 	}
+	active := s.activeTurn()
+	if request.ToolName == "AskUserQuestion" {
+		return s.requestAskUserQuestion(ctx, request, active)
+	}
 	title, kind, locations := describeTool(request.ToolName, decodeJSONValue(request.Input))
 	if request.Title != "" {
 		title = request.Title
@@ -67,23 +71,7 @@ func (s *claudeSession) requestToolPermission(ctx context.Context, request proto
 	}
 
 	// 客户端返回后再次验证 Session 与活动 turn，关闭/取消期间的迟到允许必须转为拒绝。
-	s.mu.Lock()
-	closed := s.closed
-	active := s.active
-	s.mu.Unlock()
-	current, currentOK := s.agent.sessions.get(s.id)
-	if closed || active == nil || !currentOK || current != s {
-		return permissionDenied("permission request is no longer active", request.ToolUseID), nil
-	}
-	active.mu.Lock()
-	cancelled := active.cancelled
-	active.mu.Unlock()
-	select {
-	case <-active.drained:
-		return permissionDenied("permission request is no longer active", request.ToolUseID), nil
-	default:
-	}
-	if cancelled {
+	if !s.permissionRequestStillCurrent(active) {
 		return permissionDenied("permission request cancelled", request.ToolUseID), nil
 	}
 	if response.Outcome.Cancelled != nil {
@@ -109,6 +97,68 @@ func (s *claudeSession) requestToolPermission(ctx context.Context, request proto
 		return permissionDenied("user denied permission", request.ToolUseID), nil
 	default:
 		return permissionDenied("unknown permission option", request.ToolUseID), nil
+	}
+}
+
+// requestAskUserQuestion 把 Claude 内置问题转换为 ACP form，并写回工具 answers。
+func (s *claudeSession) requestAskUserQuestion(
+	ctx context.Context,
+	request protocol.CanUseToolControlRequest,
+	active *claudeTurn,
+) (protocol.PermissionResult, error) {
+	requester, supported := s.agent.currentFormElicitation()
+	if !supported || active == nil {
+		return permissionDenied("structured user input is unavailable", request.ToolUseID), nil
+	}
+	questions, err := decodeAskUserQuestions(request.Input)
+	if err != nil {
+		return permissionDenied("invalid structured user input", request.ToolUseID), nil
+	}
+	response, err := requester.UnstableCreateElicitation(
+		ctx,
+		askUserQuestionElicitation(questions, s.id, request.ToolUseID),
+	)
+	if err != nil {
+		return permissionDenied("structured user input failed", request.ToolUseID), nil
+	}
+	if !s.permissionRequestStillCurrent(active) {
+		return permissionDenied("structured user input is no longer active", request.ToolUseID), nil
+	}
+	updatedInput, ok := applyAskUserQuestionResponse(response, request.Input, questions)
+	if !ok {
+		return permissionDenied("structured user input cancelled", request.ToolUseID), nil
+	}
+	return protocol.PermissionResult{
+		Behavior:     "allow",
+		UpdatedInput: updatedInput,
+		ToolUseID:    request.ToolUseID,
+	}, nil
+}
+
+// permissionRequestStillCurrent 防止关闭、取消或新 Turn 接受迟到的权限结果。
+func (s *claudeSession) permissionRequestStillCurrent(active *claudeTurn) bool {
+	if active == nil {
+		return false
+	}
+	s.mu.Lock()
+	closed := s.closed
+	currentActive := s.active
+	s.mu.Unlock()
+	current, currentOK := s.agent.sessions.get(s.id)
+	if closed || currentActive != active || !currentOK || current != s {
+		return false
+	}
+	active.mu.Lock()
+	cancelled := active.cancelled
+	active.mu.Unlock()
+	if cancelled {
+		return false
+	}
+	select {
+	case <-active.drained:
+		return false
+	default:
+		return true
 	}
 }
 

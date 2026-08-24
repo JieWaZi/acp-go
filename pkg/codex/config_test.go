@@ -164,8 +164,8 @@ func TestSessionConfigurationRejectsUnknownSelections(t *testing.T) {
 }
 
 // testModels 创建覆盖 Session 配置选项的稳定模型目录。
-func testModels() []protocol.DatumElement {
-	return []protocol.DatumElement{
+func testModels() []protocol.ModelListResponseDatum {
+	return []protocol.ModelListResponseDatum{
 		{
 			ID: "fast-model", DisplayName: "Fast model", Description: "Frontier", DefaultReasoningEffort: "medium",
 			SupportedReasoningEfforts: []protocol.SupportedReasoningEffortElement{

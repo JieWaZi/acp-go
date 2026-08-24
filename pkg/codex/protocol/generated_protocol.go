@@ -59,6 +59,10 @@ type Protocol struct {
 	ReasoningSummaryTextDeltaNotification   *ReasoningSummaryTextDeltaNotification   `json:"reasoningSummaryTextDeltaNotification,omitempty"`
 	ReasoningTextDeltaNotification          *ReasoningTextDeltaNotification          `json:"reasoningTextDeltaNotification,omitempty"`
 	ServerRequestResolvedNotification       *ServerRequestResolvedNotification       `json:"serverRequestResolvedNotification,omitempty"`
+	SkillsExtraRootsSetParams               *SkillsExtraRootsSetParams               `json:"skillsExtraRootsSetParams,omitempty"`
+	SkillsExtraRootsSetResponse             map[string]interface{}                   `json:"skillsExtraRootsSetResponse,omitempty"`
+	SkillsListParams                        *SkillsListParams                        `json:"skillsListParams,omitempty"`
+	SkillsListResponse                      *SkillsListResponse                      `json:"skillsListResponse,omitempty"`
 	TerminalInteractionNotification         *TerminalInteractionNotification         `json:"terminalInteractionNotification,omitempty"`
 	ThreadReadParams                        *ThreadReadParams                        `json:"threadReadParams,omitempty"`
 	ThreadReadResponse                      *ThreadReadResponse                      `json:"threadReadResponse,omitempty"`
@@ -517,7 +521,7 @@ type ThreadItem struct {
 	Changes    []ChangeElement  `json:"changes,omitempty"`
 	AppContext *AppContextClass `json:"appContext,omitempty"`
 	Arguments  json.RawMessage  `json:"arguments,omitempty"`
-	Error      *ErrorClass      `json:"error,omitempty"`
+	Error      *ItemError       `json:"error,omitempty"`
 	// Deprecated: use `appContext.resourceUri` instead.
 	MCPAppResourceURI *string `json:"mcpAppResourceUri,omitempty"`
 	ReadOnlyHint      *bool   `json:"readOnlyHint,omitempty"`
@@ -611,7 +615,7 @@ type InputDynamicToolCallOutputContentItem struct {
 	AudioURL *string                                   `json:"audioUrl,omitempty"`
 }
 
-type ErrorClass struct {
+type ItemError struct {
 	Message string `json:"message"`
 }
 
@@ -737,13 +741,13 @@ type ModelListParams struct {
 }
 
 type ModelListResponse struct {
-	Data []DatumElement `json:"data"`
+	Data []ModelListResponseDatum `json:"data"`
 	// Opaque cursor to pass to the next call to continue after the last item. If None, there
 	// are no more items to return.
 	NextCursor *string `json:"nextCursor,omitempty"`
 }
 
-type DatumElement struct {
+type ModelListResponseDatum struct {
 	// Deprecated: use `serviceTiers` instead.
 	AdditionalSpeedTiers   []string              `json:"additionalSpeedTiers,omitempty"`
 	AvailabilityNux        *AvailabilityNuxClass `json:"availabilityNux,omitempty"`
@@ -885,6 +889,70 @@ type ReasoningTextDeltaNotification struct {
 type ServerRequestResolvedNotification struct {
 	RequestID *RequestID `json:"requestId"`
 	ThreadID  string     `json:"threadId"`
+}
+
+type SkillsExtraRootsSetParams struct {
+	ExtraRoots []string `json:"extraRoots"`
+}
+
+type SkillsListParams struct {
+	// When empty, defaults to the current session working directory.
+	Cwds []string `json:"cwds,omitempty"`
+	// When true, bypass the skills cache and re-scan skills from disk.
+	ForceReload *bool `json:"forceReload,omitempty"`
+}
+
+type SkillsListResponse struct {
+	Data []SkillsListResponseDatum `json:"data"`
+}
+
+type SkillsListResponseDatum struct {
+	Cwd    string         `json:"cwd"`
+	Errors []ErrorElement `json:"errors"`
+	Skills []SkillElement `json:"skills"`
+}
+
+type ErrorElement struct {
+	Message string `json:"message"`
+	Path    string `json:"path"`
+}
+
+type SkillElement struct {
+	Dependencies *DependenciesClass `json:"dependencies,omitempty"`
+	Description  string             `json:"description"`
+	Enabled      bool               `json:"enabled"`
+	Interface    *InterfaceClass    `json:"interface,omitempty"`
+	Name         string             `json:"name"`
+	Path         string             `json:"path"`
+	Scope        Scope              `json:"scope"`
+	// Legacy short_description from SKILL.md. Prefer SKILL.json interface.short_description.
+	ShortDescription *string `json:"shortDescription,omitempty"`
+}
+
+type DependenciesClass struct {
+	Tools []ToolElement `json:"tools"`
+}
+
+type ToolElement struct {
+	Command     *string `json:"command,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Transport   *string `json:"transport,omitempty"`
+	Type        string  `json:"type"`
+	URL         *string `json:"url,omitempty"`
+	Value       string  `json:"value"`
+}
+
+type InterfaceClass struct {
+	BrandColor    *string `json:"brandColor,omitempty"`
+	DefaultPrompt *string `json:"defaultPrompt,omitempty"`
+	DisplayName   *string `json:"displayName,omitempty"`
+	IconLarge     *string `json:"iconLarge,omitempty"`
+	// Remote large icon URL from the plugin catalog.
+	IconLargeURL *string `json:"iconLargeUrl,omitempty"`
+	IconSmall    *string `json:"iconSmall,omitempty"`
+	// Remote small icon URL from the plugin catalog.
+	IconSmallURL     *string `json:"iconSmallUrl,omitempty"`
+	ShortDescription *string `json:"shortDescription,omitempty"`
 }
 
 type TerminalInteractionNotification struct {
@@ -1422,6 +1490,7 @@ const (
 type ConfigLayerSourceType string
 
 const (
+	ConfigLayerSourceTypeSystem     ConfigLayerSourceType = "system"
 	ConfigLayerSourceTypeUser       ConfigLayerSourceType = "user"
 	EnterpriseManaged               ConfigLayerSourceType = "enterpriseManaged"
 	LegacyManagedConfigTomlFromFile ConfigLayerSourceType = "legacyManagedConfigTomlFromFile"
@@ -1430,7 +1499,6 @@ const (
 	PackagedDefaults                ConfigLayerSourceType = "packagedDefaults"
 	Project                         ConfigLayerSourceType = "project"
 	SessionFlags                    ConfigLayerSourceType = "sessionFlags"
-	System                          ConfigLayerSourceType = "system"
 )
 
 type TurnKind string
@@ -1708,6 +1776,15 @@ type PermissionGrantScope string
 const (
 	Session PermissionGrantScope = "session"
 	Turn    PermissionGrantScope = "turn"
+)
+
+type Scope string
+
+const (
+	Admin       Scope = "admin"
+	Repo        Scope = "repo"
+	ScopeSystem Scope = "system"
+	ScopeUser   Scope = "user"
 )
 
 type SubAgentEnum string

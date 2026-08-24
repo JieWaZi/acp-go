@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/JieWaZi/acp-go/internal/buildinfo"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -22,8 +23,6 @@ const (
 	agentName = "codex"
 	// agentTitle 是 ACP 客户端展示的 Adapter 名称。
 	agentTitle = "Codex"
-	// agentVersion 是当前仓库尚未注入构建版本时的显式开发标识。
-	agentVersion = "development"
 	// appServerCleanupTimeout 为已获得的远端资源提供不继承请求取消的有界释放窗口。
 	appServerCleanupTimeout = 5 * time.Second
 )
@@ -315,10 +314,12 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 				Image: true, EmbeddedContext: true,
 			},
 			SessionCapabilities: acp.SessionCapabilities{
-				Close: &acp.SessionCloseCapabilities{}, Resume: &acp.SessionResumeCapabilities{},
+				AdditionalDirectories: &acp.SessionAdditionalDirectoriesCapabilities{},
+				Close:                 &acp.SessionCloseCapabilities{},
+				Resume:                &acp.SessionResumeCapabilities{},
 			},
 		},
-		AgentInfo:   &acp.Implementation{Name: agentName, Title: &title, Version: agentVersion},
+		AgentInfo:   &acp.Implementation{Name: agentName, Title: &title, Version: buildinfo.Current()},
 		AuthMethods: codexAuthMethods(a.auth.browserAuthEnabled()),
 		Meta: map[string]any{
 			"steering": map[string]any{"supported": true},
@@ -347,13 +348,22 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if err := a.requireInitialized(); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
-	cwd := request.Cwd
-	mcpConfig, mcpNames, err := a.sessionMCPConfig(ctx, request.Cwd, request.McpServers)
+	workspace, err := normalizeCodexWorkspace(request.Cwd, request.AdditionalDirectories)
+	if err != nil {
+		return acp.NewSessionResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
+	}
+	if err = a.refreshSkills(ctx, workspace); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	config, mcpNames, err := a.sessionConfig(ctx, workspace, request.McpServers)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
 	mcpAfterVersion := a.currentMCPStatusVersion()
-	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{Cwd: &cwd, Config: mcpConfig})
+	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{
+		Cwd:    &workspace.CWD,
+		Config: config,
+	})
 	if err != nil {
 		return acp.NewSessionResponse{}, fmt.Errorf("starting codex thread: %w", err)
 	}
@@ -377,9 +387,9 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 		defer cancelCleanup()
 		return acp.NewSessionResponse{}, errors.Join(err, a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID))
 	}
-	state, installed := a.sessions.install(
+	state, installed := a.sessions.installWorkspace(
 		response.Thread.ID,
-		request.Cwd,
+		workspace,
 		generation,
 		configuration,
 		a.currentTerminalOutputMode(),
@@ -401,7 +411,14 @@ func (a *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
 ) (acp.ResumeSessionResponse, error) {
-	_, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, request.McpServers, false)
+	_, state, err := a.openExistingSession(
+		ctx,
+		string(request.SessionId),
+		request.Cwd,
+		request.AdditionalDirectories,
+		request.McpServers,
+		false,
+	)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
@@ -411,7 +428,14 @@ func (a *Agent) ResumeSession(
 
 // LoadSession 先恢复并读取完整 Thread 历史，再安装 Session 状态。
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	thread, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, request.McpServers, true)
+	thread, state, err := a.openExistingSession(
+		ctx,
+		string(request.SessionId),
+		request.Cwd,
+		request.AdditionalDirectories,
+		request.McpServers,
+		true,
+	)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
@@ -434,6 +458,7 @@ func (a *Agent) openExistingSession(
 	ctx context.Context,
 	sessionID string,
 	cwd string,
+	additionalDirectories []string,
 	mcpServers []acp.McpServer,
 	includeHistory bool,
 ) (protocol.Thread, *sessionState, error) {
@@ -444,7 +469,16 @@ func (a *Agent) openExistingSession(
 	if err != nil {
 		return protocol.Thread{}, nil, err
 	}
-	mcpConfig, mcpNames, err := a.sessionMCPConfig(ctx, cwd, mcpServers)
+	workspace, err := normalizeCodexWorkspace(cwd, additionalDirectories)
+	if err != nil {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, nil, acp.NewInvalidParams(map[string]any{"error": err.Error()})
+	}
+	if err = a.refreshSkills(ctx, workspace); err != nil {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, nil, err
+	}
+	config, mcpNames, err := a.sessionConfig(ctx, workspace, mcpServers)
 	if err != nil {
 		a.sessions.abandonOpen(sessionID, generation)
 		return protocol.Thread{}, nil, err
@@ -454,10 +488,17 @@ func (a *Agent) openExistingSession(
 		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, ErrSessionClosing)
 	}
 	mcpAfterVersion := a.currentMCPStatusVersion()
-	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{ThreadID: sessionID, Cwd: &cwd, Config: mcpConfig})
+	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{
+		ThreadID: sessionID,
+		Cwd:      &workspace.CWD,
+		Config:   config,
+	})
 	if err != nil {
 		a.sessions.abandonOpen(sessionID, generation)
-		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, err)
+		return protocol.Thread{}, nil, mapCodexSessionOpenError(
+			sessionID,
+			fmt.Errorf("resuming codex thread %q: %w", sessionID, err),
+		)
 	}
 	thread := response.Thread
 	if includeHistory {
@@ -474,9 +515,9 @@ func (a *Agent) openExistingSession(
 	if err != nil {
 		return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, err)
 	}
-	state, installed := a.sessions.install(
+	state, installed := a.sessions.installWorkspace(
 		sessionID,
-		cwd,
+		workspace,
 		generation,
 		configuration,
 		a.currentTerminalOutputMode(),
@@ -558,8 +599,27 @@ func turnParamsForSession(
 		params.Effort = &selection.Effort
 	}
 	params.ApprovalPolicy = &mode.ApprovalPolicy
-	params.SandboxPolicy = &mode.SandboxPolicy
+	sandbox := sandboxPolicyWithAdditionalDirectories(
+		mode.SandboxPolicy,
+		state.additionalDirectories,
+	)
+	params.SandboxPolicy = &sandbox
 	return params
+}
+
+// refreshSkills 只在工作范围实际存在标准 Skill 目录时请求 app-server 重新扫描。
+func (a *Agent) refreshSkills(ctx context.Context, workspace codexWorkspace) error {
+	hasSkills, err := workspace.hasSkillDirectory()
+	if err != nil {
+		return err
+	}
+	if !hasSkills {
+		return nil
+	}
+	if err = a.client.RefreshSkills(ctx, workspace); err != nil {
+		return fmt.Errorf("refreshing Codex workspace Skills: %w", err)
+	}
+	return nil
 }
 
 // newAppServerCleanupContext 从原请求中只保留 value，用独立 deadline 确保 unsubscribe/cancel 能实际写出。
@@ -645,9 +705,12 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	}
 	state, ok := a.sessions.get(string(request.SessionId))
 	if !ok {
-		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, ErrSessionNotFound)
+		return acp.PromptResponse{}, codexSessionNotFoundError(string(request.SessionId))
 	}
 	if _, err := a.waitConnection(ctx); err != nil {
+		return acp.PromptResponse{}, err
+	}
+	if err := a.refreshSkills(ctx, state.workspace()); err != nil {
 		return acp.PromptResponse{}, err
 	}
 	input, err := buildPromptInput(request.Prompt)
@@ -694,16 +757,20 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 				if errors.Is(result.err, context.Canceled) {
 					_, cancelled := prompt.currentTurn()
 					if cancelled {
-						return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+						return codexPromptResponse(
+							prompt,
+							acp.StopReasonCancelled,
+							request.MessageId,
+						), nil
 					}
 				}
 				return acp.PromptResponse{}, fmt.Errorf("running codex turn: %w", result.err)
 			}
 			switch result.completion.Turn.Status {
 			case protocol.FluffyInterrupted:
-				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
 			case protocol.FluffyCompleted:
-				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn, UserMessageId: request.MessageId}, nil
+				return codexPromptResponse(prompt, acp.StopReasonEndTurn, request.MessageId), nil
 			case protocol.Failed:
 				return acp.PromptResponse{}, fmt.Errorf("codex turn %q failed", result.completion.Turn.ID)
 			default:
@@ -716,7 +783,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		case <-requestDone:
 			turnID := prompt.requestCancel()
 			if turnID == "" {
-				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
 			}
 			a.requestPromptInterrupt(state, prompt, turnID, false)
 			requestDone = nil
@@ -724,7 +791,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		case <-cancelSignal:
 			turnID, _ := prompt.currentTurn()
 			if turnID == "" {
-				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
 			}
 			a.requestPromptInterrupt(state, prompt, turnID, false)
 			requestDone = nil
@@ -733,6 +800,27 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 			return acp.PromptResponse{}, fmt.Errorf("running codex turn: %w", ErrRuntimeUnavailable)
 		}
 	}
+}
+
+// codexPromptResponse 把当前 Turn 的最终 Usage 与消息确认写入终态响应。
+func codexPromptResponse(
+	prompt *activePrompt,
+	stopReason acp.StopReason,
+	messageID *string,
+) acp.PromptResponse {
+	response := acp.PromptResponse{
+		StopReason:    stopReason,
+		UserMessageId: messageID,
+	}
+	router := prompt.currentEventRouter()
+	if router == nil {
+		return response
+	}
+	usage, ok := router.Usage()
+	if ok {
+		response.Usage = usage.PromptUsage()
+	}
+	return response
 }
 
 // installActivePrompt 在统一锁序下同时安装 session 活动槽位与后台 registry 身份。
@@ -929,11 +1017,7 @@ func (a *Agent) SetSessionConfigOption(
 		return nil
 	})
 	if errors.Is(err, ErrSessionNotFound) {
-		return acp.SetSessionConfigOptionResponse{}, fmt.Errorf(
-			"setting config for session %q: %w",
-			value.SessionId,
-			ErrSessionNotFound,
-		)
+		return acp.SetSessionConfigOptionResponse{}, codexSessionNotFoundError(string(value.SessionId))
 	}
 	if err != nil {
 		return acp.SetSessionConfigOptionResponse{}, err
@@ -958,11 +1042,7 @@ func (a *Agent) SetSessionMode(
 		return nil
 	})
 	if errors.Is(err, ErrSessionNotFound) {
-		return acp.SetSessionModeResponse{}, fmt.Errorf(
-			"setting mode for session %q: %w",
-			request.SessionId,
-			ErrSessionNotFound,
-		)
+		return acp.SetSessionModeResponse{}, codexSessionNotFoundError(string(request.SessionId))
 	}
 	if err != nil {
 		return acp.SetSessionModeResponse{}, err

@@ -47,7 +47,7 @@ type modelSelection struct {
 // sessionConfiguration 只维护单个 session 的配置选择，不持有 runtime 生命周期状态。
 type sessionConfiguration struct {
 	// models 是 app-server 返回的模型目录快照。
-	models []protocol.DatumElement
+	models []protocol.ModelListResponseDatum
 	// current 是当前模型、effort 与模式选择。
 	current modelSelection
 }
@@ -107,7 +107,7 @@ func findAgentMode(id acp.SessionModeId) (agentModeDefinition, bool) {
 
 // newSessionConfiguration 从 app-server 模型目录和实际当前值创建配置组件。
 func newSessionConfiguration(
-	models []protocol.DatumElement,
+	models []protocol.ModelListResponseDatum,
 	currentModel string,
 	currentEffort string,
 	currentMode acp.SessionModeId,
@@ -135,7 +135,7 @@ func newSessionConfiguration(
 		currentEffort = "medium"
 	}
 	return &sessionConfiguration{
-		models: append([]protocol.DatumElement(nil), models...),
+		models: append([]protocol.ModelListResponseDatum(nil), models...),
 		current: modelSelection{
 			Model:  currentModel,
 			Effort: currentEffort,
@@ -228,13 +228,13 @@ func (c *sessionConfiguration) selectEffort(effort string) error {
 }
 
 // findModel 在 app-server 模型目录中按模型 ID 查找条目。
-func (c *sessionConfiguration) findModel(id string) (protocol.DatumElement, bool) {
+func (c *sessionConfiguration) findModel(id string) (protocol.ModelListResponseDatum, bool) {
 	for _, model := range c.models {
 		if model.ID == id {
 			return model, true
 		}
 	}
-	return protocol.DatumElement{}, false
+	return protocol.ModelListResponseDatum{}, false
 }
 
 // findSupportedEffort 在一个模型声明的可选 effort 中做精确匹配。
@@ -292,7 +292,7 @@ func (c *sessionConfiguration) modelOption() acp.SessionConfigOption {
 }
 
 // effortOption 将当前模型声明的 reasoning effort 转换为 ACP thought_level 配置。
-func (c *sessionConfiguration) effortOption(model protocol.DatumElement) acp.SessionConfigOption {
+func (c *sessionConfiguration) effortOption(model protocol.ModelListResponseDatum) acp.SessionConfigOption {
 	category := acp.SessionConfigOptionCategoryThoughtLevel
 	options := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(model.SupportedReasoningEfforts))
 	for _, effort := range model.SupportedReasoningEfforts {

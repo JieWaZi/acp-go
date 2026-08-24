@@ -54,7 +54,7 @@ go run ./tools/protocolgen --check
 - 初始化：`InitializeParams`、`InitializeResponse`；
 - thread：start、resume、read、unsubscribe 的 Params/Response；
 - turn：start、steer、interrupt 的 Params/Response；
-- model/auth/config：`ModelList*`、`ConfigRead*`、`GetAccount*`、`LoginAccount*`、`CancelLoginAccount*`、`LogoutAccountResponse`；
+- model/auth/config/skills：`ModelList*`、`ConfigRead*`、`GetAccount*`、`LoginAccount*`、`CancelLoginAccount*`、`LogoutAccountResponse`、`SkillsExtraRootsSet*`、`SkillsList*`；
 - 审批与交互：Command Execution、File Change、Permissions、MCP Elicitation、`item/tool/requestUserInput` 的 Params/Response。
 - 通知：turn/item 生命周期、消息/reasoning/plan/usage、command/file/MCP 进度、MCP 启动状态、request resolved、compaction、model reroute、warning/error，以及登录流程依赖的 `AccountLoginCompletedNotification`。
 
@@ -76,15 +76,16 @@ go run ./tools/protocolgen --check
 | `src/app-server/v2/TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` | 对应生成类型 | required thread/turn identity、输入数组和 steering precondition |
 | `src/app-server/v2/ThreadItem.ts`、`UserInput.ts` | `ThreadItem`、`UserInput` 及 discriminator enum | 消息、reasoning、command、file、MCP、Text/Image/Resource 相关 wire union |
 | `src/CodexAppServerClient.ts` 的 `initialize`、`modelList`、`accountRead`、`accountLogin`、`accountLogout`、`turnStart`、`runTurn`、approval request handlers | `pkg/codex/appserver_client.go`、`approval_runtime.go` | 请求与响应配对、共享登录/账号更新订阅、early completion 捕获、生成 ServerRequest 分派，以及 SDK permission 回调前后的 stale generation fail-closed |
+| `src/CodexAppServerClient.ts` 的 `skillsExtraRootsSet`、`listSkills` 与 `src/CodexAcpClient.ts` 的 `refreshSkills` | `pkg/codex/appserver_client.go`、`workspace.go` | additional root 的 `.agents/skills`、`skills/extraRoots/set`、按 cwd 强制重新扫描与根集合串行更新 |
 | `src/StdUtils.ts` 的 `createJSONRPCReader`/`createJSONRPCWriter`、`CodexAppServerClient.runTurn` | `pkg/codex/appserver_transport.go`、`appserver_client.go` | newline 拆帧、malformed 忽略、出站删除 `jsonrpc`；Go 侧额外增加帧长、pending 与 server-request 并发上限，并用同步 response observer 保留 `turn/start` identity 先于后续帧激活的上游顺序 |
 | `src/CodexJsonRpcConnection.ts` 的 `startCodexConnection`、`attachLogs`，`CodexAcpServer.runWithProcessCheck` | `pkg/codex/process.go`、`appserver_transport.go`、`executable.go` | 唯一 `codex app-server` 进程、stdin/stdout、退出 dispose、实时 stderr 结构化日志与有界崩溃尾部；Go `Wait`/`StdoutPipe` closed-pipe 竞态只在 `FinalError` 已确认异常退出时升级为 exit code/stderr；可执行文件来源按本项目 V1 的 `CODEX_PATH`→PATH 约束替换 bundled npm fallback |
 | `src/CodexAppServerClient.ts` 的 `initialize`、`runTurn`、`awaitTurnCompleted`、`recordTurnCompleted`、`markTurnStale` | `pkg/codex/appserver_client.go` | typed request、initialized、response 前 completion 捕获、thread/turn 精确 waiter、stale 清理与 fatal fan-out |
-| `src/CodexAcpClient.ts` 的 `newSession`、`resumeSession`、`loadSession`、`closeSession`、`sendPrompt`、`buildPromptItems` | `pkg/codex/agent.go`、`session.go`、`prompt.go` | thread start、resume、load 的 resume→read 顺序、unsubscribe、model/effort/mode 进入 turn/start、Text/Image/Resource 转换与多轮 prompt |
+| `src/CodexAcpClient.ts` 的 `newSession`、`resumeSession`、`loadSession`、`closeSession`、`sendPrompt`、`buildPromptItems` | `pkg/codex/agent.go`、`session.go`、`prompt.go`、`workspace.go` | thread start、resume、load 的 resume→read 顺序、unsubscribe、additional directories/trusted roots、model/effort/mode 进入 turn/start、Text/Image/Resource 转换与多轮 prompt |
 | `src/CodexAcpServer.ts` 的 `initialize`、`authenticate`、`logout`、`newSession`、`loadSession`、`resumeSession`、`setSessionMode`、`setSessionConfigOption` | `pkg/codex/agent.go`、`session.go`、`config.go`、`auth.go` | `NO_BROWSER` 非空时只声明 API Key；只宣告 V1 纳入的 `steering.supported=true` meta；订阅完成通知后执行 login/logout，并让每个 session 保存 initialize 时的 terminal mode 与 config 快照 |
 | `src/CodexAcpServer.ts` 的 `streamThreadHistory`、`createHistoryUpdates`、`createUserMessageUpdates` | `pkg/codex/history.go`、`event_handler.go`、`tool_mapper.go` | load 按 turn/item 顺序回放 user/agent/tool 历史；command 发 completed `tool_call`→terminal update，file/MCP 发单条 completed `tool_call`，并复用现有 mapper/去重状态 |
 | `src/CodexAcpServer.ts` 的 `beginSessionOpen`、`sessionOpenCanInstall`、`cleanupStaleSessionOpen`、`trackActivePrompt`、`activePrompt.complete`、`cancelBeforeTurnStarted`、`interruptSessionTurn` | `pkg/codex/session.go`、`prompt.go`、`agent.go` | generation/close fence、取消 pending start 后立即释放前台槽位、late turn stale+interrupt、active completion 与 interrupt-once |
 | `src/SteeringQueue.ts` 与 `CodexAcpServer.executeOrQueueSteeringRequest`/`performSteeringRequest` | `pkg/codex/steering.go` | 每 session 单 consumer FIFO、活动 turn 注入、无活动竞态 fallback 新 turn、单项失败隔离与 idle identity 删除 |
-| `src/CodexEventHandler.ts` 的 `handleNotification`、`createItemEvent`、`completeItemEvent`、`completeCommandExecutionEvent` | `pkg/codex/event_router.go`、`event_handler.go` | typed method 分派、thread/turn/session identity、消息/reasoning/plan/usage 去重、terminal output fallback/exit 与 unknown 安全摘要 |
+| `src/CodexEventHandler.ts` 的 `handleNotification`、`createItemEvent`、`completeItemEvent`、`completeCommandExecutionEvent` 与 `TokenCount.ts` | `pkg/codex/event_router.go`、`event_handler.go` | typed method 分派、thread/turn/session identity、消息/reasoning/plan/usage 去重、PromptResponse token 明细、terminal output fallback/exit 与 unknown 安全摘要 |
 | `src/CodexToolCallMapper.ts`、`CommandUtils.ts`、`TerminalOutputMode.ts` | `pkg/codex/terminal_output_mode.go`、`tool_mapper.go`、`event_handler.go` | 仅 `_meta.terminal_output == true` 选择 full key，否则默认 legacy delta；live terminal delta/interaction、completion fallback 与 load history 共用 session snapshot；parsed command 在 full 模式仍用 delta |
 | `src/CodexApprovalHandler.ts`、`ApprovalOptionId.ts` | `pkg/codex/approval.go` | 三类 permission request/response、common permission meta、amendment option、全异常 fail closed 与 generation 双检 |
 | `src/AgentMode.ts`、`ModelConfigOption.ts`、`CodexAcpClient.ts` 的 model/session config helpers | `pkg/codex/config.go` | read-only/agent/full-access 权限边界、model/reasoning option、未知选择失败 |
@@ -106,6 +107,7 @@ go run ./tools/protocolgen --check
 | `command-action-events.test.ts`、`file-change-events.test.ts` 及其 snapshots | parsed Command action、File add/delete rich diff 与 update/move typed raw 保留 |
 | `mcp-session.test.ts`、`mcp-tool-in-progress.json`、`mcp-tool-repeated-progress.json`、`mcp-tool-completed-with-logs.json` | MCP title、稳定 ToolCallID、重复 progress、typed raw input/output 与终态 |
 | `mcp-config-merge.test.ts`、`elicitation-events.test.ts` | `mcp_runtime_test.go` 的 stdio/HTTP 配置与同名层保护、MCP form/url、URL complete、request_user_input options/other/fail-closed |
+| `CodexAcpClient.test.ts` 的 additional roots/Skill prefetch cases | `workspace_test.go`、`TestAppServerClientRefreshSkillsUpdatesRootsAndForcesReload`、`TestAgentSessionConfigurationFlowsIntoTurnStart` | absolute path、去重、trusted projects、writable roots、Skill extra roots、force reload 与 turn sandbox |
 | `session-config-options.test.ts` | `config_test.go` 的三模式安全边界、model/effort 保留/回退与未知选择错误 |
 | `initialize.test.ts` 和 `CodexAcpClient.test.ts` API Key/ChatGPT cases | `agent_test.go`、`auth_test.go` 的 `NO_BROWSER` 真实性、仅 `steering.supported` meta、V1 method 声明、凭据优先级、subscribe-before-start、取消 login 与 secret-safe 失败 |
 | `CodexAcpClient.test.ts` 的 logout/accountUpdated 与共享 login promise cases | `appserver_client_test.go`、`agent_wiring_test.go` | account request 使用生成 DTO，subscribe-before-request、release、duplicate notification 和 transport fatal 都只终结当前订阅 |
@@ -143,6 +145,9 @@ go run ./tools/protocolgen --check
 - 历史回放 V1 直接复用已有 event/tool mapper，但按父规格裁剪 upstream 的 history title update、response-item fallback 与非 V1 item；对这些项不另写 mapper。支持的 user text/image/localImage/skill 与 completed agent/tool item 保持 upstream 顺序和 exactly-once 终态；command 保留首条 `tool_call` 和使用 session terminal mode 的 completion，file/MCP 保留一条带完整展示字段的 completed `tool_call`。多块 user message 在每次 SDK callback 前后重新校验 generation。
 - TypeScript Promise 在请求取消后仍可以继续发送 unsubscribe/login cancel；Go request context 则会直接拒绝写出。因此已获得远端 thread/login 所有权后的失败清理统一使用 `context.WithoutCancel` 加 5 秒 deadline，合并原始错误与清理错误。
 - config setter 通过 `sessionStore.withCurrent` 按 store→state 锁序将 generation 验证、选择变更与 close 线性化；这是 Go 并发边界下对 upstream 单事件循环语义的等价机制。Prompt 与 no-active steering 共用同一个 session config 快照，避免 control turn 绕过 model/effort/mode。
+- additional directories 按固定 upstream 只接受绝对路径并保持首次出现顺序；Session config 信任全部根，workspaceWrite 同时扩展静态配置和 turn sandbox。工作区存在标准 `.agents/skills` 时，Session 打开与 Prompt 都会强制刷新；app-server 的全局 extra roots 更新与紧随其后的扫描由互斥锁串行化。
+- `ThreadTokenUsageUpdatedNotification.last` 通过 `TokenCount.ts` 相同口径映射为 PromptResponse Usage：input 扣除 cached input，cached read、output、reasoning/Thought 与 total 分字段返回；cache write 是当前 schema 可提供的附加值。
+- 内存 Session 缺失和 app-server 恢复返回的 `-32002` 统一表示为 ACP `ResourceNotFound`，供上层宿主在不匹配错误文本的情况下决定恢复或重建。
 - 固定 upstream `createModelId` 对未编目的自定义 provider model 保留 model ID，缺省 effort 回退 `medium`；Go 配置组件保持相同规则。`model/list` 仍按 upstream cursor 顺序遍历，但增加重复 cursor 检测、128 页和 4096 模型上限，防止破损 app-server 无界累积。
 - 上游 file update/move 依赖 npm `diff` 与文件读取重建 rich diff。Go V1 不自写 patch parser：add/delete 直接使用 SDK diff DTO，update/move 与 patchUpdated 保留生成协议 typed raw changes。
 - 上游静默过滤 Audio；V1 未声明 Audio，因此 `content.go` 明确返回请求错误。固定 schema 没有历史 completed plan 的生成常量，兼容分支只识别其 discriminator，稳定计划仍消费 `turn/plan/updated`。
@@ -183,3 +188,4 @@ go run ./tools/protocolgen --check
 - 2026-08-24：stabilization verification repair 薄移植 `TerminalOutputMode.ts` 和 initialize capability 条件：`NO_BROWSER` 非空时隐藏 ChatGPT、只宣告 `steering.supported`、按 session 快照选择 full/legacy terminal key，并用无 shell 派生的 helper-process fake 消除默认 package 并行下的版本探测竞争与 pipe 假挂。
 - 2026-08-24：按 `CodexAcpServer.runWithProcessCheck` 与 `process-exit-error.test.ts` 修复 Go `exec.Cmd.Wait`/`StdoutPipe` 竞态：scanner 的 closed-pipe 仅在 `process.FinalError` 确认异常退出时升级为稳定 exit/stderr fatal，并以确定性双 pending 仲裁测试及真实 helper-process 并行压力锁住普通 I/O、超长帧、clean EOF 和主动关闭优先级。
 - 2026-08-24：参考固定 codex-acp 补齐 ACP stdio/HTTP MCP 会话配置、同名配置层保护、启动失败展示、MCP form/url Elicitation 与 `item/tool/requestUserInput`；SSE、MCP-over-ACP 和动态 `item/tool/call` 继续保持未声明。
+- 2026-08-24：补齐 additional directories 的 trusted/writable roots、`.agents/skills` extra roots 与强制刷新、PromptResponse Usage 和稳定 Session `ResourceNotFound`；新增生成协议 Skills roots，并用手写兼容别名避免 quicktype 命名变化破坏既有导出名称。

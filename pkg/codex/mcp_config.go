@@ -14,20 +14,25 @@ import (
 
 const disableMCPConfigFilteringEnv = "DISABLE_MCP_CONFIG_FILTERING"
 
-// sessionMCPConfig 把 ACP stdio/http server 转为 Codex thread config，并返回清洗后的请求名称。
+// sessionConfig 合并工作范围与 ACP stdio/http server，并返回清洗后的 MCP 请求名称。
 // 同名用户或项目配置默认保留，避免 Codex 深合并不同 transport 字段。
-func (a *Agent) sessionMCPConfig(
+func (a *Agent) sessionConfig(
 	ctx context.Context,
-	cwd string,
+	workspace codexWorkspace,
 	servers []acp.McpServer,
 ) (map[string]json.RawMessage, []string, error) {
+	config, err := codexWorkspaceConfig(workspace)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(servers) == 0 {
-		return nil, nil, nil
+		return config, []string{}, nil
 	}
 
 	existing := map[string]struct{}{}
 	if os.Getenv(disableMCPConfigFilteringEnv) != "true" {
 		includeLayers := true
+		cwd := workspace.CWD
 		response, err := a.client.ConfigRead(ctx, protocol.ConfigReadParams{Cwd: &cwd, IncludeLayers: &includeLayers})
 		if err != nil {
 			return nil, nil, fmt.Errorf("reading Codex config for MCP conflicts: %w", err)
@@ -53,14 +58,15 @@ func (a *Agent) sessionMCPConfig(
 		configured[name] = config
 	}
 	if len(configured) == 0 {
-		return nil, requestedNames, nil
+		return config, requestedNames, nil
 	}
 
 	rawServers, err := json.Marshal(configured)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encoding Codex MCP config: %w", err)
 	}
-	return map[string]json.RawMessage{"mcp_servers": rawServers}, requestedNames, nil
+	config["mcp_servers"] = rawServers
+	return config, requestedNames, nil
 }
 
 // codexMCPServerConfig 实现 codex-acp 的 transport 映射；stdio 是 ACP 必选能力，HTTP 显式声明支持。

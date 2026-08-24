@@ -23,6 +23,8 @@ type sessionState struct {
 	id string
 	// cwd 是创建或恢复请求指定的工作目录。
 	cwd string
+	// additionalDirectories 是 Session 创建或恢复时冻结的附加工作目录。
+	additionalDirectories []string
 	// generation 防止旧 open、notification 和 control 覆盖重开状态。
 	generation uint64
 	// mu 保护 activePrompt。
@@ -88,6 +90,23 @@ func (s *sessionStore) install(
 	configuration *sessionConfiguration,
 	terminalMode terminalOutputMode,
 ) (*sessionState, bool) {
+	return s.installWorkspace(
+		sessionID,
+		codexWorkspace{CWD: cwd, AdditionalDirectories: []string{}},
+		generation,
+		configuration,
+		terminalMode,
+	)
+}
+
+// installWorkspace 仅在 generation 当前时安装完整工作范围状态。
+func (s *sessionStore) installWorkspace(
+	sessionID string,
+	workspace codexWorkspace,
+	generation uint64,
+	configuration *sessionConfiguration,
+	terminalMode terminalOutputMode,
+) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	openGeneration, opening := s.opening[sessionID]
@@ -95,8 +114,12 @@ func (s *sessionStore) install(
 		return nil, false
 	}
 	state := &sessionState{
-		id:                 sessionID,
-		cwd:                cwd,
+		id:  sessionID,
+		cwd: workspace.CWD,
+		additionalDirectories: append(
+			[]string{},
+			workspace.AdditionalDirectories...,
+		),
 		generation:         generation,
 		configuration:      configuration,
 		terminalOutputMode: terminalMode,
@@ -104,6 +127,16 @@ func (s *sessionStore) install(
 	s.sessions[sessionID] = state
 	delete(s.opening, sessionID)
 	return state, true
+}
+
+// workspace 返回 Session 冻结工作范围的深拷贝。
+func (s *sessionState) workspace() codexWorkspace {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return codexWorkspace{
+		CWD:                   s.cwd,
+		AdditionalDirectories: append([]string{}, s.additionalDirectories...),
+	}
 }
 
 // abandonOpen 删除仍属于当前 generation 的失败 open 记录。

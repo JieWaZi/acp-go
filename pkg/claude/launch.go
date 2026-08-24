@@ -37,6 +37,8 @@ type launchOptions struct {
 	MCPConfig string
 	// PermissionMode 是进程启动时使用的权限模式。
 	PermissionMode string
+	// AllowDangerouslySkipPermissions 允许 Session 进入 bypassPermissions 模式。
+	AllowDangerouslySkipPermissions bool
 }
 
 // mcpConfigEnvelope 是 CLI 参数接收的 MCP 配置根对象。
@@ -50,6 +52,7 @@ func prepareLaunchOptions(
 	cwd string,
 	sessionID string,
 	resume bool,
+	allowDangerouslySkipPermissions bool,
 	additionalDirectories []string,
 	mcpServers []acp.McpServer,
 ) (launchOptions, error) {
@@ -68,12 +71,13 @@ func prepareLaunchOptions(
 		return launchOptions{}, err
 	}
 	return launchOptions{
-		CWD:                   cwd,
-		SessionID:             sessionID,
-		Resume:                resume,
-		AdditionalDirectories: directories,
-		MCPConfig:             mcpConfig,
-		PermissionMode:        "default",
+		CWD:                             cwd,
+		SessionID:                       sessionID,
+		Resume:                          resume,
+		AdditionalDirectories:           directories,
+		MCPConfig:                       mcpConfig,
+		PermissionMode:                  "default",
+		AllowDangerouslySkipPermissions: allowDangerouslySkipPermissions,
 	}, nil
 }
 
@@ -245,6 +249,9 @@ func claudeLaunchArgs(options launchOptions) []string {
 	}
 	if options.PermissionMode != "" {
 		args = append(args, "--permission-mode", options.PermissionMode)
+	}
+	if options.AllowDangerouslySkipPermissions {
+		args = append(args, "--allow-dangerously-skip-permissions")
 	}
 	if options.MCPConfig != "" {
 		args = append(args, "--mcp-config", options.MCPConfig)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
@@ -322,6 +323,10 @@ type appServerClient struct {
 	pendingLogin *loginCompletionState
 	// pendingAccountUpdate 保存等待账号更新的订阅集合。
 	pendingAccountUpdate *accountUpdateState
+	// skillsMu 串行化全局 Skill extra roots 更新与紧随其后的刷新。
+	skillsMu sync.Mutex
+	// skillExtraRoots 保存 app-server 当前已经安装的额外 Skill 根快照。
+	skillExtraRoots []string
 }
 
 // newAppServerClient 创建 typed client 并监听 transport fatal。
@@ -416,8 +421,8 @@ func (c *appServerClient) ThreadUnsubscribe(ctx context.Context, threadID string
 }
 
 // ListModels 按 model/list 游标顺序读取全部模型。
-func (c *appServerClient) ListModels(ctx context.Context) ([]protocol.DatumElement, error) {
-	models := []protocol.DatumElement{}
+func (c *appServerClient) ListModels(ctx context.Context) ([]protocol.ModelListResponseDatum, error) {
+	models := []protocol.ModelListResponseDatum{}
 	var cursor *string
 	seenCursors := make(map[string]struct{})
 	for page := 0; page < maxModelListPages; page++ {
@@ -443,6 +448,43 @@ func (c *appServerClient) ListModels(ctx context.Context) ([]protocol.DatumEleme
 		cursor = &nextCursor
 	}
 	return nil, fmt.Errorf("model/list exceeded %d pages", maxModelListPages)
+}
+
+// RefreshSkills 为当前工作范围安装额外 Skill 根，并强制重新扫描全部 cwd。
+func (c *appServerClient) RefreshSkills(
+	ctx context.Context,
+	workspace codexWorkspace,
+) error {
+	c.skillsMu.Lock()
+	defer c.skillsMu.Unlock()
+
+	extraRoots := workspace.skillExtraRoots()
+	if !slices.Equal(c.skillExtraRoots, extraRoots) {
+		var response map[string]json.RawMessage
+		err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+			return protocol.NewSkillsExtraRootsSetRequest(
+				id,
+				protocol.SkillsExtraRootsSetParams{ExtraRoots: extraRoots},
+			)
+		}, &response)
+		if err != nil {
+			return fmt.Errorf("setting Codex Skill extra roots: %w", err)
+		}
+		c.skillExtraRoots = append([]string{}, extraRoots...)
+	}
+
+	forceReload := true
+	var response protocol.SkillsListResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewSkillsListRequest(id, protocol.SkillsListParams{
+			Cwds:        workspace.roots(),
+			ForceReload: &forceReload,
+		})
+	}, &response)
+	if err != nil {
+		return fmt.Errorf("refreshing Codex Skills: %w", err)
+	}
+	return nil
 }
 
 // AccountRead 直接发送生成协议的 account/read 请求。

@@ -12,6 +12,7 @@
 - 为每个 New、Load 或 Resume Session 创建独立 CLI 进程和 control transport。
 - 实现 FIFO Prompt、取消、close 与 `_session/steering`。
 - 映射 Assistant Message、Tool、Task Plan、Usage 和权限交互。
+- 把内置 `AskUserQuestion` 转换为客户端协商的 ACP Form Elicitation。
 - 把 Model、Effort、Fast Mode 与权限模式表示为 ACP Session 配置。
 - 转换 additional directories 和 stdio、HTTP、SSE MCP Server 配置。
 - 从本机 Claude 配置目录读取并安全回放可识别的 Session 历史。
@@ -27,13 +28,14 @@
 - Prompt cancel 与 `_session/steering`；空闲 Session 可启动 detached Turn 或要求客户端改用 Prompt。
 - Assistant、Tool Start/Progress/Result、Task Plan 与 Usage 更新。
 - `can_use_tool` 权限请求和安全拒绝。
+- `AskUserQuestion` Form Elicitation，支持单选、多选、每题自定义答案和取消。
 - stdio、HTTP、SSE MCP Server 与 additional directories。
-- Model、Effort、Fast Mode 和受控权限模式。
+- Model、Effort、Fast Mode 和受控权限模式；符合安全门槛时提供 `bypassPermissions`。
 
 不支持的主要能力：
 
 - `session/list`、fork、delete 等会话管理。
-- ACP 认证/登出、terminal、Elicitation、provider 和 goal。
+- ACP 认证/登出、terminal、MCP Elicitation、provider 和 goal。
 - Audio 与 MCP-over-ACP transport。
 
 ## 调用链
@@ -66,6 +68,8 @@ agent, err := claude.NewAgent(ctx, claude.Config{
 - `ClaudePath` 非空时必须指向有效可执行文件；为空时才查询 `PATH`。
 - `CLAUDE_CONFIG_DIR` 可指定历史 Session 所在的配置目录。
 - Session 的工作目录必须是存在的绝对目录；additional directories 会被规范化、去重和稳定排序。
+- 非 root 进程或 `IS_SANDBOX` 非空时，CLI 使用 `--allow-dangerously-skip-permissions` 启动并向客户端提供 `bypassPermissions`；root 且非沙箱时不提供。
+- `AskUserQuestion` 只有在客户端于 `initialize.clientCapabilities.elicitation.form` 声明支持时才启用，否则安全拒绝工具请求。
 
 构造成功后，调用方必须在生命周期结束时调用 `Agent.Close`；使用 `pkg/acpserver.Server` 时由 Server 负责关闭。
 
@@ -77,7 +81,7 @@ agent, err := claude.NewAgent(ctx, claude.Config{
 | `session.go` | Prompt 队列、活动 Turn、取消和关闭状态 |
 | `process.go`、`transport.go` | CLI 进程与有界 stream-json/control 通信 |
 | `launch.go` | 工作目录、附加目录和 MCP 启动参数 |
-| `events.go`、`permission.go` | 消息、工具、计划、Usage 与权限映射 |
+| `events.go`、`permission.go`、`elicitation.go` | 消息、工具、计划、Usage、权限与结构化提问映射 |
 | `config.go`、`steering.go` | Session 配置与 steering 行为 |
 | `content.go`、`history.go` | 输入转换与本地历史回放 |
 | [`protocol`](protocol) | stream-json/control 窄类型与冻结 fixture |
@@ -99,6 +103,7 @@ go test ./pkg/claude/protocol -count=1
 - 每个 Session 都有独立 CLI 进程；大量并发 Session 会直接增加本机进程和资源占用。
 - 取消后的 Session 必须观察到旧 Turn 的结束边界，缺少必要尾帧时会关闭该 Session。
 - 历史回放只读取受限大小的本地 transcript，并忽略无法安全表达的记录。
+- 本地 Session 缺失统一返回 ACP `ResourceNotFound`（`-32002`），恢复时已知的 CLI “conversation not found” 也映射为同一错误。
 - 版本探测只提供诊断，不作为硬性兼容门槛。
 
 ## 维护约定

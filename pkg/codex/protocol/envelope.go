@@ -21,6 +21,8 @@ const (
 	MethodTurnInterrupt                   = "turn/interrupt"
 	MethodModelList                       = "model/list"
 	MethodConfigRead                      = "config/read"
+	MethodSkillsExtraRootsSet             = "skills/extraRoots/set"
+	MethodSkillsList                      = "skills/list"
 	MethodAccountRead                     = "account/read"
 	MethodAccountLoginStart               = "account/login/start"
 	MethodAccountLoginCancel              = "account/login/cancel"
@@ -229,6 +231,33 @@ func NewConfigReadRequest(id RequestID, params ConfigReadParams) ConfigReadReque
 	return ConfigReadRequest{newClientRequest(id, MethodConfigRead, params)}
 }
 
+// SkillsExtraRootsSetRequest 表示固定 method 为 skills/extraRoots/set 的请求。
+type SkillsExtraRootsSetRequest struct {
+	// clientRequestEnvelope 提供固定方法和 SkillsExtraRootsSetParams 的耦合。
+	clientRequestEnvelope[SkillsExtraRootsSetParams]
+}
+
+// NewSkillsExtraRootsSetRequest 创建 skills/extraRoots/set 请求。
+func NewSkillsExtraRootsSetRequest(
+	id RequestID,
+	params SkillsExtraRootsSetParams,
+) SkillsExtraRootsSetRequest {
+	return SkillsExtraRootsSetRequest{
+		newClientRequest(id, MethodSkillsExtraRootsSet, params),
+	}
+}
+
+// SkillsListRequest 表示固定 method 为 skills/list 的请求。
+type SkillsListRequest struct {
+	// clientRequestEnvelope 提供固定方法和 SkillsListParams 的耦合。
+	clientRequestEnvelope[SkillsListParams]
+}
+
+// NewSkillsListRequest 创建 skills/list 请求。
+func NewSkillsListRequest(id RequestID, params SkillsListParams) SkillsListRequest {
+	return SkillsListRequest{newClientRequest(id, MethodSkillsList, params)}
+}
+
 // AccountReadRequest 表示固定 method 为 account/read 的请求。
 type AccountReadRequest struct {
 	// clientRequestEnvelope 提供固定方法和 GetAccountParams 的耦合。
@@ -320,6 +349,12 @@ func DecodeClientRequest(data []byte) (ClientRequest, error) {
 	case MethodConfigRead:
 		request, err := decodeClientRequest[ConfigReadParams](wire, true)
 		return clientRequestResult(&ConfigReadRequest{request}, err)
+	case MethodSkillsExtraRootsSet:
+		request, err := decodeClientRequest[SkillsExtraRootsSetParams](wire, true)
+		return clientRequestResult(&SkillsExtraRootsSetRequest{request}, err)
+	case MethodSkillsList:
+		request, err := decodeClientRequest[SkillsListParams](wire, true)
+		return clientRequestResult(&SkillsListRequest{request}, err)
 	case MethodAccountRead:
 		request, err := decodeClientRequest[GetAccountParams](wire, true)
 		return clientRequestResult(&AccountReadRequest{request}, err)

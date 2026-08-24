@@ -12,8 +12,8 @@
 
 | 适配器 | 启动方式 | 运行模型 | 主要能力 |
 | --- | --- | --- | --- |
-| Codex | 默认，或 `--adapter codex` | 一个 Adapter 持有一个 `codex app-server` 进程 | 认证、会话恢复、Prompt、取消、steering、工具、审批、MCP、Elicitation、模型与运行模式 |
-| Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、工具、权限、MCP、模型、effort、fast 与权限模式 |
+| Codex | 默认，或 `--adapter codex` | 一个 Adapter 持有一个 `codex app-server` 进程 | 认证、会话恢复、附加目录/Skills、Prompt Usage、取消、steering、工具、审批、MCP、Elicitation、模型与运行模式 |
+| Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
 
 Codex 是默认适配器。只有显式传入 `--adapter claude` 时，程序才会探测并构造 Claude Adapter。
 
@@ -44,6 +44,14 @@ flowchart LR
 git clone https://github.com/JieWaZi/acp-go.git
 cd acp-go
 go build -o ./acp-agent ./cmd/acp-agent
+```
+
+发布构建可把版本写入 ACP `initialize.agentInfo.version`；未注入的本地构建返回 `development`：
+
+```sh
+go build \
+  -ldflags "-X github.com/JieWaZi/acp-go/internal/buildinfo.Version=v0.1.0" \
+  -o ./acp-agent ./cmd/acp-agent
 ```
 
 检查本机 CLI：
@@ -123,7 +131,7 @@ Claude 配置示例：
 }
 ```
 
-Codex 的表单、URL Elicitation 和结构化提问依赖客户端在 `initialize` 中声明对应能力：
+Codex 的表单、URL Elicitation，以及 Claude `AskUserQuestion` 的结构化表单依赖客户端在 `initialize` 中声明对应能力：
 
 ```json
 {
@@ -135,6 +143,16 @@ Codex 的表单、URL Elicitation 和结构化提问依赖客户端在 `initiali
   }
 }
 ```
+
+## 工作范围与 Skills
+
+两个 Adapter 都声明 ACP `additionalDirectories`。Codex 会校验目录为绝对路径，把主目录和附加目录写入 Session trusted projects，并在 `workspaceWrite` 模式加入附加可写根；每次创建/恢复 Session 及 Prompt 前，会发现标准 `<root>/.agents/skills` 目录并强制刷新 Codex Skills。Claude 把规范化后的目录通过 `--add-dir` 交给对应 Session 的 CLI 进程。
+
+建议调用方统一把项目 Skill 放在 `.agents/skills/<skill-name>/SKILL.md`，避免为 Codex 和 Claude 维护两份工作区能力定义。
+
+## Claude 权限模式
+
+Claude Adapter 在非 root 进程，或显式 `IS_SANDBOX` 环境中，提供 `bypassPermissions`。进程启动时只传 `--allow-dangerously-skip-permissions` 以允许后续安全地切换模式；只有客户端选择该模式后才通过 control channel 生效。root 且非沙箱环境不会声明该选项，项目设置中的危险初始模式也会收紧为 `default`。
 
 ## 作为 Go 包使用
 
@@ -211,6 +229,6 @@ go run ./tools/protocolgen --check
 
 - 两个 Adapter 都不提供 `session/list`、fork、delete 等会话管理能力。
 - Audio 输入尚未支持，收到请求时会明确失败。
-- Claude 不提供 ACP 认证/登出、terminal、Elicitation、provider 或 goal 能力。
+- Claude 不提供 ACP 认证/登出、terminal、MCP Elicitation、provider 或 goal 能力；当前 Elicitation 只用于内置 `AskUserQuestion` 的 Form 桥接。
 - Codex 不公开 Review、Goal、Realtime、动态客户端工具、Apps、Plugins 或 Marketplace 管理能力。
 - 项目不替用户安装 CLI、写入用户配置或管理本机凭据。
