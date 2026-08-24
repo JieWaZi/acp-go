@@ -118,6 +118,8 @@ type Agent struct {
 	initialized bool
 	// terminalOutputMode 是最近一次成功 initialize 协商的 session 输出模式。
 	terminalOutputMode terminalOutputMode
+	// elicitationCapabilities 是客户端在 initialize 中声明的 ACP 表单/URL 交互能力快照。
+	elicitationCapabilities *acp.ElicitationCapabilities
 	// connectionMu 保护外层 SDK connection。
 	connectionMu sync.RWMutex
 	// connection 是 acp-go-sdk 创建的唯一 AgentSideConnection。
@@ -126,6 +128,8 @@ type Agent struct {
 	approvalRequester permissionRequester
 	// sessionUpdater 是 event/history 组件消费的 SDK 原生 session/update 窄接口。
 	sessionUpdater sessionUpdater
+	// elicitationRequester 是 MCP 与 request_user_input 使用的 ACP 交互窄接口。
+	elicitationRequester elicitationRequester
 	// connectionReady 是 notification/approval 路由的启动 barrier。
 	connectionReady chan struct{}
 	// connectionReadyOnce 保证 binder 重复调用不会 panic。
@@ -138,6 +142,14 @@ type Agent struct {
 	promptsClosing bool
 	// nextTurnGeneration 为每个 prompt/steering turn 分配 Adapter 内单调身份。
 	nextTurnGeneration atomic.Uint64
+	// mcpMu 保护启动状态快照与已接受 URL elicitation。
+	mcpMu sync.Mutex
+	// mcpStatuses 保存每个清洗后 server 名称的最后启动状态，供早到通知在 session 安装后补发。
+	mcpStatuses map[string]mcpStatusSnapshot
+	// mcpStatusVersion 为每条启动状态分配单调水位，隔离后续同名 server 的旧终态。
+	mcpStatusVersion uint64
+	// pendingURLElicitations 按 thread 保存等待 serverRequest/resolved 的 URL elicitation。
+	pendingURLElicitations map[string]map[acp.UnstableElicitationId]struct{}
 	// closeOnce 保证 transport/process 只释放一次。
 	closeOnce sync.Once
 	// closeErr 保存首次 Close 的结果。
@@ -207,13 +219,15 @@ func newAgentWithClient(
 	client *appServerClient,
 ) *Agent {
 	agent := &Agent{
-		logger:          logger,
-		runtimeCtx:      runtimeCtx,
-		runtimeCancel:   runtimeCancel,
-		client:          client,
-		sessions:        newSessionStore(),
-		connectionReady: make(chan struct{}),
-		prompts:         make(map[*activePrompt]*sessionState),
+		logger:                 logger,
+		runtimeCtx:             runtimeCtx,
+		runtimeCancel:          runtimeCancel,
+		client:                 client,
+		sessions:               newSessionStore(),
+		connectionReady:        make(chan struct{}),
+		prompts:                make(map[*activePrompt]*sessionState),
+		mcpStatuses:            make(map[string]mcpStatusSnapshot),
+		pendingURLElicitations: make(map[string]map[acp.UnstableElicitationId]struct{}),
 	}
 	agent.steering = newSteeringManager(agent, defaultSteeringQueueCapacity)
 	agent.auth = newAuthenticator(client, client, systemBrowserOpener{}, os.Getenv, logger)
@@ -229,6 +243,7 @@ func (a *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 		a.connection = connection
 		a.approvalRequester = connection
 		a.sessionUpdater = connection
+		a.elicitationRequester = connection
 	}
 	a.connectionMu.Unlock()
 	a.markConnectionReady()
@@ -287,13 +302,15 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	a.initializeMu.Lock()
 	a.initialized = true
 	a.terminalOutputMode = terminalMode
+	a.elicitationCapabilities = cloneElicitationCapabilities(request.ClientCapabilities.Elicitation)
 	a.initializeMu.Unlock()
 	title := agentTitle
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
-			Auth:        acp.AgentAuthCapabilities{Logout: &acp.LogoutCapabilities{}},
-			LoadSession: true,
+			Auth:            acp.AgentAuthCapabilities{Logout: &acp.LogoutCapabilities{}},
+			LoadSession:     true,
+			McpCapabilities: acp.McpCapabilities{Http: true},
 			PromptCapabilities: acp.PromptCapabilities{
 				Image: true, EmbeddedContext: true,
 			},
@@ -331,7 +348,12 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 		return acp.NewSessionResponse{}, err
 	}
 	cwd := request.Cwd
-	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{Cwd: &cwd})
+	mcpConfig, mcpNames, err := a.sessionMCPConfig(ctx, request.Cwd, request.McpServers)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	mcpAfterVersion := a.currentMCPStatusVersion()
+	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{Cwd: &cwd, Config: mcpConfig})
 	if err != nil {
 		return acp.NewSessionResponse{}, fmt.Errorf("starting codex thread: %w", err)
 	}
@@ -365,6 +387,7 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if !installed {
 		return acp.NewSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
 	}
+	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
 	modes, options := sessionConfigurationResponse(state)
 	return acp.NewSessionResponse{
 		SessionId:     acp.SessionId(response.Thread.ID),
@@ -378,7 +401,7 @@ func (a *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
 ) (acp.ResumeSessionResponse, error) {
-	_, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, false)
+	_, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, request.McpServers, false)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
@@ -388,7 +411,7 @@ func (a *Agent) ResumeSession(
 
 // LoadSession 按固定 upstream 顺序执行 thread/resume→thread/read(includeTurns=true)，再安装状态。
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	thread, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, true)
+	thread, state, err := a.openExistingSession(ctx, string(request.SessionId), request.Cwd, request.McpServers, true)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
@@ -411,6 +434,7 @@ func (a *Agent) openExistingSession(
 	ctx context.Context,
 	sessionID string,
 	cwd string,
+	mcpServers []acp.McpServer,
 	includeHistory bool,
 ) (protocol.Thread, *sessionState, error) {
 	if err := a.requireInitialized(); err != nil {
@@ -420,7 +444,17 @@ func (a *Agent) openExistingSession(
 	if err != nil {
 		return protocol.Thread{}, nil, err
 	}
-	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{ThreadID: sessionID, Cwd: &cwd})
+	mcpConfig, mcpNames, err := a.sessionMCPConfig(ctx, cwd, mcpServers)
+	if err != nil {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, nil, err
+	}
+	if !a.sessions.openCanProceed(sessionID, generation) {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, ErrSessionClosing)
+	}
+	mcpAfterVersion := a.currentMCPStatusVersion()
+	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{ThreadID: sessionID, Cwd: &cwd, Config: mcpConfig})
 	if err != nil {
 		a.sessions.abandonOpen(sessionID, generation)
 		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, err)
@@ -450,6 +484,7 @@ func (a *Agent) openExistingSession(
 	if !installed {
 		return protocol.Thread{}, nil, a.closeStaleOpen(ctx, sessionID, generation)
 	}
+	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
 	return thread, state, nil
 }
 

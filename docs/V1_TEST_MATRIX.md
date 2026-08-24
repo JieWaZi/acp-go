@@ -13,7 +13,8 @@ V1 验收分为三层：手写 fixture 覆盖协议异常和竞态；最近一�
 | Reasoning/Thinking、Plan、Token Usage | `TestRunProductionCompositionSessionFlow`、`TestEventRouterMapsPlanAndLatestUsage` | `message_delta_thinking_usage`、`plan_and_command_tool` | 默认测试不依赖模型是否选择输出 reasoning/plan |
 | Command Tool start/delta/completed | `TestRunProductionCompositionSessionFlow`、`tool_mapper_test.go` | `plan_and_command_tool` | 检查同一 ToolCallID 和完成状态 |
 | File Change Tool | `TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates` | `file_change_tool` | 真实测试只修改 `t.TempDir()` |
-| MCP Tool Call | `TestEventRouterMapsMCPProgressAndCompletion` | 不自动调用用户 MCP | V1 只映射 Codex 已有 MCP 事件，不管理 client-provided MCP server |
+| MCP 配置、启动状态与 Tool Call | `TestAgentSessionMCPConfigMatchesCodexACP`、`TestCodexMCPServerConfigRejectsUnsupportedTransports`、`TestEventRouterMapsMCPProgressAndCompletion` | 不自动调用用户 MCP | 覆盖 stdio/HTTP、同名配置保护、失败状态与既有 MCP 工具事件；SSE/ACP transport 明确拒绝 |
+| MCP Elicitation 与结构化用户输入 | `TestMCPServerElicitationUsesACPAndCompletesURL`、`TestToolRequestUserInputUsesACPForm` | 不自动触发外部交互 | 覆盖 form/url 能力路由、URL complete、选项/Other 答案和 fail-closed |
 | Command/File/Permissions 三类审批与 fail-closed | `approval_test.go`、`agent_runtime_test.go`、`process_test.go` | `approval_allow_once` 验证真实 allow_once 往返 | 异常、取消、stale、缺 handler 必须由确定性测试覆盖 |
 | Cancel/Interrupt 与取消后恢复 | `agent_runtime_test.go` | `cancel_and_recovery` | 真实测试取消活动 `sleep` 工具，再执行后续 turn |
 | Steering、FIFO 与单项失败隔离 | `steering_test.go` | `steering_active_turn` | FIFO/容量/失败隔离不依赖模型时序 |

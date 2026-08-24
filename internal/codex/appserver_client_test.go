@@ -152,6 +152,10 @@ func TestAppServerClientInitializesOnce(t *testing.T) {
 		if request.Method() != protocol.MethodInitialize {
 			t.Fatalf("请求方法为 %q", request.Method())
 		}
+		params := request.(protocol.InitializeRequest).Params
+		if params.Capabilities == nil || params.Capabilities.ExperimentalAPI == nil || !*params.Capabilities.ExperimentalAPI {
+			t.Fatalf("initialize 未为 request_user_input 开启 experimentalApi: %#v", params.Capabilities)
+		}
 		response := result.(*protocol.InitializeResponse)
 		response.CodexHome = "/tmp/codex-home"
 		return nil

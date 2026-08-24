@@ -47,6 +47,9 @@ type Protocol struct {
 	LoginAccountParams                      *LoginAccountParams                      `json:"loginAccountParams,omitempty"`
 	LoginAccountResponse                    *LoginAccountResponse                    `json:"loginAccountResponse,omitempty"`
 	LogoutAccountResponse                   map[string]json.RawMessage               `json:"logoutAccountResponse,omitempty"`
+	MCPServerElicitationRequestParams       *MCPServerElicitationRequestParams       `json:"mcpServerElicitationRequestParams,omitempty"`
+	MCPServerElicitationRequestResponse     *MCPServerElicitationRequestResponse     `json:"mcpServerElicitationRequestResponse,omitempty"`
+	MCPServerStatusUpdatedNotification      *MCPServerStatusUpdatedNotification      `json:"mcpServerStatusUpdatedNotification,omitempty"`
 	MCPToolCallProgressNotification         *MCPToolCallProgressNotification         `json:"mcpToolCallProgressNotification,omitempty"`
 	ModelListParams                         *ModelListParams                         `json:"modelListParams,omitempty"`
 	ModelListResponse                       *ModelListResponse                       `json:"modelListResponse,omitempty"`
@@ -67,6 +70,8 @@ type Protocol struct {
 	ThreadTokenUsageUpdatedNotification     *ThreadTokenUsageUpdatedNotification     `json:"threadTokenUsageUpdatedNotification,omitempty"`
 	ThreadUnsubscribeParams                 *ThreadUnsubscribeParams                 `json:"threadUnsubscribeParams,omitempty"`
 	ThreadUnsubscribeResponse               *ThreadUnsubscribeResponse               `json:"threadUnsubscribeResponse,omitempty"`
+	ToolRequestUserInputParams              *ToolRequestUserInputParams              `json:"toolRequestUserInputParams,omitempty"`
+	ToolRequestUserInputResponse            *ToolRequestUserInputResponse            `json:"toolRequestUserInputResponse,omitempty"`
 	TurnCompletedNotification               *TurnCompletedNotification               `json:"turnCompletedNotification,omitempty"`
 	TurnInterruptParams                     *TurnInterruptParams                     `json:"turnInterruptParams,omitempty"`
 	TurnInterruptResponse                   map[string]json.RawMessage               `json:"turnInterruptResponse,omitempty"`
@@ -188,7 +193,7 @@ type ConfigReadParams struct {
 }
 
 type ConfigReadResponse struct {
-	Config  Config                 `json:"config"`
+	Config  json.RawMessage        `json:"config"`
 	Layers  []LayerElement         `json:"layers,omitempty"`
 	Origins map[string]OriginValue `json:"origins"`
 }
@@ -431,6 +436,8 @@ type InitializeParams struct {
 
 // Client-declared capabilities negotiated during initialize.
 type InitializeCapabilities struct {
+	// Opt into receiving experimental API methods and fields.
+	ExperimentalAPI *bool `json:"experimentalApi,omitempty"`
 	// MCP extension settings declared by the app-server client.
 	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
 	// Legacy opt-in for the `openai/form` MCP extension.
@@ -675,6 +682,43 @@ type LoginAccountResponse struct {
 	UserCode *string `json:"userCode,omitempty"`
 	// URL the client should open in a browser to complete device code authorization.
 	VerificationURL *string `json:"verificationUrl,omitempty"`
+}
+
+type MCPServerElicitationRequestParams struct {
+	ServerName string `json:"serverName"`
+	ThreadID   string `json:"threadId"`
+	// Active Codex turn when this elicitation was observed, if app-server could correlate one.
+	//
+	// This is nullable because MCP models elicitation as a standalone server-to-client request
+	// identified by the MCP server request id. It may be triggered during a turn, but turn
+	// context is app-server correlation rather than part of the protocol identity of the
+	// elicitation itself.
+	TurnID          *string         `json:"turnId,omitempty"`
+	Meta            json.RawMessage `json:"_meta,omitempty"`
+	Message         string          `json:"message"`
+	Mode            Mode            `json:"mode"`
+	RequestedSchema json.RawMessage `json:"requestedSchema,omitempty"`
+	ElicitationID   *string         `json:"elicitationId,omitempty"`
+	URL             *string         `json:"url,omitempty"`
+}
+
+type MCPServerElicitationRequestResponse struct {
+	// Optional client metadata for form-mode action handling.
+	Meta   json.RawMessage            `json:"_meta,omitempty"`
+	Action MCPServerElicitationAction `json:"action"`
+	// Structured user input for accepted elicitations, mirroring RMCP
+	// `CreateElicitationResult`.
+	//
+	// This is nullable because decline/cancel responses have no content.
+	Content json.RawMessage `json:"content,omitempty"`
+}
+
+type MCPServerStatusUpdatedNotification struct {
+	Error         *string                                  `json:"error,omitempty"`
+	FailureReason *FailureReasonEnum                       `json:"failureReason,omitempty"`
+	Name          string                                   `json:"name"`
+	Status        MCPServerStatusUpdatedNotificationStatus `json:"status"`
+	ThreadID      *string                                  `json:"threadId,omitempty"`
 }
 
 type MCPToolCallProgressNotification struct {
@@ -1102,6 +1146,43 @@ type ThreadUnsubscribeResponse struct {
 	Status ThreadUnsubscribeResponseStatus `json:"status"`
 }
 
+// Params sent with a request_user_input event.
+type ToolRequestUserInputParams struct {
+	// @deprecated Use `isBlocking` to decide whether the request should block.
+	AutoResolutionMS *int64                         `json:"autoResolutionMs,omitempty"`
+	IsBlocking       bool                           `json:"isBlocking"`
+	ItemID           string                         `json:"itemId"`
+	Questions        []ToolRequestUserInputQuestion `json:"questions"`
+	ThreadID         string                         `json:"threadId"`
+	TurnID           string                         `json:"turnId"`
+}
+
+// Represents one request_user_input question and its required options.
+type ToolRequestUserInputQuestion struct {
+	Header   string                       `json:"header"`
+	ID       string                       `json:"id"`
+	IsOther  *bool                        `json:"isOther,omitempty"`
+	IsSecret *bool                        `json:"isSecret,omitempty"`
+	Options  []ToolRequestUserInputOption `json:"options,omitempty"`
+	Question string                       `json:"question"`
+}
+
+// Defines a single selectable option for request_user_input.
+type ToolRequestUserInputOption struct {
+	Description string `json:"description"`
+	Label       string `json:"label"`
+}
+
+// Response payload mapping question ids to answers.
+type ToolRequestUserInputResponse struct {
+	Answers map[string]ToolRequestUserInputAnswer `json:"answers"`
+}
+
+// Captures a user's answer to a request_user_input question.
+type ToolRequestUserInputAnswer struct {
+	Answers []string `json:"answers"`
+}
+
 type TurnCompletedNotification struct {
 	ThreadID string      `json:"threadId"`
 	Turn     TurnElement `json:"turn"`
@@ -1256,8 +1337,8 @@ const (
 type FileChangeApprovalDecision string
 
 const (
-	Accept           FileChangeApprovalDecision = "accept"
 	AcceptForSession FileChangeApprovalDecision = "acceptForSession"
+	Accept           FileChangeApprovalDecision = "accept"
 	Cancel           FileChangeApprovalDecision = "cancel"
 	Decline          FileChangeApprovalDecision = "decline"
 )
@@ -1535,6 +1616,37 @@ const (
 	TypeChatgpt       Type = "chatgpt"
 )
 
+type Mode string
+
+const (
+	Form       Mode = "form"
+	OpenaiForm Mode = "openai/form"
+	URL        Mode = "url"
+)
+
+type MCPServerElicitationAction string
+
+const (
+	MCPServerElicitationActionAccept  MCPServerElicitationAction = "accept"
+	MCPServerElicitationActionCancel  MCPServerElicitationAction = "cancel"
+	MCPServerElicitationActionDecline MCPServerElicitationAction = "decline"
+)
+
+type FailureReasonEnum string
+
+const (
+	ReauthenticationRequired FailureReasonEnum = "reauthenticationRequired"
+)
+
+type MCPServerStatusUpdatedNotificationStatus string
+
+const (
+	Cancelled    MCPServerStatusUpdatedNotificationStatus = "cancelled"
+	PurpleFailed MCPServerStatusUpdatedNotificationStatus = "failed"
+	Ready        MCPServerStatusUpdatedNotificationStatus = "ready"
+	Starting     MCPServerStatusUpdatedNotificationStatus = "starting"
+)
+
 // Canonical user-input modality tags advertised by a model.
 //
 // Plain text turns and tool payloads.
@@ -1652,8 +1764,8 @@ const (
 type TurnStatus string
 
 const (
-	Failed            TurnStatus = "failed"
 	FluffyCompleted   TurnStatus = "completed"
+	Failed            TurnStatus = "failed"
 	FluffyInterrupted TurnStatus = "interrupted"
 	PurpleInProgress  TurnStatus = "inProgress"
 )

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"acp-go/agents/codex/protocol"
 )
 
 var (
@@ -33,6 +35,12 @@ type sessionState struct {
 	terminalOutputMode terminalOutputMode
 	// promptClosed 阻止 close fence 建立后仍持有旧 state 的并发请求安装 prompt。
 	promptClosed bool
+	// mcpServers 保存本次 ACP open 请求声明的清洗后 MCP server 名称。
+	mcpServers map[string]struct{}
+	// mcpStartupReported 防止重复启动状态产生重复失败工具项。
+	mcpStartupReported map[string]protocol.MCPServerStatusUpdatedNotificationStatus
+	// mcpStartupAfterVersion 只接受本次 thread open 之后产生的启动状态。
+	mcpStartupAfterVersion uint64
 }
 
 // sessionStore 管理 session generation、open identity 与可重入 close fence。
@@ -107,6 +115,14 @@ func (s *sessionStore) abandonOpen(sessionID string, generation uint64) {
 	s.mu.Unlock()
 }
 
+// openCanProceed 验证前置配置读取结束后，本次 open 身份仍未被 close 或更新 open 取代。
+func (s *sessionStore) openCanProceed(sessionID string, generation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	openGeneration, opening := s.opening[sessionID]
+	return opening && openGeneration == generation && s.closing[sessionID] == 0 && s.generations[sessionID] == generation
+}
+
 // beginStaleCleanup 为仍是最新 open 的过期结果建立 close fence。
 // 若已有更新 open 覆盖身份，则返回 false，禁止旧请求 unsubscribe 新订阅。
 func (s *sessionStore) beginStaleCleanup(sessionID string, generation uint64) bool {
@@ -154,6 +170,17 @@ func (s *sessionStore) get(sessionID string) (*sessionState, bool) {
 	defer s.mu.Unlock()
 	state, ok := s.sessions[sessionID]
 	return state, ok
+}
+
+// snapshot 返回当前安装 session 的指针快照；调用方仍须用 isCurrent 复核 generation。
+func (s *sessionStore) snapshot() []*sessionState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]*sessionState, 0, len(s.sessions))
+	for _, state := range s.sessions {
+		result = append(result, state)
+	}
+	return result
 }
 
 // isCurrent 验证状态指针与 generation 仍是当前安装身份。

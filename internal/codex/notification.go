@@ -8,6 +8,13 @@ import (
 
 // handleNotification 以 runtime 当前 turn generation 选择已验证 eventRouter，避免复制事件 mapper。
 func (a *Agent) handleNotification(ctx context.Context, notification protocol.ServerNotification) {
+	if status, ok := notification.(*protocol.MCPServerStatusUpdatedEnvelope); ok {
+		a.handleMCPStartupStatus(ctx, status.Params)
+		return
+	}
+	if resolved, ok := notification.(*protocol.ServerRequestResolvedEnvelope); ok {
+		a.completePendingURLElicitations(ctx, resolved.Params.ThreadID)
+	}
 	threadID, turnID := notificationRouting(notification)
 	if threadID == "" {
 		if unknown, ok := notification.(*protocol.UnknownServerNotification); ok {

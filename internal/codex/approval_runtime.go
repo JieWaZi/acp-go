@@ -17,6 +17,10 @@ func failClosedServerRequest(request protocol.ServerRequest) (any, error) {
 		return failClosedFileApproval(), nil
 	case *protocol.PermissionsApprovalRequest:
 		return failClosedPermissionsApproval(), nil
+	case *protocol.MCPServerElicitationRequest:
+		return failClosedMCPServerElicitation(), nil
+	case *protocol.ToolRequestUserInputRequest:
+		return failClosedToolUserInput(), nil
 	default:
 		return nil, fmt.Errorf("unsupported Codex server request %T", request)
 	}
@@ -45,6 +49,10 @@ func (a *Agent) handleServerRequest(ctx context.Context, request protocol.Server
 			return failClosedPermissionsApproval(), nil
 		}
 		return newApprovalHandler(requester, generation, a, a.logger).HandlePermissions(ctx, value.Params), nil
+	case *protocol.MCPServerElicitationRequest:
+		return a.handleMCPServerElicitation(ctx, value.Params), nil
+	case *protocol.ToolRequestUserInputRequest:
+		return a.handleToolUserInput(ctx, value.Params), nil
 	default:
 		return failClosedServerRequest(request)
 	}

@@ -31,6 +31,10 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 	if response.AgentCapabilities.Auth.Logout == nil {
 		t.Fatal("initialize 未声明已实现的 logout 能力")
 	}
+	if !response.AgentCapabilities.McpCapabilities.Http || response.AgentCapabilities.McpCapabilities.Sse ||
+		response.AgentCapabilities.McpCapabilities.Acp {
+		t.Fatalf("MCP transport 能力为 %#v，期望 stdio 隐式支持且仅声明 HTTP", response.AgentCapabilities.McpCapabilities)
+	}
 	if len(response.AuthMethods) != 2 || response.AuthMethods[0].Agent == nil ||
 		response.AuthMethods[0].Agent.Id != "api-key" || response.AuthMethods[1].Agent == nil ||
 		response.AuthMethods[1].Agent.Id != "chat-gpt" {

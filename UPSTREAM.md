@@ -55,12 +55,12 @@ go run ./tools/protocolgen --check
 - thread：start、resume、read、unsubscribe 的 Params/Response；
 - turn：start、steer、interrupt 的 Params/Response；
 - model/auth/config：`ModelList*`、`ConfigRead*`、`GetAccount*`、`LoginAccount*`、`CancelLoginAccount*`、`LogoutAccountResponse`；
-- 审批：Command Execution、File Change、Permissions 的 Params/Response。
-- 通知：turn/item 生命周期、消息/reasoning/plan/usage、command/file/MCP 进度、request resolved、compaction、model reroute、warning/error，以及登录流程依赖的 `AccountLoginCompletedNotification`。
+- 审批与交互：Command Execution、File Change、Permissions、MCP Elicitation、`item/tool/requestUserInput` 的 Params/Response。
+- 通知：turn/item 生命周期、消息/reasoning/plan/usage、command/file/MCP 进度、MCP 启动状态、request resolved、compaction、model reroute、warning/error，以及登录流程依赖的 `AccountLoginCompletedNotification`。
 
 根清单来自固定 clone 中 `CodexAppServerClient.ts`、`CodexAcpClient.ts`、`CodexEventHandler.ts` 的实际 imports/dispatcher 与 V1 Specs，而不是重新设计协议。运行时、事件或审批后续需要新的稳定类型时，先把对应 `$ref` 加入 `protocol.root.json`，再生成类型并更新 dispatcher/mapper/test；不能在手写 Go 文件重复声明 DTO。
 
-默认稳定 schema 仍收录少量上游标记为 experimental/unstable 的声明，因此“未传 `--experimental`”不是 V1 public surface 的充分条件。生成器除检查仅由开关产生的哨兵定义外，还通过确定性、逐片段计数的薄适配隐藏 V1 不支持的 experimental capability、Bedrock login 构造项和 plan item 构造常量；完整输入 bundle 保持原样，便于后续升级审计。
+默认稳定 schema 仍收录少量上游标记为 experimental/unstable 的声明，因此“未传 `--experimental`”不是 V1 public surface 的充分条件。V1 明确采用其中的 `item/tool/requestUserInput` 以对接 ACP Form Elicitation；生成器只为该请求做窄开放，并继续通过确定性、逐片段计数的薄适配隐藏其余不支持的 experimental capability、Bedrock login 构造项和 plan item 构造常量。完整输入 bundle 保持原样，便于后续升级审计。
 
 ## TypeScript → Go 职责映射
 
@@ -105,6 +105,7 @@ go run ./tools/protocolgen --check
 | `TerminalOutputMode.test.ts`、`terminal-full-flow.json`、`terminal-output-completion-fallback.json`、`terminal-output-events.test.ts` | `terminal_output_mode_test.go`、`tool_mapper_test.go`、`agent_runtime_test.go` 的默认/显式 capability 判定、session snapshot、live delta/interaction、parsed command legacy delta、无 delta completion fallback、`terminal_exit` 与精确 wire key |
 | `command-action-events.test.ts`、`file-change-events.test.ts` 及其 snapshots | parsed Command action、File add/delete rich diff 与 update/move typed raw 保留 |
 | `mcp-session.test.ts`、`mcp-tool-in-progress.json`、`mcp-tool-repeated-progress.json`、`mcp-tool-completed-with-logs.json` | MCP title、稳定 ToolCallID、重复 progress、typed raw input/output 与终态 |
+| `mcp-config-merge.test.ts`、`elicitation-events.test.ts` | `mcp_runtime_test.go` 的 stdio/HTTP 配置与同名层保护、MCP form/url、URL complete、request_user_input options/other/fail-closed |
 | `session-config-options.test.ts` | `config_test.go` 的三模式安全边界、model/effort 保留/回退与未知选择错误 |
 | `initialize.test.ts` 和 `CodexAcpClient.test.ts` API Key/ChatGPT cases | `agent_test.go`、`auth_test.go` 的 `NO_BROWSER` 真实性、仅 `steering.supported` meta、V1 method 声明、凭据优先级、subscribe-before-start、取消 login 与 secret-safe 失败 |
 | `CodexAcpClient.test.ts` 的 logout/accountUpdated 与共享 login promise cases | `appserver_client_test.go`、`agent_wiring_test.go` | account request 使用生成 DTO，subscribe-before-request、release、duplicate notification 和 transport fatal 都只终结当前订阅 |
@@ -129,7 +130,7 @@ go run ./tools/protocolgen --check
 - `codex-acp` npm 发布物可回退 bundled `@openai/codex`；本项目按用户和父规格只使用用户预装 Codex，显式 `CODEX_PATH` 无效时禁止 PATH 回退，空值才查询 PATH，并以 0.148.0 为告警基线。
 - TypeScript `createJSONRPCReader` 和 `SteeringQueue` 使用动态字符串/无界数组；Go 等价实现保持相同顺序与结果语义，但增加 8 MiB 单帧、16 个 server request、64 个每-session pending steering 和有界 stderr，超限按稳定 fatal/RequestError 失败。
 - TypeScript 的 early-completion 切换依赖 JavaScript 单事件循环；Go 在同一 mutex 临界区原子执行“查找捕获→安装精确 waiter”，避免 goroutine 在两步间丢通知。
-- 固定 TS `InitializeCapabilities` 发送 `experimentalApi: true`；已合并的默认稳定 Go protocol 按 V1 决策有意隐藏该 experimental 字段，因此 runtime 只用生成类型发送 `requestAttestation: false`，不手写重复 DTO 绕过 protocol 边界。
+- 固定 TS `InitializeCapabilities` 发送 `experimentalApi: true`。V1 为接收已明确实现的 `item/tool/requestUserInput` 保留并发送该生成字段，同时只在封闭 dispatcher 中注册已接入的实验请求；其余实验方法不会因此成为公开支持能力。
 - fixed upstream initialize 同时宣告 Goal 与 JetBrains AIR meta，并根据客户端支持启用 boolean fast-mode；父 V1 已明确裁剪 Goal、AIR 和 fast-mode，所以 Go initialize 精确只保留已实现的 `steering.supported=true`，不以空对象或预留字段误宣告。稳定 `turn/plan/updated` 继续复用 SDK Plan；实验 `item/plan/delta` 与 `plan_update` 同样不进入 V1。
 - acp-go-sdk v0.13.5 的 `NewAgentSideConnection` 会立即启动 receive goroutine，之后调用可选 `SetLogger` 存在并发读写；本项目保持 SDK 默认 stderr logger，绝不调用 setter。`connectionBinder` 使用 ready channel 作为 prompt/event barrier。
 - Go runtime context 在启动成功后由 `Agent.Close` 单独拥有，不继续继承 construction/Serve context 的取消；这样 acpserver 可在其独立有界清理窗口内先关闭 stdin、回收唯一进程，避免 `exec.CommandContext` 把正常信号退出误报为 app-server 异常。
@@ -154,7 +155,7 @@ go run ./tools/protocolgen --check
 ## 明确跳过
 
 - 任何只有 `--experimental` 才出现的 schema 定义、方法和字段，以及默认 bundle 中 V1 不支持的 experimental capability/variant 构造项；
-- codex-acp 的 Review、Goal、Session List 管理扩展、client-provided MCP server、Gateway Auth、Audio/realtime、多 Agent 协作 UI 等父 V1 Non-goals；父 V1 runtime 不实现也不宣告这些行为，即使默认稳定 envelope 为前向兼容带出了部分 DTO；
+- codex-acp 的 Review、Goal、Session List 管理扩展、MCP SSE/ACP transport 与 OAuth/资源管理、Gateway Auth、Audio/realtime、多 Agent 协作 UI 等 V1 Non-goals；runtime 不实现也不宣告这些行为，即使默认稳定 envelope 为前向兼容带出了部分 DTO；
 - boolean fast-mode、JetBrains AIR、实验 `item/plan/delta`/`plan_update` 与 Goal 控制同属已确认 V1 裁剪；本轮只修复已纳入的 steering 与 terminal output 协商，不扩展这些 surface；
 - 完整 codex-acp vendoring、TypeScript 构建产物和 ACP SDK 内部协议实现；
 - event/tool/approval/config/content/auth 作为独立小接口组件实现；runtime composition root 只负责生命周期与 identity-aware 薄接线，不复制其 DTO、mapper 或 ACP 请求实现。
@@ -181,3 +182,4 @@ go run ./tools/protocolgen --check
 - 2026-08-24：按独立审查再对照 upstream，补齐 history command/file/MCP 的精确 `tool_call` 形状、no-active steering 配置继承、取消后有界远端清理和 config/close 线性化；同时加入模型分页资源上限。
 - 2026-08-24：stabilization verification repair 薄移植 `TerminalOutputMode.ts` 和 initialize capability 条件：`NO_BROWSER` 非空时隐藏 ChatGPT、只宣告 `steering.supported`、按 session 快照选择 full/legacy terminal key，并用无 shell 派生的 helper-process fake 消除默认 package 并行下的版本探测竞争与 pipe 假挂。
 - 2026-08-24：按 `CodexAcpServer.runWithProcessCheck` 与 `process-exit-error.test.ts` 修复 Go `exec.Cmd.Wait`/`StdoutPipe` 竞态：scanner 的 closed-pipe 仅在 `process.FinalError` 确认异常退出时升级为稳定 exit/stderr fatal，并以确定性双 pending 仲裁测试及真实 helper-process 并行压力锁住普通 I/O、超长帧、clean EOF 和主动关闭优先级。
+- 2026-08-24：参考固定 codex-acp 补齐 ACP stdio/HTTP MCP 会话配置、同名配置层保护、启动失败展示、MCP form/url Elicitation 与 `item/tool/requestUserInput`；SSE、MCP-over-ACP 和动态 `item/tool/call` 继续保持未声明。

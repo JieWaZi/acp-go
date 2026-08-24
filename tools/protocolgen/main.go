@@ -217,7 +217,6 @@ func generate(ctx context.Context, cfg generatorConfig) ([]byte, error) {
 		"MockExperimentalMethod",
 		"EXPERIMENTAL",
 		"ExperimentalFeature",
-		"ExperimentalAPI",
 		"ThreadRealtime",
 		"AmazonBedrock",
 	} {
@@ -279,6 +278,26 @@ func preserveOpenJSONFields(generated []byte) ([]byte, error) {
 			source:      "OutputSchema interface{}",
 			replacement: "OutputSchema json.RawMessage",
 		},
+		{
+			source:      "Config  Config                 `json:\"config\"`",
+			replacement: "Config  json.RawMessage       `json:\"config\"`",
+		},
+		{
+			source:      "Meta            interface{} `json:\"_meta,omitempty\"`",
+			replacement: "Meta            json.RawMessage `json:\"_meta,omitempty\"`",
+		},
+		{
+			source:      "RequestedSchema interface{} `json:\"requestedSchema,omitempty\"`",
+			replacement: "RequestedSchema json.RawMessage `json:\"requestedSchema,omitempty\"`",
+		},
+		{
+			source:      "Meta   interface{}                `json:\"_meta,omitempty\"`",
+			replacement: "Meta   json.RawMessage            `json:\"_meta,omitempty\"`",
+		},
+		{
+			source:      "Content interface{} `json:\"content,omitempty\"`",
+			replacement: "Content json.RawMessage `json:\"content,omitempty\"`",
+		},
 	}
 
 	result := generated
@@ -314,11 +333,6 @@ func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
 			replacement: "",
 		},
 		{
-			source: "\t// Opt into receiving experimental API methods and fields.\n" +
-				"\tExperimentalAPI *bool `json:\"experimentalApi,omitempty\"`\n",
-			replacement: "",
-		},
-		{
 			source:      "//\n// [UNSTABLE] Managed Amazon Bedrock login is experimental.\n",
 			replacement: "",
 		},
@@ -333,6 +347,46 @@ func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
 		{
 			source:      "\tTypeAmazonBedrock Type = \"amazonBedrock\"\n",
 			replacement: "",
+		},
+		// item/tool/requestUserInput 是 V1 明确采用的唯一 experimental 请求面；
+		// 只移除其上游状态标签，最终哨兵仍会拒绝任何其他 EXPERIMENTAL surface。
+		{
+			source:      "// EXPERIMENTAL. Captures a user's answer to a request_user_input question.\n",
+			replacement: "// Captures a user's answer to a request_user_input question.\n",
+		},
+		{
+			source:      "// EXPERIMENTAL. Defines a single selectable option for request_user_input.\n",
+			replacement: "// Defines a single selectable option for request_user_input.\n",
+		},
+		{
+			source:      "// EXPERIMENTAL. Params sent with a request_user_input event.\n",
+			replacement: "// Params sent with a request_user_input event.\n",
+		},
+		{
+			source:      "// EXPERIMENTAL. Represents one request_user_input question and its required options.\n",
+			replacement: "// Represents one request_user_input question and its required options.\n",
+		},
+		{
+			source:      "// EXPERIMENTAL. Response payload mapping question ids to answers.\n",
+			replacement: "// Response payload mapping question ids to answers.\n",
+		},
+		// 新增 elicitation 枚举后 quicktype 会为既有 V1 常量改名；恢复原公开标识，
+		// 新 MCP 枚举本身已带类型前缀，不会产生 Go 标识冲突。
+		{
+			source:      "\tFileChangeApprovalDecisionAccept  FileChangeApprovalDecision = \"accept\"\n",
+			replacement: "\tAccept                              FileChangeApprovalDecision = \"accept\"\n",
+		},
+		{
+			source:      "\tFileChangeApprovalDecisionCancel  FileChangeApprovalDecision = \"cancel\"\n",
+			replacement: "\tCancel                              FileChangeApprovalDecision = \"cancel\"\n",
+		},
+		{
+			source:      "\tFileChangeApprovalDecisionDecline FileChangeApprovalDecision = \"decline\"\n",
+			replacement: "\tDecline                             FileChangeApprovalDecision = \"decline\"\n",
+		},
+		{
+			source:      "\tFluffyFailed      TurnStatus = \"failed\"\n",
+			replacement: "\tFailed            TurnStatus = \"failed\"\n",
 		},
 	}
 

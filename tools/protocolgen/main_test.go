@@ -70,8 +70,6 @@ func TestGenerateExcludesExperimentalPublicSurface(t *testing.T) {
 		"ThreadRealtime",
 		"type AppListUpdatedNotification",
 		"type PlanDeltaNotification",
-		"type ToolRequestUserInput",
-		"ExperimentalAPI",
 		"AmazonBedrock",
 	} {
 		if strings.Contains(text, forbidden) {

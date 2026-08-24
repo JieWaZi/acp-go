@@ -29,6 +29,8 @@ const (
 	MethodCommandExecutionRequestApproval = "item/commandExecution/requestApproval"
 	MethodFileChangeRequestApproval       = "item/fileChange/requestApproval"
 	MethodPermissionsRequestApproval      = "item/permissions/requestApproval"
+	MethodMCPServerElicitationRequest     = "mcpServer/elicitation/request"
+	MethodToolRequestUserInput            = "item/tool/requestUserInput"
 	MethodError                           = "error"
 	MethodTurnStarted                     = "turn/started"
 	MethodTurnCompleted                   = "turn/completed"
@@ -43,6 +45,7 @@ const (
 	MethodCommandExecutionOutputDelta     = "item/commandExecution/outputDelta"
 	MethodTerminalInteraction             = "item/commandExecution/terminalInteraction"
 	MethodMCPToolCallProgress             = "item/mcpToolCall/progress"
+	MethodMCPServerStartupStatusUpdated   = "mcpServer/startupStatus/updated"
 	MethodFileChangePatchUpdated          = "item/fileChange/patchUpdated"
 	MethodServerRequestResolved           = "serverRequest/resolved"
 	MethodThreadCompacted                 = "thread/compacted"
@@ -456,6 +459,18 @@ type PermissionsApprovalRequest struct {
 	serverRequestEnvelope[PermissionsRequestApprovalParams]
 }
 
+// MCPServerElicitationRequest 表示 MCP server 发起的表单或 URL 交互请求。
+type MCPServerElicitationRequest struct {
+	// serverRequestEnvelope 固定 MCP elicitation 方法与参数类型。
+	serverRequestEnvelope[MCPServerElicitationRequestParams]
+}
+
+// ToolRequestUserInputRequest 表示 Codex request_user_input 工具发起的结构化提问。
+type ToolRequestUserInputRequest struct {
+	// serverRequestEnvelope 固定 request_user_input 方法与参数类型。
+	serverRequestEnvelope[ToolRequestUserInputParams]
+}
+
 // DecodeServerRequest 先按 method 选择审批变体，再解析唯一对应的 Params 类型。
 func DecodeServerRequest(data []byte) (ServerRequest, error) {
 	var wire requestWire
@@ -472,6 +487,12 @@ func DecodeServerRequest(data []byte) (ServerRequest, error) {
 	case MethodPermissionsRequestApproval:
 		request, err := decodeServerRequest[PermissionsRequestApprovalParams](wire)
 		return serverRequestResult(&PermissionsApprovalRequest{request}, err)
+	case MethodMCPServerElicitationRequest:
+		request, err := decodeServerRequest[MCPServerElicitationRequestParams](wire)
+		return serverRequestResult(&MCPServerElicitationRequest{request}, err)
+	case MethodToolRequestUserInput:
+		request, err := decodeServerRequest[ToolRequestUserInputParams](wire)
+		return serverRequestResult(&ToolRequestUserInputRequest{request}, err)
 	default:
 		return nil, fmt.Errorf("%w: unsupported server request method %q", ErrInvalidEnvelope, wire.Method)
 	}
@@ -628,6 +649,12 @@ type MCPToolCallProgressEnvelope struct {
 	notificationEnvelope[MCPToolCallProgressNotification]
 }
 
+// MCPServerStatusUpdatedEnvelope 表示单个 MCP server 启动状态变化。
+type MCPServerStatusUpdatedEnvelope struct {
+	// notificationEnvelope 固定 MCP 启动状态方法与参数类型。
+	notificationEnvelope[MCPServerStatusUpdatedNotification]
+}
+
 // FileChangePatchUpdatedEnvelope 表示文件补丁更新通知。
 type FileChangePatchUpdatedEnvelope struct {
 	// notificationEnvelope 固定文件补丁 method 与 Params 类型。
@@ -757,6 +784,9 @@ func DecodeServerNotification(data []byte) (ServerNotification, error) {
 	case MethodMCPToolCallProgress:
 		envelope, err := decodeNotification[MCPToolCallProgressNotification](wire)
 		return serverNotificationResult(&MCPToolCallProgressEnvelope{envelope}, err)
+	case MethodMCPServerStartupStatusUpdated:
+		envelope, err := decodeNotification[MCPServerStatusUpdatedNotification](wire)
+		return serverNotificationResult(&MCPServerStatusUpdatedEnvelope{envelope}, err)
 	case MethodFileChangePatchUpdated:
 		envelope, err := decodeNotification[FileChangePatchUpdatedNotification](wire)
 		return serverNotificationResult(&FileChangePatchUpdatedEnvelope{envelope}, err)

@@ -53,17 +53,19 @@ flowchart LR
 | --- | --- |
 | `initialize` | `initialize` 后发送 `initialized`，并读取客户端终端输出能力。 |
 | `authenticate` / `logout` | API Key 或 ChatGPT `account/*` 流程；登录完成通知始终先订阅后发起请求。 |
-| `session/new` | `thread/start`，随后读取模型目录并建立 Session 配置快照。 |
-| `session/resume` | `thread/resume` 并重新安装受 generation 保护的 Session。 |
-| `session/load` | `thread/resume` → `thread/read(includeTurns=true)`，再通过现有 Mapper 回放历史。 |
+| `session/new` | 把 stdio/HTTP `mcpServers` 注入配置后执行 `thread/start`，随后读取模型目录并建立 Session 配置快照。 |
+| `session/resume` | 带会话 MCP 配置执行 `thread/resume`，并重新安装受 generation 保护的 Session。 |
+| `session/load` | 带会话 MCP 配置执行 `thread/resume` → `thread/read(includeTurns=true)`，再通过现有 Mapper 回放历史。 |
 | `session/close` | 提升 generation、取消活动 Prompt、`thread/unsubscribe`。 |
 | `session/prompt` | 转换内容后执行 `turn/start`，流式转发事件并等待精确 Turn 完成。 |
 | `session/cancel` | 取消 pending/active Prompt；已知 Turn 时最多发送一次 `turn/interrupt`。 |
 | `session/set_mode` / `session/set_config_option` | 更新当前 Session 的审批、沙箱、模型和推理强度快照。 |
 | `_session/steering` | 每个 Session 使用有界 FIFO；活动 Turn 走 `turn/steer`，否则回退为新 Turn。 |
 | permission request | 映射 command、file change、permissions 三类审批，并把选择转换回强类型响应。 |
+| MCP Elicitation | 标准 form/url 走 ACP Elicitation，客户端能力不足时回退 permission request。 |
+| `item/tool/requestUserInput` | 构造 ACP form schema，并把 accept content 转回 question-id 答案。 |
 
-V1 不实现 `session/list`；Audio 输入会被明确拒绝。MCP 只负责映射 Codex 已产生的工具调用事件，不管理客户端提供的 MCP Server。
+V1 不实现 `session/list`；Audio 输入会被明确拒绝。MCP-over-SSE、MCP-over-ACP、OAuth/资源管理和 `item/tool/call` 暂未接入。
 
 ## 关键不变量
 
@@ -95,6 +97,7 @@ V1 不实现 `session/list`；Audio 输入会被明确拒绝。MCP 只负责映�
 | `session.go`、`prompt.go`、`steering.go` | generation/close fence、活动 Prompt 生命周期和每 Session FIFO steering。 |
 | `auth.go`、`browser.go` | API Key、ChatGPT 登录、取消流程和系统浏览器薄适配。 |
 | `approval.go`、`approval_runtime.go` | 三类审批的 ACP option、Codex decision 与 stale fail-closed 检查。 |
+| `mcp_config.go`、`mcp_status.go`、`elicitation.go` | MCP stdio/HTTP 配置、同名层过滤、启动失败展示、MCP Elicitation 与结构化用户输入。 |
 | `config.go` | 模型、推理强度以及三种审批/沙箱模式。 |
 | `content.go` | ACP Text、Image、Resource、ResourceLink 到 Codex `UserInput` 的转换。 |
 | `event_router.go`、`notification.go` | 通知的强类型分派、身份过滤和 Agent 级通知接线。 |

@@ -346,16 +346,20 @@ func newAppServerClient(runtimeCtx context.Context, rpc appServerRPC) *appServer
 }
 
 // Initialize 发送一次 app-server initialize，成功后紧接 initialized 通知。
-// 参数对照 CodexAcpClient.initialize；当前生成 V1 capabilities 不含旧 experimentalApi 字段。
+// 参数对照 CodexAcpClient.initialize；为已接入的 request_user_input 显式开启 experimentalApi。
 func (c *appServerClient) Initialize(
 	ctx context.Context,
 	clientInfo protocol.ClientInfo,
 ) (protocol.InitializeResponse, error) {
 	c.initializeOnce.Do(func() {
 		requestAttestation := false
+		experimentalAPI := true
 		params := protocol.InitializeParams{
-			Capabilities: &protocol.InitializeCapabilities{RequestAttestation: &requestAttestation},
-			ClientInfo:   clientInfo,
+			Capabilities: &protocol.InitializeCapabilities{
+				ExperimentalAPI:    &experimentalAPI,
+				RequestAttestation: &requestAttestation,
+			},
+			ClientInfo: clientInfo,
 		}
 		c.initializeErr = c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
 			return protocol.NewInitializeRequest(id, params)
@@ -390,6 +394,15 @@ func (c *appServerClient) ThreadRead(ctx context.Context, params protocol.Thread
 	var response protocol.ThreadReadResponse
 	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
 		return protocol.NewThreadReadRequest(id, params)
+	}, &response)
+	return response, err
+}
+
+// ConfigRead 读取当前 cwd 的有效配置与各层，用于避免 ACP MCP 配置覆盖同名用户配置。
+func (c *appServerClient) ConfigRead(ctx context.Context, params protocol.ConfigReadParams) (protocol.ConfigReadResponse, error) {
+	var response protocol.ConfigReadResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewConfigReadRequest(id, params)
 	}, &response)
 	return response, err
 }
