@@ -138,6 +138,8 @@ func TestRunStartsDefaultAndExplicitCodex(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("CODEX_PATH", writeFakeCodex(t))
+			// 未选择 Claude 时不应探测或启动该 Adapter。
+			t.Setenv("CLAUDE_CODE_EXECUTABLE", filepath.Join(t.TempDir(), "missing-claude"))
 			response := runInitializeExchange(t, tt.args)
 			if response.ProtocolVersion != acp.ProtocolVersionNumber {
 				t.Fatalf("协议版本为 %d，期望 %d", response.ProtocolVersion, acp.ProtocolVersionNumber)
@@ -146,6 +148,25 @@ func TestRunStartsDefaultAndExplicitCodex(t *testing.T) {
 				t.Fatalf("Agent 信息为 %#v，期望 codex", response.AgentInfo)
 			}
 		})
+	}
+}
+
+// TestRunRejectsInvalidClaudePathBeforeProtocolOutput 验证显式选择 Claude 时路径错误只写诊断流。
+func TestRunRejectsInvalidClaudePathBeforeProtocolOutput(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_EXECUTABLE", filepath.Join(t.TempDir(), "missing-claude"))
+	var protocolOutput bytes.Buffer
+	var diagnostics bytes.Buffer
+	exitCode := run(context.Background(), []string{"--adapter", "claude"}, processIO{
+		input: bytes.NewReader(nil), output: &protocolOutput, diagnostics: &diagnostics,
+	})
+	if exitCode == 0 {
+		t.Fatal("无效 CLAUDE_CODE_EXECUTABLE 返回成功")
+	}
+	if protocolOutput.Len() != 0 {
+		t.Fatalf("启动失败污染 stdout: %q", protocolOutput.String())
+	}
+	if !strings.Contains(diagnostics.String(), "missing-claude") {
+		t.Fatalf("启动诊断为 %q", diagnostics.String())
 	}
 }
 
@@ -602,7 +623,7 @@ func runFakeCodexProcess(args []string, input io.Reader, output io.Writer) int {
 	return 0
 }
 
-// handleFakeCodexRequest 对 V1 production composition 使用的方法返回固定 upstream 形状。
+// handleFakeCodexRequest 对 V1 production composition 使用的方法返回固定协议形状。
 func handleFakeCodexRequest(
 	encoder *json.Encoder,
 	id json.RawMessage,

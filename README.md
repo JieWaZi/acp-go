@@ -2,9 +2,9 @@
 
 `acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) stdio Agent 服务。它通过可选择的 Adapter，把 ACP 客户端请求转交给具体的 Agent 运行时，并将运行时事件映射回统一的 ACP 会话、内容和工具调用模型。
 
-当前 V1 提供 Codex Adapter：进程会启动用户本机已安装的 [OpenAI Codex CLI](https://github.com/openai/codex) `app-server`，在 ACP 客户端与 Codex 之间完成协议和生命周期适配。
+当前 V1 提供 Codex 与 Claude Adapter：Codex 使用用户本机已安装的 [OpenAI Codex CLI](https://github.com/openai/codex) `app-server`；Claude 使用用户本机已安装且已登录的 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)，由每个 ACP Session 独立持有一个 stream-json 进程。
 
-> 项目目前处于 V1 阶段，默认且唯一注册的 Adapter 是 `codex`。
+> `codex` 始终是默认 Adapter；只有显式传入 `--adapter claude` 才会探测和构造 Claude。
 
 ## 特性
 
@@ -17,8 +17,10 @@
 - 映射消息、推理、计划、Token Usage、命令、文件变更、MCP 工具和终端输出事件。
 - 映射命令执行、文件变更和细粒度权限审批；取消、异常或过期请求默认拒绝。
 - 使用固定 Schema 生成强类型 Codex app-server DTO，并提供可重复的协议新鲜度检查。
+- Claude 支持 new/load/resume/close、多轮 FIFO Prompt、cancel、steering、文本/图片/资源、工具、权限、计划、usage、model/effort/fast/mode、additional directories 和客户端 stdio/HTTP/SSE MCP。
 
 Codex Adapter 的实现边界、调用链和维护约束见 [`internal/codex/README.md`](internal/codex/README.md)。
+Claude 的固定版本、协议声明、fixture 和 Go 文件映射统一见 [`UPSTREAM.md`](UPSTREAM.md)。
 
 ## 架构
 
@@ -26,8 +28,10 @@ Codex Adapter 的实现边界、调用链和维护约束见 [`internal/codex/REA
 flowchart LR
     Client[ACP 客户端] <-->|ACP / stdio| Server[acp-agent]
     Server --> Registry[Adapter Registry]
-    Registry --> Adapter[Codex Adapter]
-    Adapter <-->|强类型 NDJSON| AppServer[用户预装的 Codex CLI<br/>app-server]
+    Registry --> Codex[Codex Adapter]
+    Registry --> Claude[Claude Adapter]
+    Codex <-->|强类型 NDJSON| AppServer[用户预装的 Codex CLI<br/>app-server]
+    Claude <-->|stream-json / control| ClaudeCLI[用户预装的 Claude Code CLI<br/>每 Session 一个进程]
 ```
 
 `acp-agent` 只在 `stdout` 读写 ACP 协议帧，启动错误、版本警告和 Codex 诊断信息统一写入 `stderr`，避免污染协议流。
@@ -37,7 +41,8 @@ flowchart LR
 ### 环境要求
 
 - Go `1.25.8`，以 [`go.mod`](go.mod) 为准。
-- 用户自行安装的 Codex CLI。当前 Adapter 的验证基线是 `0.148.0`；其他可识别版本会输出兼容性警告，然后继续尝试启动。
+- 使用 Codex Adapter 时，用户自行安装 Codex CLI。当前验证基线是 `0.148.0`；其他可识别版本会输出兼容性警告，然后继续尝试启动。
+- 使用 Claude Adapter 时，用户自行安装并登录 Claude Code CLI；版本探测只用于诊断，不作为硬性门槛。
 - 仅在刷新或重新生成 Codex 协议类型时需要 Node.js 与 npm；构建和运行已提交代码不依赖它们。
 
 先确认 Codex 可执行且能输出版本：
@@ -62,6 +67,12 @@ go build -o ./acp-agent ./cmd/acp-agent
 
 `codex` 是默认 Adapter，因此也可以省略 `--adapter codex`。
 
+Claude 需要显式选择：
+
+```sh
+./acp-agent --adapter claude
+```
+
 不同 ACP 客户端的配置格式并不完全相同，核心启动信息如下：
 
 ```json
@@ -76,6 +87,8 @@ go build -o ./acp-agent ./cmd/acp-agent
 
 如果 `codex` 已在客户端进程的 `PATH` 中，可以不设置 `CODEX_PATH`。
 
+Claude 客户端配置使用 `"args": ["--adapter", "claude"]`；如果 `claude` 已在 `PATH` 中，无需设置环境变量，否则可设置 `CLAUDE_CODE_EXECUTABLE` 为绝对路径。
+
 ## 运行时配置
 
 | 环境变量 | 作用 |
@@ -84,6 +97,8 @@ go build -o ./acp-agent ./cmd/acp-agent
 | `CODEX_API_KEY` | API Key 认证使用的首选环境变量。 |
 | `OPENAI_API_KEY` | `CODEX_API_KEY` 未设置时使用的后备 API Key。 |
 | `NO_BROWSER` | 任意非空值都会隐藏 ChatGPT 浏览器认证入口，适合无图形界面的运行环境。 |
+| `CLAUDE_CODE_EXECUTABLE` | 指定 Claude Code 可执行文件。非空时只使用该路径，路径无效不会回退到 `PATH`；未设置时才查找 `claude`。 |
+| `CLAUDE_CONFIG_DIR` | 可选 Claude 配置目录；Claude load 历史回放会从其 `projects` 子目录查找 transcript。 |
 
 API Key 的完整选择顺序是：ACP 认证请求中的 `_meta.api-key.apiKey`、`CODEX_API_KEY`、`OPENAI_API_KEY`。
 
@@ -96,13 +111,16 @@ API Key 的完整选择顺序是：ACP 认证请求中的 `_meta.api-key.apiKey`
 | [`internal/core`](internal/core) | 与具体实现无关的 Adapter 注册和选择。 |
 | [`internal/codex`](internal/codex) | Codex app-server 到 ACP 的运行时适配。 |
 | [`agents/codex/protocol`](agents/codex/protocol) | Codex app-server Schema、生成 DTO 和受控 Envelope。 |
+| [`internal/claude`](internal/claude) | Claude per-session 进程、Session、事件、权限与配置适配。 |
+| [`agents/claude/protocol`](agents/claude/protocol) | Claude stream-json/control 窄类型与冻结 fixture。 |
 | [`tools/protocolgen`](tools/protocolgen) | 固定工具链下的协议生成、新鲜度和稳定面检查。 |
 | [`UPSTREAM.md`](UPSTREAM.md) | 上游版本、源码映射、Fixture 对照和已知差异。 |
 | [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md) | V1 能力对应的默认测试与真实 Codex 测试矩阵。 |
+| [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md) | Claude V1 fake CLI 证据与真实 CLI smoke 边界。 |
 
 ## 开发与验证
 
-默认测试使用可控的 fake app-server，不需要账号凭据，也不会产生模型费用：
+默认测试使用可控的 fake app-server 和 fake Claude CLI，不需要账号凭据，也不会产生模型费用：
 
 ```sh
 go test ./... -count=1 -timeout=300s
@@ -116,7 +134,7 @@ go run ./tools/protocolgen --check
 go test -race -p=1 ./... -count=1 -timeout=600s
 ```
 
-真实 Codex Smoke Test 和完整 V1 场景是显式开启的付费/本机状态测试，运行方式和安全边界见 [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md)。
+真实 Codex Smoke Test 和完整 V1 场景见 [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md)；Claude 的真实 CLI smoke 边界见 [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md)。两者都是显式开启的本机状态/潜在付费测试。
 
 ## 协议同步
 
@@ -137,7 +155,7 @@ go run ./tools/protocolgen --refresh-schema
 
 ## V1 边界
 
-- 当前只注册 `codex` Adapter，但注册表和进程入口允许后续显式增加其他实现。
-- 项目不捆绑、下载或自动安装 Codex CLI。
-- `session/list` 和 Audio 输入尚未实现。
-- V1 会映射 Codex 已产生的 MCP 工具事件，但不负责管理客户端提供的 MCP Server。
+- 默认 Adapter 是 `codex`；Claude 只能通过 `--adapter claude` 显式选择。
+- 项目不捆绑、下载或自动安装 Codex/Claude CLI，也不修改用户的登录状态。
+- Claude V1 不实现 session list/fork/delete、认证/登出、terminal、elicitation、providers、goal 和 Audio 输入；完整清单见 [`UPSTREAM.md`](UPSTREAM.md)。
+- Codex V1 会映射已产生的 MCP 工具事件；Claude V1 还会把客户端 stdio/HTTP/SSE MCP 配置传给该 Session 的 CLI。

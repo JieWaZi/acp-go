@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"acp-go/internal/acpserver"
+	"acp-go/internal/claude"
 	"acp-go/internal/codex"
 	"acp-go/internal/core"
 
@@ -124,6 +125,21 @@ func newRegistry(logger *slog.Logger) (*core.Registry, error) {
 			agent, factoryErr := codex.NewAgent(ctx, codex.Config{
 				Logger:    logger,
 				CodexPath: os.Getenv("CODEX_PATH"),
+			})
+			if factoryErr != nil {
+				return nil, factoryErr
+			}
+			return agent, nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = registry.Register(core.Registration{
+		Name: "claude",
+		Factory: func(ctx context.Context) (acp.Agent, error) {
+			agent, factoryErr := claude.NewAgent(ctx, claude.Config{
+				Logger: logger, ClaudePath: os.Getenv("CLAUDE_CODE_EXECUTABLE"),
 			})
 			if factoryErr != nil {
 				return nil, factoryErr
