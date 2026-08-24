@@ -47,6 +47,6 @@ func (a *Agent) handleNotification(ctx context.Context, notification protocol.Se
 		rawSize = len(unknown.Params)
 	}
 	if err := router.Handle(ctx, notification, rawSize); err != nil {
-		a.logger.Warn("映射 Codex session event 失败", "session_id", threadID, "method", notification.Method(), "error", err)
+		a.logger.Warn("Failed to map Codex session event", "session_id", threadID, "method", notification.Method(), "error", err)
 	}
 }

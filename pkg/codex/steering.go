@@ -236,7 +236,7 @@ func (m *steeringManager) Handle(ctx context.Context, raw json.RawMessage) (stee
 	if errors.As(err, &requestErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return steeringResponse{}, err
 	}
-	m.agent.logger.Warn("Codex steering 单项失败", "session_id", params.SessionID, "error", err)
+	m.agent.logger.Warn("Codex steering item failed", "session_id", params.SessionID, "error", err)
 	return steeringResponse{Outcome: steeringFailed}, nil
 }
 

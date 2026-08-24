@@ -45,7 +45,7 @@ func (*recordingACPClient) ReadTextFile(
 	context.Context,
 	acp.ReadTextFileRequest,
 ) (acp.ReadTextFileResponse, error) {
-	return acp.ReadTextFileResponse{}, errors.New("测试客户端不支持读文件")
+	return acp.ReadTextFileResponse{}, errors.New("test client does not support reading files")
 }
 
 // WriteTextFile 实现 SDK Client；本 E2E 不声明文件写入能力。
@@ -53,7 +53,7 @@ func (*recordingACPClient) WriteTextFile(
 	context.Context,
 	acp.WriteTextFileRequest,
 ) (acp.WriteTextFileResponse, error) {
-	return acp.WriteTextFileResponse{}, errors.New("测试客户端不支持写文件")
+	return acp.WriteTextFileResponse{}, errors.New("test client does not support writing files")
 }
 
 // RequestPermission 实现 SDK Client；本 E2E 的 fake turn 不发起审批。
@@ -61,7 +61,7 @@ func (*recordingACPClient) RequestPermission(
 	context.Context,
 	acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
-	return acp.RequestPermissionResponse{}, errors.New("测试 fake turn 不应请求审批")
+	return acp.RequestPermissionResponse{}, errors.New("test fake turn must not request permission")
 }
 
 // SessionUpdate 记录 production event router 发送的 ACP 更新。
@@ -80,7 +80,7 @@ func (*recordingACPClient) CreateTerminal(
 	context.Context,
 	acp.CreateTerminalRequest,
 ) (acp.CreateTerminalResponse, error) {
-	return acp.CreateTerminalResponse{}, errors.New("测试客户端不支持 terminal")
+	return acp.CreateTerminalResponse{}, errors.New("test client does not support terminal operations")
 }
 
 // KillTerminal 实现 SDK Client；本 E2E 不声明 terminal 能力。
@@ -88,7 +88,7 @@ func (*recordingACPClient) KillTerminal(
 	context.Context,
 	acp.KillTerminalRequest,
 ) (acp.KillTerminalResponse, error) {
-	return acp.KillTerminalResponse{}, errors.New("测试客户端不支持 terminal")
+	return acp.KillTerminalResponse{}, errors.New("test client does not support terminal operations")
 }
 
 // TerminalOutput 实现 SDK Client；本 E2E 不声明 terminal 能力。
@@ -96,7 +96,7 @@ func (*recordingACPClient) TerminalOutput(
 	context.Context,
 	acp.TerminalOutputRequest,
 ) (acp.TerminalOutputResponse, error) {
-	return acp.TerminalOutputResponse{}, errors.New("测试客户端不支持 terminal")
+	return acp.TerminalOutputResponse{}, errors.New("test client does not support terminal operations")
 }
 
 // ReleaseTerminal 实现 SDK Client；本 E2E 不声明 terminal 能力。
@@ -104,7 +104,7 @@ func (*recordingACPClient) ReleaseTerminal(
 	context.Context,
 	acp.ReleaseTerminalRequest,
 ) (acp.ReleaseTerminalResponse, error) {
-	return acp.ReleaseTerminalResponse{}, errors.New("测试客户端不支持 terminal")
+	return acp.ReleaseTerminalResponse{}, errors.New("test client does not support terminal operations")
 }
 
 // WaitForTerminalExit 实现 SDK Client；本 E2E 不声明 terminal 能力。
@@ -112,7 +112,7 @@ func (*recordingACPClient) WaitForTerminalExit(
 	context.Context,
 	acp.WaitForTerminalExitRequest,
 ) (acp.WaitForTerminalExitResponse, error) {
-	return acp.WaitForTerminalExitResponse{}, errors.New("测试客户端不支持 terminal")
+	return acp.WaitForTerminalExitResponse{}, errors.New("test client does not support terminal operations")
 }
 
 // snapshotUpdates 返回一份不与 SDK 通知 goroutine 共享底层数组的快照。

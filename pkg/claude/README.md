@@ -11,7 +11,7 @@
 - 查找并验证用户安装的 Claude Code CLI。
 - 为每个 New、Load 或 Resume Session 创建独立 CLI 进程和 control transport。
 - 实现 FIFO Prompt、取消、close 与 `_session/steering`。
-- 映射 Assistant Message、Tool、Task Plan、Usage 和权限交互。
+- 映射 Assistant Message、内置/MCP Tool、Task Plan、Usage 和权限交互。
 - 把内置 `AskUserQuestion` 转换为客户端协商的 ACP Form Elicitation。
 - 把 Model、Effort、Fast Mode 与权限模式表示为 ACP Session 配置。
 - 转换 additional directories 和 stdio、HTTP、SSE MCP Server 配置。
@@ -26,7 +26,7 @@
 - New、Load、Resume、Close Session 与历史回放。
 - 多轮 FIFO Prompt、Text、Image、Embedded Resource 和 Resource Link。
 - Prompt cancel 与 `_session/steering`；空闲 Session 可启动 detached Turn 或要求客户端改用 Prompt。
-- Assistant、Tool Start/Progress/Result、Task Plan 与 Usage 更新。
+- Assistant、Tool Start/Progress/Result、Task Plan 与 Usage 更新；Task、文件、搜索、Web、Skill 和 AskUserQuestion 按 upstream 生成结构化 ACP 工具信息。
 - `can_use_tool` 权限请求和安全拒绝。
 - `AskUserQuestion` Form Elicitation，支持单选、多选、每题自定义答案和取消。
 - stdio、HTTP、SSE MCP Server 与 additional directories。

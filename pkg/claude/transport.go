@@ -265,7 +265,7 @@ func (t *claudeTransport) dispatchLine(line []byte) {
 	message, err := protocol.DecodeMessage(line)
 	if err != nil {
 		// 单条坏帧不破坏后续行边界；只记录长度和错误，避免原始内容泄露。
-		t.options.Logger.Debug("忽略 Claude CLI malformed JSONL", "bytes", len(line), "error", err)
+		t.options.Logger.Debug("Ignoring malformed Claude CLI JSONL", "bytes", len(line), "error", err)
 		return
 	}
 	switch typed := message.(type) {

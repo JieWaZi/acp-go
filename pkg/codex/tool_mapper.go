@@ -29,6 +29,12 @@ func (toolMapper) mapStarted(item protocol.ThreadItem) (*acp.SessionUpdate, erro
 	case protocol.MCPToolCall:
 		update, err := mapMCPStarted(item)
 		return &update, err
+	case protocol.WebSearch:
+		update, err := mapWebSearchStarted(item)
+		return &update, err
+	case protocol.ImageView:
+		update := mapImageView(item)
+		return &update, nil
 	default:
 		return nil, nil
 	}
@@ -49,6 +55,9 @@ func (toolMapper) mapCompleted(item protocol.ThreadItem) (*acp.SessionUpdate, er
 		return &update, nil
 	case protocol.MCPToolCall:
 		update, err := mapMCPCompleted(item)
+		return &update, err
+	case protocol.WebSearch:
+		update, err := mapWebSearchCompleted(item)
 		return &update, err
 	default:
 		return nil, nil
@@ -237,6 +246,143 @@ func mapMCPCompleted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 		}))
 	}
 	return acp.UpdateToolCall(acp.ToolCallId(item.ID), options...), nil
+}
+
+// mapWebSearchStarted 将 Codex 网页操作转换为 ACP search ToolCall。
+func mapWebSearchStarted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
+	return acp.StartToolCall(
+		acp.ToolCallId(item.ID),
+		webSearchTitle(item),
+		acp.WithStartKind(acp.ToolKindSearch),
+		acp.WithStartStatus(acp.ToolCallStatusInProgress),
+		acp.WithStartRawInput(webSearchRawInput(item)),
+	), nil
+}
+
+// mapWebSearchCompleted 保留网页操作终态、标题和输入。
+func mapWebSearchCompleted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
+	return acp.UpdateToolCall(
+		acp.ToolCallId(item.ID),
+		acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+		acp.WithUpdateTitle(webSearchTitle(item)),
+		acp.WithUpdateRawInput(webSearchRawInput(item)),
+	), nil
+}
+
+// mapWebSearchHistory 把历史网页操作恢复为单条 completed ToolCall。
+func mapWebSearchHistory(item protocol.ThreadItem) acp.SessionUpdate {
+	return acp.StartToolCall(
+		acp.ToolCallId(item.ID),
+		webSearchTitle(item),
+		acp.WithStartKind(acp.ToolKindSearch),
+		acp.WithStartStatus(acp.ToolCallStatusCompleted),
+		acp.WithStartRawInput(map[string]any{
+			"query":  item.Query,
+			"action": item.Action,
+		}),
+	)
+}
+
+// mapImageView 将本地图片查看转换为单条 completed ACP read ToolCall。
+func mapImageView(item protocol.ThreadItem) acp.SessionUpdate {
+	path := stringValue(item.Path)
+	options := []acp.ToolCallStartOpt{
+		acp.WithStartKind(acp.ToolKindRead),
+		acp.WithStartStatus(acp.ToolCallStatusCompleted),
+		acp.WithStartRawInput(map[string]any{"path": path}),
+	}
+	if path != "" {
+		options = append(
+			options,
+			acp.WithStartContent([]acp.ToolCallContent{
+				acp.ToolContent(acp.ResourceLinkBlock(path, path)),
+			}),
+			acp.WithStartLocations([]acp.ToolCallLocation{{Path: path}}),
+		)
+	}
+	return acp.StartToolCall(
+		acp.ToolCallId(item.ID),
+		imageViewTitle(path),
+		options...,
+	)
+}
+
+// webSearchRawInput 保存 ACP Client 展示网页操作所需的稳定字段。
+func webSearchRawInput(item protocol.ThreadItem) map[string]any {
+	return map[string]any{
+		"type":   string(item.Type),
+		"id":     item.ID,
+		"query":  item.Query,
+		"action": item.Action,
+	}
+}
+
+// webSearchTitle 根据动作生成不包含结果正文的可读标题。
+func webSearchTitle(item protocol.ThreadItem) string {
+	if item.Action == nil {
+		if query := stringValue(item.Query); query != "" {
+			return fmt.Sprintf("Web search: %s", query)
+		}
+		return "Web search"
+	}
+	action := item.Action
+	switch action.Type {
+	case protocol.WebSearchActionTypeSearch:
+		query := stringValue(action.Query)
+		if query == "" && len(action.Queries) > 0 {
+			queries := make([]string, 0, len(action.Queries))
+			for _, candidate := range action.Queries {
+				if candidate != "" {
+					queries = append(queries, candidate)
+				}
+			}
+			query = strings.Join(queries, ", ")
+		}
+		if query == "" {
+			query = stringValue(item.Query)
+		}
+		if query != "" {
+			return fmt.Sprintf("Web search: %s", query)
+		}
+	case protocol.OpenPage:
+		if rawURL := stringValue(action.URL); rawURL != "" {
+			return fmt.Sprintf("Open page: %s", rawURL)
+		}
+		return "Open page"
+	case protocol.FindInPage:
+		pattern := stringValue(action.Pattern)
+		rawURL := stringValue(action.URL)
+		return strings.TrimSpace(fmt.Sprintf(
+			"Find in page%s%s",
+			formatOptionalQuoted(" for ", pattern),
+			formatOptional(" in ", rawURL),
+		))
+	}
+	return "Web search"
+}
+
+// formatOptional 只在 value 非空时拼接前缀。
+func formatOptional(prefix, value string) string {
+	if value == "" {
+		return ""
+	}
+	return prefix + value
+}
+
+// formatOptionalQuoted 只在 value 非空时拼接带单引号的前缀。
+func formatOptionalQuoted(prefix, value string) string {
+	if value == "" {
+		return ""
+	}
+	return prefix + "'" + value + "'"
+}
+
+// imageViewTitle 返回图片路径可用时的 ACP 工具标题。
+func imageViewTitle(path string) string {
+	if path == "" {
+		return "View Image"
+	}
+	return fmt.Sprintf("View Image %s", path)
 }
 
 // mapMCPProgress 使用 mcp_output_delta 元数据逐条保留重复进度消息。

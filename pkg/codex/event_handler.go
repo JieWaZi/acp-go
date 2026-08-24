@@ -74,6 +74,8 @@ type eventHandler struct {
 	streamedMessages map[string]struct{}
 	// streamedReasoning 标记已通过任一 reasoning delta 发出的 reasoning item。
 	streamedReasoning map[string]struct{}
+	// emittedImageViews 标记 started 阶段已经发出的单次图片查看工具卡片。
+	emittedImageViews map[string]struct{}
 	// completedItems 标记已成功处理的完成项，避免 app-server 重放导致重复通知。
 	completedItems map[string]struct{}
 	// terminalCommands 标记 started 阶段实际展示了 ACP terminal 的命令。
@@ -102,6 +104,7 @@ func newEventHandler(
 		messagePhases:          make(map[string]protocol.PhaseEnum),
 		streamedMessages:       make(map[string]struct{}),
 		streamedReasoning:      make(map[string]struct{}),
+		emittedImageViews:      make(map[string]struct{}),
 		completedItems:         make(map[string]struct{}),
 		terminalCommands:       make(map[string]struct{}),
 		terminalCommandOutputs: make(map[string]struct{}),
@@ -134,14 +137,21 @@ func (h *eventHandler) handleItemStarted(ctx context.Context, params protocol.It
 		return err
 	}
 	if update != nil {
-		return h.emit(ctx, *update)
+		if err := h.emit(ctx, *update); err != nil {
+			return err
+		}
+		if params.Item.Type == protocol.ImageView {
+			h.emittedImageViews[params.Item.ID] = struct{}{}
+		}
+		return nil
 	}
 	switch params.Item.Type {
-	case protocol.AgentMessage, protocol.Reasoning, protocol.UserMessage:
+	case protocol.AgentMessage, protocol.Reasoning, protocol.UserMessage,
+		protocol.HookPrompt, protocol.Sleep:
 		return nil
 	default:
 		h.logger.Info(
-			"忽略未知 Codex started item",
+			"Ignoring unknown Codex started item",
 			"item_type", string(params.Item.Type),
 			"item_id", params.Item.ID,
 		)
@@ -207,7 +217,7 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 	case protocol.ThreadItemType("plan"):
 		// 当前生成类型未提供 plan 常量，但历史完成项仍可能返回该 discriminator。
 		err = h.handleCompletedPlan(ctx, item)
-	case protocol.CommandExecution, protocol.FileChange, protocol.MCPToolCall:
+	case protocol.CommandExecution, protocol.FileChange, protocol.MCPToolCall, protocol.WebSearch:
 		var update *acp.SessionUpdate
 		update, err = h.tools.mapCompleted(item)
 		if err == nil && update != nil {
@@ -216,8 +226,17 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 			}
 			err = h.emit(ctx, *update)
 		}
+	case protocol.ImageView:
+		if _, emitted := h.emittedImageViews[item.ID]; emitted {
+			delete(h.emittedImageViews, item.ID)
+			break
+		}
+		update := mapImageView(item)
+		err = h.emit(ctx, update)
+	case protocol.UserMessage, protocol.HookPrompt, protocol.Sleep:
+		// 与 upstream 一致：用户输入、hook prompt 与 sleep 不展示为 ACP 工具。
 	default:
-		h.logger.Info("忽略未知 Codex item", "item_type", string(item.Type), "item_id", item.ID)
+		h.logger.Info("Ignoring unknown Codex item", "item_type", string(item.Type), "item_id", item.ID)
 	}
 	// 只在成功后记录完成态；客户端发送失败时允许调用方重试同一事件。
 	if err == nil {
@@ -266,6 +285,18 @@ func (h *eventHandler) handleHistoryItem(
 			return err
 		}
 		if err = h.emit(ctx, update); err != nil {
+			return err
+		}
+		h.completedItems[item.ID] = struct{}{}
+		return nil
+	case protocol.WebSearch:
+		if err := h.emit(ctx, mapWebSearchHistory(item)); err != nil {
+			return err
+		}
+		h.completedItems[item.ID] = struct{}{}
+		return nil
+	case protocol.ImageView:
+		if err := h.emit(ctx, mapImageView(item)); err != nil {
 			return err
 		}
 		h.completedItems[item.ID] = struct{}{}

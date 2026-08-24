@@ -139,7 +139,7 @@ func (a *authenticator) authenticateAPIKey(ctx context.Context, request acp.Auth
 
 	subscription, err := a.subscriber.SubscribeLoginCompleted()
 	if err != nil {
-		a.logger.Error("订阅登录完成通知失败")
+		a.logger.Error("Failed to subscribe to login completion notifications")
 		return errAuthenticationFailed
 	}
 	defer subscription.Close()
@@ -147,7 +147,7 @@ func (a *authenticator) authenticateAPIKey(ctx context.Context, request acp.Auth
 		Type: protocol.TypeAPIKey, APIKey: &apiKey,
 	}); err != nil {
 		// 不包装服务端错误：其文本可能包含服务端回显的 secret。
-		a.logger.Error("API key 登录启动失败")
+		a.logger.Error("Failed to start API key login")
 		return errAuthenticationFailed
 	}
 	return waitForLoginCompletion(ctx, subscription)
@@ -158,7 +158,7 @@ func (a *authenticator) authenticateChatGPT(ctx context.Context) error {
 	refresh := true
 	account, err := a.server.AccountRead(ctx, protocol.GetAccountParams{RefreshToken: &refresh})
 	if err != nil {
-		a.logger.Error("读取 ChatGPT 账号失败")
+		a.logger.Error("Failed to read ChatGPT account")
 		return errAuthenticationFailed
 	}
 	if account.Account != nil && account.Account.Type == protocol.AccountTypeChatgpt {
@@ -167,20 +167,20 @@ func (a *authenticator) authenticateChatGPT(ctx context.Context) error {
 
 	subscription, err := a.subscriber.SubscribeLoginCompleted()
 	if err != nil {
-		a.logger.Error("订阅登录完成通知失败")
+		a.logger.Error("Failed to subscribe to login completion notifications")
 		return errAuthenticationFailed
 	}
 	defer subscription.Close()
 	login, err := a.server.AccountLogin(ctx, protocol.LoginAccountParams{Type: protocol.TypeChatgpt})
 	if err != nil {
-		a.logger.Error("ChatGPT 登录启动失败")
+		a.logger.Error("Failed to start ChatGPT login")
 		return errAuthenticationFailed
 	}
 	if login.Type != protocol.TypeChatgpt || login.AuthURL == nil || *login.AuthURL == "" || a.browser == nil {
 		return errAuthenticationFailed
 	}
 	if err := a.browser.Open(ctx, *login.AuthURL); err != nil {
-		a.logger.Error("打开 ChatGPT 登录页面失败")
+		a.logger.Error("Failed to open ChatGPT login page")
 		return errAuthenticationFailed
 	}
 	completion, waitErr := subscription.Wait(ctx)
@@ -193,7 +193,7 @@ func (a *authenticator) authenticateChatGPT(ctx context.Context) error {
 				cleanupCtx,
 				protocol.CancelLoginAccountParams{LoginID: *login.LoginID},
 			); cancelErr != nil {
-				a.logger.Error("取消 ChatGPT 登录失败")
+				a.logger.Error("Failed to cancel ChatGPT login")
 			}
 		}
 		return errAuthenticationFailed

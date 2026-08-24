@@ -401,6 +401,8 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	exitCode := int64(0)
 	mcpServer := "github"
 	mcpTool := "search"
+	webQuery := "ACP protocol"
+	imagePath := "/workspace/chart.png"
 	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
 		switch request.Method() {
 		case protocol.MethodInitialize:
@@ -437,6 +439,12 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 							ID: "mcp-1", Type: protocol.MCPToolCall, Status: &completedStatus,
 							Server: &mcpServer, Tool: &mcpTool, Arguments: json.RawMessage(`{"query":"codex"}`),
 						},
+						{
+							ID: "web-1", Type: protocol.WebSearch, Query: &webQuery,
+						},
+						{
+							ID: "image-1", Type: protocol.ImageView, Path: &imagePath,
+						},
 					},
 				}},
 			}
@@ -464,8 +472,8 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("LoadSession 返回错误: %v", err)
 	}
-	if len(updater.notifications) != 6 {
-		t.Fatalf("历史更新数为 %d，期望去重并补齐工具后 6", len(updater.notifications))
+	if len(updater.notifications) != 8 {
+		t.Fatalf("历史更新数为 %d，期望去重并补齐工具后 8", len(updater.notifications))
 	}
 	user := updater.notifications[0].Update.UserMessageChunk
 	if user == nil || user.Content.Text == nil || user.Content.Text.Text != text {
@@ -492,6 +500,17 @@ func TestAgentLoadReplaysHistoryThroughExistingMappers(t *testing.T) {
 	if mcpStart == nil || mcpStart.Title != "mcp.github.search" ||
 		mcpStart.Status != acp.ToolCallStatusCompleted || mcpStart.RawInput == nil {
 		t.Fatalf("MCP 历史更新为 %#v", updater.notifications[5])
+	}
+	webStart := updater.notifications[6].Update.ToolCall
+	if webStart == nil || webStart.Title != "Web search: ACP protocol" ||
+		webStart.Kind != acp.ToolKindSearch || webStart.Status != acp.ToolCallStatusCompleted {
+		t.Fatalf("网页搜索历史更新为 %#v", updater.notifications[6])
+	}
+	imageStart := updater.notifications[7].Update.ToolCall
+	if imageStart == nil || imageStart.Title != "View Image /workspace/chart.png" ||
+		imageStart.Kind != acp.ToolKindRead || imageStart.Status != acp.ToolCallStatusCompleted ||
+		len(imageStart.Content) != 1 {
+		t.Fatalf("图片查看历史更新为 %#v", updater.notifications[7])
 	}
 }
 

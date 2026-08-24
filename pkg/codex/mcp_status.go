@@ -112,7 +112,7 @@ func (a *Agent) publishMCPStartupFailure(
 	)
 	if updater := a.currentSessionUpdater(); updater != nil {
 		if err := updater.SessionUpdate(ctx, acp.SessionNotification{SessionId: acp.SessionId(state.id), Update: update}); err != nil {
-			a.logger.Debug("发布 MCP 启动失败状态失败", "session_id", state.id, "server", status.Name, "error", err)
+			a.logger.Debug("Failed to publish MCP startup failure", "session_id", state.id, "server", status.Name, "error", err)
 		}
 	}
 }

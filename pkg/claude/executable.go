@@ -67,13 +67,13 @@ func prepareExecutable(
 	version := "unknown"
 	output, probeErr := runVersion(ctx, path, "--version")
 	if probeErr != nil {
-		logger.Warn("Claude CLI 版本探测失败，将继续尝试启动", "error", probeErr)
+		logger.Warn("Claude CLI version probe failed; startup will continue", "error", probeErr)
 	} else if match := claudeVersionPattern.FindSubmatch(output); len(match) == 2 {
 		version = string(match[1])
 	} else {
-		logger.Warn("Claude CLI 版本输出无法识别，将继续尝试启动")
+		logger.Warn("Claude CLI version output was not recognized; startup will continue")
 	}
-	logger.Debug("已解析 Claude CLI", "path", path, "version", version)
+	logger.Debug("Resolved Claude CLI", "path", path, "version", version)
 	return executable{Path: path, Version: version}, nil
 }
 

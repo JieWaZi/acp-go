@@ -173,14 +173,14 @@ func (h *approvalHandler) request(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			h.logger.Error("ACP permission 回调异常，已 fail-closed")
+			h.logger.Error("ACP permission callback panicked; denying request")
 			response = acp.RequestPermissionResponse{}
 			ok = false
 		}
 	}()
 	response, err := h.requester.RequestPermission(ctx, request)
 	if err != nil {
-		h.logger.Error("ACP permission 请求失败，已 fail-closed")
+		h.logger.Error("ACP permission request failed; denying request")
 		return acp.RequestPermissionResponse{}, false
 	}
 	return response, true

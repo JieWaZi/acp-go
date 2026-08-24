@@ -191,6 +191,62 @@ func TestEventRouterMapsMCPProgressAndCompletion(t *testing.T) {
 	}
 }
 
+// TestEventRouterMapsWebSearchAndImageView 验证 Codex 原生工具不会落入未知 item 分支。
+func TestEventRouterMapsWebSearchAndImageView(t *testing.T) {
+	t.Parallel()
+
+	updater := &recordingSessionUpdater{}
+	router := newTestEventRouter(
+		updater,
+		&fixedGenerationGuard{current: true},
+		slog.Default(),
+	)
+	for _, raw := range []string{
+		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"webSearch","id":"web-1","status":"inProgress","action":{"type":"search","query":"ACP 最新进展","queries":["ACP 最新进展"]}}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"webSearch","id":"web-1","status":"completed","action":{"type":"search","query":"ACP 最新进展","queries":["ACP 最新进展"]},"results":[{"title":"ACP"}]}}}`,
+		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":2,"item":{"type":"imageView","id":"image-1","status":"inProgress","path":"/work/chart.png"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":3,"item":{"type":"imageView","id":"image-1","status":"completed","path":"/work/chart.png"}}}`,
+	} {
+		if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+			t.Fatalf("HandleJSON 返回错误: %v", err)
+		}
+	}
+	if got, want := len(updater.notifications), 3; got != want {
+		t.Fatalf("native tool update 数 = %d，期望 %d", got, want)
+	}
+	webStarted := updater.notifications[0].Update.ToolCall
+	if webStarted == nil || webStarted.Kind != acp.ToolKindSearch ||
+		webStarted.Status != acp.ToolCallStatusInProgress ||
+		webStarted.Title != "Web search: ACP 最新进展" {
+		t.Fatalf("webSearch start = %#v", webStarted)
+	}
+	webInput, ok := webStarted.RawInput.(map[string]any)
+	if !ok || webInput["type"] != "webSearch" || webInput["id"] != "web-1" ||
+		webInput["action"] == nil {
+		t.Fatalf("webSearch raw input = %#v", webStarted.RawInput)
+	}
+	webCompleted := updater.notifications[1].Update.ToolCallUpdate
+	if webCompleted == nil || webCompleted.Status == nil ||
+		*webCompleted.Status != acp.ToolCallStatusCompleted ||
+		webCompleted.Title == nil || *webCompleted.Title != "Web search: ACP 最新进展" ||
+		webCompleted.RawOutput != nil {
+		t.Fatalf("webSearch completed = %#v", webCompleted)
+	}
+	imageStarted := updater.notifications[2].Update.ToolCall
+	if imageStarted == nil || imageStarted.Kind != acp.ToolKindRead ||
+		imageStarted.Status != acp.ToolCallStatusCompleted ||
+		imageStarted.Title != "View Image /work/chart.png" ||
+		len(imageStarted.Locations) != 1 ||
+		imageStarted.Locations[0].Path != "/work/chart.png" {
+		t.Fatalf("imageView start = %#v", imageStarted)
+	}
+	if len(imageStarted.Content) != 1 || imageStarted.Content[0].Content == nil ||
+		imageStarted.Content[0].Content.Content.ResourceLink == nil ||
+		imageStarted.Content[0].Content.Content.ResourceLink.Uri != "/work/chart.png" {
+		t.Fatalf("imageView content = %#v", imageStarted.Content)
+	}
+}
+
 // TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates 验证 add/delete rich diff 与 update/move raw 保留策略。
 func TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates(t *testing.T) {
 	t.Parallel()

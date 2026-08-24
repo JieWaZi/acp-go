@@ -100,7 +100,7 @@ func (s *claudeSession) steer(ctx context.Context, message protocol.UserInputMes
 	}
 	go func() {
 		if _, err := s.prompt(s.ctx, message); err != nil && !errors.Is(err, context.Canceled) {
-			s.agent.logger.Warn("Claude steering detached turn 失败", "session_id", s.id, "error", err)
+			s.agent.logger.Warn("Failed to steer detached Claude turn", "session_id", s.id, "error", err)
 		}
 	}()
 	return map[string]any{"outcome": "startedNewTurn"}, nil

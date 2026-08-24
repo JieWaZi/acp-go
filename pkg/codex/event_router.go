@@ -72,6 +72,10 @@ func (r *eventRouter) HandleJSON(ctx context.Context, raw []byte) error {
 // Handle 对强类型通知执行 generation/thread/turn 校验后分派。
 func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNotification, rawSize int) error {
 	if unknown, ok := notification.(*protocol.UnknownServerNotification); ok {
+		if ignoredCodexNotification(unknown.Method()) {
+			r.logger.Debug("Ignoring Codex notification", "method", unknown.Method())
+			return nil
+		}
 		threadID, turnID := unknownNotificationIdentity(unknown.Params)
 		attributes := []any{
 			"method", unknown.Method(),
@@ -84,16 +88,16 @@ func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNo
 		if turnID != "" {
 			attributes = append(attributes, "turn_id", turnID)
 		}
-		r.logger.Info("忽略未知 Codex 通知", attributes...)
+		r.logger.Info("Ignoring unknown Codex notification", attributes...)
 		return nil
 	}
 	threadID, turnID, scoped := notificationScope(notification)
 	if scoped && (threadID != r.generation.ThreadID || turnID != r.generation.TurnID) {
-		r.logger.Debug("忽略非当前 turn 的 Codex 通知", "method", notification.Method())
+		r.logger.Debug("Ignoring Codex notification from another turn", "method", notification.Method())
 		return nil
 	}
 	if r.guard == nil || !r.guard.IsCurrent(r.generation) {
-		r.logger.Debug("忽略失效 generation 的 Codex 通知", "method", notification.Method())
+		r.logger.Debug("Ignoring Codex notification from stale generation", "method", notification.Method())
 		return nil
 	}
 
@@ -124,12 +128,17 @@ func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNo
 		return r.handler.emit(ctx, mapFilePatchUpdated(event.Params))
 	default:
 		r.logger.Debug(
-			"忽略 V1 未映射的 Codex 通知",
+			"Ignoring Codex notification not mapped by V1",
 			"method", notification.Method(),
 			"payload_bytes", rawSize,
 		)
 		return nil
 	}
+}
+
+// ignoredCodexNotification 标识 upstream 明确忽略且不应作为未知能力告警的方法。
+func ignoredCodexNotification(method string) bool {
+	return method == "hook/started" || method == "hook/completed"
 }
 
 // unknownNotificationIdentity 只从未知 params 中提取安全 thread/turn 字符串，不记录其他字段。

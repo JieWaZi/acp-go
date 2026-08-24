@@ -948,7 +948,7 @@ func (a *Agent) requestPromptInterrupt(
 				defer a.client.ResolveTurnInterrupted(state.id, turnID)
 			}
 			if err := a.client.TurnInterrupt(a.runtimeCtx, state.id, turnID); err != nil {
-				a.logger.Warn("Codex turn interrupt 失败", "thread_id", state.id, "turn_id", turnID, "error", err)
+				a.logger.Warn("Failed to interrupt Codex turn", "thread_id", state.id, "turn_id", turnID, "error", err)
 			}
 		}()
 	})

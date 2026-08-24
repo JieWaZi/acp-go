@@ -90,7 +90,7 @@ func (a *Agent) handleToolUserInput(
 	defer cancelTimeout()
 	response, err := requester.UnstableCreateElicitation(requestContext, request)
 	if err != nil {
-		a.logger.Debug("ACP request_user_input 交互未完成", "thread_id", params.ThreadID, "item_id", params.ItemID, "error", err)
+		a.logger.Debug("ACP request_user_input interaction did not complete", "thread_id", params.ThreadID, "item_id", params.ItemID, "error", err)
 		return failClosedToolUserInput()
 	}
 	if !a.IsCurrent(generation) {
@@ -229,7 +229,7 @@ func (a *Agent) handleMCPServerElicitation(
 	if useElicitation {
 		response, err := requester.UnstableCreateElicitation(requestContext, mcpElicitationRequest(params))
 		if err != nil {
-			a.logger.Debug("ACP MCP elicitation 未完成", "thread_id", params.ThreadID, "server", params.ServerName, "error", err)
+			a.logger.Debug("ACP MCP elicitation did not complete", "thread_id", params.ThreadID, "server", params.ServerName, "error", err)
 			return failClosedMCPServerElicitation()
 		}
 		if !a.mcpElicitationStillCurrent(state, params, generation) {
@@ -417,7 +417,7 @@ func (a *Agent) completePendingURLElicitations(ctx context.Context, threadID str
 	}
 	for elicitationID := range pending {
 		if err := requester.UnstableCompleteElicitation(ctx, acp.UnstableCompleteElicitationNotification{ElicitationId: elicitationID}); err != nil {
-			a.logger.Debug("完成 ACP URL elicitation 失败", "thread_id", threadID, "error", err)
+			a.logger.Debug("Failed to complete ACP URL elicitation", "thread_id", threadID, "error", err)
 		}
 	}
 }

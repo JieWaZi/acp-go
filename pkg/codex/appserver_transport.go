@@ -335,7 +335,7 @@ func (t *appServerTransport) dispatchLine(line []byte) {
 	}
 	if err := json.Unmarshal(line, &envelope); err != nil {
 		// malformed 行不会进入协议分发，仅写 stderr logger 便于诊断。
-		t.options.Logger.Debug("忽略 Codex app-server malformed NDJSON", "error", err)
+		t.options.Logger.Debug("Ignoring malformed Codex app-server NDJSON", "error", err)
 		return
 	}
 	switch {
@@ -346,7 +346,7 @@ func (t *appServerTransport) dispatchLine(line []byte) {
 	case len(envelope.ID) == 0 && envelope.Method != "":
 		t.handleNotification(line)
 	default:
-		t.options.Logger.Debug("忽略 Codex app-server 未知 envelope")
+		t.options.Logger.Debug("Ignoring unknown Codex app-server envelope")
 	}
 }
 
@@ -354,7 +354,7 @@ func (t *appServerTransport) dispatchLine(line []byte) {
 func (t *appServerTransport) handleResponse(line []byte) {
 	var response rpcResponseWire
 	if err := json.Unmarshal(line, &response); err != nil {
-		t.options.Logger.Debug("忽略无法解码的 Codex app-server response", "error", err)
+		t.options.Logger.Debug("Ignoring undecodable Codex app-server response", "error", err)
 		return
 	}
 	key := normalizeJSONID(response.ID)
@@ -384,7 +384,7 @@ func (t *appServerTransport) handleResponse(line []byte) {
 func (t *appServerTransport) handleNotification(line []byte) {
 	notification, err := protocol.DecodeServerNotification(line)
 	if err != nil {
-		t.options.Logger.Debug("忽略无法解码的 Codex app-server notification", "error", err)
+		t.options.Logger.Debug("Ignoring undecodable Codex app-server notification", "error", err)
 		return
 	}
 	if t.options.NotificationHandler != nil {

@@ -44,9 +44,9 @@ func (s *claudeSession) requestToolPermission(ctx context.Context, request proto
 	if request.ToolName == "AskUserQuestion" {
 		return s.requestAskUserQuestion(ctx, request, active)
 	}
-	title, kind, locations := describeTool(request.ToolName, decodeJSONValue(request.Input))
+	info := toolInfoFromToolUse(request.ToolName, decodeJSONValue(request.Input))
 	if request.Title != "" {
-		title = request.Title
+		info.Title = request.Title
 	}
 	options := []acp.PermissionOption{
 		{OptionId: permissionAllowOnce, Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
@@ -59,11 +59,17 @@ func (s *claudeSession) requestToolPermission(ctx context.Context, request proto
 		})
 	}
 	status := acp.ToolCallStatusPending
+	rawInput := decodeJSONValue(request.Input)
+	if info.RawInput != nil {
+		rawInput = info.RawInput
+	}
 	response, err := s.agent.requestPermission(ctx, acp.RequestPermissionRequest{
 		SessionId: acp.SessionId(s.id), Options: options,
 		ToolCall: acp.ToolCallUpdate{
-			ToolCallId: acp.ToolCallId(request.ToolUseID), Title: &title, Kind: &kind,
-			Locations: locations, RawInput: decodeJSONValue(request.Input), Status: &status,
+			Meta:       info.Meta,
+			ToolCallId: acp.ToolCallId(request.ToolUseID), Title: &info.Title, Kind: &info.Kind,
+			Content: info.Content, Locations: info.Locations,
+			RawInput: rawInput, Status: &status,
 		},
 	})
 	if err != nil {

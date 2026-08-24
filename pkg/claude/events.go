@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -65,10 +64,10 @@ func (s *claudeSession) handleMessage(ctx context.Context, message protocol.Mess
 	case *protocol.SystemMessage:
 		err = s.handleSystem(ctx, typed)
 	case *protocol.UnknownMessage:
-		s.agent.logger.Debug("忽略未知 Claude 消息", "type", typed.MessageType(), "bytes", len(typed.RawJSON()))
+		s.agent.logger.Debug("Ignoring unknown Claude message", "type", typed.MessageType(), "bytes", len(typed.RawJSON()))
 	}
 	if err != nil && !errors.Is(err, ErrClaudeConnectionNotReady) {
-		s.agent.logger.Warn("处理 Claude 消息失败", "session_id", s.id, "type", message.MessageType(), "error", err)
+		s.agent.logger.Warn("Failed to handle Claude message", "session_id", s.id, "type", message.MessageType(), "error", err)
 	}
 }
 
@@ -361,12 +360,19 @@ func (s *claudeSession) startTool(ctx context.Context, block protocol.ContentBlo
 	tool := &toolState{ID: block.ID, Name: block.Name, Input: input}
 	s.tools[block.ID] = tool
 	s.mu.Unlock()
-	title, kind, locations := describeTool(block.Name, input)
-	return s.agent.sendUpdate(ctx, s.id, acp.StartToolCall(
-		acp.ToolCallId(block.ID), title,
-		acp.WithStartKind(kind), acp.WithStartStatus(acp.ToolCallStatusInProgress),
-		acp.WithStartRawInput(input), acp.WithStartLocations(locations),
-	))
+	info := toolInfoFromToolUse(block.Name, input)
+	rawInput := input
+	if info.RawInput != nil {
+		rawInput = info.RawInput
+	}
+	update := acp.StartToolCall(
+		acp.ToolCallId(block.ID), info.Title,
+		acp.WithStartKind(info.Kind), acp.WithStartStatus(acp.ToolCallStatusInProgress),
+		acp.WithStartRawInput(rawInput), acp.WithStartContent(info.Content),
+		acp.WithStartLocations(info.Locations),
+	)
+	update.ToolCall.Meta = info.Meta
+	return s.agent.sendUpdate(ctx, s.id, update)
 }
 
 // completeTool 终止一个已知工具；未知结果先创建 generic 调用再完成。
@@ -499,42 +505,6 @@ func decodeJSONValue(raw json.RawMessage) any {
 		return map[string]any{"unparsed": true}
 	}
 	return value
-}
-
-// describeTool 返回常见工具的标题、kind 与文件位置。
-func describeTool(name string, input any) (string, acp.ToolKind, []acp.ToolCallLocation) {
-	kind := acp.ToolKindOther
-	switch name {
-	case "Read":
-		kind = acp.ToolKindRead
-	case "Edit", "Write", "NotebookEdit":
-		kind = acp.ToolKindEdit
-	case "Bash", "Task", "TodoWrite":
-		kind = acp.ToolKindExecute
-	case "Grep", "Glob", "Search":
-		kind = acp.ToolKindSearch
-	case "WebFetch", "WebSearch":
-		kind = acp.ToolKindFetch
-	case "EnterPlanMode", "ExitPlanMode":
-		kind = acp.ToolKindSwitchMode
-	}
-	title := name
-	if title == "" {
-		title = "Tool"
-	}
-	locations := []acp.ToolCallLocation{}
-	if object, ok := input.(map[string]any); ok {
-		for _, key := range []string{"file_path", "path", "notebook_path"} {
-			if path, ok := object[key].(string); ok && path != "" {
-				locations = append(locations, acp.ToolCallLocation{Path: filepath.Clean(path)})
-				break
-			}
-		}
-		if command, ok := object["command"].(string); ok && command != "" && name == "Bash" {
-			title = command
-		}
-	}
-	return title, kind, locations
 }
 
 // toolResultContent 把文本和图片结果转换为 ACP tool content。

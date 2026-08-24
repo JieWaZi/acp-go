@@ -14,6 +14,7 @@ V1 验收分为三层：手写 fixture 覆盖协议异常和竞态；最近一�
 | Reasoning/Thinking、Plan、Token/Prompt Usage | `TestRunProductionCompositionSessionFlow`、`TestEventRouterMapsPlanAndLatestUsage`、`TestAgentSessionConfigurationFlowsIntoTurnStart` | `message_delta_thinking_usage`、`plan_and_command_tool` | 同时覆盖 session usage_update 与 PromptResponse 的 input/cache/output/thought/total 明细 |
 | Command Tool start/delta/completed | `TestRunProductionCompositionSessionFlow`、`tool_mapper_test.go` | `plan_and_command_tool` | 检查同一 ToolCallID 和完成状态 |
 | File Change Tool | `TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates` | `file_change_tool` | 真实测试只修改 `t.TempDir()` |
+| Web Search 与 Image View Tool | `TestEventRouterMapsWebSearchAndImageView`、`TestAgentLoadReplaysHistoryThroughExistingMappers` | 不依赖模型随机触发 | 与 upstream 一致使用 search/read、结构化 rawInput、ResourceLink，并保证 Image View 只发一张 completed 工具卡片 |
 | MCP 配置、启动状态与 Tool Call | `TestAgentSessionMCPConfigMatchesCodexACP`、`TestCodexMCPServerConfigRejectsUnsupportedTransports`、`TestEventRouterMapsMCPProgressAndCompletion` | 不自动调用用户 MCP | 覆盖 stdio/HTTP、同名配置保护、失败状态与既有 MCP 工具事件；SSE/ACP transport 明确拒绝 |
 | MCP Elicitation 与结构化用户输入 | `TestMCPServerElicitationUsesACPAndCompletesURL`、`TestToolRequestUserInputUsesACPForm` | 不自动触发外部交互 | 覆盖 form/url 能力路由、URL complete、选项/Other 答案和 fail-closed |
 | Command/File/Permissions 三类审批与 fail-closed | `approval_test.go`、`agent_runtime_test.go`、`process_test.go` | `approval_allow_once` 验证真实 allow_once 往返 | 异常、取消、stale、缺 handler 必须由确定性测试覆盖 |
@@ -22,7 +23,7 @@ V1 验收分为三层：手写 fixture 覆盖协议异常和竞态；最近一�
 | Model、Reasoning Effort、Sandbox/Agent Mode | `config_test.go`、`agent_wiring_test.go` | 真实测试实际设置当前 model、最高可用 effort 和 mode | 未知选择必须稳定失败 |
 | Text、Image、Resource、ResourceLink 输入 | `content_test.go`、`prompt_test.go` | `image_resource_and_resource_link` | 图片由测试生成；资源文件只位于临时目录；Audio 是 V1 非目标 |
 | ChatGPT/API Key 认证与凭据安全 | `auth_test.go`、`agent_wiring_test.go` | initialize 检查声明；真实 Prompt 验证当前本机登录态 | 真实测试不自动 logout、不读取或打印密钥 |
-| early completion、stale turn/approval、unknown event | `appserver_client_test.go`、`agent_runtime_test.go`、`event_handler_test.go` | 不依赖模型随机触发 | 这些竞态必须使用屏障和固定 identity 验证 |
+| early completion、stale turn/approval、unknown event | `appserver_client_test.go`、`agent_runtime_test.go`、`event_handler_test.go` | 不依赖模型随机触发 | 这些竞态必须使用屏障和固定 identity 验证；upstream 明确忽略的 hook 通知不记录为未知能力 |
 | Session 缺失错误 | `TestAgentReturnsResourceNotFoundForMissingSession`、`agent_wiring_test.go` | 不适用 | Prompt、配置和 steering 使用 ACP `ResourceNotFound`，恢复透传 app-server `-32002` |
 | Schema freshness、上游固定点、中文注释 | `protocolgen` 测试、`TestHandwrittenGoDeclarationsHaveChineseComments` | 不适用 | 生成代码豁免中文注释但必须通过 freshness |
 

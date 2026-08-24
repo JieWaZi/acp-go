@@ -71,7 +71,7 @@ func prepareExecutable(
 	}
 	if version != verifiedCodexVersion {
 		logger.Warn(
-			"Codex CLI 版本尚未经过当前 Adapter 基线验证，将继续尝试启动",
+			"Codex CLI version has not been verified against the current adapter baseline; startup will continue",
 			"version", version,
 			"verified_version", verifiedCodexVersion,
 		)
