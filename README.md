@@ -1,10 +1,10 @@
 # acp-go
 
-`acp-go` 是一个基于 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) 的 stdio Agent 服务，用来把支持 ACP 的客户端连接到本机 Codex CLI。
+`acp-go` 是一个基于 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) 的 stdio Agent 服务，用来把支持 ACP 的客户端连接到本机 Agent CLI。
 
-ACP 客户端启动 `acp-agent` 后，`acp-agent` 会再启动用户已经安装的 `codex app-server`，并在两者之间转换会话、消息、工具调用、权限审批和运行时配置。
+当前 V1 提供 Codex 与 Claude Adapter：Codex 使用用户本机已安装的 [OpenAI Codex CLI](https://github.com/openai/codex) `app-server`；Claude 使用用户本机已安装且已登录的 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)，由每个 ACP Session 独立持有一个 stream-json 进程。
 
-> 当前版本为 V1，默认且唯一可用的 Adapter 是 `codex`。项目不会下载、安装或更新 Codex CLI。
+> `codex` 始终是默认 Adapter；只有显式传入 `--adapter claude` 才会探测和构造 Claude。
 
 ## Codex 支持情况
 
@@ -47,7 +47,6 @@ ACP 客户端启动 `acp-agent` 后，`acp-agent` 会再启动用户已经安装
 
 | 类别 | 暂未支持的能力 | 当前表现 | 后续扩展方向 |
 | --- | --- | --- | --- |
-| Adapter | Codex 之外的其他 Agent Runtime | `--adapter` 目前只接受 `codex` | 可以在保持 ACP 接入方式不变的前提下增加新 Adapter |
 | 会话 | `session/list` | 返回 ACP `MethodNotFound` | 增加会话目录与分页映射后可开放 |
 | 会话 | Thread fork、archive、delete、rename、rollback 等高级管理 | 不向 ACP 客户端声明这些能力 | 需要明确 ACP 标准能力或项目扩展方法 |
 | 输入 | Audio | 请求会明确失败，不会静默丢弃 | 需要同时定义 ACP 能力声明与 Codex 音频映射 |
@@ -61,15 +60,27 @@ ACP 客户端启动 `acp-agent` 后，`acp-agent` 会再启动用户已经安装
 | 实验协议 | 其他实验方法或字段 | 除已明确接入的 `item/tool/requestUserInput` 外，实验 surface 仍被排除或忽略 | 上游稳定且产品范围确认后再纳入 |
 | 安装更新 | 自动安装或升级 Codex CLI | 找不到 Codex 时直接返回可诊断错误 | 继续由用户或系统包管理器维护 Codex |
 
+## Claude 支持情况
+
+Claude Adapter 支持 new/load/resume/close、多轮 FIFO Prompt、cancel、`_session/steering`、文本/图片/资源输入、工具与权限映射、计划与 usage、model/effort/fast/mode 配置、additional directories，以及客户端 stdio/HTTP/SSE MCP。
+
+Claude V1 不实现 session list/fork/delete、认证/登出、terminal、elicitation、providers、goal 和 Audio 输入。固定版本、协议声明、fixture、Go 文件映射及完整能力边界统一记录在 [`UPSTREAM.md`](UPSTREAM.md)。
+
 ## 对接流程
 
-```text
-ACP 客户端  <-- ACP / stdin + stdout -->  acp-agent  <-- stdio -->  codex app-server
+```mermaid
+flowchart LR
+    Client[ACP 客户端] <-->|ACP / stdio| Server[acp-agent]
+    Server --> Registry[Adapter Registry]
+    Registry --> Codex[Codex Adapter]
+    Registry --> Claude[Claude Adapter]
+    Codex <-->|强类型 NDJSON| AppServer[用户预装的 Codex CLI<br/>app-server]
+    Claude <-->|stream-json / control| ClaudeCLI[用户预装的 Claude Code CLI<br/>每 Session 一个进程]
 ```
 
 对接只需要完成三件事：
 
-1. 在运行 ACP 客户端的机器上安装并登录 Codex CLI。
+1. 在运行 ACP 客户端的机器上安装所需的 Codex 或 Claude CLI，并完成登录。
 2. 构建 `acp-agent`。
 3. 在 ACP 客户端中把 `acp-agent` 配置为一个 stdio Agent 命令。
 
@@ -86,7 +97,17 @@ codex login status
 
 当前 V1 的验证基线是 Codex CLI `0.148.0`。检测到其他可识别版本时，Adapter 会在 stderr 输出兼容性警告，然后继续尝试连接。
 
-### 2. 构建 acp-agent
+### 2. 安装并检查 Claude
+
+使用 Claude Adapter 时，需要由用户自行安装并登录 Claude Code CLI：
+
+```sh
+claude --version
+```
+
+版本探测只用于 stderr 诊断，不作为硬性兼容门槛。项目不会下载、捆绑、更新 CLI，也不会修改用户的登录状态。
+
+### 3. 构建 acp-agent
 
 构建要求以 [`go.mod`](go.mod) 中声明的 Go 版本为准，当前为 Go `1.25.8`。
 
@@ -105,12 +126,13 @@ go build -o ./acp-agent ./cmd/acp-agent
 | 配置项 | 必需 | 值 |
 | --- | --- | --- |
 | Command | 是 | `acp-agent` 的绝对路径 |
-| Arguments | 否 | `--adapter codex`；Codex 是默认 Adapter，可以省略 |
-| Working Directory | 建议 | 用户希望 Codex 操作的项目目录 |
+| Arguments | 否 | Codex 可省略或使用 `--adapter codex`；Claude 必须使用 `--adapter claude` |
+| Working Directory | 建议 | 用户希望 Agent 操作的项目目录 |
 | `CODEX_PATH` | 否 | Codex CLI 的绝对路径；不设置时从客户端进程的 `PATH` 查找 |
+| `CLAUDE_CODE_EXECUTABLE` | 否 | Claude CLI 的绝对路径；不设置时从客户端进程的 `PATH` 查找 |
 | 认证环境变量 | 否 | 按需要设置 `CODEX_API_KEY`、`OPENAI_API_KEY` 或 `NO_BROWSER` |
 
-通用配置示例：
+Codex 配置示例：
 
 ```json
 {
@@ -130,6 +152,19 @@ go build -o ./acp-agent ./cmd/acp-agent
   "command": "/absolute/path/to/acp-go/acp-agent",
   "args": ["--adapter", "codex"],
   "cwd": "/absolute/path/to/your/project"
+}
+```
+
+Claude 客户端配置使用 `"args": ["--adapter", "claude"]`；如果 `claude` 已在 `PATH` 中无需设置环境变量，否则可设置 `CLAUDE_CODE_EXECUTABLE`：
+
+```json
+{
+  "command": "/absolute/path/to/acp-go/acp-agent",
+  "args": ["--adapter", "claude"],
+  "cwd": "/absolute/path/to/your/project",
+  "env": {
+    "CLAUDE_CODE_EXECUTABLE": "/absolute/path/to/claude"
+  }
 }
 ```
 
@@ -161,7 +196,7 @@ ACP 客户端在创建、加载或恢复会话时，通过标准 `mcpServers` �
 
 使用时需要注意：
 
-- stdio 和 Streamable HTTP 可以同时配置；SSE 与 MCP-over-ACP 会返回明确错误。
+- Codex 支持 stdio 和 Streamable HTTP；Claude 支持 stdio、HTTP 和 SSE；MCP-over-ACP 不在当前 V1 范围内。
 - Server 名称中的空白会转换为 `_`，例如 `local tools` 会成为 `local_tools`。
 - 如果 Codex 用户配置或项目配置已经存在同名 Server，默认继续使用已有配置，避免不同 transport 被错误合并。
 - `DISABLE_MCP_CONFIG_FILTERING=true` 可以关闭同名保护；仅在明确需要让会话配置参与 Codex 合并时使用。
@@ -246,11 +281,65 @@ API Key 的选择顺序如下，找到第一个非空值后停止：
 | MCP Server 没有使用会话中的新配置 | 检查 Codex 用户/项目配置中是否已有清洗后的同名 Server；默认已有配置优先 |
 | 看不到 MCP 表单或结构化提问 | 确认客户端在 initialize 中声明了 `clientCapabilities.elicitation.form`；URL 交互还需要声明 `url` |
 | 客户端请求了未支持能力 | 对照上面的“暂未支持”表；未声明的 ACP 方法通常返回 `MethodNotFound` 或明确的参数错误 |
+| 提示找不到 Claude | 确认 ACP 客户端进程的 `PATH` 包含 `claude`，或显式设置正确的 `CLAUDE_CODE_EXECUTABLE` |
+| Claude load 找不到历史 | 检查 `CLAUDE_CONFIG_DIR`；历史回放会从其 `projects` 子目录安全定位 transcript |
 
 ## 开发与维护资料
 
 根 README 只说明安装、能力和客户端对接。开发、测试及上游协议同步请阅读：
 
-- [Codex Adapter 维护说明](internal/codex/README.md)
-- [V1 测试矩阵](docs/V1_TEST_MATRIX.md)
-- [上游版本与协议同步记录](UPSTREAM.md)
+| 路径 | 职责 |
+| --- | --- |
+| [`cmd/acp-agent`](cmd/acp-agent) | 命令行入口、进程 stdio 边界和 Adapter 组合根。 |
+| [`internal/acpserver`](internal/acpserver) | 使用 ACP SDK 建立 Agent 侧连接，并管理 Adapter 的有界关闭。 |
+| [`internal/core`](internal/core) | 与具体实现无关的 Adapter 注册和选择。 |
+| [`internal/codex`](internal/codex) | Codex app-server 到 ACP 的运行时适配。 |
+| [`agents/codex/protocol`](agents/codex/protocol) | Codex app-server Schema、生成 DTO 和受控 Envelope。 |
+| [`internal/claude`](internal/claude) | Claude per-session 进程、Session、事件、权限与配置适配。 |
+| [`agents/claude/protocol`](agents/claude/protocol) | Claude stream-json/control 窄类型与冻结 fixture。 |
+| [`tools/protocolgen`](tools/protocolgen) | 固定工具链下的协议生成、新鲜度和稳定面检查。 |
+| [`UPSTREAM.md`](UPSTREAM.md) | 上游版本、源码映射、Fixture 对照和已知差异。 |
+| [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md) | V1 能力对应的默认测试与真实 Codex 测试矩阵。 |
+| [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md) | Claude V1 fake CLI 证据与真实 CLI smoke 边界。 |
+
+## 开发与验证
+
+默认测试使用可控的 fake app-server 和 fake Claude CLI，不需要账号凭据，也不会产生模型费用：
+
+```sh
+go test ./... -count=1 -timeout=300s
+go vet ./...
+go run ./tools/protocolgen --check
+```
+
+涉及并发、生命周期或协议边界的变更，还应运行竞态检查：
+
+```sh
+go test -race -p=1 ./... -count=1 -timeout=600s
+```
+
+真实 Codex Smoke Test 和完整 V1 场景见 [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md)；Claude 的真实 CLI smoke 边界见 [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md)。两者都是显式开启的本机状态/潜在付费测试。
+
+## 协议同步
+
+Codex app-server 的稳定 Schema、生成工具和参考实现版本均已固定。不要手工修改 `agents/codex/protocol/generated_protocol.go`。
+
+```sh
+# 从已提交 Schema 重新生成 Go 类型
+go generate ./agents/codex/protocol
+
+# 检查已提交产物是否与固定输入一致
+go run ./tools/protocolgen --check
+
+# 刷新 Codex Schema 并重新生成；需要 Node.js/npm
+go run ./tools/protocolgen --refresh-schema
+```
+
+升级上游或扩大 V1 协议面前，请先阅读 [`UPSTREAM.md`](UPSTREAM.md)，并同步更新源码映射、Fixture 证据和测试。
+
+## V1 边界
+
+- 默认 Adapter 是 `codex`；Claude 只能通过 `--adapter claude` 显式选择。
+- 项目不捆绑、下载或自动安装 Codex/Claude CLI，也不修改用户的登录状态。
+- Claude V1 不实现 session list/fork/delete、认证/登出、terminal、elicitation、providers、goal 和 Audio 输入；完整清单见 [`UPSTREAM.md`](UPSTREAM.md)。
+- Codex V1 会映射已产生的 MCP 工具事件；Claude V1 还会把客户端 stdio/HTTP/SSE MCP 配置传给该 Session 的 CLI。
