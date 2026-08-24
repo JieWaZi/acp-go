@@ -53,7 +53,7 @@ type commandOptions struct {
 	outputPath string
 }
 
-// schemaBundle 只读取稳定性校验需要的 definitions 索引，不复制上游完整 schema 模型。
+// schemaBundle 只读取稳定性校验需要的 definitions 索引，不复制完整 schema 模型。
 type schemaBundle struct {
 	// Definitions 是 bundle 顶层及其 v2 命名空间中的协议定义。
 	Definitions map[string]json.RawMessage `json:"definitions"`
@@ -126,7 +126,7 @@ func parseArguments(args []string) (commandOptions, error) {
 
 // defaultConfig 返回仓库内固定输入、输出和工具 lockfile 的规范位置。
 func defaultConfig(repoRoot string) generatorConfig {
-	protocolPath := filepath.Join(repoRoot, "agents", "codex", "protocol")
+	protocolPath := filepath.Join(repoRoot, "pkg", "codex", "protocol")
 	return generatorConfig{
 		repoRoot:   repoRoot,
 		schemaPath: filepath.Join(protocolPath, "schema", "codex_app_server_protocol.schemas.json"),
@@ -227,7 +227,7 @@ func generate(ctx context.Context, cfg generatorConfig) ([]byte, error) {
 	return formatted, nil
 }
 
-// preserveOpenJSONFields 将 V1 DTO 中上游开放 JsonValue 收窄为不丢字节语义的 json.RawMessage。
+// preserveOpenJSONFields 将 V1 DTO 中开放 JsonValue 收窄为不丢字节语义的 json.RawMessage。
 func preserveOpenJSONFields(generated []byte) ([]byte, error) {
 	replacements := []struct {
 		// source 是 quicktype 为开放 JSON 字段生成的 interface{} 类型。
@@ -349,7 +349,7 @@ func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
 			replacement: "",
 		},
 		// item/tool/requestUserInput 是 V1 明确采用的唯一 experimental 请求面；
-		// 只移除其上游状态标签，最终哨兵仍会拒绝任何其他 EXPERIMENTAL surface。
+		// 只移除该方法的状态标签，最终哨兵仍会拒绝其他 EXPERIMENTAL surface。
 		{
 			source:      "// EXPERIMENTAL. Captures a user's answer to a request_user_input question.\n",
 			replacement: "// Captures a user's answer to a request_user_input question.\n",

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	codexprotocol "acp-go/agents/codex/protocol"
+	codexprotocol "github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 

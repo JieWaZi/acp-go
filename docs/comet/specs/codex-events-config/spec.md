@@ -55,7 +55,7 @@
 - initialize 声明 ChatGPT 与 API Key 两种基础认证方式。
 - ChatGPT 登录和 API Key 环境/请求的选择、成功、取消和失败按固定上游基线映射。
 - V1 不支持 client-provided custom gateway/Gateway Auth；不得误宣告该能力。
-- 凭据不得写入日志、UPSTREAM.md、fixture 或错误详情。
+- 凭据不得写入日志、`pkg/codex/UPSTREAM.md`、fixture 或错误详情。
 
 ## Acceptance mapping
 

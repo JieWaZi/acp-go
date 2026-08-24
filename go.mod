@@ -1,4 +1,4 @@
-module acp-go
+module github.com/JieWaZi/acp-go
 
 go 1.25.8
 

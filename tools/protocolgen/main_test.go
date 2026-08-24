@@ -33,8 +33,8 @@ func TestGenerateIsByteDeterministic(t *testing.T) {
 	}
 }
 
-// TestGenerateMarksExactSource 防止提交的 generated 文件失去禁止手改标记或精确上游来源。
-func TestGenerateMarksExactSource(t *testing.T) {
+// TestGenerateMarksV1RootDescription 防止 generated 文件失去禁止手改标记或 V1 根说明。
+func TestGenerateMarksV1RootDescription(t *testing.T) {
 	cfg := defaultConfig(testRepositoryRoot(t))
 
 	generated, err := generate(context.Background(), cfg)
@@ -46,15 +46,15 @@ func TestGenerateMarksExactSource(t *testing.T) {
 	if !strings.HasPrefix(text, "// Code generated") {
 		t.Fatal("生成文件缺少标准 Code generated 标记")
 	}
-	if !strings.Contains(text, "Codex 0.148.0 default stable app-server schema") {
-		t.Fatal("生成文件缺少固定 Codex schema 来源")
+	if !strings.Contains(text, "V1 Codex app-server protocol roots used by the runtime") {
+		t.Fatal("生成文件缺少 V1 协议根说明")
 	}
 	if strings.Contains(text, "MockExperimentalMethod") {
 		t.Fatal("默认稳定生成结果意外包含 experimental-only 类型")
 	}
 }
 
-// TestGenerateExcludesExperimentalPublicSurface 防止完整上游 envelope 把实验方法和类型带入 V1 包。
+// TestGenerateExcludesExperimentalPublicSurface 防止完整 envelope 把实验方法和类型带入 V1 包。
 func TestGenerateExcludesExperimentalPublicSurface(t *testing.T) {
 	cfg := defaultConfig(testRepositoryRoot(t))
 

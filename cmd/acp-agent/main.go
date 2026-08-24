@@ -12,15 +12,17 @@ import (
 	"strings"
 	"syscall"
 
-	"acp-go/internal/acpserver"
-	"acp-go/internal/claude"
-	"acp-go/internal/codex"
-	"acp-go/internal/core"
+	"github.com/JieWaZi/acp-go/pkg/acpserver"
+	"github.com/JieWaZi/acp-go/pkg/claude"
+	"github.com/JieWaZi/acp-go/pkg/codex"
 
 	acp "github.com/coder/acp-go-sdk"
 )
 
-const defaultAdapterName = "codex"
+const (
+	codexAdapterName  = "codex"
+	claudeAdapterName = "claude"
+)
 
 // processIO 隔离协议流与诊断流，防止日志污染 stdout 上的 ACP 帧。
 type processIO struct {
@@ -101,7 +103,7 @@ func runAgent(ctx context.Context, args []string, streams processIO) error {
 func parseOptions(args []string) (commandOptions, error) {
 	flags := flag.NewFlagSet("acp-agent", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	adapter := flags.String("adapter", defaultAdapterName, "ACP Adapter name")
+	adapter := flags.String("adapter", codexAdapterName, "ACP Adapter name")
 	if err := flags.Parse(args); err != nil {
 		return commandOptions{}, err
 	}
@@ -113,14 +115,14 @@ func parseOptions(args []string) (commandOptions, error) {
 }
 
 // newRegistry 显式组装进程支持的 Adapter，避免 init 注册或全局 service locator。
-func newRegistry(logger *slog.Logger) (*core.Registry, error) {
-	registry, err := core.NewRegistry(defaultAdapterName)
+func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
+	registry, err := acpserver.NewRegistry(codexAdapterName)
 	if err != nil {
 		return nil, err
 	}
 
-	err = registry.Register(core.Registration{
-		Name: defaultAdapterName,
+	err = registry.Register(acpserver.Registration{
+		Name: codexAdapterName,
 		Factory: func(ctx context.Context) (acp.Agent, error) {
 			agent, factoryErr := codex.NewAgent(ctx, codex.Config{
 				Logger:    logger,
@@ -135,8 +137,8 @@ func newRegistry(logger *slog.Logger) (*core.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = registry.Register(core.Registration{
-		Name: "claude",
+	err = registry.Register(acpserver.Registration{
+		Name: claudeAdapterName,
 		Factory: func(ctx context.Context) (acp.Agent, error) {
 			agent, factoryErr := claude.NewAgent(ctx, claude.Config{
 				Logger: logger, ClaudePath: os.Getenv("CLAUDE_CODE_EXECUTABLE"),
