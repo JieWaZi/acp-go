@@ -234,7 +234,7 @@ func (h *eventHandler) handleItemCompleted(ctx context.Context, params protocol.
 		update := mapImageView(item)
 		err = h.emit(ctx, update)
 	case protocol.UserMessage, protocol.HookPrompt, protocol.Sleep:
-		// 与 upstream 一致：用户输入、hook prompt 与 sleep 不展示为 ACP 工具。
+		// 用户输入、hook prompt 与 sleep 不展示为 ACP 工具。
 	default:
 		h.logger.Info("Ignoring unknown Codex item", "item_type", string(item.Type), "item_id", item.ID)
 	}

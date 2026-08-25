@@ -20,8 +20,12 @@ var (
 	ErrInvalidCodexPath = errors.New("invalid codex executable path")
 )
 
-// processOptions 保存 app-server 进程的有界诊断策略。
+// processOptions 保存 app-server 的启动配置和有界诊断策略。
 type processOptions struct {
+	// PrefixArgs 是放在 app-server 子命令之前的调用方启动参数。
+	PrefixArgs []string
+	// Environment 是 app-server 使用的完整环境；nil 表示继承当前进程。
+	Environment []string
 	// MaxStderrBytes 是只保留最近 stderr 尾部的字节上限。
 	MaxStderrBytes int
 	// Logger 实时接收 app-server stderr 诊断；为空时仅保存崩溃尾部。
@@ -60,7 +64,10 @@ func startAppServer(ctx context.Context, path string, options processOptions) (*
 		options.MaxStderrBytes = defaultMaxStderrBytes
 	}
 
-	command := exec.CommandContext(ctx, path, "app-server")
+	arguments := append([]string{}, options.PrefixArgs...)
+	arguments = append(arguments, "app-server")
+	command := exec.CommandContext(ctx, path, arguments...)
+	command.Env = options.Environment
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("creating codex app-server stdin: %w", err)

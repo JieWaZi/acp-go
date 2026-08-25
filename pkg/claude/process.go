@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -233,23 +235,79 @@ func (b *tailBuffer) String() string {
 	return string(append([]byte(nil), b.data...))
 }
 
-// claudeProcessEnv 构造 Claude CLI 子进程需要的隔离环境。
-func claudeProcessEnv(extra map[string]string) []string {
-	env := make(map[string]string)
-	for _, item := range os.Environ() {
-		if key, value, ok := strings.Cut(item, "="); ok {
-			env[key] = value
+// cloneClaudeEnvironment 保留 nil 的继承语义并隔离调用方后续切片修改。
+func cloneClaudeEnvironment(environment []string) []string {
+	if environment == nil {
+		return nil
+	}
+	return append([]string{}, environment...)
+}
+
+// claudeEnvironmentValue 从完整环境读取最后一个同名键；nil 环境继承当前进程。
+func claudeEnvironmentValue(environment []string, name string) string {
+	if environment == nil {
+		return os.Getenv(name)
+	}
+	normalizedName := normalizeClaudeEnvironmentName(name)
+	value := ""
+	for _, item := range environment {
+		key, candidate, found := strings.Cut(item, "=")
+		if found && normalizeClaudeEnvironmentName(key) == normalizedName {
+			value = candidate
 		}
 	}
-	delete(env, "NODE_OPTIONS")
-	env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts"
-	env["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] = "1"
-	for key, value := range extra {
-		env[key] = value
+	return value
+}
+
+// claudeProcessEnv 构造 Claude CLI 子进程需要的隔离环境。
+func claudeProcessEnv(base []string, extra map[string]string) []string {
+	if base == nil {
+		base = os.Environ()
 	}
-	result := make([]string, 0, len(env))
-	for key, value := range env {
-		result = append(result, key+"="+value)
+	values := make(map[string]string, len(base)+len(extra)+2)
+	names := make(map[string]string, len(base)+len(extra)+2)
+	for _, item := range base {
+		key, value, found := strings.Cut(item, "=")
+		if !found {
+			continue
+		}
+		setClaudeEnvironmentValue(values, names, key, value)
+	}
+	delete(values, normalizeClaudeEnvironmentName("NODE_OPTIONS"))
+	delete(names, normalizeClaudeEnvironmentName("NODE_OPTIONS"))
+	setClaudeEnvironmentValue(values, names, "CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
+	setClaudeEnvironmentValue(values, names, "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")
+	for key, value := range extra {
+		setClaudeEnvironmentValue(values, names, key, value)
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, names[key]+"="+values[key])
 	}
 	return result
+}
+
+// setClaudeEnvironmentValue 按平台键语义覆盖一条环境值并保留最后使用的键名。
+func setClaudeEnvironmentValue(
+	values map[string]string,
+	names map[string]string,
+	name string,
+	value string,
+) {
+	normalized := normalizeClaudeEnvironmentName(name)
+	values[normalized] = value
+	names[normalized] = name
+}
+
+// normalizeClaudeEnvironmentName 保持 Windows 环境键大小写不敏感的进程语义。
+func normalizeClaudeEnvironmentName(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(name)
+	}
+	return name
 }

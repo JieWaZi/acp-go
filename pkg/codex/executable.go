@@ -5,10 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -42,26 +43,38 @@ type executable struct {
 // lookPathFunc 隔离 PATH 查询，测试可证明显式 CODEX_PATH 不会回退。
 type lookPathFunc func(file string) (string, error)
 
+// commandOptions 保存短生命周期命令的参数和完整环境。
+type commandOptions struct {
+	// Args 是传给 Codex 的完整参数列表。
+	Args []string
+	// Environment 是命令使用的完整环境；nil 表示继承当前进程。
+	Environment []string
+}
+
 // commandRunner 隔离短生命周期命令，进程 runtime 不依赖该测试缝。
-type commandRunner func(ctx context.Context, path string, args ...string) ([]byte, error)
+type commandRunner func(ctx context.Context, path string, options commandOptions) ([]byte, error)
 
 // prepareExecutable 按 CODEX_PATH→PATH 的单向规则解析并探测 Codex。
 func prepareExecutable(
 	ctx context.Context,
-	explicitPath string,
-	logger *slog.Logger,
+	config Config,
 	lookPath lookPathFunc,
 	run commandRunner,
 ) (executable, error) {
-	if logger == nil {
+	if config.Logger == nil {
 		return executable{}, fmt.Errorf("preparing codex executable: %w", ErrInvalidLogger)
 	}
 
-	path, err := resolveCodexPath(explicitPath, lookPath)
+	path, err := resolveCodexPath(config.CodexPath, lookPath)
 	if err != nil {
 		return executable{}, err
 	}
-	output, err := run(ctx, path, "--version")
+	versionArgs := append([]string{}, config.PrefixArgs...)
+	versionArgs = append(versionArgs, "--version")
+	output, err := run(ctx, path, commandOptions{
+		Args:        versionArgs,
+		Environment: config.Environment,
+	})
 	if err != nil {
 		return executable{}, fmt.Errorf("probing codex executable %q: %w", path, err)
 	}
@@ -70,7 +83,7 @@ func prepareExecutable(
 		return executable{}, fmt.Errorf("probing codex executable %q: %w", path, err)
 	}
 	if version != verifiedCodexVersion {
-		logger.Warn(
+		config.Logger.Warn(
 			"Codex CLI version has not been verified against the current adapter baseline; startup will continue",
 			"version", version,
 			"verified_version", verifiedCodexVersion,
@@ -105,19 +118,46 @@ func parseCodexVersion(output []byte) (string, error) {
 }
 
 // runVersionCommand 使用有界输出和超时执行一次版本探测。
-func runVersionCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
+func runVersionCommand(ctx context.Context, path string, options commandOptions) ([]byte, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, versionProbeTimeout)
 	defer cancel()
 
 	var output limitedBuffer
 	output.limit = maxVersionOutput
-	command := exec.CommandContext(probeCtx, path, args...)
+	command := exec.CommandContext(probeCtx, path, options.Args...)
+	command.Env = options.Environment
 	command.Stdout = &output
 	command.Stderr = &output
 	if err := command.Run(); err != nil {
 		return output.Bytes(), err
 	}
 	return output.Bytes(), nil
+}
+
+// environmentLookupFromList 把 exec.Cmd 形式的完整环境转换为 Adapter 读取接口。
+func environmentLookupFromList(environment []string) environmentLookup {
+	if environment == nil {
+		return os.Getenv
+	}
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		name, value, found := strings.Cut(entry, "=")
+		if !found {
+			continue
+		}
+		values[normalizeEnvironmentName(name)] = value
+	}
+	return func(name string) string {
+		return values[normalizeEnvironmentName(name)]
+	}
+}
+
+// normalizeEnvironmentName 保持 Windows 环境键大小写不敏感的进程语义。
+func normalizeEnvironmentName(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(name)
+	}
+	return name
 }
 
 // limitedBuffer 只保留固定上限字节，避免子进程异常输出导致无界内存增长。

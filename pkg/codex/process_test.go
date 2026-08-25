@@ -88,7 +88,7 @@ func writeExecutableScript(t *testing.T, body string) string {
 
 // newProcessTestAgent 跳过与进程生命周期断言无关的真实 --version 子进程，避免并行夹具争用生产探测期限。
 func newProcessTestAgent(ctx context.Context, config Config) (*Agent, error) {
-	return newAgentWithVersionRunner(ctx, config, func(context.Context, string, ...string) ([]byte, error) {
+	return newAgentWithVersionRunner(ctx, config, func(context.Context, string, commandOptions) ([]byte, error) {
 		return []byte("codex-cli " + verifiedCodexVersion + "\n"), nil
 	})
 }
@@ -123,6 +123,43 @@ cat >/dev/null
 	}
 	if err = process.Close(closeCtx); err != nil {
 		t.Fatalf("重复关闭 app-server 失败: %v", err)
+	}
+}
+
+// TestStartAppServerAppliesPrefixArgsAndEnvironment 验证自定义启动配置不会被 Adapter 静默丢弃。
+func TestStartAppServerAppliesPrefixArgsAndEnvironment(t *testing.T) {
+	t.Parallel()
+	path := writeExecutableScript(t, `
+if [ "$1" != "--profile" ] || [ "$2" != "team" ] || [ "$3" != "app-server" ]; then
+  echo "unexpected arguments:$*" >&2
+  exit 9
+fi
+if [ "$ACP_GO_CODEX_TEST_ENV" != "enabled" ]; then
+  echo "missing environment" >&2
+  exit 8
+fi
+echo '{"method":"warning","params":{"message":"configured"}}'
+cat >/dev/null
+`)
+
+	process, err := startAppServer(context.Background(), path, processOptions{
+		PrefixArgs:  []string{"--profile", "team"},
+		Environment: append(os.Environ(), "ACP_GO_CODEX_TEST_ENV=enabled"),
+	})
+	if err != nil {
+		t.Fatalf("启动 app-server 失败: %v", err)
+	}
+	line, err := bufio.NewReader(process.Stdout()).ReadString('\n')
+	if err != nil {
+		t.Fatalf("读取 fake app-server 输出失败: %v", err)
+	}
+	if !strings.Contains(line, "configured") {
+		t.Fatalf("fake app-server 输出为 %q", line)
+	}
+	closeContext, cancelClose := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClose()
+	if err = process.Close(closeContext); err != nil {
+		t.Fatalf("关闭 app-server 失败: %v", err)
 	}
 }
 

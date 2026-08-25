@@ -48,6 +48,7 @@
     "toolRequestUserInputResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/ToolRequestUserInputResponse" },
     "turnStartedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TurnStartedNotification" },
     "turnCompletedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TurnCompletedNotification" },
+    "turnDiffUpdatedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/TurnDiffUpdatedNotification" },
     "itemStartedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ItemStartedNotification" },
     "itemCompletedNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ItemCompletedNotification" },
     "agentMessageDeltaNotification": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/AgentMessageDeltaNotification" },

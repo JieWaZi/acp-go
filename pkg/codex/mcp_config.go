@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"unicode"
 
@@ -30,7 +29,7 @@ func (a *Agent) sessionConfig(
 	}
 
 	existing := map[string]struct{}{}
-	if os.Getenv(disableMCPConfigFilteringEnv) != "true" {
+	if a.getenv(disableMCPConfigFilteringEnv) != "true" {
 		includeLayers := true
 		cwd := workspace.CWD
 		response, err := a.client.ConfigRead(ctx, protocol.ConfigReadParams{Cwd: &cwd, IncludeLayers: &includeLayers})

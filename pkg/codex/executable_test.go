@@ -16,13 +16,15 @@ func TestPrepareExecutableHonorsExplicitPath(t *testing.T) {
 	lookupCalled := false
 	_, err := prepareExecutable(
 		context.Background(),
-		"/missing/codex",
-		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		Config{
+			Logger:    slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+			CodexPath: "/missing/codex",
+		},
 		func(string) (string, error) {
 			lookupCalled = true
 			return "/path/codex", nil
 		},
-		func(context.Context, string, ...string) ([]byte, error) {
+		func(context.Context, string, commandOptions) ([]byte, error) {
 			return nil, errors.New("not executable")
 		},
 	)
@@ -40,17 +42,16 @@ func TestPrepareExecutableUsesPATHWhenExplicitPathIsEmpty(t *testing.T) {
 
 	got, err := prepareExecutable(
 		context.Background(),
-		"",
-		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		Config{Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))},
 		func(name string) (string, error) {
 			if name != "codex" {
 				t.Fatalf("查询名称为 %q，期望 codex", name)
 			}
 			return "/path/codex", nil
 		},
-		func(_ context.Context, path string, args ...string) ([]byte, error) {
-			if path != "/path/codex" || len(args) != 1 || args[0] != "--version" {
-				t.Fatalf("版本命令为 %q %v", path, args)
+		func(_ context.Context, path string, options commandOptions) ([]byte, error) {
+			if path != "/path/codex" || len(options.Args) != 1 || options.Args[0] != "--version" {
+				t.Fatalf("版本命令为 %q %v", path, options.Args)
 			}
 			return []byte("codex-cli 0.148.0\n"), nil
 		},
@@ -70,10 +71,12 @@ func TestPrepareExecutableWarnsForUnverifiedVersion(t *testing.T) {
 	var diagnostics bytes.Buffer
 	got, err := prepareExecutable(
 		context.Background(),
-		"/opt/codex",
-		slog.New(slog.NewTextHandler(&diagnostics, nil)),
+		Config{
+			Logger:    slog.New(slog.NewTextHandler(&diagnostics, nil)),
+			CodexPath: "/opt/codex",
+		},
 		func(string) (string, error) { return "", errors.New("unexpected lookup") },
-		func(context.Context, string, ...string) ([]byte, error) {
+		func(context.Context, string, commandOptions) ([]byte, error) {
 			return []byte("codex-cli 0.149.1\n"), nil
 		},
 	)
@@ -85,6 +88,55 @@ func TestPrepareExecutableWarnsForUnverifiedVersion(t *testing.T) {
 	}
 	if !strings.Contains(diagnostics.String(), "0.149.1") || !strings.Contains(diagnostics.String(), verifiedCodexVersion) {
 		t.Fatalf("版本警告为 %q", diagnostics.String())
+	}
+}
+
+// TestPrepareExecutablePassesPrefixArgsAndEnvironment 验证探测与长期进程共享同一启动配置。
+func TestPrepareExecutablePassesPrefixArgsAndEnvironment(t *testing.T) {
+	t.Parallel()
+
+	environment := []string{"PATH=/custom/bin", "CODEX_HOME=/custom/home"}
+	_, err := prepareExecutable(
+		context.Background(),
+		Config{
+			Logger:      slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+			CodexPath:   "/opt/codex",
+			PrefixArgs:  []string{"--profile", "team"},
+			Environment: environment,
+		},
+		func(string) (string, error) { return "", errors.New("unexpected lookup") },
+		func(_ context.Context, path string, options commandOptions) ([]byte, error) {
+			if path != "/opt/codex" {
+				t.Fatalf("版本探测路径为 %q", path)
+			}
+			if got := strings.Join(options.Args, " "); got != "--profile team --version" {
+				t.Fatalf("版本探测参数为 %q", got)
+			}
+			if got := strings.Join(options.Environment, "\n"); got != strings.Join(environment, "\n") {
+				t.Fatalf("版本探测环境为 %q", got)
+			}
+			return []byte("codex-cli 0.148.0\n"), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("准备可执行文件失败: %v", err)
+	}
+}
+
+// TestEnvironmentLookupFromListUsesCompleteSnapshot 验证显式环境不回退宿主且同名键以后值为准。
+func TestEnvironmentLookupFromListUsesCompleteSnapshot(t *testing.T) {
+	t.Parallel()
+
+	lookup := environmentLookupFromList([]string{
+		"NO_BROWSER=1",
+		"CODEX_API_KEY=old",
+		"CODEX_API_KEY=current",
+	})
+	if lookup("NO_BROWSER") != "1" || lookup("CODEX_API_KEY") != "current" {
+		t.Fatal("显式环境未按完整快照读取")
+	}
+	if lookup("PATH") != "" {
+		t.Fatal("显式环境不应回退宿主 PATH")
 	}
 }
 

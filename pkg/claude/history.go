@@ -58,7 +58,7 @@ type historyMessage struct {
 
 // replaySessionHistory 查找本地 transcript，并按原顺序发送可表达更新。
 func (a *Agent) replaySessionHistory(ctx context.Context, session *claudeSession) error {
-	path, err := findHistoryPath(session.id)
+	path, err := findHistoryPath(session.id, a.environment)
 	if err != nil {
 		return fmt.Errorf("loading Claude session %q: %w", session.id, err)
 	}
@@ -94,11 +94,11 @@ func (a *Agent) replaySessionHistory(ctx context.Context, session *claudeSession
 }
 
 // findHistoryPath 在配置目录的 project transcript 中按 Session ID 精确查找。
-func findHistoryPath(sessionID string) (string, error) {
+func findHistoryPath(sessionID string, environment []string) (string, error) {
 	if !historySessionIDPattern.MatchString(sessionID) {
 		return "", ErrInvalidClaudeHistorySessionID
 	}
-	configDirectory := os.Getenv("CLAUDE_CONFIG_DIR")
+	configDirectory := claudeEnvironmentValue(environment, "CLAUDE_CONFIG_DIR")
 	if configDirectory == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -150,7 +150,7 @@ func (s *claudeSession) replayEntry(ctx context.Context, entry historyEntry) err
 					}
 				}
 			case "tool_result":
-				if err := s.completeTool(ctx, block); err != nil {
+				if err := s.completeTool(ctx, block, nil); err != nil {
 					return err
 				}
 			}

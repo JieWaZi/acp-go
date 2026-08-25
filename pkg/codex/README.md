@@ -26,7 +26,8 @@
 - New、Load、Resume、Close Session 与历史回放。
 - 多轮 Prompt、Text、Image、Embedded Resource 和 Resource Link。
 - Prompt cancel/interrupt 与 `_session/steering`。
-- Command、File Change、Web Search、Image View、MCP Tool、Plan、Reasoning 和 Usage 更新。
+- Command、Web Search、Image View、MCP Tool、Plan、Reasoning 和 Usage 更新。
+- File Change 的 add、delete、update 和 move 标准 ACP diff；`turn/diff/updated` 作为已知聚合通知识别，不重复生成工具调用。
 - PromptResponse 级 Input/Cache/Output/Thought/Total Usage。
 - additional directories、trusted projects、workspace-write roots 与工作区 Skill 刷新。
 - stdio、Streamable HTTP MCP Server，以及 Form/URL Elicitation。
@@ -60,13 +61,17 @@ flowchart LR
 
 ```go
 agent, err := codex.NewAgent(ctx, codex.Config{
-    Logger:    logger,
-    CodexPath: explicitPath,
+    Logger:      logger,
+    CodexPath:   explicitPath,
+    PrefixArgs:  prefixArgs,
+    Environment: environment,
 })
 ```
 
 - `Logger` 必须非空，且应写入 stderr。
 - `CodexPath` 非空时必须指向有效可执行文件；为空时才查询 `PATH`。
+- `PrefixArgs` 会按原顺序放在 `--version` 和 `app-server` 子命令之前。
+- `Environment` 是 Adapter、版本探测和 app-server 共用的完整环境列表；`nil` 表示继承当前进程。
 - `CODEX_API_KEY` 和 `OPENAI_API_KEY` 可用于 API Key 认证。
 - `NO_BROWSER` 非空时隐藏浏览器登录。
 - `DISABLE_MCP_CONFIG_FILTERING=true` 时关闭同名 MCP 配置保护。
@@ -84,7 +89,7 @@ agent, err := codex.NewAgent(ctx, codex.Config{
 | `appserver_client.go` | typed 请求、通知与 Turn 完成关联 |
 | `appserver_transport.go` | 有界 NDJSON 读写、请求关联与反向请求 |
 | `session.go`、`prompt.go`、`steering.go` | Session generation、Prompt 与 steering 状态机 |
-| `event_handler.go`、`tool_mapper.go` | 消息、工具、计划和 Usage 映射 |
+| `event_handler.go`、`tool_mapper.go`、`file_diff.go` | 消息、工具、文件 diff、计划和 Usage 映射 |
 | `approval.go`、`elicitation.go` | 权限与用户交互 |
 | `auth.go`、`config.go`、`mcp_config.go` | 认证、Session 配置与 MCP 转换 |
 | [`protocol`](protocol) | Schema、生成 DTO、Envelope 与生成入口 |

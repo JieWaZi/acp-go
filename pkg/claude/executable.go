@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,21 +41,28 @@ type executable struct {
 // pathLookup 隔离 PATH 查询以验证显式路径失败不回退。
 type pathLookup func(file string) (string, error)
 
+// versionCommandOptions 保存版本探测的完整参数和环境。
+type versionCommandOptions struct {
+	// Args 是传给 Claude 的完整版本探测参数。
+	Args []string
+	// Environment 是版本探测使用的完整环境；nil 表示继承当前进程。
+	Environment []string
+}
+
 // versionRunner 隔离短生命周期版本命令。
-type versionRunner func(ctx context.Context, path string, args ...string) ([]byte, error)
+type versionRunner func(ctx context.Context, path string, options versionCommandOptions) ([]byte, error)
 
 // prepareExecutable 按 CLAUDE_CODE_EXECUTABLE→PATH 的单向规则解析 Claude CLI。
 func prepareExecutable(
 	ctx context.Context,
-	explicitPath string,
-	logger *slog.Logger,
+	config Config,
 	lookPath pathLookup,
 	runVersion versionRunner,
 ) (executable, error) {
-	if logger == nil {
+	if config.Logger == nil {
 		return executable{}, errors.New("preparing claude executable: logger is nil")
 	}
-	path, err := resolveClaudePath(explicitPath, lookPath)
+	path, err := resolveClaudePath(config.ClaudePath, lookPath)
 	if err != nil {
 		return executable{}, err
 	}
@@ -65,15 +71,20 @@ func prepareExecutable(
 	}
 
 	version := "unknown"
-	output, probeErr := runVersion(ctx, path, "--version")
+	versionArgs := append([]string{}, config.PrefixArgs...)
+	versionArgs = append(versionArgs, "--version")
+	output, probeErr := runVersion(ctx, path, versionCommandOptions{
+		Args:        versionArgs,
+		Environment: config.Environment,
+	})
 	if probeErr != nil {
-		logger.Warn("Claude CLI version probe failed; startup will continue", "error", probeErr)
+		config.Logger.Warn("Claude CLI version probe failed; startup will continue", "error", probeErr)
 	} else if match := claudeVersionPattern.FindSubmatch(output); len(match) == 2 {
 		version = string(match[1])
 	} else {
-		logger.Warn("Claude CLI version output was not recognized; startup will continue")
+		config.Logger.Warn("Claude CLI version output was not recognized; startup will continue")
 	}
-	logger.Debug("Resolved Claude CLI", "path", path, "version", version)
+	config.Logger.Debug("Resolved Claude CLI", "path", path, "version", version)
 	return executable{Path: path, Version: version}, nil
 }
 
@@ -106,11 +117,12 @@ func validateExecutable(path string) error {
 }
 
 // runClaudeVersion 使用超时和有界输出执行版本探测。
-func runClaudeVersion(ctx context.Context, path string, args ...string) ([]byte, error) {
+func runClaudeVersion(ctx context.Context, path string, options versionCommandOptions) ([]byte, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, claudeVersionProbeTimeout)
 	defer cancel()
 	buffer := &boundedBuffer{limit: maxClaudeVersionOutput}
-	command := exec.CommandContext(probeCtx, path, args...)
+	command := exec.CommandContext(probeCtx, path, options.Args...)
+	command.Env = options.Environment
 	command.Stdout = buffer
 	command.Stderr = buffer
 	if err := command.Run(); err != nil {

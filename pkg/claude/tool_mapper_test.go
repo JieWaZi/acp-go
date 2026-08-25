@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"testing"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -47,6 +48,31 @@ func TestToolInfoFromToolUseMatchesClaudeUpstream(t *testing.T) {
 				t.Fatalf("tool content is empty: %#v", info)
 			}
 		})
+	}
+}
+
+// TestToolDiffUpdateFromResultMatchesClaudeUpstream 验证多 hunk structuredPatch 映射为标准 ACP diff。
+func TestToolDiffUpdateFromResultMatchesClaudeUpstream(t *testing.T) {
+	t.Parallel()
+
+	content, locations := toolDiffUpdateFromResult(json.RawMessage(`{
+		"filePath":"/work/file.ts",
+		"structuredPatch":[
+			{"oldStart":5,"oldLines":3,"newStart":5,"newLines":3,"lines":[" context","-oldValue","+newValue"]},
+			{"oldStart":20,"oldLines":1,"newStart":20,"newLines":1,"lines":["-oldValue","+newValue"]}
+		]
+	}`))
+	if len(content) != 2 || len(locations) != 2 {
+		t.Fatalf("content = %#v, locations = %#v", content, locations)
+	}
+	first := content[0].Diff
+	if first == nil || first.OldText == nil || *first.OldText != "context\noldValue" ||
+		first.NewText != "context\nnewValue" || first.Path != "/work/file.ts" {
+		t.Fatalf("first diff = %#v", first)
+	}
+	if locations[0].Path != "/work/file.ts" || locations[0].Line == nil ||
+		*locations[0].Line != 5 || locations[1].Line == nil || *locations[1].Line != 20 {
+		t.Fatalf("locations = %#v", locations)
 	}
 }
 

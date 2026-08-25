@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -25,7 +26,29 @@ type toolInfo struct {
 	Meta map[string]any
 }
 
-// toolInfoFromToolUse 参考 Claude Agent ACP upstream 映射内置工具语义。
+// diffToolResponse 保存 Claude PostToolUse 或 tool_use_result 的结构化文件补丁。
+type diffToolResponse struct {
+	// FilePath 是补丁对应的完整文件路径。
+	FilePath string `json:"filePath"`
+	// StructuredPatch 是 Claude 已解析的一个或多个变更区间。
+	StructuredPatch []diffToolResponseHunk `json:"structuredPatch"`
+}
+
+// diffToolResponseHunk 保存 Claude 结构化补丁中的单个 hunk。
+type diffToolResponseHunk struct {
+	// OldStart 是旧文件 hunk 的 1-based 起始行。
+	OldStart int `json:"oldStart"`
+	// OldLines 是旧文件 hunk 的行数。
+	OldLines int `json:"oldLines"`
+	// NewStart 是新文件 hunk 的 1-based 起始行。
+	NewStart int `json:"newStart"`
+	// NewLines 是新文件 hunk 的行数。
+	NewLines int `json:"newLines"`
+	// Lines 是包含 unified diff 前缀的 hunk 行。
+	Lines []string `json:"lines"`
+}
+
+// toolInfoFromToolUse 映射内置工具语义。
 func toolInfoFromToolUse(name string, input any) toolInfo {
 	if server, tool, ok := claudeMCPToolIdentity(name); ok {
 		return toolInfo{
@@ -240,6 +263,63 @@ func textContents(values []string) []acp.ToolCallContent {
 		content = append(content, acp.ToolContent(acp.TextBlock(value)))
 	}
 	return content
+}
+
+// toolDiffUpdateFromResult 参考 Claude Agent ACP upstream，把 structuredPatch 转成标准 ACP diff。
+func toolDiffUpdateFromResult(
+	raw json.RawMessage,
+) ([]acp.ToolCallContent, []acp.ToolCallLocation) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var response diffToolResponse
+	if err := json.Unmarshal(raw, &response); err != nil ||
+		response.FilePath == "" || len(response.StructuredPatch) == 0 {
+		return nil, nil
+	}
+	content := make([]acp.ToolCallContent, 0, len(response.StructuredPatch))
+	locations := make([]acp.ToolCallLocation, 0, len(response.StructuredPatch))
+	for _, hunk := range response.StructuredPatch {
+		oldLines := make([]string, 0, len(hunk.Lines))
+		newLines := make([]string, 0, len(hunk.Lines))
+		valid := true
+		for _, line := range hunk.Lines {
+			if line == "" {
+				valid = false
+				break
+			}
+			switch line[0] {
+			case '-':
+				oldLines = append(oldLines, line[1:])
+			case '+':
+				newLines = append(newLines, line[1:])
+			case ' ':
+				oldLines = append(oldLines, line[1:])
+				newLines = append(newLines, line[1:])
+			default:
+				valid = false
+			}
+			if !valid {
+				break
+			}
+		}
+		if !valid || (len(oldLines) == 0 && len(newLines) == 0) {
+			continue
+		}
+		oldText := strings.Join(oldLines, "\n")
+		newText := strings.Join(newLines, "\n")
+		if oldText == "" {
+			content = append(content, acp.ToolDiffContent(response.FilePath, newText))
+		} else {
+			content = append(content, acp.ToolDiffContent(response.FilePath, newText, oldText))
+		}
+		location := acp.ToolCallLocation{Path: response.FilePath}
+		if hunk.NewStart > 0 {
+			location.Line = acp.Ptr(hunk.NewStart)
+		}
+		locations = append(locations, location)
+	}
+	return content, locations
 }
 
 // stringSlice 读取开放 JSON 中的字符串数组。

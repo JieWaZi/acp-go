@@ -394,7 +394,7 @@ func mapMCPProgress(params protocol.MCPToolCallProgressNotification) acp.Session
 	return update
 }
 
-// mapFileStarted 对 add/delete 使用 SDK diff DTO；update/move 不解析 patch，仅保留 typed raw changes。
+// mapFileStarted 参考 Codex ACP upstream，把可验证的文件变更转换为标准 ACP diff。
 func mapFileStarted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	status, err := mapToolStatus(item.Status)
 	if err != nil {
@@ -403,19 +403,10 @@ func mapFileStarted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	content := make([]acp.ToolCallContent, 0, len(item.Changes))
 	var rawChanges []protocol.ChangeElement
 	for _, change := range item.Changes {
-		switch change.Kind.Type {
-		case protocol.Add:
-			diff := acp.ToolDiffContent(change.Path, change.Diff)
-			diff.Diff.Meta = map[string]any{"kind": "add"}
+		if diff, ok := createFileDiffContent(change); ok {
 			content = append(content, diff)
-		case protocol.Delete:
-			diff := acp.ToolDiffContent(change.Path, "", change.Diff)
-			diff.Diff.Meta = map[string]any{"kind": "delete"}
-			content = append(content, diff)
-		case protocol.Update:
-			// 当前实现不解析 patch 文本，避免不完整解析产生错误文件变更。
-			rawChanges = append(rawChanges, change)
-		default:
+		} else {
+			// 无法验证的补丁只保留原始 typed change，不能伪造 oldText/newText。
 			rawChanges = append(rawChanges, change)
 		}
 	}

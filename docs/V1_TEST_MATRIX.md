@@ -7,13 +7,13 @@ V1 验收分为三层：手写 fixture 覆盖协议异常和竞态；最近一�
 | V1 能力 | 默认确定性测试 | 真实 Codex 测试 | 说明 |
 | --- | --- | --- | --- |
 | 默认/显式 Codex Adapter、ACP initialize | `TestRunStartsDefaultAndExplicitCodex`、`TestRunProductionCompositionSessionFlow` | `TestRunRealCodexSmoke`、`TestRunRealCodexV1Capabilities` | 检查协议版本、能力、认证方式与 steering meta |
-| Codex 路径、版本探测、唯一 app-server、退出清理 | `executable_test.go`、`process_test.go`、`appserver_transport_test.go` | 两个真实测试都会启动本机 app-server | 录制 fixture 的文件名和内容不绑定本机 Codex 版本 |
+| Codex 路径、前置参数、完整环境、版本探测、唯一 app-server、退出清理 | `executable_test.go`、`process_test.go`、`appserver_transport_test.go` | 两个真实测试都会启动本机 app-server | 前置参数和完整环境同时用于探测与长期进程；录制 fixture 的文件名和内容不绑定本机 Codex 版本 |
 | New/Load/Resume/Close Session 与历史回放 | `agent_runtime_test.go`、`agent_wiring_test.go` | `load_resume_and_history` | 真实测试关闭、加载历史、再次关闭并恢复后继续 Prompt |
 | Additional directories、trusted roots 与 Skills | `workspace_test.go`、`TestAppServerClientRefreshSkillsUpdatesRootsAndForcesReload`、`TestAgentSessionConfigurationFlowsIntoTurnStart` | 未单独执行真实 Skill 场景 | 覆盖绝对路径/去重、Session config、workspaceWrite roots、extra roots 与强制扫描 |
 | 多轮 Prompt、Agent Message 与 delta | `TestRunProductionCompositionSessionFlow`、`event_handler_test.go` | `message_delta_thinking_usage` 及后续多轮场景 | fake 组合测试强制发送两段 message delta |
 | Reasoning/Thinking、Plan、Token/Prompt Usage | `TestRunProductionCompositionSessionFlow`、`TestEventRouterMapsPlanAndLatestUsage`、`TestAgentSessionConfigurationFlowsIntoTurnStart` | `message_delta_thinking_usage`、`plan_and_command_tool` | 同时覆盖 session usage_update 与 PromptResponse 的 input/cache/output/thought/total 明细 |
 | Command Tool start/delta/completed | `TestRunProductionCompositionSessionFlow`、`tool_mapper_test.go` | `plan_and_command_tool` | 检查同一 ToolCallID 和完成状态 |
-| File Change Tool | `TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates` | `file_change_tool` | 真实测试只修改 `t.TempDir()` |
+| File Change Tool 与 turn 聚合 diff | `TestEventRouterMapsFileChangesToStandardDiff`、`TestEventRouterPreservesUnverifiableFileUpdate`、`file_diff_test.go`、`TestTurnDiffUpdatedNotificationIsStronglyTyped` | `file_change_tool` | add/delete/update/move 生成标准 ACP diff；坏补丁安全降级；`turn/diff/updated` 只做强类型识别；真实测试只修改 `t.TempDir()` |
 | Web Search 与 Image View Tool | `TestEventRouterMapsWebSearchAndImageView`、`TestAgentLoadReplaysHistoryThroughExistingMappers` | 不依赖模型随机触发 | 与 upstream 一致使用 search/read、结构化 rawInput、ResourceLink，并保证 Image View 只发一张 completed 工具卡片 |
 | MCP 配置、启动状态与 Tool Call | `TestAgentSessionMCPConfigMatchesCodexACP`、`TestCodexMCPServerConfigRejectsUnsupportedTransports`、`TestEventRouterMapsMCPProgressAndCompletion` | 不自动调用用户 MCP | 覆盖 stdio/HTTP、同名配置保护、失败状态与既有 MCP 工具事件；SSE/ACP transport 明确拒绝 |
 | MCP Elicitation 与结构化用户输入 | `TestMCPServerElicitationUsesACPAndCompletesURL`、`TestToolRequestUserInputUsesACPForm` | 不自动触发外部交互 | 覆盖 form/url 能力路由、URL complete、选项/Other 答案和 fail-closed |

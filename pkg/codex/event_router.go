@@ -169,6 +169,8 @@ func notificationScope(notification protocol.ServerNotification) (string, string
 	switch event := notification.(type) {
 	case *protocol.ErrorEnvelope:
 		return event.Params.ThreadID, event.Params.TurnID, true
+	case *protocol.TurnDiffUpdatedEnvelope:
+		return event.Params.ThreadID, event.Params.TurnID, true
 	case *protocol.ItemStartedEnvelope:
 		return event.Params.ThreadID, event.Params.TurnID, true
 	case *protocol.ItemCompletedEnvelope:

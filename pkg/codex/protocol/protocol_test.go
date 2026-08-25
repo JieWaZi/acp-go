@@ -168,6 +168,22 @@ func TestServerNotificationKeepsMethodParamsCoupled(t *testing.T) {
 	}
 }
 
+// TestTurnDiffUpdatedNotificationIsStronglyTyped 验证 turn 级聚合 diff 不会落入未知通知。
+func TestTurnDiffUpdatedNotificationIsStronglyTyped(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"method":"turn/diff/updated","params":{"threadId":"thread-1","turnId":"turn-1","diff":"diff --git a/a b/a"}}`)
+	notification, err := DecodeServerNotification(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	typed, ok := notification.(*TurnDiffUpdatedEnvelope)
+	if !ok || typed.Params.ThreadID != "thread-1" || typed.Params.TurnID != "turn-1" ||
+		typed.Params.Diff != "diff --git a/a b/a" {
+		t.Fatalf("turn diff notification = %#v", notification)
+	}
+}
+
 // TestUnknownServerNotificationPreservesRawParams 防止前向扩展通知经过 fallback 后丢失未知字段或整数精度。
 func TestUnknownServerNotificationPreservesRawParams(t *testing.T) {
 	raw := []byte(`{"method":"extension/future","params":{"counter":9007199254740993}}`)

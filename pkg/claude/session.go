@@ -236,8 +236,13 @@ func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*c
 	}
 
 	sessionCtx, sessionCancel := context.WithCancel(a.runtimeCtx)
+	arguments := append([]string{}, a.prefixArgs...)
+	arguments = append(arguments, claudeLaunchArgs(options)...)
 	process, err := startClaudeProcess(a.runtimeCtx, a.executable.Path, processOptions{
-		CWD: options.CWD, Args: claudeLaunchArgs(options), Env: claudeProcessEnv(nil), Logger: a.logger,
+		CWD:    options.CWD,
+		Args:   arguments,
+		Env:    claudeProcessEnv(a.environment, nil),
+		Logger: a.logger,
 	})
 	if err != nil {
 		sessionCancel()

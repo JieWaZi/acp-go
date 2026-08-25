@@ -36,6 +36,7 @@ const (
 	MethodError                           = "error"
 	MethodTurnStarted                     = "turn/started"
 	MethodTurnCompleted                   = "turn/completed"
+	MethodTurnDiffUpdated                 = "turn/diff/updated"
 	MethodItemStarted                     = "item/started"
 	MethodItemCompleted                   = "item/completed"
 	MethodAgentMessageDelta               = "item/agentMessage/delta"
@@ -618,6 +619,12 @@ type TurnCompletedEnvelope struct {
 	notificationEnvelope[TurnCompletedNotification]
 }
 
+// TurnDiffUpdatedEnvelope 表示 turn/diff/updated 通知。
+type TurnDiffUpdatedEnvelope struct {
+	// notificationEnvelope 固定 turn/diff/updated method 与 Params 类型。
+	notificationEnvelope[TurnDiffUpdatedNotification]
+}
+
 // ItemStartedEnvelope 表示 item/started 通知。
 type ItemStartedEnvelope struct {
 	// notificationEnvelope 固定 item/started method 与强类型 Item Params。
@@ -786,6 +793,9 @@ func DecodeServerNotification(data []byte) (ServerNotification, error) {
 	case MethodTurnCompleted:
 		envelope, err := decodeNotification[TurnCompletedNotification](wire)
 		return serverNotificationResult(&TurnCompletedEnvelope{envelope}, err)
+	case MethodTurnDiffUpdated:
+		envelope, err := decodeNotification[TurnDiffUpdatedNotification](wire)
+		return serverNotificationResult(&TurnDiffUpdatedEnvelope{envelope}, err)
 	case MethodItemStarted:
 		envelope, err := decodeNotification[ItemStartedNotification](wire)
 		return serverNotificationResult(&ItemStartedEnvelope{envelope}, err)

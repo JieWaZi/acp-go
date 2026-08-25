@@ -168,9 +168,20 @@ func (s *claudeSession) handleUser(ctx context.Context, message *protocol.UserMe
 		return nil
 	}
 	// 工具结果拥有独立 UUID，必须先按 tool_use_id 处理，不能误当成未知 prompt echo 丢弃。
+	toolResultCount := 0
 	for _, block := range message.Message.Content {
 		if block.Type == "tool_result" {
-			if err := s.completeTool(ctx, block); err != nil {
+			toolResultCount++
+		}
+	}
+	for _, block := range message.Message.Content {
+		if block.Type == "tool_result" {
+			var toolUseResult json.RawMessage
+			// Claude 的 message-level tool_use_result 不带 tool_use_id，只能归属到唯一结果块。
+			if toolResultCount == 1 {
+				toolUseResult = message.ToolUseResult
+			}
+			if err := s.completeTool(ctx, block, toolUseResult); err != nil {
 				return err
 			}
 		}
@@ -376,7 +387,11 @@ func (s *claudeSession) startTool(ctx context.Context, block protocol.ContentBlo
 }
 
 // completeTool 终止一个已知工具；未知结果先创建 generic 调用再完成。
-func (s *claudeSession) completeTool(ctx context.Context, block protocol.ContentBlock) error {
+func (s *claudeSession) completeTool(
+	ctx context.Context,
+	block protocol.ContentBlock,
+	toolUseResult json.RawMessage,
+) error {
 	if block.ToolUseID == "" {
 		return nil
 	}
@@ -407,10 +422,28 @@ func (s *claudeSession) completeTool(ctx context.Context, block protocol.Content
 		status = acp.ToolCallStatusFailed
 	}
 	content, rawOutput := toolResultContent(block)
-	return s.agent.sendUpdate(ctx, s.id, acp.UpdateToolCall(
-		acp.ToolCallId(block.ToolUseID), acp.WithUpdateStatus(status),
-		acp.WithUpdateContent(content), acp.WithUpdateRawOutput(rawOutput),
-	))
+	options := []acp.ToolCallUpdateOpt{
+		acp.WithUpdateStatus(status),
+		acp.WithUpdateRawOutput(rawOutput),
+	}
+	if !block.IsError && (tool.Name == "Edit" || tool.Name == "Write") {
+		// Upstream 由 PostToolUse structuredPatch 修正乐观 diff；CLI 直接携带同形结果时等价处理。
+		diffContent, locations := toolDiffUpdateFromResult(toolUseResult)
+		if len(diffContent) > 0 {
+			options = append(
+				options,
+				acp.WithUpdateContent(diffContent),
+				acp.WithUpdateLocations(locations),
+			)
+		}
+	} else {
+		options = append(options, acp.WithUpdateContent(content))
+	}
+	return s.agent.sendUpdate(
+		ctx,
+		s.id,
+		acp.UpdateToolCall(acp.ToolCallId(block.ToolUseID), options...),
+	)
 }
 
 // promptResponseFromResult 转换 stop reason 与本轮 token 用量。

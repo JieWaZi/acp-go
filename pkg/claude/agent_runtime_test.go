@@ -18,7 +18,12 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 )
 
-const fakeClaudeProcessEnv = "ACP_GO_TEST_FAKE_CLAUDE_PROCESS"
+const (
+	fakeClaudeProcessEnv          = "ACP_GO_TEST_FAKE_CLAUDE_PROCESS"
+	fakeClaudeLaunchConfigGateEnv = "ACP_GO_TEST_REQUIRE_CLAUDE_LAUNCH_CONFIG"
+	fakeClaudeCustomEnvironment   = "ACP_GO_TEST_CLAUDE_CUSTOM_ENVIRONMENT"
+	fakeClaudePrefixArgument      = "--acp-test-prefix"
+)
 
 // TestMain 在子进程标记存在时运行 fake CLI，否则执行正常测试集合。
 func TestMain(m *testing.M) {
@@ -96,15 +101,26 @@ func (c *recordingClaudeClient) snapshot() ([]acp.SessionNotification, []acp.Req
 // TestClaudeAgentSessionPromptPermissionConfigAndCancel 覆盖真实进程边界上的核心 V1 生命周期。
 func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 	t.Setenv(fakeClaudeProcessEnv, "1")
+	t.Setenv(fakeClaudeLaunchConfigGateEnv, "1")
+	t.Setenv(fakeClaudeCustomEnvironment, "")
 	executablePath, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	agent, err := NewAgent(ctx, Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ClaudePath: executablePath})
+	environment := append(os.Environ(), fakeClaudeCustomEnvironment+"=enabled")
+	agent, err := NewAgent(ctx, Config{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ClaudePath:  executablePath,
+		PrefixArgs:  []string{fakeClaudePrefixArgument, "team"},
+		Environment: environment,
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if agent.executable.Version != "2.1.232" {
+		t.Fatalf("版本探测结果为 %q", agent.executable.Version)
 	}
 	agent.allowBypassPermissions = true
 	t.Cleanup(func() { _ = agent.Close(context.Background()) })
@@ -328,6 +344,15 @@ func waitForActiveTurn(t *testing.T, agent *Agent, sessionID string) {
 
 // runFakeClaudeProcess 实现测试所需的最小 stream-json/control CLI。
 func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int {
+	if os.Getenv(fakeClaudeLaunchConfigGateEnv) != "" {
+		if os.Getenv(fakeClaudeCustomEnvironment) != "enabled" {
+			return 9
+		}
+		if len(args) < 2 || args[0] != fakeClaudePrefixArgument || args[1] != "team" {
+			return 8
+		}
+		args = args[2:]
+	}
 	if len(args) == 1 && args[0] == "--version" {
 		_, _ = fmt.Fprintln(output, "2.1.232")
 		return 0

@@ -3,7 +3,10 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -247,16 +250,20 @@ func TestEventRouterMapsWebSearchAndImageView(t *testing.T) {
 	}
 }
 
-// TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates 验证 add/delete rich diff 与 update/move raw 保留策略。
-func TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates(t *testing.T) {
+// TestEventRouterMapsFileChangesToStandardDiff 验证 add/delete/update 都使用标准 ACP diff。
+func TestEventRouterMapsFileChangesToStandardDiff(t *testing.T) {
 	t.Parallel()
 
+	updatedPath := filepath.Join(t.TempDir(), "Old.go")
+	if err := os.WriteFile(updatedPath, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	updater := &recordingSessionUpdater{}
 	router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.Default())
 	for _, raw := range []string{
 		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"fileChange","id":"file-add","status":"completed","changes":[{"path":"/work/New.go","kind":{"type":"add"},"diff":"package main\n"}]}}}`,
 		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"fileChange","id":"file-delete","status":"completed","changes":[{"path":"/work/Old.go","kind":{"type":"delete"},"diff":"package old\n"}]}}}`,
-		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"fileChange","id":"file-update","status":"inProgress","changes":[{"path":"/work/Old.go","kind":{"type":"update","move_path":"/work/New.go"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]}}}`,
+		fmt.Sprintf(`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"fileChange","id":"file-update","status":"inProgress","changes":[{"path":%q,"kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]}}}`, updatedPath),
 	} {
 		if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
 			t.Fatalf("HandleJSON 返回错误: %v", err)
@@ -274,7 +281,26 @@ func TestEventRouterMapsFileAddsDeletesAndPreservesRawUpdates(t *testing.T) {
 		t.Fatalf("file delete = %#v", deleted)
 	}
 	updated := updater.notifications[2].Update.ToolCall
-	if updated == nil || len(updated.Content) != 0 || updated.RawInput == nil {
-		t.Fatalf("file update = %#v，期望无自造 rich diff 且保留 raw", updated)
+	if updated == nil || len(updated.Content) != 1 || updated.Content[0].Diff == nil ||
+		updated.Content[0].Diff.OldText == nil || *updated.Content[0].Diff.OldText != "old\n" ||
+		updated.Content[0].Diff.NewText != "new\n" || updated.Content[0].Diff.Path != updatedPath ||
+		updated.RawInput != nil {
+		t.Fatalf("file update = %#v", updated)
+	}
+}
+
+// TestEventRouterPreservesUnverifiableFileUpdate 验证坏补丁不会生成不可靠 diff。
+func TestEventRouterPreservesUnverifiableFileUpdate(t *testing.T) {
+	t.Parallel()
+
+	updater := &recordingSessionUpdater{}
+	router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.Default())
+	raw := `{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"fileChange","id":"file-update-broken","status":"inProgress","changes":[{"path":"/work/Old.go","kind":{"type":"update"},"diff":"@@ broken @@\n-old\n+new\n"}]}}}`
+	if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+		t.Fatalf("HandleJSON 返回错误: %v", err)
+	}
+	tool := updater.notifications[0].Update.ToolCall
+	if tool == nil || len(tool.Content) != 0 || tool.RawInput == nil {
+		t.Fatalf("坏补丁工具 = %#v", tool)
 	}
 }

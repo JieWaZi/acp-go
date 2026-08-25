@@ -76,6 +76,7 @@ type Protocol struct {
 	ToolRequestUserInputParams              *ToolRequestUserInputParams              `json:"toolRequestUserInputParams,omitempty"`
 	ToolRequestUserInputResponse            *ToolRequestUserInputResponse            `json:"toolRequestUserInputResponse,omitempty"`
 	TurnCompletedNotification               *TurnCompletedNotification               `json:"turnCompletedNotification,omitempty"`
+	TurnDiffUpdatedNotification             *TurnDiffUpdatedNotification             `json:"turnDiffUpdatedNotification,omitempty"`
 	TurnInterruptParams                     *TurnInterruptParams                     `json:"turnInterruptParams,omitempty"`
 	TurnInterruptResponse                   map[string]json.RawMessage               `json:"turnInterruptResponse,omitempty"`
 	TurnPlanUpdatedNotification             *TurnPlanUpdatedNotification             `json:"turnPlanUpdatedNotification,omitempty"`
@@ -1253,6 +1254,14 @@ type ToolRequestUserInputAnswer struct {
 type TurnCompletedNotification struct {
 	ThreadID string      `json:"threadId"`
 	Turn     TurnElement `json:"turn"`
+}
+
+// Notification that the turn-level unified diff has changed. Contains the latest aggregated
+// diff across all file changes in the turn.
+type TurnDiffUpdatedNotification struct {
+	Diff     string `json:"diff"`
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
 }
 
 type TurnInterruptParams struct {

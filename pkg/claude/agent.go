@@ -43,6 +43,10 @@ type Config struct {
 	Logger *slog.Logger
 	// ClaudePath 是 CLAUDE_CODE_EXECUTABLE 的值；空值才允许查询 PATH。
 	ClaudePath string
+	// PrefixArgs 是放在 Adapter 固有 Claude 参数之前的调用方启动参数。
+	PrefixArgs []string
+	// Environment 是 Adapter、版本探测和 Session 进程使用的完整环境；nil 表示继承当前进程。
+	Environment []string
 }
 
 // sessionUpdater 是事件组件消费的 ACP session/update 窄接口。
@@ -72,6 +76,10 @@ type Agent struct {
 	logger *slog.Logger
 	// executable 是构造时已经验证的 CLI。
 	executable executable
+	// prefixArgs 是每次版本探测和 Session 进程共享的调用方前置参数。
+	prefixArgs []string
+	// environment 是 Adapter 与全部 Session 进程共享的完整环境快照。
+	environment []string
 	// allowBypassPermissions 保存进程身份与沙箱环境共同决定的危险模式门槛。
 	allowBypassPermissions bool
 	// runtimeCtx 跨单次 ACP 请求存活，直到 Adapter Close。
@@ -117,7 +125,9 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if config.Logger == nil {
 		return nil, fmt.Errorf("creating Claude agent: %w", ErrInvalidClaudeLogger)
 	}
-	executable, err := prepareExecutable(ctx, config.ClaudePath, config.Logger, exec.LookPath, runClaudeVersion)
+	config.PrefixArgs = append([]string{}, config.PrefixArgs...)
+	config.Environment = cloneClaudeEnvironment(config.Environment)
+	executable, err := prepareExecutable(ctx, config, exec.LookPath, runClaudeVersion)
 	if err != nil {
 		return nil, fmt.Errorf("creating Claude agent: %w", err)
 	}
@@ -125,7 +135,9 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	return &Agent{
 		logger:                 config.Logger,
 		executable:             executable,
-		allowBypassPermissions: bypassPermissionsAllowed(),
+		prefixArgs:             config.PrefixArgs,
+		environment:            config.Environment,
+		allowBypassPermissions: bypassPermissionsAllowed(config.Environment),
 		runtimeCtx:             runtimeCtx,
 		runtimeCancel:          runtimeCancel,
 		sessions:               newClaudeSessionStore(),

@@ -21,7 +21,7 @@ func claudeSessionNotFoundError(sessionID string) *acp.RequestError {
 	}
 }
 
-// mapClaudeSessionOpenError 把固定 upstream 的恢复缺失形状提升为 ResourceNotFound。
+// mapClaudeSessionOpenError 把固定的恢复缺失形状提升为 ResourceNotFound。
 func mapClaudeSessionOpenError(sessionID string, err error) error {
 	missingConversation := strings.Contains(err.Error(), "No conversation found with session ID")
 	if errors.Is(err, ErrClaudeSessionNotFound) || missingConversation {

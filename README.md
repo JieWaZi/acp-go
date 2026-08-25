@@ -12,8 +12,8 @@
 
 | 适配器 | 启动方式 | 运行模型 | 主要能力 |
 | --- | --- | --- | --- |
-| Codex | 默认，或 `--adapter codex` | 一个 Adapter 持有一个 `codex app-server` 进程 | 认证、会话恢复、附加目录/Skills、Prompt Usage、取消、steering、工具、审批、MCP、Elicitation、模型与运行模式 |
-| Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
+| Codex | 默认，或 `--adapter codex` | 一个 Adapter 持有一个 `codex app-server` 进程 | 认证、会话恢复、附加目录/Skills、Prompt Usage、取消、steering、标准文件 diff、工具、审批、MCP、Elicitation、模型与运行模式 |
+| Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、Edit/Write 标准文件 diff、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
 
 Codex 是默认适配器。只有显式传入 `--adapter claude` 时，程序才会探测并构造 Claude Adapter。
 
@@ -144,6 +144,15 @@ Codex 的表单、URL Elicitation，以及 Claude `AskUserQuestion` 的结构化
 }
 ```
 
+## 工具与文件变更
+
+两个 Adapter 都把厂商工具事件映射为 ACP 标准 `tool_call`/`tool_call_update`，不会要求客户端理解 Codex 或 Claude 的私有事件结构。
+
+| 适配器 | 工具范围 | 文件变更 |
+| --- | --- | --- |
+| Codex | Command、Web Search、Image View、MCP Tool、Plan 与 Reasoning | `fileChange` 的 add、delete、update 和 move 转换为标准 ACP diff；update/move 会参考 upstream 从当前文件正向或反向应用 unified patch，还原完整 `oldText`/`newText`。无法验证的补丁只保留原始 change，不生成不可靠 diff。`turn/diff/updated` 会被强类型识别，但按 upstream 不重复生成工具调用。 |
+| Claude | Task、Bash、Read、Edit、Write、搜索、Web、Skill、AskUserQuestion 与 MCP Tool | Edit/Write 开始时发送标准 ACP diff；唯一 tool result 携带 `filePath/structuredPatch` 时，按 upstream 用多 hunk diff 和 locations 修正完成态内容。当前 CLI 边界不注入通用 PostToolUse hook；没有结构化结果时保留开始态 diff。 |
+
 ## 工作范围与 Skills
 
 两个 Adapter 都声明 ACP `additionalDirectories`。Codex 会校验目录为绝对路径，把主目录和附加目录写入 Session trusted projects，并在 `workspaceWrite` 模式加入附加可写根；每次创建/恢复 Session 及 Prompt 前，会发现标准 `<root>/.agents/skills` 目录并强制刷新 Codex Skills。Claude 把规范化后的目录通过 `--add-dir` 交给对应 Session 的 CLI 进程。
@@ -156,13 +165,17 @@ Claude Adapter 在非 root 进程，或显式 `IS_SANDBOX` 环境中，提供 `b
 
 ## 作为 Go 包使用
 
-两个 Adapter 都以 `Config`、`NewAgent` 和 `Agent` 作为公开入口，并实现 `github.com/coder/acp-go-sdk` 的 Agent 接口。`pkg/acpserver` 提供公共 Registry 和 stdio Server。调用方负责提供非空日志器、选择 CLI 路径，并在不再使用时关闭 Agent。
+两个 Adapter 都以 `Config`、`NewAgent` 和 `Agent` 作为公开入口，并实现 `github.com/coder/acp-go-sdk` 的 Agent 接口。`pkg/acpserver` 提供公共 Registry 和 stdio Server。调用方负责提供非空日志器、选择 CLI 路径和可选启动配置，并在不再使用时关闭 Agent。
 
 ```go
 logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+runtimePrefixArgs := []string{}
+runtimeEnvironment := os.Environ()
 agent, err := codex.NewAgent(ctx, codex.Config{
-    Logger:    logger,
-    CodexPath: os.Getenv("CODEX_PATH"),
+    Logger:      logger,
+    CodexPath:   os.Getenv("CODEX_PATH"),
+    PrefixArgs:  runtimePrefixArgs,
+    Environment: runtimeEnvironment,
 })
 if err != nil {
     return err
@@ -175,7 +188,7 @@ if err != nil {
 return server.Serve(ctx)
 ```
 
-`Server.Serve` 在连接结束时会调用 Adapter 的可选 `Close(context.Context)` 方法。Claude 的构造方式相同，改用 `claude.NewAgent`、`claude.Config` 和 `ClaudePath`。
+Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置参数会放在 Adapter 固有参数之前；完整环境同时用于 Adapter 自身配置读取、版本探测，以及 Codex app-server 或每个 Claude Session 进程。`nil` 表示继承当前进程，调用方设置覆盖项时应先完成同名键合并，避免重复环境键。Claude 配置目录通过完整环境中的 `CLAUDE_CONFIG_DIR` 表达，Codex 配置目录则使用 `CODEX_HOME`。`Server.Serve` 在连接结束时会调用 Adapter 的可选 `Close(context.Context)` 方法。Claude 的构造方式相同，改用 `claude.NewAgent`、`claude.Config` 和 `ClaudePath`。
 
 ## 项目结构
 

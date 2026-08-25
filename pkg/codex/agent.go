@@ -44,6 +44,10 @@ type Config struct {
 	Logger *slog.Logger
 	// CodexPath 是 CODEX_PATH 的值；空值才允许从 PATH 查询。
 	CodexPath string
+	// PrefixArgs 是放在 Codex 子命令之前的调用方启动参数。
+	PrefixArgs []string
+	// Environment 是 Adapter、版本探测和 app-server 使用的完整环境；nil 表示继承当前进程。
+	Environment []string
 }
 
 // appServerRouter 解决 transport 必须先启动 reader，而 typed client/Agent 随后才可构造的依赖环。
@@ -95,6 +99,8 @@ func (r *appServerRouter) routeServerRequest(ctx context.Context, request protoc
 type Agent struct {
 	// logger 是进程级诊断入口，绝不写外层 ACP stdout。
 	logger *slog.Logger
+	// getenv 读取调用方完整环境中的 Adapter 开关与认证信息。
+	getenv environmentLookup
 	// runtimeCtx 跨单次 ACP 请求存活，直到 Adapter Close。
 	runtimeCtx context.Context
 	// runtimeCancel 终止所有后台 turn、steering 和通知任务。
@@ -175,14 +181,18 @@ func newAgentWithVersionRunner(ctx context.Context, config Config, runVersion co
 	if runVersion == nil {
 		return nil, errors.New("creating codex agent: version runner is nil")
 	}
-	executable, err := prepareExecutable(ctx, config.CodexPath, config.Logger, exec.LookPath, runVersion)
+	executable, err := prepareExecutable(ctx, config, exec.LookPath, runVersion)
 	if err != nil {
 		return nil, fmt.Errorf("creating codex agent: %w", err)
 	}
 	// construction/Serve context 只约束启动；成功后 runtime 由 Agent.Close 单独拥有，
 	// 否则信号取消会让 exec.CommandContext 抢在 acpserver 的有界清理窗口前杀死子进程。
 	runtimeCtx, runtimeCancel := context.WithCancel(context.WithoutCancel(ctx))
-	process, err := startAppServer(runtimeCtx, executable.Path, processOptions{Logger: config.Logger})
+	process, err := startAppServer(runtimeCtx, executable.Path, processOptions{
+		PrefixArgs:  config.PrefixArgs,
+		Environment: config.Environment,
+		Logger:      config.Logger,
+	})
 	if err != nil {
 		runtimeCancel()
 		return nil, fmt.Errorf("creating codex agent: %w", err)
@@ -204,6 +214,7 @@ func newAgentWithVersionRunner(ctx context.Context, config Config, runVersion co
 	client := newAppServerClient(runtimeCtx, transport)
 	router.publish(client)
 	agent := newAgentWithClient(config.Logger, runtimeCtx, runtimeCancel, client)
+	agent.setEnvironment(config.Environment)
 	agent.transport = transport
 	agent.process = process
 	router.publishAgent(agent)
@@ -219,6 +230,7 @@ func newAgentWithClient(
 ) *Agent {
 	agent := &Agent{
 		logger:                 logger,
+		getenv:                 os.Getenv,
 		runtimeCtx:             runtimeCtx,
 		runtimeCancel:          runtimeCancel,
 		client:                 client,
@@ -229,9 +241,15 @@ func newAgentWithClient(
 		pendingURLElicitations: make(map[string]map[acp.UnstableElicitationId]struct{}),
 	}
 	agent.steering = newSteeringManager(agent, defaultSteeringQueueCapacity)
-	agent.auth = newAuthenticator(client, client, systemBrowserOpener{}, os.Getenv, logger)
+	agent.auth = newAuthenticator(client, client, systemBrowserOpener{}, agent.getenv, logger)
 	client.SetNotificationHandler(agent.handleNotification)
 	return agent
+}
+
+// setEnvironment 让进程内 Adapter 行为与其探测和 app-server 使用同一环境快照。
+func (a *Agent) setEnvironment(environment []string) {
+	a.getenv = environmentLookupFromList(environment)
+	a.auth.getenv = a.getenv
 }
 
 // SetAgentConnection 接收 acpserver 创建的 SDK connection，并释放事件路由 barrier。
