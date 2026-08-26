@@ -49,7 +49,7 @@ type unifiedPatchLine struct {
 	Text string
 }
 
-// createFileDiffContent 参考 Codex ACP upstream，把 fileChange 转换为标准 ACP diff。
+// createFileDiffContent 把 fileChange 转换为标准 ACP diff。
 func createFileDiffContent(change protocol.ChangeElement) (acp.ToolCallContent, bool) {
 	switch change.Kind.Type {
 	case protocol.Add:

@@ -30,6 +30,8 @@ type fakeAppServerRPC struct {
 	done chan struct{}
 	// err 模拟 transport 稳定错误。
 	err error
+	// accountResponse 覆盖 Session 鉴权前置检查的默认已登录响应。
+	accountResponse *protocol.GetAccountResponse
 }
 
 // observedTurnStartRPC 验证 RunTurn 会消费 transport 提供的同步 response observer 小接口。
@@ -101,6 +103,16 @@ func (f *fakeAppServerRPC) Call(
 	f.mu.Lock()
 	f.calls = append(f.calls, request.Method())
 	f.mu.Unlock()
+	if request.Method() == protocol.MethodAccountRead {
+		response := protocol.GetAccountResponse{
+			Account: &protocol.Account{Type: protocol.AccountTypeAPIKey},
+		}
+		if f.accountResponse != nil {
+			response = *f.accountResponse
+		}
+		*(result.(*protocol.GetAccountResponse)) = response
+		return nil
+	}
 	if f.handleCall == nil {
 		return errors.New("unexpected fake app-server call")
 	}

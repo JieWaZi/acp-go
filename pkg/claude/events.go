@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -40,15 +40,8 @@ func (s *claudeSession) handleMessage(ctx context.Context, message protocol.Mess
 	var err error
 	switch typed := message.(type) {
 	case *protocol.SystemInitMessage:
-		first := false
-		s.initOnce.Do(func() {
-			first = true
-			s.initMessages <- typed
-		})
-		if !first {
-			// 重复 init 用于配置状态刷新，不得阻塞唯一 stdout reader。
-			s.syncSystemInit(*typed)
-		}
+		// 首条 init 也在 prompt 消费期校准状态。
+		err = s.syncSystemInit(ctx, *typed)
 	case *protocol.StreamEventMessage:
 		err = s.handleStreamEvent(ctx, typed)
 	case *protocol.AssistantMessage:
@@ -71,16 +64,25 @@ func (s *claudeSession) handleMessage(ctx context.Context, message protocol.Mess
 	}
 }
 
-// syncSystemInit 更新 CLI 可自主变化的模型、权限和快速模式状态。
-func (s *claudeSession) syncSystemInit(init protocol.SystemInitMessage) {
+// syncSystemInit 更新 CLI 可自主变化的配置，并在终端命令集合变化时重新发布菜单。
+func (s *claudeSession) syncSystemInit(ctx context.Context, init protocol.SystemInitMessage) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if init.SessionID != s.id || s.closed {
-		return
+		s.mu.Unlock()
+		return nil
+	}
+	terminalCommandsChanged := init.TerminalSlashCommands != nil &&
+		!slices.Equal(init.TerminalSlashCommands, s.systemInit.TerminalSlashCommands)
+	if init.TerminalSlashCommands == nil {
+		init.TerminalSlashCommands = s.systemInit.TerminalSlashCommands
 	}
 	s.systemInit = init
 	if init.Model != "" {
+		modelChanged := s.configuration.model != init.Model
 		s.configuration.model = init.Model
+		if modelChanged {
+			s.seedContextWindowLocked(init.Model)
+		}
 	}
 	if init.PermissionMode != "" {
 		s.configuration.mode = acp.SessionModeId(init.PermissionMode)
@@ -88,6 +90,11 @@ func (s *claudeSession) syncSystemInit(init protocol.SystemInitMessage) {
 	if init.FastModeState != "" {
 		s.configuration.fast = init.FastModeState == "on" || init.FastModeState == "cooldown"
 	}
+	s.mu.Unlock()
+	if terminalCommandsChanged {
+		return s.sendAvailableCommandsUpdate(ctx)
+	}
+	return nil
 }
 
 // handleStreamEvent 映射文本、思考、工具开始和 usage 增量。
@@ -98,6 +105,18 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 	}
 	event := message.Event
 	switch event.Type {
+	case "message_start":
+		turn.mu.Lock()
+		delete(turn.streamedBlocks, streamedBlockOwner(message.ParentToolUseID))
+		turn.mu.Unlock()
+		if message.ParentToolUseID != nil || event.Message == nil {
+			return nil
+		}
+		s.useAssistantModel(event.Message.Model)
+		if event.Message.Usage != nil {
+			recordContextUsage(turn, *event.Message.Usage, event.Message.Model)
+			return s.sendUsageUpdate(ctx, turn, false)
+		}
 	case "content_block_start":
 		if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
 			return s.startTool(ctx, *event.ContentBlock)
@@ -108,19 +127,32 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 		}
 		if event.Delta.Text != "" {
 			turn.mu.Lock()
-			turn.streamedText[event.Index] += event.Delta.Text
+			recordStreamedBlock(
+				turn.streamedBlocks,
+				streamedBlockOwner(message.ParentToolUseID),
+				event.Index,
+				"text",
+				event.Delta.Text,
+			)
 			turn.mu.Unlock()
 			return s.sendAgentText(ctx, message.UUID, event.Delta.Text, false)
 		}
 		if event.Delta.Thinking != "" {
 			turn.mu.Lock()
-			turn.streamedThinking[event.Index] += event.Delta.Thinking
+			recordStreamedBlock(
+				turn.streamedBlocks,
+				streamedBlockOwner(message.ParentToolUseID),
+				event.Index,
+				"thinking",
+				event.Delta.Thinking,
+			)
 			turn.mu.Unlock()
 			return s.sendAgentText(ctx, message.UUID, event.Delta.Thinking, true)
 		}
 	case "message_delta":
-		if event.Usage != nil {
-			return s.sendUsageUpdate(ctx, *event.Usage, 0)
+		if message.ParentToolUseID == nil && event.Usage != nil {
+			recordContextUsageDelta(turn, *event.Usage)
+			return s.sendUsageUpdate(ctx, turn, false)
 		}
 	}
 	return nil
@@ -132,22 +164,41 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
 		return nil
 	}
-	for index, block := range message.Message.Content {
+	if message.ParentToolUseID == nil {
+		s.useAssistantModel(message.Message.Model)
+		if message.Error != "" {
+			turn.mu.Lock()
+			turn.assistantError = message.Error
+			turn.mu.Unlock()
+		}
+		if message.Message.Usage != nil {
+			recordContextUsage(turn, *message.Message.Usage, message.Message.Model)
+		}
+	}
+	owner := streamedBlockOwner(message.ParentToolUseID)
+	turn.mu.Lock()
+	streamed := append([]streamedContentBlock(nil), turn.streamedBlocks[owner]...)
+	delete(turn.streamedBlocks, owner)
+	turn.mu.Unlock()
+	streamPosition := 0
+	for _, block := range message.Message.Content {
 		switch block.Type {
 		case "text":
-			turn.mu.Lock()
-			streamed := turn.streamedText[index]
-			turn.mu.Unlock()
-			if remainder := unstreamedRemainder(block.Text, streamed); remainder != "" {
+			remainder, consumed := streamedBlockRemainder(block.Text, "text", streamed, streamPosition)
+			if consumed {
+				streamPosition++
+			}
+			if remainder != "" {
 				if err := s.sendAgentText(ctx, message.UUID, remainder, false); err != nil {
 					return err
 				}
 			}
 		case "thinking":
-			turn.mu.Lock()
-			streamed := turn.streamedThinking[index]
-			turn.mu.Unlock()
-			if remainder := unstreamedRemainder(block.Thinking, streamed); remainder != "" {
+			remainder, consumed := streamedBlockRemainder(block.Thinking, "thinking", streamed, streamPosition)
+			if consumed {
+				streamPosition++
+			}
+			if remainder != "" {
 				if err := s.sendAgentText(ctx, message.UUID, remainder, true); err != nil {
 					return err
 				}
@@ -159,6 +210,53 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 		}
 	}
 	return nil
+}
+
+// streamedBlockOwner 把顶层与不同子代理消息映射到互不污染的去重槽位。
+func streamedBlockOwner(parentToolUseID *string) string {
+	if parentToolUseID == nil {
+		return ""
+	}
+	return *parentToolUseID
+}
+
+// recordStreamedBlock 按规则合并同一原始 index/type 的连续增量。
+func recordStreamedBlock(
+	blocks map[string][]streamedContentBlock,
+	owner string,
+	index int,
+	kind string,
+	text string,
+) {
+	if text == "" {
+		return
+	}
+	owned := blocks[owner]
+	if len(owned) > 0 && owned[len(owned)-1].index == index && owned[len(owned)-1].kind == kind {
+		owned[len(owned)-1].text += text
+		blocks[owner] = owned
+		return
+	}
+	blocks[owner] = append(owned, streamedContentBlock{index: index, kind: kind, text: text})
+}
+
+// streamedBlockRemainder 按聚合消息的文档顺序匹配流式块，并只返回未发送尾部。
+func streamedBlockRemainder(
+	assembled string,
+	kind string,
+	streamed []streamedContentBlock,
+	position int,
+) (string, bool) {
+	if assembled == "" {
+		return "", false
+	}
+	if position >= len(streamed) || streamed[position].kind != kind || streamed[position].text == "" {
+		return assembled, false
+	}
+	if !strings.HasPrefix(assembled, streamed[position].text) {
+		return assembled, false
+	}
+	return strings.TrimPrefix(assembled, streamed[position].text), true
 }
 
 // handleUser 匹配 prompt/steering echo，并完成工具结果。
@@ -206,7 +304,10 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
 		return nil
 	}
-	response, err := promptResponseFromResult(message)
+	turn.mu.Lock()
+	assistantError := turn.assistantError
+	turn.mu.Unlock()
+	response, err := promptResponseFromResult(message, assistantError)
 	turn.mu.Lock()
 	turn.gotResult = true
 	cancelled := turn.cancelled
@@ -216,6 +317,12 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 		turn.steeredResult = &copy
 	}
 	turn.mu.Unlock()
+	if !steered {
+		// Claude 的每个非 steering result 后都会发送无 Turn ID 的 idle；先记账，避免它误结算下一轮。
+		s.mu.Lock()
+		s.owedTrailingIdles++
+		s.mu.Unlock()
+	}
 	if cancelled {
 		turn.drain()
 		return nil
@@ -225,7 +332,8 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 		turn.drain()
 		return nil
 	}
-	updateErr := s.sendUsageUpdate(ctx, message.Usage, contextWindow(message.ModelUsage))
+	s.updateContextWindowFromResult(turn, message.ModelUsage)
+	updateErr := s.sendUsageUpdate(ctx, turn, true)
 	if steered {
 		return updateErr
 	}
@@ -234,11 +342,21 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 	return updateErr
 }
 
-// handleSystem 使用 idle 作为缺失 result 的终止保护，并完成 steering 周期。
-func (s *claudeSession) handleSystem(_ context.Context, message *protocol.SystemMessage) error {
+// handleSystem 同步动态命令，并使用 idle 作为缺失 result 的终止保护。
+func (s *claudeSession) handleSystem(ctx context.Context, message *protocol.SystemMessage) error {
+	if message.Subtype == "commands_changed" {
+		return s.updateAvailableCommands(ctx, message.Commands)
+	}
 	if message.Subtype != "session_state_changed" || message.State != "idle" {
 		return nil
 	}
+	s.mu.Lock()
+	if s.owedTrailingIdles > 0 {
+		s.owedTrailingIdles--
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
 	turn := s.activeTurn()
 	if turn == nil {
 		return nil
@@ -343,17 +461,6 @@ func (s *claudeSession) sendAgentText(ctx context.Context, messageID, text strin
 	return s.agent.sendUpdate(ctx, s.id, update)
 }
 
-// sendUsageUpdate 发布当前消息可确定的 token 与上下文窗口。
-func (s *claudeSession) sendUsageUpdate(ctx context.Context, usage protocol.Usage, window int64) error {
-	used := usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
-	if used == 0 || window <= 0 {
-		return nil
-	}
-	return s.agent.sendUpdate(ctx, s.id, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
-		Used: boundedInt(used), Size: boundedInt(window),
-	}})
-}
-
 // startTool 幂等发布工具开始；重复来源只刷新缓存而不重复创建。
 func (s *claudeSession) startTool(ctx context.Context, block protocol.ContentBlock) error {
 	if block.ID == "" {
@@ -371,7 +478,7 @@ func (s *claudeSession) startTool(ctx context.Context, block protocol.ContentBlo
 	tool := &toolState{ID: block.ID, Name: block.Name, Input: input}
 	s.tools[block.ID] = tool
 	s.mu.Unlock()
-	info := toolInfoFromToolUse(block.Name, input)
+	info := toolInfoFromToolUse(block.Name, input, s.cwd, claudeUserHomeDirectory(s.agent.environment))
 	rawInput := input
 	if info.RawInput != nil {
 		rawInput = info.RawInput
@@ -427,7 +534,7 @@ func (s *claudeSession) completeTool(
 		acp.WithUpdateRawOutput(rawOutput),
 	}
 	if !block.IsError && (tool.Name == "Edit" || tool.Name == "Write") {
-		// Upstream 由 PostToolUse structuredPatch 修正乐观 diff；CLI 直接携带同形结果时等价处理。
+		// 由 PostToolUse structuredPatch 修正乐观 diff；CLI 直接携带同形结果时等价处理。
 		diffContent, locations := toolDiffUpdateFromResult(toolUseResult)
 		if len(diffContent) > 0 {
 			options = append(
@@ -447,7 +554,10 @@ func (s *claudeSession) completeTool(
 }
 
 // promptResponseFromResult 转换 stop reason 与本轮 token 用量。
-func promptResponseFromResult(message *protocol.ResultMessage) (acp.PromptResponse, error) {
+func promptResponseFromResult(
+	message *protocol.ResultMessage,
+	assistantError string,
+) (acp.PromptResponse, error) {
 	stopReason := acp.StopReasonEndTurn
 	if message.StopReason != nil {
 		switch *message.StopReason {
@@ -457,15 +567,17 @@ func promptResponseFromResult(message *protocol.ResultMessage) (acp.PromptRespon
 			stopReason = acp.StopReasonRefusal
 		}
 	}
-	switch message.Subtype {
-	case "error_max_turns":
-		stopReason = acp.StopReasonMaxTurnRequests
-	case "error_during_execution", "error_max_budget_usd", "error_max_structured_output_retries":
-		detail := strings.Join(message.Errors, "; ")
-		if detail == "" {
-			detail = message.Subtype
+	if stopReason != acp.StopReasonMaxTokens && stopReason != acp.StopReasonRefusal {
+		if message.Subtype == "success" && strings.Contains(message.Result, "Please run /login") {
+			return acp.PromptResponse{}, acp.NewAuthRequired(claudeErrorKindData("authentication_failed"))
 		}
-		return acp.PromptResponse{}, fmt.Errorf("Claude turn failed: %s", detail)
+		if message.IsError {
+			return acp.PromptResponse{}, claudeResultRequestError(message, assistantError)
+		}
+		switch message.Subtype {
+		case "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
+			stopReason = acp.StopReasonMaxTurnRequests
+		}
 	}
 	usage := acp.Usage{
 		InputTokens:       boundedInt(message.Usage.InputTokens),
@@ -473,39 +585,35 @@ func promptResponseFromResult(message *protocol.ResultMessage) (acp.PromptRespon
 		CachedReadTokens:  intPointer(message.Usage.CacheReadInputTokens),
 		CachedWriteTokens: intPointer(message.Usage.CacheCreationInputTokens),
 	}
-	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-	if usage.CachedReadTokens != nil {
-		usage.TotalTokens += *usage.CachedReadTokens
-	}
-	if usage.CachedWriteTokens != nil {
-		usage.TotalTokens += *usage.CachedWriteTokens
-	}
+	usage.TotalTokens = boundedInt(totalClaudeUsage(message.Usage))
 	return acp.PromptResponse{StopReason: stopReason, Usage: &usage}, nil
 }
 
-// unstreamedRemainder 去掉组装消息中已经实时发送的前缀。
-func unstreamedRemainder(assembled, streamed string) string {
-	if streamed == "" {
-		return assembled
+// claudeResultRequestError 把 is_error 结果转换为 ACP InternalError。
+func claudeResultRequestError(
+	message *protocol.ResultMessage,
+	assistantError string,
+) *acp.RequestError {
+	detail := strings.TrimSpace(message.Result)
+	if detail == "" {
+		detail = strings.Join(message.Errors, "; ")
 	}
-	if strings.HasPrefix(assembled, streamed) {
-		return strings.TrimPrefix(assembled, streamed)
+	if detail == "" {
+		detail = message.Subtype
 	}
-	if strings.HasPrefix(streamed, assembled) {
-		return ""
+	return &acp.RequestError{
+		Code:    -32603,
+		Message: detail,
+		Data:    claudeErrorKindData(assistantError),
 	}
-	return assembled
 }
 
-// contextWindow 返回 model usage 中最大的上下文窗口。
-func contextWindow(models map[string]protocol.ModelUsage) int64 {
-	var result int64
-	for _, model := range models {
-		if model.ContextWindow > result {
-			result = model.ContextWindow
-		}
+// claudeErrorKindData 复用开放 errorKind 扩展，不引入产品失败码。
+func claudeErrorKindData(errorKind string) any {
+	if errorKind == "" {
+		return nil
 	}
-	return result
+	return map[string]any{"errorKind": errorKind}
 }
 
 // boundedInt 把 wire int64 安全收窄到当前平台 int。

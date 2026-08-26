@@ -136,7 +136,7 @@ func (r *eventRouter) Handle(ctx context.Context, notification protocol.ServerNo
 	}
 }
 
-// ignoredCodexNotification 标识 upstream 明确忽略且不应作为未知能力告警的方法。
+// ignoredCodexNotification 标识明确忽略且不应作为未知能力告警的方法。
 func ignoredCodexNotification(method string) bool {
 	return method == "hook/started" || method == "hook/completed"
 }

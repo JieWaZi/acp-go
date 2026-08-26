@@ -24,8 +24,8 @@ func TestSessionConfigurationAdvertisesBypassPermissions(t *testing.T) {
 	t.Parallel()
 
 	configuration := newSessionConfiguration(
-		protocol.SystemInitMessage{PermissionMode: "default"},
 		protocol.InitializeControlResponse{},
+		"default",
 		true,
 	)
 	state := configuration.modeState()
@@ -52,12 +52,25 @@ func TestSessionConfigurationClampsUnavailableInitialMode(t *testing.T) {
 	t.Parallel()
 
 	configuration := newSessionConfiguration(
-		protocol.SystemInitMessage{PermissionMode: "bypassPermissions"},
 		protocol.InitializeControlResponse{},
+		"bypassPermissions",
 		false,
 	)
 	if configuration.mode != "default" {
 		t.Fatalf("mode = %q", configuration.mode)
+	}
+}
+
+// TestSessionConfigurationUsesInitializeDefaultModel 锁定 upstream 的首个模型即新 Session 默认模型语义。
+func TestSessionConfigurationUsesInitializeDefaultModel(t *testing.T) {
+	t.Parallel()
+
+	configuration := newSessionConfiguration(protocol.InitializeControlResponse{
+		Models:        []protocol.ModelInfo{{Value: "default"}, {Value: "sonnet"}},
+		FastModeState: "on",
+	}, "default", false)
+	if configuration.model != "default" || !configuration.fast {
+		t.Fatalf("configuration = %#v", configuration)
 	}
 }
 

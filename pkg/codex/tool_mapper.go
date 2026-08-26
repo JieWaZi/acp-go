@@ -394,7 +394,7 @@ func mapMCPProgress(params protocol.MCPToolCallProgressNotification) acp.Session
 	return update
 }
 
-// mapFileStarted 参考 Codex ACP upstream，把可验证的文件变更转换为标准 ACP diff。
+// mapFileStarted 把可验证的文件变更转换为标准 ACP diff。
 func mapFileStarted(item protocol.ThreadItem) (acp.SessionUpdate, error) {
 	status, err := mapToolStatus(item.Status)
 	if err != nil {

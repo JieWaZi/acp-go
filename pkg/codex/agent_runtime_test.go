@@ -140,10 +140,36 @@ func TestAgentNewAndLoadSessionUseThreadFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载 session 失败: %v", err)
 	}
-	if got := rpc.calls; len(got) != 6 || got[1] != protocol.MethodThreadStart ||
-		got[2] != protocol.MethodModelList || got[3] != protocol.MethodThreadResume ||
-		got[4] != protocol.MethodThreadRead || got[5] != protocol.MethodModelList {
+	if got := rpc.calls; len(got) != 8 || got[1] != protocol.MethodAccountRead ||
+		got[2] != protocol.MethodThreadStart || got[3] != protocol.MethodModelList ||
+		got[4] != protocol.MethodAccountRead || got[5] != protocol.MethodThreadResume ||
+		got[6] != protocol.MethodThreadRead || got[7] != protocol.MethodModelList {
 		t.Fatalf("请求顺序为 %v", got)
+	}
+}
+
+// TestAgentNewSessionRequiresAuthenticationBeforeThreadStart 验证固定 upstream 的前置鉴权检查。
+func TestAgentNewSessionRequiresAuthenticationBeforeThreadStart(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	rpc.accountResponse = &protocol.GetAccountResponse{RequiresOpenaiAuth: true}
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, _ any) error {
+		if request.Method() == protocol.MethodInitialize {
+			return nil
+		}
+		return errors.New("unexpected call: " + request.Method())
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+
+	_, err := agent.NewSession(context.Background(), acp.NewSessionRequest{
+		Cwd: "/tmp", McpServers: []acp.McpServer{},
+	})
+	var requestErr *acp.RequestError
+	if !errors.As(err, &requestErr) || requestErr.Code != acp.NewAuthRequired(nil).Code {
+		t.Fatalf("NewSession() error = %v，期望 AuthRequired", err)
+	}
+	if got := rpc.calls; len(got) != 2 || got[1] != protocol.MethodAccountRead {
+		t.Fatalf("鉴权失败调用顺序为 %v", got)
 	}
 }
 

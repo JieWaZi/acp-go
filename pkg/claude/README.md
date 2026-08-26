@@ -27,6 +27,9 @@
 - 多轮 FIFO Prompt、Text、Image、Embedded Resource 和 Resource Link。
 - Prompt cancel 与 `_session/steering`；空闲 Session 可启动 detached Turn 或要求客户端改用 Prompt。
 - Assistant、Tool Start/Progress/Result、Task Plan 与 Usage 更新；Task、文件、搜索、Web、Skill 和 AskUserQuestion 按 upstream 生成结构化 ACP 工具信息。
+- Agent SDK `assistant.error` 与 `result.is_error` 按 upstream 转为 ACP Provider 错误，保留开放 `errorKind`；login 使用标准 AuthRequired，不把 API Error 当成功回复。
+- New、Load、Resume 后发布 Claude SDK 权威 Slash Command，并在 `commands_changed` 时通过 ACP 标准通知完整替换；过滤本地终端命令并保留 MCP 名称和参数提示。
+- 全部 ToolCall 携带 upstream `claudeCode.toolName`；Skill 额外携带名称和可定位时的项目、目录作用域、插件或用户级 `SKILL.md` 路径。
 - Edit/Write 开始态标准 ACP diff，以及唯一 tool result 携带 `filePath/structuredPatch` 时的多 hunk 完成态 diff 和 locations 修正。
 - `can_use_tool` 权限请求和安全拒绝。
 - `AskUserQuestion` Form Elicitation，支持单选、多选、每题自定义答案和取消。
@@ -109,6 +112,8 @@ go test ./pkg/claude/protocol -count=1
 - 取消后的 Session 必须观察到旧 Turn 的结束边界，缺少必要尾帧时会关闭该 Session。
 - 历史回放只读取受限大小的本地 transcript，并忽略无法安全表达的记录。
 - 当前 CLI 边界不注入通用 PostToolUse hook；Edit/Write 没有结构化结果时保留开始态 diff，不用普通结果文本覆盖。
+- Context Usage 使用顶层 assistant 的 input、output、cache read 与 cache creation 累计快照；PromptResponse Usage 单独表示当前 Prompt 的 Turn 总量，权威模型窗口由 result.modelUsage 确认并在当前 Agent 内缓存。
+- Slash Command 与 Skill 元数据直接跟随固定 Claude Agent ACP/Agent SDK upstream；Adapter 不维护产品层命令或 Skill 规则。
 - 本地 Session 缺失统一返回 ACP `ResourceNotFound`（`-32002`），恢复时已知的 CLI “conversation not found” 也映射为同一错误。
 - 版本探测只提供诊断，不作为硬性兼容门槛。
 

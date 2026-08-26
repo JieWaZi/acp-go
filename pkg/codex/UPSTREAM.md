@@ -90,7 +90,7 @@ go run ./tools/protocolgen --check
 | `src/CodexApprovalHandler.ts`、`ApprovalOptionId.ts` | `pkg/codex/approval.go` | 三类 permission request/response、common permission meta、amendment option、全异常 fail closed 与 generation 双检 |
 | `src/AgentMode.ts`、`ModelConfigOption.ts`、`CodexAcpClient.ts` 的 model/session config helpers | `pkg/codex/config.go` | read-only/agent/full-access 权限边界、model/reasoning option、未知选择失败 |
 | `src/CodexAcpClient.ts` 的 `buildPromptItems`、`imageDataUrl`、`formatUriAsLink` | `pkg/codex/content.go` | ACP SDK Text/Image/Resource 到生成协议 input；Audio 按 V1 明确拒绝 |
-| `src/CodexAuthMethod.ts`、`CodexAcpClient.ts` 的 `authenticateWithApiKey`、`authenticateWithChatGpt`、`awaitNextLoginCompleted` | `pkg/codex/auth.go` | 仅 API Key/ChatGPT、完成通知先订阅、取消 login、secret-safe 错误边界 |
+| `src/CodexAuthMethod.ts`、`CodexAcpClient.ts` 的 `authenticateWithApiKey`、`authenticateWithChatGpt`、`awaitNextLoginCompleted`、`authRequired` 与 `CodexAcpServer.checkAuthorization` | `pkg/codex/auth.go`、`agent.go` | 仅 API Key/ChatGPT、完成通知先订阅、取消 login、secret-safe 错误边界；Session new/resume/load 前以 `account/read(refreshToken=false)` 返回标准 ACP `AuthRequired` |
 
 使用 Codex 0.148.0 `generate-ts` 重新生成后，以下固定 clone 文件均做过逐字节对照且完全一致：`ClientRequest.ts`、`ServerRequest.ts`、`ServerNotification.ts`、`ThreadStartParams.ts`、`ThreadResumeParams.ts`、`TurnStartParams.ts`、`TurnSteerParams.ts`、`TurnInterruptParams.ts` 以及三类 approval Params。
 

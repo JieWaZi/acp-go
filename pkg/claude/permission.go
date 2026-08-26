@@ -44,7 +44,12 @@ func (s *claudeSession) requestToolPermission(ctx context.Context, request proto
 	if request.ToolName == "AskUserQuestion" {
 		return s.requestAskUserQuestion(ctx, request, active)
 	}
-	info := toolInfoFromToolUse(request.ToolName, decodeJSONValue(request.Input))
+	info := toolInfoFromToolUse(
+		request.ToolName,
+		decodeJSONValue(request.Input),
+		s.cwd,
+		claudeUserHomeDirectory(s.agent.environment),
+	)
 	if request.Title != "" {
 		info.Title = request.Title
 	}

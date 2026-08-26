@@ -641,6 +641,8 @@ func handleFakeCodexRequest(
 			return err
 		}
 		return writeFakeNotification(encoder, codexprotocol.MethodAccountLoginCompleted, `{"success":true}`)
+	case codexprotocol.MethodAccountRead:
+		return writeFakeResult(encoder, id, `{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}`)
 	case codexprotocol.MethodThreadStart:
 		return writeFakeResult(encoder, id, `{"approvalPolicy":"on-request","approvalsReviewer":"user","cwd":"/workspace","model":"fast-model","modelProvider":"openai","reasoningEffort":"medium","sandbox":{"type":"workspaceWrite"},"thread":{"cliVersion":"0.148.0","createdAt":1,"cwd":"/workspace","ephemeral":false,"id":"e2e-thread","modelProvider":"openai","preview":"","sessionId":"e2e-session","source":{},"status":{"type":"idle"},"turns":[],"updatedAt":1}}`)
 	case codexprotocol.MethodModelList:

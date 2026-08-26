@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -143,12 +144,30 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 		!initialized.AgentCapabilities.LoadSession || initialized.AgentCapabilities.Auth.Logout != nil {
 		t.Fatalf("Initialize() = %#v", initialized)
 	}
-	created, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}})
+	workspace := t.TempDir()
+	created, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: workspace, McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if created.SessionId == "" || len(created.ConfigOptions) != 4 || created.Modes == nil {
 		t.Fatalf("NewSession() = %#v", created)
+	}
+	initialCommands := waitForAvailableCommandUpdates(t, client, 1)
+	if len(initialCommands) != 3 || initialCommands[0].Name != "diagnosing-bugs" ||
+		initialCommands[1].Name != "doctor" || initialCommands[2].Name != "mcp:github" {
+		t.Fatalf("initial available commands = %#v", initialCommands)
+	}
+
+	commandResponse, err := agent.Prompt(ctx, acp.PromptRequest{
+		SessionId: created.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("commands-change")},
+	})
+	if err != nil || commandResponse.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("commands Prompt() = %#v, %v", commandResponse, err)
+	}
+	// 首轮 system/init 先过滤终端命令，commands_changed 随后发布动态目录。
+	dynamicCommands := waitForAvailableCommandUpdates(t, client, 3)
+	if len(dynamicCommands) != 1 || dynamicCommands[0].Name != "new-skill" {
+		t.Fatalf("dynamic available commands = %#v", dynamicCommands)
 	}
 
 	response, err := agent.Prompt(ctx, acp.PromptRequest{
@@ -162,14 +181,16 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 
 	steeredPrompt := make(chan acp.PromptResponse, 1)
 	steeredError := make(chan error, 1)
+	steeredMessageID := "wait-steer-message"
 	go func() {
 		result, promptError := agent.Prompt(ctx, acp.PromptRequest{
-			SessionId: created.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("wait-steer")},
+			SessionId: created.SessionId, MessageId: &steeredMessageID,
+			Prompt: []acp.ContentBlock{acp.TextBlock("wait-steer")},
 		})
 		steeredPrompt <- result
 		steeredError <- promptError
 	}()
-	waitForActiveTurn(t, agent, string(created.SessionId))
+	waitForActiveTurn(t, agent, string(created.SessionId), steeredMessageID)
 	steeringResult, err := agent.HandleExtensionMethod(ctx, "_session/steering", json.RawMessage(fmt.Sprintf(
 		`{"sessionId":%q,"prompt":[{"type":"text","text":"follow up"}]}`,
 		created.SessionId,
@@ -227,14 +248,16 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 
 	promptDone := make(chan acp.PromptResponse, 1)
 	promptErr := make(chan error, 1)
+	cancelMessageID := "wait-cancel-message"
 	go func() {
 		result, promptError := agent.Prompt(ctx, acp.PromptRequest{
-			SessionId: created.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("wait")},
+			SessionId: created.SessionId, MessageId: &cancelMessageID,
+			Prompt: []acp.ContentBlock{acp.TextBlock("wait")},
 		})
 		promptDone <- result
 		promptErr <- promptError
 	}()
-	waitForActiveTurn(t, agent, string(created.SessionId))
+	waitForActiveTurn(t, agent, string(created.SessionId), cancelMessageID)
 	if err := agent.Cancel(ctx, acp.CancelNotification{SessionId: created.SessionId}); err != nil {
 		t.Fatal(err)
 	}
@@ -246,6 +269,146 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 	}
 	if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestClaudeAgentUsageSeparatesContextSnapshotFromTurnTotals 锁住 upstream 的两类 Usage 语义。
+func TestClaudeAgentUsageSeparatesContextSnapshotFromTurnTotals(t *testing.T) {
+	t.Setenv(fakeClaudeProcessEnv, "1")
+	executablePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	agent, err := NewAgent(ctx, Config{
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ClaudePath: executablePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = agent.Close(context.Background()) })
+	client := &recordingClaudeClient{}
+	agent.connectionMu.Lock()
+	agent.updater = client
+	agent.connectionMu.Unlock()
+	if _, err = agent.Initialize(ctx, acp.InitializeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := agent.NewSession(ctx, acp.NewSessionRequest{
+		Cwd:        t.TempDir(),
+		McpServers: []acp.McpServer{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := agent.Prompt(ctx, acp.PromptRequest{
+		SessionId: created.SessionId,
+		Prompt:    []acp.ContentBlock{acp.TextBlock("usage-cumulative")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Usage == nil || response.Usage.InputTokens != 10 ||
+		response.Usage.OutputTokens != 5 || response.Usage.TotalTokens != 18 {
+		t.Fatalf("PromptResponse Usage = %#v", response.Usage)
+	}
+
+	updates, _ := client.snapshot()
+	usageUpdates := make([]acp.SessionUsageUpdate, 0, 3)
+	for _, notification := range updates {
+		if notification.Update.UsageUpdate != nil {
+			usageUpdates = append(usageUpdates, *notification.Update.UsageUpdate)
+		}
+	}
+	if len(usageUpdates) != 3 {
+		t.Fatalf("Usage updates = %#v", usageUpdates)
+	}
+	if usageUpdates[0].Used != 30_184 ||
+		usageUpdates[0].Size != boundedInt(extendedClaudeContextWindow) {
+		t.Fatalf("message_start Usage = %#v", usageUpdates[0])
+	}
+	if usageUpdates[1].Used != 30_190 ||
+		usageUpdates[1].Size != boundedInt(extendedClaudeContextWindow) {
+		t.Fatalf("message_delta Usage = %#v", usageUpdates[1])
+	}
+	if usageUpdates[2].Used != 30_190 ||
+		usageUpdates[2].Size != boundedInt(extendedClaudeContextWindow) {
+		t.Fatalf("result Usage = %#v", usageUpdates[2])
+	}
+
+	session, ok := agent.sessions.get(string(created.SessionId))
+	if !ok {
+		t.Fatal("Claude Session 不存在")
+	}
+	session.mu.Lock()
+	window := session.contextWindowSize
+	authoritative := session.contextWindowAuthoritative
+	session.mu.Unlock()
+	if window != extendedClaudeContextWindow || !authoritative {
+		t.Fatalf("context window = %d authoritative=%v", window, authoritative)
+	}
+	if cached, ok := agent.cachedContextWindow("claude-opus-4-6-1m"); !ok || cached != extendedClaudeContextWindow {
+		t.Fatalf("cached context window = %d, %v", cached, ok)
+	}
+}
+
+// TestClaudeAgentPublishesCommandsAfterResumeAndLoad 锁定两类恢复入口的初始命令菜单。
+func TestClaudeAgentPublishesCommandsAfterResumeAndLoad(t *testing.T) {
+	t.Setenv(fakeClaudeProcessEnv, "1")
+	configDirectory := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDirectory)
+	projectDirectory := filepath.Join(configDirectory, "projects", "-workspace")
+	if err := os.MkdirAll(projectDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDirectory, "load-command-session.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executablePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	agent, err := NewAgent(ctx, Config{
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ClaudePath:  executablePath,
+		Environment: os.Environ(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = agent.Close(context.Background()) })
+	client := &recordingClaudeClient{}
+	agent.connectionMu.Lock()
+	agent.updater = client
+	agent.connectionMu.Unlock()
+	if _, err := agent.Initialize(ctx, acp.InitializeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	resumeID := acp.SessionId("resume-command-session")
+	if _, err := agent.ResumeSession(ctx, acp.ResumeSessionRequest{
+		SessionId: resumeID, Cwd: workspace, McpServers: []acp.McpServer{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if commands := waitForAvailableCommandUpdates(t, client, 1); len(commands) != 3 {
+		t.Fatalf("resume commands = %#v", commands)
+	}
+	if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: resumeID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.LoadSession(ctx, acp.LoadSessionRequest{
+		SessionId: "load-command-session", Cwd: workspace, McpServers: []acp.McpServer{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if commands := waitForAvailableCommandUpdates(t, client, 2); len(commands) != 3 {
+		t.Fatalf("load commands = %#v", commands)
 	}
 }
 
@@ -276,14 +439,16 @@ func TestClaudeAgentCancelUnresponsiveInterrupt(t *testing.T) {
 	}
 	promptResult := make(chan acp.PromptResponse, 1)
 	promptError := make(chan error, 1)
+	unresponsiveMessageID := "wait-unresponsive-message"
 	go func() {
 		response, promptErr := agent.Prompt(context.Background(), acp.PromptRequest{
-			SessionId: created.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("wait-no-interrupt")},
+			SessionId: created.SessionId, MessageId: &unresponsiveMessageID,
+			Prompt: []acp.ContentBlock{acp.TextBlock("wait-no-interrupt")},
 		})
 		promptResult <- response
 		promptError <- promptErr
 	}()
-	waitForActiveTurn(t, agent, string(created.SessionId))
+	waitForActiveTurn(t, agent, string(created.SessionId), unresponsiveMessageID)
 
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	err = agent.Cancel(cancelCtx, acp.CancelNotification{SessionId: created.SessionId})
@@ -300,6 +465,69 @@ func TestClaudeAgentCancelUnresponsiveInterrupt(t *testing.T) {
 	session, ok := agent.sessions.get(string(created.SessionId))
 	if !ok || session.isOpen() {
 		t.Fatalf("Session 应在 interrupt 超时后关闭：exists=%v open=%v", ok, ok && session.isOpen())
+	}
+}
+
+// TestClaudeAgentCancelConcurrentCloseIsIdempotent 验证关闭 Session 不会把已完成取消误报为协议错误。
+func TestClaudeAgentCancelConcurrentCloseIsIdempotent(t *testing.T) {
+	t.Setenv(fakeClaudeProcessEnv, "1")
+	executablePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	agent, err := NewAgent(ctx, Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ClaudePath: executablePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = agent.Close(context.Background()) })
+	agent.idGenerator = func() (string, error) { return "delay-interrupt-session", nil }
+	agent.connectionMu.Lock()
+	agent.updater = &recordingClaudeClient{}
+	agent.connectionMu.Unlock()
+	if _, err := agent.Initialize(ctx, acp.InitializeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, ok := agent.sessions.get(string(created.SessionId))
+	if !ok {
+		t.Fatal("Claude Session 未安装")
+	}
+
+	promptResult := make(chan acp.PromptResponse, 1)
+	promptError := make(chan error, 1)
+	messageID := "wait-close-race-message"
+	go func() {
+		response, promptErr := agent.Prompt(ctx, acp.PromptRequest{
+			SessionId: created.SessionId, MessageId: &messageID,
+			Prompt: []acp.ContentBlock{acp.TextBlock("wait-close-race")},
+		})
+		promptResult <- response
+		promptError <- promptErr
+	}()
+	waitForActiveTurn(t, agent, string(created.SessionId), messageID)
+	cancelError := make(chan error, 1)
+	go func() {
+		cancelError <- agent.Cancel(ctx, acp.CancelNotification{SessionId: created.SessionId})
+	}()
+	waitForPendingClaudeControlCall(t, session)
+	if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: created.SessionId}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-cancelError; err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+	if response := <-promptResult; response.StopReason != acp.StopReasonCancelled {
+		t.Fatalf("Prompt() = %#v", response)
+	}
+	if err := <-promptError; err != nil {
+		t.Fatalf("Prompt() error = %v", err)
 	}
 }
 
@@ -330,16 +558,62 @@ func assertRuntimeUpdates(t *testing.T, updates []acp.SessionNotification) {
 }
 
 // waitForActiveTurn 等待 worker 安装活动 turn，不依赖固定 sleep。
-func waitForActiveTurn(t *testing.T, agent *Agent, sessionID string) {
+func waitForActiveTurn(t *testing.T, agent *Agent, sessionID string, turnID string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if session, ok := agent.sessions.get(sessionID); ok && session.activeTurn() != nil {
-			return
+		if session, ok := agent.sessions.get(sessionID); ok {
+			if active := session.activeTurn(); active != nil && active.id == turnID {
+				return
+			}
 		}
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("等待活动 turn 超时")
+}
+
+// waitForPendingClaudeControlCall 等待 cancel interrupt 已写入并开始等待响应。
+func waitForPendingClaudeControlCall(t *testing.T, session *claudeSession) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		session.transport.pendingMu.Lock()
+		pending := len(session.transport.pending)
+		session.transport.pendingMu.Unlock()
+		if pending > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("等待 Claude control request 超时")
+}
+
+// waitForAvailableCommandUpdates 等待指定数量的完整命令更新并返回最后一份列表。
+func waitForAvailableCommandUpdates(
+	t *testing.T,
+	client *recordingClaudeClient,
+	want int,
+) []acp.AvailableCommand {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.mu.Lock()
+		count := 0
+		var commands []acp.AvailableCommand
+		for _, notification := range client.updates {
+			if update := notification.Update.AvailableCommandsUpdate; update != nil {
+				count++
+				commands = append([]acp.AvailableCommand(nil), update.AvailableCommands...)
+			}
+		}
+		client.mu.Unlock()
+		if count >= want {
+			return commands
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("等待 %d 条 available_commands_update 超时", want)
+	return nil
 }
 
 // runFakeClaudeProcess 实现测试所需的最小 stream-json/control CLI。
@@ -364,6 +638,7 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 	permissionPending := false
 	pendingToolID := ""
 	ignoreInterrupt := strings.Contains(sessionID, "ignore-interrupt")
+	delayInterrupt := strings.Contains(sessionID, "delay-interrupt")
 	for scanner.Scan() {
 		var header struct {
 			// Type 是输入消息判别值。
@@ -386,9 +661,18 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 			if control.Subtype == protocol.ControlInterrupt && ignoreInterrupt {
 				continue
 			}
+			if control.Subtype == protocol.ControlInterrupt && delayInterrupt {
+				time.Sleep(time.Second)
+			}
 			response := map[string]any{}
 			if control.Subtype == protocol.ControlInitialize {
 				response = map[string]any{
+					"commands": []map[string]any{
+						{"name": "diagnosing-bugs", "description": "Diagnose hard bugs", "argumentHint": "<symptom>"},
+						{"name": "doctor", "description": "Terminal diagnostics"},
+						{"name": "clear", "description": "Clear terminal state"},
+						{"name": "github (MCP)", "description": "Use GitHub MCP"},
+					},
 					"models": []map[string]any{{
 						"value": "sonnet", "displayName": "Sonnet", "description": "Balanced",
 						"supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high"},
@@ -400,13 +684,6 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 			_ = encoder.Encode(map[string]any{"type": "control_response", "response": map[string]any{
 				"subtype": "success", "request_id": header.RequestID, "response": response,
 			}})
-			if control.Subtype == protocol.ControlInitialize {
-				_ = encoder.Encode(map[string]any{
-					"type": "system", "subtype": "init", "session_id": sessionID, "uuid": "init-1",
-					"claude_code_version": "2.1.232", "cwd": "/tmp", "model": "sonnet",
-					"permissionMode": "default", "tools": []string{"Read", "Bash"}, "mcp_servers": []any{},
-				})
-			}
 			if control.Subtype == protocol.ControlInterrupt && !ignoreInterrupt {
 				emitFakeResult(encoder, sessionID, "cancel-result")
 			}
@@ -416,9 +693,26 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 				continue
 			}
 			_ = encoder.Encode(map[string]any{
+				"type": "system", "subtype": "init", "session_id": sessionID, "uuid": "init-1",
+				"claude_code_version": "2.1.232", "cwd": "/tmp", "model": "sonnet",
+				"permissionMode": "default", "tools": []string{"Read", "Bash"}, "mcp_servers": []any{},
+				"terminal_slash_commands": []string{"doctor"},
+			})
+			_ = encoder.Encode(map[string]any{
 				"type": "user", "message": message.Message, "parent_tool_use_id": nil,
 				"uuid": message.UUID, "session_id": sessionID,
 			})
+			if strings.Contains(string(message.Message.Content), "commands-change") {
+				_ = encoder.Encode(map[string]any{
+					"type": "system", "subtype": "commands_changed", "session_id": sessionID, "uuid": "commands-2",
+					"commands": []map[string]any{
+						{"name": "new-skill", "description": "Newly discovered skill"},
+						{"name": "doctor", "description": "Terminal diagnostics"},
+					},
+				})
+				emitFakeResult(encoder, sessionID, "commands-result")
+				continue
+			}
 			if strings.Contains(string(message.Message.Content), "wait") && message.Priority == "" {
 				continue
 			}
@@ -455,6 +749,10 @@ func runFakeClaudeProcess(args []string, input io.Reader, output io.Writer) int 
 						"tool_use_id": "question-tool",
 					},
 				})
+				continue
+			}
+			if strings.Contains(string(message.Message.Content), "usage-cumulative") {
+				emitFakeUsageTurn(encoder, sessionID, message.UUID)
 				continue
 			}
 			emitFakeTurn(encoder, sessionID, message.UUID)
@@ -503,7 +801,12 @@ func emitFakeTurn(encoder *json.Encoder, sessionID, messageID string) {
 	})
 	_ = encoder.Encode(map[string]any{
 		"type": "assistant", "message": map[string]any{
-			"id": "assistant-message", "role": "assistant", "content": []map[string]any{
+			"id": "assistant-message", "role": "assistant", "model": "sonnet",
+			"usage": map[string]any{
+				"input_tokens": 10, "output_tokens": 5,
+				"cache_read_input_tokens": 2, "cache_creation_input_tokens": 1,
+			},
+			"content": []map[string]any{
 				{"type": "text", "text": "answer"},
 				{"type": "tool_use", "id": "tool-1", "name": "Read", "input": map[string]any{"file_path": "/tmp/a"}},
 			},
@@ -527,6 +830,53 @@ func emitFakeTurn(encoder *json.Encoder, sessionID, messageID string) {
 		"status": "in_progress", "uuid": "task", "session_id": sessionID,
 	})
 	emitFakeResult(encoder, sessionID, messageID+"-result")
+}
+
+// emitFakeUsageTurn 输出 message_delta 累计快照与不同的 result Turn Usage。
+func emitFakeUsageTurn(encoder *json.Encoder, sessionID, messageID string) {
+	model := "claude-opus-4-6-1m"
+	_ = encoder.Encode(map[string]any{
+		"type": "stream_event",
+		"event": map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "usage-message", "role": "assistant", "model": model, "content": []any{},
+				"usage": map[string]any{
+					"input_tokens": 29_953, "output_tokens": 1,
+					"cache_read_input_tokens": 200, "cache_creation_input_tokens": 30,
+				},
+			},
+		},
+		"parent_tool_use_id": nil, "uuid": "usage-start", "session_id": sessionID,
+	})
+	_ = encoder.Encode(map[string]any{
+		"type": "stream_event",
+		"event": map[string]any{
+			"type":  "message_delta",
+			"usage": map[string]any{"output_tokens": 7},
+		},
+		"parent_tool_use_id": nil, "uuid": "usage-delta", "session_id": sessionID,
+	})
+	_ = encoder.Encode(map[string]any{
+		"type": "result", "subtype": "success", "session_id": sessionID,
+		"uuid": messageID + "-result", "is_error": false, "stop_reason": "end_turn",
+		"result": "answer",
+		"usage": map[string]any{
+			"input_tokens": 10, "output_tokens": 5,
+			"cache_read_input_tokens": 2, "cache_creation_input_tokens": 1,
+		},
+		"modelUsage": map[string]any{
+			model: map[string]any{
+				"inputTokens": 10, "outputTokens": 5,
+				"cacheReadInputTokens": 2, "cacheCreationInputTokens": 1,
+				"contextWindow": extendedClaudeContextWindow,
+			},
+		},
+	})
+	_ = encoder.Encode(map[string]any{
+		"type": "system", "subtype": "session_state_changed", "state": "idle",
+		"session_id": sessionID, "uuid": messageID + "-idle",
+	})
 }
 
 // emitFakeResult 输出成功 result 与 idle 边界。

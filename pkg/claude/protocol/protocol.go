@@ -128,8 +128,8 @@ type AnthropicMessage struct {
 	Content []ContentBlock `json:"content"`
 	// StopReason 保存可选的模型停止原因。
 	StopReason *string `json:"stop_reason,omitempty"`
-	// Usage 保留消息级开放用量结构。
-	Usage json.RawMessage `json:"usage,omitempty"`
+	// Usage 是当前 assistant 消息的累计上下文用量快照。
+	Usage *Usage `json:"usage,omitempty"`
 }
 
 // SystemInitMessage 是 CLI 启动后发出的 system/init 消息。
@@ -152,6 +152,8 @@ type SystemInitMessage struct {
 	PermissionMode string `json:"permissionMode"`
 	// Tools 是当前会话可用工具名。
 	Tools []string `json:"tools"`
+	// TerminalSlashCommands 是只适合 CLI 终端交互、不应出现在 ACP 菜单中的命令名。
+	TerminalSlashCommands []string `json:"terminal_slash_commands,omitempty"`
 	// MCPServers 是 CLI 报告的 MCP 状态。
 	MCPServers []MCPServerStatus `json:"mcp_servers"`
 	// Capabilities 是 CLI 支持的开放能力标识。
@@ -184,6 +186,8 @@ type SystemMessage struct {
 	Status json.RawMessage `json:"status,omitempty"`
 	// State 是 Session 状态变化后的新状态。
 	State string `json:"state,omitempty"`
+	// Commands 是 commands_changed 携带的完整权威命令列表。
+	Commands []SlashCommand `json:"commands,omitempty"`
 	// Data 保存完整 system 载荷供兼容处理。
 	Data json.RawMessage `json:"-"`
 }
@@ -286,6 +290,18 @@ type Usage struct {
 	CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
 }
 
+// UsageDelta 是 message_delta 中允许省略累计字段的上下文用量增量。
+type UsageDelta struct {
+	// InputTokens 是可选的累计普通输入 token 数。
+	InputTokens *int64 `json:"input_tokens,omitempty"`
+	// OutputTokens 是 Anthropic message_delta 保证提供的累计输出 token 数。
+	OutputTokens int64 `json:"output_tokens"`
+	// CacheCreationInputTokens 是可选的累计缓存写入 token 数。
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
+	// CacheReadInputTokens 是可选的累计缓存读取 token 数。
+	CacheReadInputTokens *int64 `json:"cache_read_input_tokens,omitempty"`
+}
+
 // ModelUsage 是 result.modelUsage 中单模型的累计用量。
 type ModelUsage struct {
 	// InputTokens 是该模型普通输入 token 数。
@@ -338,8 +354,8 @@ type StreamEvent struct {
 	ContentBlock *ContentBlock `json:"content_block,omitempty"`
 	// Delta 保存内容增量。
 	Delta *ContentBlock `json:"delta,omitempty"`
-	// Usage 保存 message_delta 的增量用量。
-	Usage *Usage `json:"usage,omitempty"`
+	// Usage 保存 message_delta 的可空累计用量字段。
+	Usage *UsageDelta `json:"usage,omitempty"`
 }
 
 // ToolProgressMessage 是 Claude 独立 tool progress 消息。
@@ -493,6 +509,8 @@ type InitializeControlRequest struct {
 
 // InitializeControlResponse 保存 Session 配置选择需要的初始化结果。
 type InitializeControlResponse struct {
+	// Commands 是初始化时 Claude SDK 报告的完整 Slash Command 列表。
+	Commands []SlashCommand `json:"commands"`
 	// Models 是当前账号与设置允许选择的模型。
 	Models []ModelInfo `json:"models"`
 	// OutputStyle 是当前输出风格。
@@ -503,6 +521,18 @@ type InitializeControlResponse struct {
 	FastModeState string `json:"fast_mode_state,omitempty"`
 	// FastModeDisabledReason 说明快速模式不可用原因。
 	FastModeDisabledReason string `json:"fast_mode_disabled_reason,omitempty"`
+}
+
+// SlashCommand 描述 Claude SDK 公开的一条可调用 Skill 或内置命令。
+type SlashCommand struct {
+	// Name 是不带前导斜杠的命令名。
+	Name string `json:"name"`
+	// Description 是命令的人类可读说明。
+	Description string `json:"description"`
+	// ArgumentHint 是参数占位提示；兼容对字符串数组的防御性处理。
+	ArgumentHint any `json:"argumentHint,omitempty"`
+	// Aliases 是解析到同一命令的备用名称。
+	Aliases []string `json:"aliases,omitempty"`
 }
 
 // ModelInfo 描述 CLI 当前允许选择的一个模型。

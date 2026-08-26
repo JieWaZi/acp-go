@@ -88,6 +88,10 @@ type Agent struct {
 	runtimeCancel context.CancelFunc
 	// sessions 按 Claude Session ID 保存独立进程状态。
 	sessions *claudeSessionStore
+	// contextWindowsMu 保护按模型缓存的权威上下文窗口。
+	contextWindowsMu sync.RWMutex
+	// contextWindows 保存当前 Agent 环境内已由 result.modelUsage 确认的模型窗口。
+	contextWindows map[string]int64
 	// openMu 串行化同一 ID 的恢复、替换和安装边界。
 	openMu sync.Mutex
 	// initializedMu 保护 initialized。
@@ -141,6 +145,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		runtimeCtx:             runtimeCtx,
 		runtimeCancel:          runtimeCancel,
 		sessions:               newClaudeSessionStore(),
+		contextWindows:         make(map[string]int64),
 		idGenerator:            generateUUID,
 	}, nil
 }
@@ -219,6 +224,7 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	a.scheduleAvailableCommandsUpdate(session.id)
 	return acp.NewSessionResponse{
 		SessionId: acp.SessionId(session.id), ConfigOptions: session.configOptions(), Modes: session.modeState(),
 	}, nil
@@ -236,6 +242,7 @@ func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequ
 	if err != nil {
 		return acp.ResumeSessionResponse{}, mapClaudeSessionOpenError(string(request.SessionId), err)
 	}
+	a.scheduleAvailableCommandsUpdate(session.id)
 	return acp.ResumeSessionResponse{ConfigOptions: session.configOptions(), Modes: session.modeState()}, nil
 }
 
@@ -259,6 +266,7 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 		}
 		return acp.LoadSessionResponse{}, err
 	}
+	a.scheduleAvailableCommandsUpdate(session.id)
 	return acp.LoadSessionResponse{ConfigOptions: session.configOptions(), Modes: session.modeState()}, nil
 }
 

@@ -335,8 +335,8 @@ func TestAgentRejectsMissingRequiredSessionModel(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "did not include a model") {
 		t.Fatalf("缺失 model 错误为 %v", err)
 	}
-	if got := rpc.calls; len(got) != 3 || got[1] != protocol.MethodThreadStart ||
-		got[2] != protocol.MethodThreadUnsubscribe {
+	if got := rpc.calls; len(got) != 4 || got[1] != protocol.MethodAccountRead ||
+		got[2] != protocol.MethodThreadStart || got[3] != protocol.MethodThreadUnsubscribe {
 		t.Fatalf("缺失 model 调用顺序为 %v", got)
 	}
 }
@@ -559,8 +559,8 @@ func TestAgentLoadHistoryFailureDoesNotLeaveInstalledSession(t *testing.T) {
 	if _, installed := agent.sessions.get("failed-history-thread"); installed {
 		t.Fatal("history callback 失败后仍留下已安装 session")
 	}
-	if got := rpc.calls; len(got) != 5 || got[3] != protocol.MethodModelList ||
-		got[4] != protocol.MethodThreadUnsubscribe {
+	if got := rpc.calls; len(got) != 6 || got[4] != protocol.MethodModelList ||
+		got[5] != protocol.MethodThreadUnsubscribe {
 		t.Fatalf("失败 load 调用顺序为 %v，期望最终 unsubscribe", got)
 	}
 }

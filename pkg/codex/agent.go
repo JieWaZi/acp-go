@@ -303,6 +303,19 @@ func (a *Agent) Authenticate(
 	return acp.AuthenticateResponse{}, nil
 }
 
+// checkAuthorization 在创建或恢复 Session 前复用 app-server 的无刷新账号检查。
+func (a *Agent) checkAuthorization(ctx context.Context) error {
+	refresh := false
+	account, err := a.client.AccountRead(ctx, protocol.GetAccountParams{RefreshToken: &refresh})
+	if err != nil {
+		return fmt.Errorf("checking Codex authentication: %w", err)
+	}
+	if account.RequiresOpenaiAuth && account.Account == nil {
+		return acp.NewAuthRequired(nil)
+	}
+	return nil
+}
+
 // Initialize 先完成唯一 app-server 握手，再声明真实可用的 session/prompt 能力。
 func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	terminalMode := resolveTerminalOutputMode(request.ClientCapabilities)
@@ -364,6 +377,9 @@ func (a *Agent) Logout(ctx context.Context, _ acp.LogoutRequest) (acp.LogoutResp
 // NewSession 把 ACP session/new 映射为 Codex thread/start 并安装 generation 状态。
 func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	if err := a.requireInitialized(); err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	if err := a.checkAuthorization(ctx); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
 	workspace, err := normalizeCodexWorkspace(request.Cwd, request.AdditionalDirectories)
@@ -481,6 +497,9 @@ func (a *Agent) openExistingSession(
 	includeHistory bool,
 ) (protocol.Thread, *sessionState, error) {
 	if err := a.requireInitialized(); err != nil {
+		return protocol.Thread{}, nil, err
+	}
+	if err := a.checkAuthorization(ctx); err != nil {
 		return protocol.Thread{}, nil, err
 	}
 	generation, err := a.sessions.beginOpen(sessionID)

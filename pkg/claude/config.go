@@ -70,20 +70,20 @@ func permissionModes(auto bool, allowBypass bool) []permissionModeDefinition {
 	return modes
 }
 
-// newSessionConfiguration 从两条初始化通道建立配置真值。
+// newSessionConfiguration 从 control initialize 建立首轮前配置；system/init 到达后再校准运行时真值。
 func newSessionConfiguration(
-	init protocol.SystemInitMessage,
 	response protocol.InitializeControlResponse,
+	permissionMode string,
 	allowBypass bool,
 ) sessionConfiguration {
-	mode := acp.SessionModeId(init.PermissionMode)
+	mode := acp.SessionModeId(permissionMode)
 	if mode == "" {
 		mode = "default"
 	}
 	configuration := sessionConfiguration{
 		models:                 append([]protocol.ModelInfo(nil), response.Models...),
-		model:                  init.Model,
-		fast:                   init.FastModeState == "on" || init.FastModeState == "cooldown",
+		model:                  initialClaudeModel(response.Models),
+		fast:                   response.FastModeState == "on" || response.FastModeState == "cooldown",
 		mode:                   mode,
 		allowBypassPermissions: allowBypass,
 	}
@@ -91,6 +91,14 @@ func newSessionConfiguration(
 		configuration.mode = "default"
 	}
 	return configuration
+}
+
+// initialClaudeModel 复用新 Session 规则：initialize 模型目录首项是 CLI 当前默认模型。
+func initialClaudeModel(models []protocol.ModelInfo) string {
+	if len(models) == 0 {
+		return ""
+	}
+	return models[0].Value
 }
 
 // permissionModeAvailable 判断模式是否同时满足模型和进程权限门槛。
@@ -330,6 +338,7 @@ func (s *claudeSession) applyModel(ctx context.Context, configuration sessionCon
 	if !model.SupportsFastMode {
 		s.configuration.fast = false
 	}
+	s.seedContextWindowLocked(value)
 	s.mu.Unlock()
 	return nil
 }

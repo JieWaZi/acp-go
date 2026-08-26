@@ -21,8 +21,13 @@ func TestDecodeMessageVariants(t *testing.T) {
 	}{
 		{
 			name: "system init",
-			raw:  `{"type":"system","subtype":"init","session_id":"s1","uuid":"u1","claude_code_version":"2.1.0","cwd":"/tmp","model":"sonnet","permissionMode":"default","tools":[],"mcp_servers":[],"future":true}`,
+			raw:  `{"type":"system","subtype":"init","session_id":"s1","uuid":"u1","claude_code_version":"2.1.0","cwd":"/tmp","model":"sonnet","permissionMode":"default","tools":[],"terminal_slash_commands":["doctor"],"mcp_servers":[],"future":true}`,
 			want: &SystemInitMessage{},
+		},
+		{
+			name: "commands changed",
+			raw:  `{"type":"system","subtype":"commands_changed","session_id":"s1","uuid":"u-command","commands":[{"name":"diagnosing-bugs","description":"Diagnose","argumentHint":"<symptom>"}]}`,
+			want: &SystemMessage{},
 		},
 		{
 			name: "assistant",
@@ -46,8 +51,15 @@ func TestDecodeMessageVariants(t *testing.T) {
 			switch test.want.(type) {
 			case *SystemInitMessage:
 				init, ok := message.(*SystemInitMessage)
-				if !ok || init.SessionID != "s1" || init.ClaudeCodeVersion != "2.1.0" {
+				if !ok || init.SessionID != "s1" || init.ClaudeCodeVersion != "2.1.0" ||
+					!reflect.DeepEqual(init.TerminalSlashCommands, []string{"doctor"}) {
 					t.Fatalf("init = %#v", message)
+				}
+			case *SystemMessage:
+				system, ok := message.(*SystemMessage)
+				if !ok || system.Subtype != "commands_changed" || len(system.Commands) != 1 ||
+					system.Commands[0].Name != "diagnosing-bugs" {
+					t.Fatalf("system = %#v", message)
 				}
 			case *AssistantMessage:
 				assistant, ok := message.(*AssistantMessage)
@@ -87,7 +99,10 @@ func TestFrozenSessionFixture(t *testing.T) {
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"system", "user", "stream_event", "assistant", "tool_progress", "user", "result", "system"}
+	want := []string{
+		"system", "system", "user", "stream_event", "stream_event", "stream_event",
+		"assistant", "tool_progress", "user", "result", "system",
+	}
 	if !reflect.DeepEqual(types, want) {
 		t.Fatalf("types = %#v, want %#v", types, want)
 	}

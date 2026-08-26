@@ -1,9 +1,13 @@
 package claude
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -40,7 +44,7 @@ func TestToolInfoFromToolUseMatchesClaudeUpstream(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			info := toolInfoFromToolUse(test.name, test.input)
+			info := toolInfoFromToolUse(test.name, test.input, "", "")
 			if info.Title != test.wantTitle || info.Kind != test.wantKind {
 				t.Fatalf("tool info = %#v", info)
 			}
@@ -48,6 +52,62 @@ func TestToolInfoFromToolUseMatchesClaudeUpstream(t *testing.T) {
 				t.Fatalf("tool content is empty: %#v", info)
 			}
 		})
+	}
+}
+
+// TestSkillToolCallIncludesClaudeMetadata 验证 Skill 工具卡片携带 upstream 的名称与可打开路径。
+func TestSkillToolCallIncludesClaudeMetadata(t *testing.T) {
+	cwd := t.TempDir()
+	skillPath := filepath.Join(cwd, ".agents", "skills", "diagnosing-bugs", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(skillPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skillPath, []byte("# Diagnosing Bugs\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingClaudeClient{}
+	session := &claudeSession{
+		agent: &Agent{updater: client}, id: "skill-session", cwd: cwd,
+		tools: make(map[string]*toolState),
+	}
+	if err := session.startTool(context.Background(), protocol.ContentBlock{
+		Type: "tool_use", ID: "skill-tool", Name: "Skill",
+		Input: json.RawMessage(`{"skill":"diagnosing-bugs"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updates, _ := client.snapshot()
+	if len(updates) != 1 || updates[0].Update.ToolCall == nil {
+		t.Fatalf("updates = %#v", updates)
+	}
+	meta, ok := updates[0].Update.ToolCall.Meta["claudeCode"].(map[string]any)
+	if !ok || meta["toolName"] != "Skill" || meta["skill"] != "diagnosing-bugs" || meta["skillPath"] != skillPath {
+		t.Fatalf("claudeCode meta = %#v", meta)
+	}
+}
+
+// TestResolveClaudeSkillPathMatchesUpstreamLayouts 验证目录作用域、插件和用户级布局的探测顺序。
+func TestResolveClaudeSkillPathMatchesUpstreamLayouts(t *testing.T) {
+	cwd := t.TempDir()
+	home := t.TempDir()
+	want := map[string]string{
+		"project":          filepath.Join(cwd, ".claude", "skills", "project", "SKILL.md"),
+		"docs:scoped":      filepath.Join(cwd, "docs", ".agents", "skills", "scoped", "SKILL.md"),
+		"plugin:installed": filepath.Join(cwd, ".claude", "plugins", "plugin", "skills", "installed", "SKILL.md"),
+		"user":             filepath.Join(home, ".agents", "skills", "user", "SKILL.md"),
+	}
+	for _, path := range want {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("# Skill\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for skill, path := range want {
+		if got := resolveClaudeSkillPath(skill, cwd, home); got != path {
+			t.Fatalf("resolveClaudeSkillPath(%q) = %q, want %q", skill, got, path)
+		}
 	}
 }
 
@@ -83,6 +143,8 @@ func TestToolInfoFromToolUsePreservesMCPIdentity(t *testing.T) {
 	info := toolInfoFromToolUse(
 		"mcp__github__search_code",
 		map[string]any{"query": "runtime"},
+		"",
+		"",
 	)
 	if info.Title != "mcp.github.search_code" || info.Kind != acp.ToolKindExecute ||
 		info.Meta["is_mcp_tool_call"] != true {

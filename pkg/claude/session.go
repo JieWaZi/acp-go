@@ -51,6 +51,16 @@ type turnResult struct {
 	err error
 }
 
+// streamedContentBlock 保存已经实时发送、等待与聚合 assistant 帧核对的内容块。
+type streamedContentBlock struct {
+	// index 是流式事件中的原始内容块位置。
+	index int
+	// kind 区分 text 与 thinking。
+	kind string
+	// text 是该块已经发送的累计正文。
+	text string
+}
+
 // claudeTurn 保存 FIFO 中一个用户 prompt 的身份、输出去重和完成信号。
 type claudeTurn struct {
 	// id 是用户消息 UUID，并用于匹配 CLI echo。
@@ -73,16 +83,26 @@ type claudeTurn struct {
 	cancelled bool
 	// gotResult 表示已收到明确 result 帧。
 	gotResult bool
-	// streamedText 按 content index 记录已发送文本。
-	streamedText map[int]string
-	// streamedThinking 按 content index 记录已发送思考文本。
-	streamedThinking map[int]string
+	// streamedBlocks 按父工具调用隔离并按文档顺序保存已发送内容块。
+	streamedBlocks map[string][]streamedContentBlock
 	// steeringIDs 保存注入当前 turn 的 priority 消息标识。
 	steeringIDs map[string]struct{}
 	// steered 表示本轮曾注入 priority 消息，最终在 idle 边界完成。
 	steered bool
 	// steeredResult 保存 steering 周期内最后一个可用结果。
 	steeredResult *acp.PromptResponse
+	// contextUsage 保存当前顶层 assistant 消息的累计上下文用量快照。
+	contextUsage protocol.Usage
+	// contextUsageSet 表示已经观察到当前 assistant 的用量字段。
+	contextUsageSet bool
+	// contextUsagePublished 保存最近一次成功发布的上下文 token 总量。
+	contextUsagePublished int64
+	// contextUsagePublishedSet 区分尚未发布与已发布零用量。
+	contextUsagePublishedSet bool
+	// assistantModel 保存当前顶层 assistant 消息实际使用的模型标识。
+	assistantModel string
+	// assistantError 保存固定 Agent SDK 声明的最近一次顶层 Provider 错误类别。
+	assistantError string
 }
 
 // claudeSession 保存一个 ACP Session 独占的 CLI、transport、FIFO 与事件状态。
@@ -103,10 +123,6 @@ type claudeSession struct {
 	process *claudeProcess
 	// transport 管理 CLI JSONL/control 读写。
 	transport *claudeTransport
-	// initMessages 接收首次 system/init 握手。
-	initMessages chan *protocol.SystemInitMessage
-	// initOnce 保证只有首次 system/init 进入握手 channel。
-	initOnce sync.Once
 	// turns 是有界 prompt FIFO。
 	turns chan *claudeTurn
 	// queueMu 线性化 prompt 入队与 cancel 清空队列的边界。
@@ -119,6 +135,8 @@ type claudeSession struct {
 	active *claudeTurn
 	// cancelEpoch 每次 cancel 递增，使并发旧请求失效。
 	cancelEpoch uint64
+	// owedTrailingIdles 记录已收到 result、但尚未消费的无身份尾随 idle 数量。
+	owedTrailingIdles int
 	// closed 表示 Session 不再接受任何输入。
 	closed bool
 	// fatalErr 是 Session 永久结束的首次原因。
@@ -129,6 +147,12 @@ type claudeSession struct {
 	initialization protocol.InitializeControlResponse
 	// configuration 保存当前模型、effort、fast 和权限模式。
 	configuration sessionConfiguration
+	// contextWindowSize 是当前模型用于 ACP usage_update 的上下文窗口。
+	contextWindowSize int64
+	// contextWindowAuthoritative 表示窗口已经由 result.modelUsage 确认。
+	contextWindowAuthoritative bool
+	// contextWindowModel 是当前窗口状态对应的模型标识。
+	contextWindowModel string
 	// configMu 串行化会改变 CLI 配置的 control request。
 	configMu sync.Mutex
 	// tools 保存当前 Session 已发布工具调用。
@@ -251,8 +275,7 @@ func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*c
 	session := &claudeSession{
 		agent: a, id: request.SessionID, cwd: request.CWD, fingerprint: fingerprint,
 		ctx: sessionCtx, cancel: sessionCancel, process: process,
-		initMessages: make(chan *protocol.SystemInitMessage, 1),
-		turns:        make(chan *claudeTurn, defaultTurnQueueCapacity), workerDone: make(chan struct{}),
+		turns: make(chan *claudeTurn, defaultTurnQueueCapacity), workerDone: make(chan struct{}),
 		tools: make(map[string]*toolState), tasks: make(map[string]taskState),
 	}
 	session.transport = newClaudeTransport(
@@ -263,7 +286,7 @@ func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*c
 		},
 	)
 	go session.watchTransport()
-	if err := session.initialize(ctx); err != nil {
+	if err := session.initialize(ctx, options); err != nil {
 		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCloseTimeout)
 		_ = session.close(closeCtx)
 		cancel()
@@ -279,34 +302,24 @@ func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*c
 	return session, nil
 }
 
-// initialize 同时等待 control 初始化结果与 system/init，确认 Session 身份一致后才返回。
-func (s *claudeSession) initialize(ctx context.Context) error {
+// initialize 等待官方 SDK 同义的 control 初始化结果；system/init 会在首个 prompt 开始后异步校准运行时真值。
+func (s *claudeSession) initialize(ctx context.Context, options launchOptions) error {
 	initializeCtx, cancel := context.WithTimeout(ctx, sessionInitializeTimeout)
 	defer cancel()
 	var response protocol.InitializeControlResponse
 	if err := s.transport.Call(initializeCtx, protocol.InitializeControlRequest{Subtype: protocol.ControlInitialize}, &response); err != nil {
 		return fmt.Errorf("initializing Claude control channel: %w", err)
 	}
-	select {
-	case init := <-s.initMessages:
-		if init.SessionID == "" || init.SessionID != s.id {
-			return fmt.Errorf("initializing Claude stream: unexpected session id %q", init.SessionID)
-		}
-		s.mu.Lock()
-		s.systemInit = *init
-		s.initialization = response
-		s.configuration = newSessionConfiguration(
-			*init,
-			response,
-			s.agent.allowBypassPermissions,
-		)
-		s.mu.Unlock()
-		return nil
-	case <-initializeCtx.Done():
-		return fmt.Errorf("waiting for Claude system init: %w", initializeCtx.Err())
-	case <-s.transport.Done():
-		return s.transport.Err()
-	}
+	s.mu.Lock()
+	s.initialization = response
+	s.configuration = newSessionConfiguration(
+		response,
+		options.PermissionMode,
+		s.agent.allowBypassPermissions,
+	)
+	s.seedContextWindowLocked(s.configuration.model)
+	s.mu.Unlock()
+	return nil
 }
 
 // prompt 入队一个 turn；取消请求上下文时同时触发 Session cancel，避免遗留后台 prompt。
@@ -343,8 +356,8 @@ func (s *claudeSession) enqueueTurn(ctx context.Context, message protocol.UserIn
 	turn := &claudeTurn{
 		id: message.UUID, epoch: s.cancelEpoch, message: message,
 		result: make(chan turnResult, 1), drained: make(chan struct{}),
-		streamedText: make(map[int]string), streamedThinking: make(map[int]string),
-		steeringIDs: make(map[string]struct{}),
+		streamedBlocks: make(map[string][]streamedContentBlock),
+		steeringIDs:    make(map[string]struct{}),
 	}
 	s.mu.Unlock()
 
@@ -451,6 +464,12 @@ drained:
 	}, &response)
 	cancelInterrupt()
 	if err != nil {
+		// 固定 upstream 在 query stream 已关闭后把 cancel 视为幂等成功。
+		// CloseSession 可能在 interrupt 等待期间完成同一关闭动作，此时不把
+		// fire-and-forget 的 session/cancel 误报为协议错误。
+		if errors.Is(err, ErrClaudeTransportClosed) && !s.isOpen() {
+			return nil
+		}
 		s.fail(fmt.Errorf("interrupting Claude turn: %w", err))
 		go s.closeWithTimeout()
 		return err

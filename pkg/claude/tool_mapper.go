@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -48,8 +49,18 @@ type diffToolResponseHunk struct {
 	Lines []string `json:"lines"`
 }
 
-// toolInfoFromToolUse 映射内置工具语义。
-func toolInfoFromToolUse(name string, input any) toolInfo {
+// toolInfoFromToolUse 映射标准工具语义，并附加 Claude 元数据。
+func toolInfoFromToolUse(name string, input any, cwd string, home string) toolInfo {
+	info := mappedToolInfoFromToolUse(name, input)
+	if info.Meta == nil {
+		info.Meta = make(map[string]any)
+	}
+	info.Meta["claudeCode"] = claudeCodeMetaFromToolUse(name, input, cwd, home)
+	return info
+}
+
+// mappedToolInfoFromToolUse 映射内置工具的标准 ACP 展示语义。
+func mappedToolInfoFromToolUse(name string, input any) toolInfo {
 	if server, tool, ok := claudeMCPToolIdentity(name); ok {
 		return toolInfo{
 			Title: fmt.Sprintf("mcp.%s.%s", server, tool),
@@ -198,6 +209,75 @@ func toolInfoFromToolUse(name string, input any) toolInfo {
 	}
 }
 
+// claudeCodeMetaFromToolUse Claude Code 工具扩展元数据。
+func claudeCodeMetaFromToolUse(name string, input any, cwd string, home string) map[string]any {
+	meta := map[string]any{"toolName": name}
+	object, _ := input.(map[string]any)
+	if name == "Bash" {
+		if title := objectString(object, "description"); title != "" {
+			meta["title"] = title
+		}
+	}
+	if name == "Agent" || name == "Task" {
+		meta["subagent"] = true
+	}
+	if name == "Skill" {
+		if skill := objectString(object, "skill"); skill != "" {
+			meta["skill"] = skill
+			if skillPath := resolveClaudeSkillPath(skill, cwd, home); skillPath != "" {
+				meta["skillPath"] = skillPath
+			}
+		}
+	}
+	return meta
+}
+
+// resolveClaudeSkillPath 按项目、目录作用域、插件和用户目录布局查找 SKILL.md。
+func resolveClaudeSkillPath(skillName string, cwd string, home string) string {
+	if cwd == "" {
+		return ""
+	}
+	scope, name := "", skillName
+	if separator := strings.IndexByte(skillName, ':'); separator >= 0 {
+		scope, name = skillName[:separator], skillName[separator+1:]
+	}
+	if name == "" {
+		return ""
+	}
+	candidates := make([]string, 0, 7)
+	addCandidates := func(base string) {
+		for _, container := range [...]string{".claude/skills", ".agents/skills"} {
+			candidates = append(candidates, filepath.Join(base, container, name, "SKILL.md"))
+		}
+	}
+	if scope != "" {
+		addCandidates(filepath.Join(cwd, scope))
+		candidates = append(candidates, filepath.Join(cwd, ".claude/plugins", scope, "skills", name, "SKILL.md"))
+	}
+	addCandidates(cwd)
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	if home != "" {
+		addCandidates(home)
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// claudeUserHomeDirectory 返回与 Claude 子进程配置一致的用户目录。
+func claudeUserHomeDirectory(environment []string) string {
+	if home := claudeEnvironmentValue(environment, "HOME"); home != "" {
+		return home
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
+
 // claudeMCPToolIdentity 解析 Claude 使用的 mcp__server__tool 标识。
 func claudeMCPToolIdentity(name string) (string, string, bool) {
 	parts := strings.Split(name, "__")
@@ -265,7 +345,7 @@ func textContents(values []string) []acp.ToolCallContent {
 	return content
 }
 
-// toolDiffUpdateFromResult 参考 Claude Agent ACP upstream，把 structuredPatch 转成标准 ACP diff。
+// toolDiffUpdateFromResult 把 structuredPatch 转成标准 ACP diff。
 func toolDiffUpdateFromResult(
 	raw json.RawMessage,
 ) ([]acp.ToolCallContent, []acp.ToolCallLocation) {
