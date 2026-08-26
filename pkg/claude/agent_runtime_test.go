@@ -144,6 +144,10 @@ func TestClaudeAgentSessionPromptPermissionConfigAndCancel(t *testing.T) {
 		!initialized.AgentCapabilities.LoadSession || initialized.AgentCapabilities.Auth.Logout != nil {
 		t.Fatalf("Initialize() = %#v", initialized)
 	}
+	runtimeMeta, ok := initialized.AgentInfo.Meta["runtime"].(map[string]any)
+	if !ok || runtimeMeta["version"] != "2.1.232" {
+		t.Fatalf("Runtime 元数据为 %#v，期望 CLI 版本 2.1.232", initialized.AgentInfo.Meta)
+	}
 	workspace := t.TempDir()
 	created, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: workspace, McpServers: []acp.McpServer{}})
 	if err != nil {

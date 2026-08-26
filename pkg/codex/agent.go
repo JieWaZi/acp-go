@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/internal/buildinfo"
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -99,6 +100,8 @@ func (r *appServerRouter) routeServerRequest(ctx context.Context, request protoc
 type Agent struct {
 	// logger 是进程级诊断入口，绝不写外层 ACP stdout。
 	logger *slog.Logger
+	// executable 是构造时已解析并完成版本探测的 Codex CLI。
+	executable executable
 	// getenv 读取调用方完整环境中的 Adapter 开关与认证信息。
 	getenv environmentLookup
 	// runtimeCtx 跨单次 ACP 请求存活，直到 Adapter Close。
@@ -214,6 +217,7 @@ func newAgentWithVersionRunner(ctx context.Context, config Config, runVersion co
 	client := newAppServerClient(runtimeCtx, transport)
 	router.publish(client)
 	agent := newAgentWithClient(config.Logger, runtimeCtx, runtimeCancel, client)
+	agent.executable = executable
 	agent.setEnvironment(config.Environment)
 	agent.transport = transport
 	agent.process = process
@@ -350,7 +354,12 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 				Resume:                &acp.SessionResumeCapabilities{},
 			},
 		},
-		AgentInfo:   &acp.Implementation{Name: agentName, Title: &title, Version: buildinfo.Current()},
+		AgentInfo: &acp.Implementation{
+			Meta:    acpmeta.RuntimeVersionMetadata(a.executable.Version),
+			Name:    agentName,
+			Title:   &title,
+			Version: buildinfo.Current(),
+		},
 		AuthMethods: codexAuthMethods(a.auth.browserAuthEnabled()),
 		Meta: map[string]any{
 			"steering": map[string]any{"supported": true},

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/internal/buildinfo"
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -185,7 +186,12 @@ func (a *Agent) Initialize(_ context.Context, request acp.InitializeRequest) (ac
 				Resume:                &acp.SessionResumeCapabilities{},
 			},
 		},
-		AgentInfo:   &acp.Implementation{Name: claudeAgentName, Title: &title, Version: buildinfo.Current()},
+		AgentInfo: &acp.Implementation{
+			Meta:    acpmeta.RuntimeVersionMetadata(a.executable.Version),
+			Name:    claudeAgentName,
+			Title:   &title,
+			Version: buildinfo.Current(),
+		},
 		AuthMethods: []acp.AuthMethod{},
 		Meta: map[string]any{
 			"steering": map[string]any{"supported": true},

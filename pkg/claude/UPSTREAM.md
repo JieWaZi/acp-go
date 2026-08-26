@@ -62,6 +62,7 @@ fixture 只保留无凭据、无真实用户路径、无真实 transcript 的最
 ## Go 等价改写与已知边界
 
 - TypeScript 通过 Agent SDK `query()` 持有子进程；Go 直接持有 `exec.Cmd`、stdin/stdout/stderr 和 control transport，但仍保持一个 ACP Session 对应一个持续 CLI 进程。
+- 固定 upstream 的 `initialize` 把 `agentInfo.version` 设为 `packageJson.version`，即 Adapter 实现版本。Go Adapter 保持该标准字段语义，并把启动时通过 `claude --version` 已探测到的被包装 CLI 版本放入通用 `agentInfo._meta.runtime.version`；客户端不得用 Adapter 的本地 `development` 构建标识代替 CLI 版本。
 - TypeScript 把调用方 `env` 合并到进程环境并通过 `extraArgs` 扩展 CLI 参数；Go `Config` 接收调用方已合并的完整 `Environment` 与有序 `PrefixArgs`，并同时用于版本探测、Adapter 配置读取和每个 Session 进程。stream-json、权限、MCP 等协议参数仍由 Adapter 追加。
 - TypeScript 的 async iterable 和单事件循环由单 stdout reader、单写锁、有界 prompt channel、活动 turn 身份和 cancel epoch 表达。前台 cancel 可立即返回；下一 turn 必须等待旧 turn 的 result/idle，缺少尾帧会关闭 Session。若 CloseSession 在 interrupt 等待期间关闭 transport，则按 upstream 的 query-closed no-op 语义将 cancel 视为幂等成功；仍存活 Session 的 interrupt 超时或 CLI 错误不得吞掉。
 - 非 steering `result` 会按 upstream `owedTrailingIdles` 记录无 Turn ID 的尾随 idle；旧 idle 即使晚于下一轮激活，也只偿还旧轮次债务，不会误判新轮次缺少 result。
@@ -104,3 +105,4 @@ fixture 只保留无凭据、无真实用户路径、无真实 transcript 的最
 - 2026-08-25：按 upstream 两阶段启动行为让 `session/new` 只等待 control initialize，并在首个 Prompt 后消费 `system/init`；按内容块顺序核对流式与聚合 assistant 帧，兼容聚合帧 content index 重排。
 - 2026-08-25：参考 upstream `assistant.error`、`result.is_error` 与 `errorKindData` fallback，补齐 Provider 错误、login 和 stop reason 优先级；不引入客户端专属 Session Failure 产品扩展。
 - 2026-08-26：按固定 upstream `cancel` 在 query 已关闭时直接成功的语义，补齐 cancel 与并发 CloseSession 的幂等处理和确定性竞态回归；仍保留 interrupt 无响应的有界失败。
+- 2026-08-26：核对固定 upstream 的 `agentInfo.version = packageJson.version` 后保持 Adapter 实现版本语义，并通过通用 `agentInfo._meta.runtime.version` 发布构造阶段已探测的 Claude CLI 真实版本。

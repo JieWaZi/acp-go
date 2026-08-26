@@ -128,6 +128,7 @@ go run ./tools/protocolgen --check
 - 上游本来定义为开放 `JsonValue`/开放 schema 的 DTO 字段使用 `json.RawMessage`（以及对应 map/slice），不让 `interface{}` 在解码时把整数改写成浮点数；`ItemStartedNotification.Item` 和 `ItemCompletedNotification.Item` 明确为 `ThreadItem`，核心通知 payload 不退化。
 - 空 object response 生成 `map[string]json.RawMessage`；JSON-RPC 层仍按对应 method 的具名响应职责配对。
 - 外层 ACP JSON-RPC framing、dispatch、prompt context cancel、loader 与 extension 继续直接使用 `github.com/coder/acp-go-sdk` v0.13.5；没有第二套 ACP RPC。Codex 内层必须按 `StdUtils.ts` 自建薄 NDJSON 边界，因为 app-server wire 不带 `jsonrpc`。
+- 固定 upstream 的 `CodexAcpServer.initialize` 把 `agentInfo.version` 设为 `packageJson.version`，即 Adapter 实现版本。Go Adapter 保持该标准字段语义，并把启动时通过 `codex --version` 已探测到的被包装 CLI 版本放入通用 `agentInfo._meta.runtime.version`；客户端不得用 Adapter 的本地 `development` 构建标识代替 CLI 版本。
 - 生成代码保留纳入 V1 声明的上游英文文档；被明确排除的 experimental 构造项及其专属说明由可审计薄适配一并移除，不增加逐字段中文翻译。中文注释规范仅适用于手写 Go。
 - `codex-acp` npm 发布物可回退 bundled `@openai/codex`；本项目按用户和父规格只使用用户预装 Codex，显式 `CODEX_PATH` 无效时禁止 PATH 回退，空值才查询 PATH，并以 0.148.0 为告警基线。
 - TypeScript `createJSONRPCReader` 和 `SteeringQueue` 使用动态字符串/无界数组；Go 等价实现保持相同顺序与结果语义，但增加 8 MiB 单帧、16 个 server request、64 个每-session pending steering 和有界 stderr，超限按稳定 fatal/RequestError 失败。

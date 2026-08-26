@@ -17,12 +17,17 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 	t.Parallel()
 
 	agent := newTestAgent(t)
+	agent.executable.Version = "0.149.1"
 	response := initializeTestAgent(t, agent)
 	if response.ProtocolVersion != acp.ProtocolVersionNumber {
 		t.Fatalf("协议版本为 %d，期望 %d", response.ProtocolVersion, acp.ProtocolVersionNumber)
 	}
 	if response.AgentInfo == nil || response.AgentInfo.Name != "codex" {
 		t.Fatalf("Agent 信息为 %#v，期望 codex", response.AgentInfo)
+	}
+	runtimeMeta, ok := response.AgentInfo.Meta["runtime"].(map[string]any)
+	if !ok || runtimeMeta["version"] != "0.149.1" {
+		t.Fatalf("Runtime 元数据为 %#v，期望 CLI 版本 0.149.1", response.AgentInfo.Meta)
 	}
 	if !response.AgentCapabilities.LoadSession || response.AgentCapabilities.SessionCapabilities.Close == nil ||
 		response.AgentCapabilities.SessionCapabilities.Resume == nil ||

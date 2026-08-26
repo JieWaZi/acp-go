@@ -5,6 +5,7 @@
 项目同时提供可直接嵌入其他 Go 程序的公开包：
 
 - `github.com/JieWaZi/acp-go/pkg/acpserver`
+- `github.com/JieWaZi/acp-go/pkg/acpmeta`
 - `github.com/JieWaZi/acp-go/pkg/codex`
 - `github.com/JieWaZi/acp-go/pkg/claude`
 
@@ -53,6 +54,8 @@ go build \
   -ldflags "-X github.com/JieWaZi/acp-go/internal/buildinfo.Version=v0.1.0" \
   -o ./acp-agent ./cmd/acp-agent
 ```
+
+`agentInfo.version` 表示 ACP Adapter 的实现版本，与被包装 CLI 的版本不同。Codex 和 Claude Adapter 会在构造阶段执行对应 CLI 的 `--version`，并把探测结果放入 `agentInfo._meta.runtime.version`；`pkg/acpmeta` 提供该通用元数据的构造与读取函数。
 
 检查本机 CLI：
 
