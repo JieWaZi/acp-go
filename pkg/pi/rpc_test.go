@@ -198,6 +198,11 @@ func TestPiRPCProcess(t *testing.T) {
 			if request["message"] == "wait" {
 				_ = os.WriteFile(filepath.Join(cwd, "waiting"), nil, 0600)
 			} else {
+				if request["message"] == "usage" {
+					for _, usage := range []map[string]any{{"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "totalTokens": 20}, {"input": 20, "output": 6, "cacheRead": 4, "cacheWrite": 1, "totalTokens": 31}} {
+						write(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "usage": usage}})
+					}
+				}
 				write(map[string]any{"type": "agent_end"})
 				time.Sleep(80 * time.Millisecond)
 				write(map[string]any{"type": "agent_settled"})
@@ -235,5 +240,24 @@ func TestPiBlockedWriteCancellation(t *testing.T) {
 	}
 	if len(p.pending) != 0 {
 		t.Fatal("cancelled write retained pending request")
+	}
+}
+
+// TestPiPromptUsagePerTurn 验证多次模型调用累计用量，下一轮无数据不能复用上一轮统计。
+func TestPiPromptUsagePerTurn(t *testing.T) {
+	a, id := testAgent(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := a.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("usage")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := result.Usage
+	if u == nil || u.InputTokens != 30 || u.OutputTokens != 11 || u.TotalTokens != 51 || u.CachedReadTokens == nil || *u.CachedReadTokens != 7 || u.CachedWriteTokens == nil || *u.CachedWriteTokens != 3 {
+		t.Fatalf("missing or incorrect Pi token statistics: %+v", u)
+	}
+	result, err = a.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("normal")}})
+	if err != nil || result.Usage != nil {
+		t.Fatalf("previous turn usage leaked: %+v, %v", result.Usage, err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -43,6 +44,10 @@ var bundledMCP []byte
 type Agent struct {
 	// config 是本次 Agent 固定的启动配置。
 	config Config
+	// versionOnce 保证 CLI 版本仅探测一次。
+	versionOnce sync.Once
+	// version 保存 Pi 实际版本，不使用适配器版本替代。
+	version string
 	// directory 保存生命周期内的私有扩展文件。
 	directory string
 	// modulePath 是内置或显式覆盖的 MCP 工厂路径。
@@ -87,6 +92,8 @@ type session struct {
 	generation uint64
 	// cancelled 表示宿主明确取消本轮。
 	cancelled bool
+	// usage 保存本次提示内各模型调用累计的真实用量。
+	usage *acp.Usage
 	// failure 保存模型或协议错误，不把上游失败伪装为完成。
 	failure error
 	// tools 记录当前回合的工具状态，避免重复创建与状态倒退。
@@ -154,7 +161,10 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	a.mutex.Lock()
 	a.formUI = request.ClientCapabilities.Elicitation != nil && request.ClientCapabilities.Elicitation.Form != nil
 	a.mutex.Unlock()
-	return convert[acp.InitializeResponse](map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "pi", "title": "Pi", "version": "acp-go"}, "authMethods": []any{map[string]any{"id": "pi_terminal_login", "name": "Launch Pi to configure credentials", "_meta": map[string]any{"terminal-auth": map[string]any{"command": a.config.PiPath, "args": []string{}, "label": "Launch Pi"}}}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]bool{"http": true, "sse": true}, "promptCapabilities": map[string]bool{"image": true, "embeddedContext": true}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "close": map[string]any{}, "resume": map[string]any{}, "delete": map[string]any{}}}})
+	a.versionOnce.Do(func() {
+		a.version = nativeacp.RuntimeVersion(ctx, a.config.PiPath, append(append([]string{}, a.config.PrefixArgs...), "--version"), a.config.Environment, a.config.WorkingDirectory)
+	})
+	return convert[acp.InitializeResponse](map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "pi", "title": "Pi", "version": a.version, "_meta": acpmeta.RuntimeVersionMetadata(a.version)}, "authMethods": []any{map[string]any{"id": "pi_terminal_login", "name": "Launch Pi to configure credentials", "_meta": map[string]any{"terminal-auth": map[string]any{"command": a.config.PiPath, "args": []string{}, "label": "Launch Pi"}}}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]bool{"http": true, "sse": true}, "promptCapabilities": map[string]bool{"image": true, "embeddedContext": true}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "close": map[string]any{}, "resume": map[string]any{}, "delete": map[string]any{}}}})
 }
 
 // Authenticate 由用户在 Pi 原生终端配置提供方，本方法不自动执行登录。

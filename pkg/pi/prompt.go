@@ -53,6 +53,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	s.cancelTurn = cancel
 	s.cancelled = false
 	s.failure = nil
+	s.usage = nil
 	s.mutex.Unlock()
 	defer func() {
 		s.mutex.Lock()
@@ -77,9 +78,9 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	select {
 	case reason := <-turn:
 		s.mutex.Lock()
-		failure := s.failure
+		failure, usage := s.failure, s.usage
 		s.mutex.Unlock()
-		return acp.PromptResponse{StopReason: reason}, failure
+		return acp.PromptResponse{StopReason: reason, Usage: usage}, failure
 	case <-ctx.Done():
 		a.abortTurn(s, turn)
 		return acp.PromptResponse{}, ctx.Err()

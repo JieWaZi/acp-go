@@ -22,3 +22,7 @@ Go 移植对照：
 `extension.ts` 组合开源 MCP 工厂、风险分类模块和官方工具 hook，不重写 MCP 客户端。只引入分类模块，不载入可以关闭保护的全局配置/命令入口；不采用自动允许工作区写入或外部 readOnlyHint 的快捷路径。分类失败或否决时转人工审批。`tools/pi-extension/entry.ts` 是固定源码组合入口。构建工具位于 `tools/pi-extension`，npm 依赖由 package-lock.json 固定，esbuild 生成 `mcp.generated.ts` 及 `MCP-LICENSES.txt`，第三方许可证随 Go 包交付。Pi 自身的包保持外部引用，由 Pi 官方 extension loader 解析。不要手改生成文件。没有使用 AGPL 的 pi-golang 实现。
 
 原 pi-acp 0.0.33 的进程组合已被替换；其先前测试结果不替代 Go 移植测试。升级需重跑 Go/race 与真实 Pi 集成，覆盖模型、历史、审批副作用、三种 MCP 传输、特殊字符、文件差异、终端、输入、模板和内置命令。
+
+## 用量补齐（2026-09-08）
+
+pi-acp 当前参考实现没有完成 Token 投影，因此统计另外对照 Pi 0.84.1 的 `AssistantMessage.usage` 与官方 `ExtensionContext.getContextUsage()`：Go 累计当前 Prompt 内的输入、输出、缓存读取/创建；`extension.ts` 仅转发官方上下文快照。上下文是 Pi 的估计值，压缩后未知时不编造数字。Pi 没有独立 reasoning token 字段，费用不进入 Ally 现有 Token 契约。版本直接探测 `pi --version`，不显示适配器版本。

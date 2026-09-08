@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 const [binary,piPath,kimiPath]=process.argv.slice(2).map(x=>resolve(x));
 if(!binary||!piPath||!kimiPath)throw Error('binary, Pi path, Kimi path required');
 const root=mkdtempSync(join(tmpdir(),'acp-unified-'));console.log('Artifacts: '+root);
-const reviews=[],modelCalls=[],questions=[],approvals=[],audit=[];
+const reviews=[],modelCalls=[],questions=[],approvals=[],audit=[],usageUpdates=[];
 let task;
 const textOf=(content)=>typeof content==='string'?content:(content??[]).filter(x=>x.type==='text').map(x=>x.text).join('\n');
 const server=createServer(async(req,res)=>{
@@ -54,7 +54,7 @@ const server=createServer(async(req,res)=>{
  }
  if(body.stream===false){res.writeHead(200,{'content-type':'application/json'}).end(JSON.stringify({id:'fixture',object:'chat.completion',created:0,model:body.model,choices:[{index:0,message:delta,finish_reason:stop}],usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15}}));return}
  res.writeHead(200,{'content-type':'text/event-stream'});
- for(const [d,f] of [[delta,null],[{},stop]])res.write('data: '+JSON.stringify({id:'fixture',object:'chat.completion.chunk',created:0,model:body.model,choices:[{index:0,delta:d,finish_reason:f}]})+'\n\n');res.end('data: [DONE]\n\n');
+ for(const [d,f] of [[delta,null],[{},stop]])res.write('data: '+JSON.stringify({id:'fixture',object:'chat.completion.chunk',created:0,model:body.model,choices:[{index:0,delta:d,finish_reason:f}],...(f?{usage:{prompt_tokens:10,completion_tokens:5,total_tokens:15,prompt_tokens_details:{cached_tokens:3}}}:{})})+'\n\n');res.end('data: [DONE]\n\n');
  }catch(error){console.error(error);res.writeHead(500).end(JSON.stringify({error:{message:String(error)}}))}
 });
 await new Promise(r=>server.listen(0,'127.0.0.1',r));const baseUrl='http://127.0.0.1:'+server.address().port+'/v1';
@@ -77,6 +77,7 @@ for(const cli of (process.env.ACP_TEST_ONLY_CLI?[process.env.ACP_TEST_ONLY_CLI]:
  createInterface({input:child.stdout}).on('line',line=>{
   const message=JSON.parse(line);writeFileSync(join(work,'last-message.json'),line);
   if(!message.method){const entry=pending.get(message.id);if(entry){pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(Error(JSON.stringify(message.error))):entry.resolve(message.result)};return}
+  if(message.method==='session/update' && message.params.update.sessionUpdate==='usage_update'){usageUpdates.push({cli,...message.params.update});}
   if(message.method==='session/update' && message.params.update._meta?.['acp-go/permission-review']){
    audit.push({cli,marker:task.marker,...message.params.update._meta['acp-go/permission-review']});
   }else if(message.method==='session/request_permission'){
@@ -98,7 +99,14 @@ for(const cli of (process.env.ACP_TEST_ONLY_CLI?[process.env.ACP_TEST_ONLY_CLI]:
  for(const scenario of [{marker:'question',kind:'question'},{marker:'allow',kind:'write'},{marker:'deny',kind:'write',deny:true,review:'deny'},{marker:'mcp-allow',kind:'mcp'},{marker:'mcp-deny',kind:'mcp',deny:true,review:'deny'},...(permission==='auto'?[{marker:'review-failure',kind:'write',deny:true,review:'malformed'}]:[])]){
   task={...scenario,cli,permission,cwd,marker:cli+'-'+permission+'-'+scenario.marker};
   const beforeApprovals=approvals.length,beforeReviews=reviews.length,beforeQuestions=questions.length;
-  await request('session/prompt',{sessionId:session.sessionId,prompt:[{type:'text',text:'LOCAL_FIXTURE '+task.marker}]});
+  const response = await request('session/prompt',{sessionId:session.sessionId,prompt:[{type:'text',text:'LOCAL_FIXTURE '+task.marker}]});
+  assert.ok(response.usage,cli+' dropped turn usage');
+  const calls = modelCalls.filter(x=>x.marker===task.marker).length;
+  assert.equal(response.usage.inputTokens,7*calls,cli+' noncached input');
+  assert.equal(response.usage.cachedReadTokens,3*calls,cli+' cached input');
+  assert.equal(response.usage.outputTokens,5*calls,cli+' output');
+  assert.equal(response.usage.totalTokens,15*calls,cli+' per-turn total');
+  assert.ok(usageUpdates.some(x=>x.cli===cli && x.used>0 && x.size>0),cli+' missing context usage');
   if(scenario.kind==='question'){
    assert.equal(questions.length,beforeQuestions+1,'question was silently dropped');
    const last=modelCalls.findLast(x=>x.marker===task.marker);assert.ok(last.messages.filter(m=>m.role==='tool').map(m=>textOf(m.content)).join('\n').includes('"B"'),'answer not returned to actual model');

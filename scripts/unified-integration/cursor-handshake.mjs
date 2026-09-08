@@ -18,6 +18,7 @@ for(const permission of ['default','auto','full-access']){
  createInterface({input:child.stdout}).on('line',line=>{const message=JSON.parse(line);if(message.id===1){clearTimeout(timer);message.error?reject(Error(JSON.stringify(message.error))):resolve(message.result)}});
  child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:1,clientCapabilities:{elicitation:{form:{}},fs:{readTextFile:false,writeTextFile:false},terminal:false}}})+'\n');
  });
+ assert.match(initialized.agentInfo?._meta?.runtime?.version ?? '', /^\d{4}\.\d{2}\.\d{2}-/,'missing real Cursor version');
  assert.equal(initialized.protocolVersion,1);assert.equal(initialized.agentCapabilities.mcpCapabilities.http,true);
  writeFileSync(join(root,permission+'.json'),JSON.stringify(initialized,null,2));console.log(permission+' initialize PASS: '+initialized.agentInfo?.name);
  }finally{child.stdin.end();child.kill();await new Promise(r=>child.once('exit',r))}

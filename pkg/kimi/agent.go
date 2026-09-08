@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
@@ -37,6 +38,12 @@ type Agent struct {
 	*nativeacp.Agent
 	// directory 是可删除的本次配置目录，不包含持久会话的真实文件。
 	directory string
+	// host 是用于发布补充用量通知的标准宿主连接。
+	host atomic.Pointer[acp.AgentSideConnection]
+	// usagePrompts 阻止同一会话并发提示读取到彼此的统计。
+	usagePrompts sync.Map
+	// wirePaths 将会话标识映射到受管目录中的官方 wire.jsonl。
+	wirePaths sync.Map
 	// pythonACP 标识原生问答会被丢弃、必须等待受管工具就绪的 Python 实现。
 	pythonACP atomic.Bool
 }

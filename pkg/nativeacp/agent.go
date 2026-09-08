@@ -23,6 +23,10 @@ type Config struct {
 	Command string
 	// Args 是包含 ACP 子命令的完整参数列表。
 	Args []string
+	// VersionArgs 可选的 CLI 版本参数，不包含 ACP 或权限参数。
+	VersionArgs []string
+	// RuntimeName 在上游完全省略实现信息时标识 CLI。
+	RuntimeName string
 	// Environment 是完整子进程环境；nil 表示继承当前环境。
 	Environment []string
 	// WorkingDirectory 是进程启动目录；Session cwd 仍由调用者指定。
@@ -51,6 +55,10 @@ type Agent struct {
 	done chan struct{}
 	// closed 在主动关闭开始时关闭，解除回调等待。
 	closed chan struct{}
+	// versionOnce 保证版本只在初始化时探测一次。
+	versionOnce sync.Once
+	// version 保存实际 CLI 版本，探测失败保持空。
+	version string
 	// closeOnce 保证关闭幂等。
 	closeOnce sync.Once
 	// mutex 保护宿主连接、初始化能力和会话配置。
@@ -171,6 +179,7 @@ func (agent *Agent) Close(ctx context.Context) error {
 func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	response, err := acp.SendRequest[acp.InitializeResponse](agent.conn, ctx, "initialize", request)
 	if err == nil {
+		agent.completeRuntimeVersion(ctx, &response)
 		agent.mutex.Lock()
 		agent.capabilities = response.AgentCapabilities
 		agent.mutex.Unlock()

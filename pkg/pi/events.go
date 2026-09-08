@@ -51,6 +51,22 @@ func (a *Agent) events(s *session) {
 		s.mutex.Unlock()
 		kind := text(event["type"])
 		if kind == "extension_ui_request" {
+			if event["method"] == "setStatus" && event["statusKey"] == "acp-go.context-usage" {
+				var value map[string]any
+				if json.Unmarshal([]byte(text(event["statusText"])), &value) == nil {
+					tokens, tokensOK := value["tokens"].(float64)
+					window, windowOK := value["contextWindow"].(float64)
+					if tokensOK && windowOK && tokens >= 0 && window > 0 {
+						if err := a.emit(ctx, s, map[string]any{"sessionUpdate": "usage_update", "used": int(tokens), "size": int(window)}); err != nil {
+							s.mutex.Lock()
+							s.failure = err
+							s.mutex.Unlock()
+						}
+					}
+				}
+				continue
+			}
+
 			if event["method"] == "setStatus" && event["statusKey"] == "acp-go.permission-review" {
 				var record map[string]any
 				if json.Unmarshal([]byte(text(event["statusText"])), &record) == nil && text(record["toolCallId"]) != "" {
@@ -108,6 +124,7 @@ func (a *Agent) events(s *session) {
 		case "message_end":
 			message := object(event["message"])
 			if message["role"] == "assistant" {
+				s.accumulateUsage(object(message["usage"]))
 				if reason := text(message["stopReason"]); reason == "error" {
 					s.mutex.Lock()
 					s.failure = errors.New("Pi model request failed: " + text(message["errorMessage"]))

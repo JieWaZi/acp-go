@@ -50,5 +50,5 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, errors.New("unsupported Cursor permission mode")
 	}
 	args = append(args, "acp")
-	return nativeacp.NewAgent(ctx, nativeacp.Config{Command: command, Args: args, Environment: config.Environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger, CursorExtensions: true})
+	return nativeacp.NewAgent(ctx, nativeacp.Config{Command: command, Args: args, Environment: config.Environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger, CursorExtensions: true, RuntimeName: "cursor", VersionArgs: append(append([]string{}, config.PrefixArgs...), "--version")})
 }

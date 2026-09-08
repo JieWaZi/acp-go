@@ -40,6 +40,16 @@ export default async function (pi: any) {
       },
     });
   }
+  // Forward Pi's documented context snapshot; conversion stays in the Go adapter.
+  const reportContext = (_event: any, ctx: any) => {
+    const usage = ctx.getContextUsage();
+    if (usage && Number.isFinite(usage.tokens) && usage.tokens >= 0 && usage.contextWindow > 0) {
+      ctx.ui.setStatus("acp-go.context-usage", JSON.stringify(usage));
+    }
+  };
+  pi.on("turn_end", reportContext);
+  pi.on("session_start", reportContext);
+  pi.on("session_compact", reportContext);
   if (permissionMode === "full-access") return;
   // MCP tools use the library's own approval gate, including direct and resource tools.
   // Other tools use Pi's documented pre-execution hook, following the upstream gate example.

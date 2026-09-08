@@ -14,3 +14,16 @@ Python 实现通过官方 `KIMI_SHARE_DIR` 使用私有配置副本，模型/思
 使用 `acpserver.NewWithUserInput` 接入统一问答。TypeScript 原生 elicitation 的顶层 sessionId 被保留到宿主元数据；Python ACP 的原生 AskUserQuestion 会丢弃答案，因此使用进程内 MCP 提供同名工具。执行前确认该目录已经被 CLI 发现，失败会阻止执行。受管进程允许长时间 MCP 问答等待，不修改用户真实配置；取消仍立即传播。Python 的 MCP 工具访问可能先触发原生工具审批，实际问题仍走独立表单，任何权限档位都不能代答。
 
 真实 Python CLI 三档权限、模型选择、风险审查、问答和外部 MCP 拒绝副作用，已由 `scripts/unified-integration/` 的 loopback 模型覆盖；另有超过一分钟的真实问答等待回归。线上供应商认证和真实模型质量不属于这个离线测试的结论。
+
+## Usage
+
+Python Kimi currently discards `StatusUpdate` in ACP. The Go adapter reads only
+the appended portion of the managed session's official `wire.jsonl` after each
+prompt. It maps Kosong's noncached input, output, cache read/write, and context
+counts to standard ACP usage. Missing/invalid data stays unknown. It does not
+modify the CLI, patch Python modules, or scan unrelated sessions. This mapping
+follows MoonshotAI/kimi-cli commit `86f136422a0aae6b217ea49e7ea1d2e8a1defcd2`
+(`metadata.py`, `wire/file.py`, `wire/types.py`, and Kosong `TokenUsage`).
+TypeScript Kimi is a separate implementation: its native ACP context update is
+forwarded, but its ACP currently omits per-turn usage. The Python file mapping
+is never applied to TypeScript sessions.

@@ -32,3 +32,9 @@ provider authentication, a model turn, native tool execution, or UI rendering.
 Those require separate environment acceptance. Codex and Claude remain covered
 by their existing protocol and host tests; this fixture is not evidence of their
 commercial-provider execution.
+
+The same matrix now asserts real per-turn input/output/cache counts and context
+updates. The loopback provider supplies known usage for every model call; rejected
+tool turns may contain fewer calls. Counts must reset between prompts and exclude
+automatic approval reviewer calls. Cursor handshake checks the actual CLI version
+without invoking a model.

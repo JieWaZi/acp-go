@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -12,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
+	"github.com/JieWaZi/acp-go/pkg/cursor"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -112,7 +115,12 @@ func startAgent(t *testing.T, variant string, reviewers ...func(context.Context,
 	if len(reviewers) > 0 {
 		config.LegacyPermissionReviewer = reviewers[0]
 	}
-	agent, err := nativeacp.NewAgent(context.Background(), config)
+	var agent *nativeacp.Agent
+	if variant == "version" {
+		agent, err = cursor.NewAgent(context.Background(), cursor.Config{CursorPath: binary, PrefixArgs: []string{"-test.run=^TestACPProcess$", "--"}, Environment: config.Environment, Logger: config.Logger})
+	} else {
+		agent, err = nativeacp.NewAgent(context.Background(), config)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +230,10 @@ func TestACPProcess(t *testing.T) {
 	if variant == "" {
 		return
 	}
+	if variant == "version" && os.Args[len(os.Args)-1] == "--version" {
+		fmt.Println("2026.09.02-c22c1a3")
+		os.Exit(0)
+	}
 	ready := make(chan struct{})
 	var connection *acp.Connection
 	options := func(model string) []map[string]any {
@@ -233,6 +245,9 @@ func TestACPProcess(t *testing.T) {
 		_ = json.Unmarshal(data, &request)
 		switch method {
 		case "initialize":
+			if variant == "version" {
+				return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{}}, nil
+			}
 			return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}}, "authMethods": []any{}, "agentInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
 		case "session/new", "session/load":
 			if variant == "mcp" {
@@ -404,5 +419,17 @@ func TestLegacyAutoReviewFallsBackToHost(t *testing.T) {
 				t.Fatalf("reviewed=%v approvals=%d", reviewed, host.approvals)
 			}
 		})
+	}
+}
+
+// TestCursorVersionWithoutAgentInfo 验证真实 Cursor 握手缺少信息时仍向宿主返回 CLI 版本。
+func TestCursorVersionWithoutAgentInfo(t *testing.T) {
+	_, client, _ := startAgent(t, "version")
+	response, err := client.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.AgentInfo == nil || acpmeta.RuntimeVersion(response.AgentInfo.Meta) != "2026.09.02-c22c1a3" {
+		t.Fatalf("Cursor CLI version missing: %+v", response.AgentInfo)
 	}
 }
