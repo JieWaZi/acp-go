@@ -1,6 +1,6 @@
 # acp-go
 
-`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor CLI 或 Pi 的开源 ACP 适配器。
+`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor CLI 或 Pi CLI。
 
 项目同时提供可直接嵌入其他 Go 程序的公开包：
 
@@ -21,9 +21,9 @@
 | Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、Edit/Write 标准文件 diff、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
 | Kimi | `--adapter kimi` | 复用 `kimi acp` 原生服务 | 原生模型目录（含旧 models）、会话、消息、审批与 MCP |
 | Cursor | `--adapter cursor` | 复用 `cursor-agent acp`，默认命令缺失时尝试 `agent acp` | 原生会话、模型、MCP、审批、提问与计划/待办投影 |
-| Pi | `--adapter pi` | 复用预装的 `svkozak/pi-acp` | Pi 模型、思考、会话、MCP 与工具审批 |
+| Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、MCP 与工具审批 |
 
-Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 和 Pi 共用现有 Go ACP SDK 的外部进程连接；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
+Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 复用 Go ACP SDK 连接原生 ACP；Pi 在 Go 内部适配官方 RPC；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
 
 ```mermaid
 flowchart LR
@@ -110,7 +110,7 @@ Claude 配置示例：
 | `CODEX_PATH` | Codex | 指定 Codex CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
 | `KIMI_PATH` | Kimi | 指定已安装的 `kimi` 路径 |
 | `CURSOR_PATH` | Cursor | 指定 `cursor-agent` 或 `agent` 路径 |
-| `PI_ACP_PATH` | Pi | 指定 `pi-acp` 路径，不能填写 `pi` |
+| `PI_PATH` | Pi | 指定 Pi CLI 路径，默认发现 `pi` |
 | `CLAUDE_CODE_EXECUTABLE` | Claude | 指定 Claude CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
 | `CLAUDE_CONFIG_DIR` | Claude | 指定读取本地 Session 历史的 Claude 配置目录 |
 | `CODEX_API_KEY` | Codex | 提供 API Key，优先级高于 `OPENAI_API_KEY` |

@@ -1,6 +1,9 @@
 package pi
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,17 +15,20 @@ import (
 // TestMCPConfigSnapshotPreservesLiteralsAndReplacesCredentials 验证 MCP 字面量、凭据替换和私有快照。
 func TestMCPConfigSnapshotPreservesLiteralsAndReplacesCredentials(t *testing.T) {
 	directory := t.TempDir()
-	agent := &Agent{directory: directory, modulePath: "/installed package/index.ts", permissionMode: "default"}
+	extension := filepath.Join(directory, "extension.ts")
+	prepare := func(servers []acp.McpServer) error {
+		return writeExtension(extension, "/installed package/index.ts", "default", servers)
+	}
 	secret := "!do-not-run ${HOME} {env:HOME} __MANUAL__ __CONFIG__"
 	servers := []acp.McpServer{
 		{Http: &acp.McpServerHttpInline{Name: "remote", Url: "http://127.0.0.1/mcp", Headers: []acp.HttpHeader{{Name: "Authorization", Value: secret}}}},
 		{Stdio: &acp.McpServerStdio{Name: "local", Command: "node", Args: []string{"literal ${HOME}"}, Env: []acp.EnvVariable{{Name: "TOKEN", Value: secret}}}},
 		{Sse: &acp.McpServerSseInline{Name: "events", Url: "http://127.0.0.1/sse"}},
 	}
-	if err := agent.prepareExtension(servers); err != nil {
+	if err := prepare(servers); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(agent.extensionPath())
+	data, err := os.ReadFile(extension)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,41 +38,40 @@ func TestMCPConfigSnapshotPreservesLiteralsAndReplacesCredentials(t *testing.T) 
 			t.Fatalf("snapshot lost %q", expected)
 		}
 	}
-	info, _ := os.Stat(agent.extensionPath())
+	info, _ := os.Stat(extension)
 	if info.Mode().Perm() != 0600 {
 		t.Fatal("credential file must be private")
 	}
-	if err := agent.prepareExtension(nil); err != nil {
+	if err := prepare(nil); err != nil {
 		t.Fatal(err)
 	}
-	data, _ = os.ReadFile(agent.extensionPath())
+	data, _ = os.ReadFile(extension)
 	if strings.Contains(string(data), secret) {
 		t.Fatal("disabled connector credentials survived into the next session")
 	}
-	if err := agent.prepareExtension(append(servers, servers[0])); err == nil {
+	if err := prepare(append(servers, servers[0])); err == nil {
 		t.Fatal("duplicate MCP identities accepted")
 	}
 }
 
-// TestDependencyDiscoveryUsesAdapterInstallation 验证从适配器安装位置发现已安装依赖。
-func TestDependencyDiscoveryUsesAdapterInstallation(t *testing.T) {
-	root := t.TempDir()
-	bin := filepath.Join(root, "node_modules", ".bin")
-	module := filepath.Join(root, "node_modules", "pi-mcp-adapter", "index.ts")
-	if err := os.MkdirAll(bin, 0700); err != nil {
+// TestPiDiscoveryNeedsOnlyPi 验证只安装 Pi 即可构造适配器，MCP 工厂来自 Go 内置资源。
+func TestPiDiscoveryNeedsOnlyPi(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(module), 0700); err != nil {
+	agent, err := NewAgent(context.Background(), Config{PiPath: binary, Environment: []string{"PATH=/no-pi-acp"}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{filepath.Join(bin, "pi"), filepath.Join(bin, "pi-acp"), module} {
-		if err := os.WriteFile(path, []byte("fixture"), 0700); err != nil {
-			t.Fatal(err)
-		}
+	module := agent.modulePath
+	if data, err := os.ReadFile(module); err != nil || len(data) < 1000 {
+		t.Fatalf("missing embedded module: %v", err)
 	}
-	piPath, modulePath, err := resolveDependencies(filepath.Join(bin, "pi-acp"), Config{Environment: []string{}})
-	expectedModule, _ := filepath.EvalSymlinks(module)
-	if err != nil || piPath != filepath.Join(bin, "pi") || modulePath != expectedModule {
-		t.Fatalf("discovery: %s %s %v", piPath, modulePath, err)
+	if err := agent.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(module); !os.IsNotExist(err) {
+		t.Fatal("extension not cleaned up")
 	}
 }

@@ -41,6 +41,23 @@ const configDir = root + "/go-config",
   workspace = root + "/go-workspace";
 mkdirSync(configDir, { recursive: true });
 mkdirSync(workspace, { recursive: true });
+mkdirSync(join(configDir,"extensions"), {recursive:true});
+writeFileSync(join(configDir,"extensions","fixture.ts"), `
+import { writeFileSync } from "node:fs";
+export default function(pi:any) {
+ pi.registerTool({name:"fixture_ui",label:"Fixture UI",description:"Local UI regression",parameters:{type:"object",properties:{}},
+ async execute(_id:any,_args:any,_signal:any,_update:any,ctx:any) {
+  const input=await ctx.ui.input("Fixture input","input hint");
+  const editor=await ctx.ui.editor("Fixture editor","initial text");
+  const declined=await ctx.ui.input("Fixture declined");
+  const timedOut=await ctx.ui.select("Fixture timeout",["Hold"],{timeout:50});
+  writeFileSync(${JSON.stringify(join(workspace,"ui-result.json"))},JSON.stringify({input,editor,declined:declined===undefined,timedOut:timedOut===undefined}));
+  return {content:[{type:"text",text:"UI completed"}],details:{}};
+ }});
+}
+`);
+mkdirSync(join(configDir,"prompts"),{recursive:true});
+writeFileSync(join(configDir,"prompts","fixture.md"), '---\ndescription: Fixture template\n---\nGOFIX:{"marker":"TEMPLATE","transport":"stdio","decision":"allow","kind":"bash"}');
 const log = root + "/go-chain-events.jsonl";
 writeFileSync(log, "");
 const append = (x) =>
@@ -189,13 +206,15 @@ const server = createServer(async (req, res) => {
       alreadyCalled,
       tools: (body.tools ?? []).map((x) => x.function?.name),
     });
-    const tool = task.kind === "bash" ? "bash" : "mcp";
+    const tool = ["bash","write","edit"].includes(task.kind) ? task.kind : task.kind === "ui" ? "fixture_ui" : "mcp";
     const args =
       tool === "bash"
         ? {
             command: `printf 'fixture-approved' > '${workspace}/${task.marker}.txt'`,
           }
-        : {
+        : tool === "write" ? {path:"diff.txt",content:"before\n"}
+        : tool === "edit" ? {path:"diff.txt",oldText:"before",newText:"after"}
+        : tool === "fixture_ui" ? {} : {
             server: task.transport,
             tool: "record",
             args: { marker: task.marker },
@@ -297,9 +316,9 @@ const env = {
   PATH: process.env.PATH,
   TMPDIR: configDir,
   PI_CODING_AGENT_DIR: configDir,
-  PI_ACP_PATH: dependencies + "/node_modules/.bin/pi-acp",
-  PI_ACP_PI_COMMAND: dependencies + "/node_modules/.bin/pi",
-  PI_MCP_ADAPTER_PATH: dependencies + "/node_modules/pi-mcp-adapter/index.ts",
+  PI_PATH: dependencies + "/node_modules/.bin/pi",
+  PI_ACP_PATH: "/must-not-launch-pi-acp",
+  PI_MCP_ADAPTER_PATH: "/must-use-embedded-module",
   XDG_CONFIG_HOME: configDir,
   NO_COLOR: "1",
   PI_SKIP_VERSION_CHECK: "1",
@@ -328,8 +347,12 @@ createInterface({ input: child.stdout }).on("line", (line) => {
       pending.get(value.id)(value);
       pending.delete(value.id);
     }
+    if (value.method === "elicitation/create") {
+      child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:value.id,result:value.params.message==="Fixture declined" ? {action:"decline"} : {action:"accept",content:{value:value.params.message==="Fixture input" ? "entered input" : "edited\ntext"}}})+"\n");
+    }
     if (value.method === "session/request_permission") {
       const options = value.params.options;
+      if (value.params.toolCall.title === "Fixture timeout") return;
       if (currentTask.decision === "cancel") {
         permissionRequests.push({
           marker: currentTask.marker,
@@ -427,13 +450,19 @@ async function prompt(
 try {
   const initialized = await rpc("initialize", {
     protocolVersion: 1,
-    clientCapabilities: {},
+    clientCapabilities: {elicitation:{form:{}}},
     clientInfo: { name: "go-chain-local-fixture", version: "1" },
   });
   const a = await rpc("session/new", {
     cwd: workspace,
     mcpServers: mcpServers("A"),
   });
+  assert.ok(initialized.agentCapabilities.sessionCapabilities.delete);
+  await rpc("authenticate",{methodId:"pi_terminal_login"});
+  assert.ok(a.configOptions.find(x=>x.id==="model").options.some(x=>x.value==="ally-local-fixture/local-model"));
+  await rpc("session/set_config_option",{sessionId:a.sessionId,configId:"model",value:"ally-local-fixture/local-model"});
+  await rpc("session/set_mode",{sessionId:a.sessionId,modeId:"high"});
+  await rpc("session/set_config_option",{sessionId:a.sessionId,configId:"reasoning",value:"off"});
   await prompt(a.sessionId, "A_FIRST");
   const b = await rpc("session/new", {
     cwd: workspace,
@@ -481,8 +510,35 @@ try {
     "fixture-approved",
   );
   assert.equal(permissionRequests.length, 11);
+  await prompt(a.sessionId,"WRITE_DIFF","stdio","allow","write");
+  await prompt(a.sessionId,"EDIT_DIFF","stdio","allow","edit");
+  assert.equal(readFileSync(join(workspace,"diff.txt"),"utf8"),"after\n");
+  assert.ok(events.some(x=>x.params?.update?.content?.some?.(c=>c.type==="diff"&&c.oldText==="before\n"&&c.newText==="after\n")));
+  assert.ok(events.some(x=>x.params?.update?._meta?.terminal_exit?.exit_code===0));
+  await prompt(a.sessionId,"EXTENSION_UI","stdio","allow","ui");
+  assert.deepEqual(JSON.parse(readFileSync(join(workspace,"ui-result.json"),"utf8")),{input:"entered input",editor:"edited\ntext",declined:true,timedOut:true});
+  currentTask={marker:"TEMPLATE",decision:"allow"};
+  await rpc("session/prompt",{sessionId:a.sessionId,prompt:[{type:"text",text:"/fixture"}]});
+  assert.ok(existsSync(join(workspace,"TEMPLATE.txt")));
+  for (const command of ["/name Native Pi session","/session","/steering all","/follow-up one-at-a-time","/autocompact off","/export","/changelog"]) {
+    await rpc("session/prompt",{sessionId:a.sessionId,prompt:[{type:"text",text:command}]});
+  }
+  assert.ok(existsSync(join(workspace,`pi-session-${a.sessionId}.html`)));
+  assert.ok(events.some(x=>x.params?.update?.title==="Native Pi session"));
+  const listed=await rpc("session/list",{cwd:workspace});
+  assert.ok(listed.sessions.some(x=>x.sessionId===a.sessionId&&x.title==="Native Pi session"));
+  await rpc("session/close",{sessionId:b.sessionId});
+  const replayStart=events.length;
+  await rpc("session/load",{sessionId:b.sessionId,cwd:workspace,mcpServers:[]});
+  assert.ok(events.slice(replayStart).some(x=>x.params?.update?.sessionUpdate==="user_message_chunk"));
+  await rpc("session/delete",{sessionId:b.sessionId});
+  await rpc("session/delete",{sessionId:b.sessionId});
+  assert.ok(!(await rpc("session/list",{cwd:workspace})).sessions.some(x=>x.sessionId===b.sessionId));
+  const resumeStart=events.length;
+  await rpc("session/resume",{sessionId:a.sessionId,cwd:workspace,mcpServers:[]});
+  assert.ok(!events.slice(resumeStart).some(x=>x.params?.update?.sessionUpdate==="user_message_chunk"));
   const starts = records.filter((x) => x.event === "stdio_start");
-  assert.ok(starts.length >= 4);
+  assert.ok(starts.length >= 3);
   assert.ok(
     starts.every(
       (x) =>
@@ -498,6 +554,8 @@ try {
   assert.ok(headers.every((x) => x.header === special));
   const summary = {
     success: true,
+    directPiOnly: true,
+    historyModelsCommandsDiffTerminalAndInputPassed: true,
     initialized,
     actual,
     permissionRequests,

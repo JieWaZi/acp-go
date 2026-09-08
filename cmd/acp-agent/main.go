@@ -168,7 +168,7 @@ func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
 	}
 
 	if err := registry.Register(acpserver.Registration{Name: "pi", Factory: func(ctx context.Context) (acp.Agent, error) {
-		return pi.NewAgent(ctx, pi.Config{Logger: logger, AdapterPath: os.Getenv("PI_ACP_PATH")})
+		return pi.NewAgent(ctx, pi.Config{Logger: logger, PiPath: os.Getenv("PI_PATH")})
 	}}); err != nil {
 		return nil, err
 	}
