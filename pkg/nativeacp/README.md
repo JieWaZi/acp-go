@@ -1,0 +1,28 @@
+# 原生 ACP 进程接入
+
+`pkg/kimi`、`pkg/cursor`、`pkg/pi` 提供现有 Adapter 风格的 Config、NewAgent 和 Agent，可直接交给 acpserver.New。公共层使用 coder/acp-go-sdk 的 Connection、请求关联、通知排序、取消与类型校验，不包含第二套 JSON-RPC 实现。
+
+```go
+agent, err := kimi.NewAgent(ctx, kimi.Config{
+    Logger: logger,
+    KimiPath: "/absolute/path/to/kimi",
+    Environment: os.Environ(),
+    WorkingDirectory: "/absolute/path/to/project",
+})
+if err != nil { return err }
+server, err := acpserver.New(agent, os.Stdin, os.Stdout)
+if err != nil { return err }
+return server.Serve(ctx)
+```
+
+WorkingDirectory 是进程启动目录，session/new.cwd 是会话目录；需要固定 cwd 的进程应对应一个工作区。命令从所传完整环境的 PATH 解析，nil 环境继承宿主。PrefixArgs 位于 Kimi/Cursor 的 acp 子命令前，Pi 原样传给 pi-acp。不会安装、升级程序或登录。
+
+模型 category=model 规范化为 model，思考规范化为 reasoning，选项值保持原样。旧 Kimi models 兼容 set_model，但只有显式选择才切换；Kimi 包负责隔离 Python 默认配置。发现过程不循环切换模型。
+
+Cursor 问答经标准表单 Elicitation，计划经一次性审批并包含完整正文。无法唯一关联活跃会话时取消。待办、task/image 通知投影到标准会话更新。Pi 复用现成扩展 UI 桥和 MCP 工厂，具体权限边界见各包 README。
+
+会话列表、load、resume、additionalDirectories、图片等沿用上游 initialize，不能把方法存在当作能力支持。MCP HTTP/SSE 以握手为准；Pi 在确认依赖安装后声明现成扩展提供的传输。宿主必须展示并如实回传审批选项。
+
+未声明 close 的上游收到取消，本地映射删除，资源随进程退出回收。Close 先结束 stdin，再有界终止进程；acpserver.Serve 负责调用。Unix 终止独立进程组，包含 Pi / MCP 子进程。其他平台目前只保证直接子进程清理，未做 Windows 进程树实测。
+
+[来源基线](UPSTREAM.md) · [验证记录](../../docs/NATIVE_ACP_TEST_MATRIX.md)

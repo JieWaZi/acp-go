@@ -1,6 +1,6 @@
 # acp-go
 
-`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex CLI 或 Claude Code CLI。
+`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor CLI 或 Pi 的开源 ACP 适配器。
 
 项目同时提供可直接嵌入其他 Go 程序的公开包：
 
@@ -8,6 +8,10 @@
 - `github.com/JieWaZi/acp-go/pkg/acpmeta`
 - `github.com/JieWaZi/acp-go/pkg/codex`
 - `github.com/JieWaZi/acp-go/pkg/claude`
+- `github.com/JieWaZi/acp-go/pkg/kimi`
+- `github.com/JieWaZi/acp-go/pkg/cursor`
+- `github.com/JieWaZi/acp-go/pkg/pi`
+- `github.com/JieWaZi/acp-go/pkg/nativeacp`
 
 ## 适配器
 
@@ -15,8 +19,11 @@
 | --- | --- | --- | --- |
 | Codex | 默认，或 `--adapter codex` | 一个 Adapter 持有一个 `codex app-server` 进程 | 认证、会话恢复、附加目录/Skills、Prompt Usage、取消、steering、标准文件 diff、工具、审批、MCP、Elicitation、模型与运行模式 |
 | Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、Edit/Write 标准文件 diff、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
+| Kimi | `--adapter kimi` | 复用 `kimi acp` 原生服务 | 原生模型目录（含旧 models）、会话、消息、审批与 MCP |
+| Cursor | `--adapter cursor` | 复用 `cursor-agent acp`，默认命令缺失时尝试 `agent acp` | 原生会话、模型、MCP、审批、提问与计划/待办投影 |
+| Pi | `--adapter pi` | 复用预装的 `svkozak/pi-acp` | Pi 模型、思考、会话、MCP 与工具审批 |
 
-Codex 是默认适配器。只有显式传入 `--adapter claude` 时，程序才会探测并构造 Claude Adapter。
+Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 和 Pi 共用现有 Go ACP SDK 的外部进程连接；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
 
 ```mermaid
 flowchart LR
@@ -33,7 +40,7 @@ flowchart LR
 - Go 版本以 [`go.mod`](go.mod) 为准。
 - 使用 Codex Adapter 时，需要安装并登录 [Codex CLI](https://github.com/openai/codex)。
 - 使用 Claude Adapter 时，需要安装并登录 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)。
-- 构建和运行已提交代码不依赖 Node.js 或 npm；只有刷新 Codex 协议类型时才需要相应工具链。
+- 构建 Go 程序不需要 Node.js；运行 Pi 适配器需要它自己的 Node.js 与 Pi 环境，见 [Pi 说明](pkg/pi/README.md)。刷新 Codex 协议类型也需要对应工具链。
 
 本项目不会下载、更新 CLI，也不会修改用户的登录状态。
 
@@ -101,6 +108,9 @@ Claude 配置示例：
 | 变量 | 适配器 | 用途 |
 | --- | --- | --- |
 | `CODEX_PATH` | Codex | 指定 Codex CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
+| `KIMI_PATH` | Kimi | 指定已安装的 `kimi` 路径 |
+| `CURSOR_PATH` | Cursor | 指定 `cursor-agent` 或 `agent` 路径 |
+| `PI_ACP_PATH` | Pi | 指定 `pi-acp` 路径，不能填写 `pi` |
 | `CLAUDE_CODE_EXECUTABLE` | Claude | 指定 Claude CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
 | `CLAUDE_CONFIG_DIR` | Claude | 指定读取本地 Session 历史的 Claude 配置目录 |
 | `CODEX_API_KEY` | Codex | 提供 API Key，优先级高于 `OPENAI_API_KEY` |
@@ -168,7 +178,7 @@ Claude Adapter 在非 root 进程，或显式 `IS_SANDBOX` 环境中，提供 `b
 
 ## 作为 Go 包使用
 
-两个 Adapter 都以 `Config`、`NewAgent` 和 `Agent` 作为公开入口，并实现 `github.com/coder/acp-go-sdk` 的 Agent 接口。`pkg/acpserver` 提供公共 Registry 和 stdio Server。调用方负责提供非空日志器、选择 CLI 路径和可选启动配置，并在不再使用时关闭 Agent。
+所有 Adapter 都以 `Config`、`NewAgent` 和 `Agent` 作为公开入口，并实现 `github.com/coder/acp-go-sdk` 的 Agent 接口。`pkg/acpserver` 提供公共 Registry 和 stdio Server。调用方负责提供非空日志器、选择 CLI 路径和可选启动配置，并在不再使用时关闭 Agent。
 
 ```go
 logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -201,6 +211,8 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | [`pkg/acpserver`](pkg/acpserver) | Adapter 注册、选择和 ACP 服务生命周期 |
 | [`pkg/codex`](pkg/codex) | Codex 公开包、运行时与协议类型 |
 | [`pkg/claude`](pkg/claude) | Claude 公开包、运行时与协议类型 |
+| [`pkg/nativeacp`](pkg/nativeacp) | 原生 stdio 连接、配置规范化与 Cursor 交互转换 |
+| [`pkg/kimi`](pkg/kimi)、[`pkg/cursor`](pkg/cursor)、[`pkg/pi`](pkg/pi) | 原生 CLI 与开源适配器启动入口 |
 | [`tools/protocolgen`](tools/protocolgen) | Codex 协议生成与新鲜度检查 |
 | [`docs`](docs) | 测试矩阵和维护规格 |
 
@@ -210,6 +222,7 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | --- | --- | --- | --- |
 | Codex | [`pkg/codex/README.md`](pkg/codex/README.md) | [`pkg/codex/UPSTREAM.md`](pkg/codex/UPSTREAM.md) | [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md) |
 | Claude | [`pkg/claude/README.md`](pkg/claude/README.md) | [`pkg/claude/UPSTREAM.md`](pkg/claude/UPSTREAM.md) | [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md) |
+| Kimi / Cursor / Pi | [`pkg/nativeacp/README.md`](pkg/nativeacp/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
 
 ## 开发与验证
 
@@ -243,7 +256,7 @@ go run ./tools/protocolgen --check
 
 ## 当前边界
 
-- 两个 Adapter 都不提供 `session/list`、fork、delete 等会话管理能力。
+- Codex 与 Claude Adapter 不提供 `session/list`、fork、delete 等会话管理能力。
 - Audio 输入尚未支持，收到请求时会明确失败。
 - Claude 不提供 ACP 认证/登出、terminal、MCP Elicitation、provider 或 goal 能力；当前 Elicitation 只用于内置 `AskUserQuestion` 的 Form 桥接。
 - Codex 不公开 Review、Goal、Realtime、动态客户端工具、Apps、Plugins 或 Marketplace 管理能力。
