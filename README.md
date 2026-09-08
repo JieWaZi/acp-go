@@ -19,9 +19,9 @@
 | --- | --- | --- | --- |
 | Codex | 默认，或 `--adapter codex` | 一个 Adapter 持有一个 `codex app-server` 进程 | 认证、会话恢复、附加目录/Skills、Prompt Usage、取消、steering、标准文件 diff、工具、审批、MCP、Elicitation、模型与运行模式 |
 | Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、Edit/Write 标准文件 diff、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
-| Kimi | `--adapter kimi` | 复用 `kimi acp` 原生服务 | 原生模型目录（含旧 models）、会话、消息、审批与 MCP |
+| Kimi | `--adapter kimi` | 复用 `kimi acp` 原生服务 | 原生模型目录（含旧 models）、会话、消息、三档权限、统一问答与 MCP |
 | Cursor | `--adapter cursor` | 复用 `cursor-agent acp`，默认命令缺失时尝试 `agent acp` | 原生会话、模型、MCP、审批、提问与计划/待办投影 |
-| Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、MCP 与工具审批 |
+| Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、三档权限、AskUserQuestion 与 MCP |
 
 Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 复用 Go ACP SDK 连接原生 ACP；Pi 在 Go 内部适配官方 RPC；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
 
@@ -261,3 +261,8 @@ go run ./tools/protocolgen --check
 - Claude 不提供 ACP 认证/登出、terminal、MCP Elicitation、provider 或 goal 能力；当前 Elicitation 只用于内置 `AskUserQuestion` 的 Form 桥接。
 - Codex 不公开 Review、Goal、Realtime、动态客户端工具、Apps、Plugins 或 Marketplace 管理能力。
 - 项目不替用户安装 CLI、写入用户配置或管理本机凭据。
+
+
+## 统一交互入口
+
+需要跨 CLI 统一问答的宿主使用 `acpserver.NewWithUserInput(agent, input, output)`，并在 initialize 声明 form elicitation。CLI 入口已使用该入口。原生问答完整的适配器保留原生交互，其余使用 Go 进程内受管 MCP，用户不需要安装其他程序。具体生命周期和结果语义见 [userinput](pkg/userinput/README.md)。

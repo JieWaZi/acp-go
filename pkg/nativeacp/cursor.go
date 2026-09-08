@@ -140,3 +140,6 @@ func (agent *Agent) cursorInteraction(ctx context.Context, method string, params
 	}
 	return map[string]any{"outcome": map[string]any{"outcome": "answered", "answers": answers}}, nil
 }
+
+// ProvidesUserInput 表示 Cursor 专用交互扩展已提供原生问答，无需重复注入工具。
+func (agent *Agent) ProvidesUserInput() bool { return agent.config.CursorExtensions }

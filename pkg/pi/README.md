@@ -18,13 +18,8 @@ PI_PATH=/absolute/path/to/pi acp-agent --adapter pi
 
 MCP 直接复用 `pi-mcp-adapter@2.32.1` 公开配置工厂，支持 STDIO、Streamable HTTP、SSE。该开源扩展及其依赖已生成并嵌入 Go 二进制，在同一个 Pi 进程内加载，无需用户安装额外 MCP 包。临时配置权限 0600，关闭后删除；不合并或改写用户配置，参数/环境/请求头保持字面量。`MCPModulePath` 仅保留显式开发覆盖。
 
-`PermissionMode` 支持 `default` 与 `full-access`：默认使用成熟 MCP 插件审批及 Pi 官方 `tool_call` hook 审批其他非只读工具。Go 将 select/confirm 转成 ACP 权限请求，按实际选项 ID 回传；input/editor 通过支持 form elicitation 的 ACP 客户端收集输入，否则取消。超时、拒绝和提示取消不会自动批准。完全访问关闭本扩展审批门；不提供独立沙箱或 auto/read-only 权限等级。
+`PermissionMode` 提供 `default`、`auto`、`full-access` 三档。默认档使用上游 MCP 审批和官方工具 hook；自动档复用固定的开源风险分类器，使用当前所选模型，判断不明或失败时转人工；完全访问跳过本扩展的工具审批，仍受操作系统和外部服务限制。工作区外读取会请求确认，不把任意 MCP readOnlyHint 当成授权。
 
-维护者重新生成嵌入资源：
+宿主需要完整问答时使用 `acpserver.NewWithUserInput`。Go 进程内提供受管 AskUserQuestion，Pi 第一轮就能调用，问题始终等待真实用户。普通 select/input/editor 转为 ACP form；只有确认和 MCP 审批选项进入 RequestPermission。取消、跳过与回答分别处理。没有 pi-acp 或额外问答进程，不提供独立操作系统沙箱。
 
-```sh
-npm ci --prefix tools/pi-extension
-npm run --prefix tools/pi-extension build
-```
-
-普通 Go 构建使用已提交资源，不需要 npm。来源、移植范围与许可证见 [UPSTREAM](UPSTREAM.md)，验证命令见 [测试矩阵](../../docs/NATIVE_ACP_TEST_MATRIX.md)。
+新增真实进程回归见 `scripts/unified-integration/`：三档权限、所选模型参与审查、失败转人工、外部 MCP 副作用、问答回填与一分钟以上等待。原始会话/文件/终端/三传输回归保留在 `scripts/pi-integration/`。

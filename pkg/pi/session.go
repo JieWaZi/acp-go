@@ -3,6 +3,8 @@ package pi
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
+	"github.com/JieWaZi/acp-go/pkg/userinput"
 	acp "github.com/coder/acp-go-sdk"
 	"os"
 	"path/filepath"
@@ -17,6 +19,7 @@ var extensionTemplate string
 // prepareExtension 把标准 ACP 服务转换为现有 MCP 库接受的配置形状。
 func writeExtension(path, modulePath, permissionMode string, servers []acp.McpServer) error {
 	entries := make(map[string]any, len(servers))
+	questions := []string{}
 	for _, server := range servers {
 		var name string
 		entry := map[string]any{"auth": false, "oauth": false}
@@ -46,15 +49,22 @@ func writeExtension(path, modulePath, permissionMode string, servers []acp.McpSe
 		if _, exists := entries[name]; exists {
 			return acp.NewInvalidParams(nil)
 		}
+		if userinput.IsServer(server) {
+			entry["requestTimeoutMs"] = 2147483647
+			entry["directTools"] = true
+			entry["approveTools"] = false
+			questions = append(questions, name)
+		}
 		entries[name] = entry
 	}
-	config := map[string]any{"mcpServers": entries, "settings": map[string]any{"autoAuth": false, "directTools": false, "approveTools": permissionMode != "full-access"}}
+	config := map[string]any{"mcpServers": entries, "settings": map[string]any{"autoAuth": false, "directTools": false, "approveTools": permissionMode == "default"}}
 	encoded, err := json.Marshal(config)
 	if err != nil {
 		return err
 	}
 	module, _ := json.Marshal(filepath.ToSlash(modulePath))
-	source := strings.NewReplacer("__MCP_MODULE__", string(module), "__CONFIG__", string(encoded), "__MANUAL__", map[bool]string{true: "true", false: "false"}[permissionMode != "full-access"]).Replace(extensionTemplate)
+	questionTools, _ := json.Marshal(questions)
+	source := strings.NewReplacer("__QUESTION_TOOLS__", string(questionTools), "__MCP_MODULE__", string(module), "__CONFIG__", string(encoded), "__PERMISSION_MODE__", fmt.Sprintf("%q", permissionMode)).Replace(extensionTemplate)
 	return os.WriteFile(path, []byte(source), 0600)
 }
 

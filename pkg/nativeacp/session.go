@@ -16,6 +16,10 @@ type sessionOptions struct {
 	options []acp.SessionConfigOption
 	// legacyModel 表示上游仍使用 models 与 session/set_model。
 	legacyModel bool
+	// legacyPermissions 标识只声明 default、需要适配器补充自动审查的上游。
+	legacyPermissions bool
+	// cwd 是会话实际工作目录，供风险审查使用。
+	cwd string
 	// todos 保存 Cursor merge 通知需要的有序计划状态。
 	todos []cursorTodo
 }
@@ -50,7 +54,7 @@ func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionReques
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
-	agent.normalizeSession(&response, response.SessionId)
+	agent.normalizeSession(&response, response.SessionId, request.Cwd)
 	return response.NewSessionResponse, nil
 }
 
@@ -60,7 +64,7 @@ func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequ
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
-	agent.normalizeSession(&response, request.SessionId)
+	agent.normalizeSession(&response, request.SessionId, request.Cwd)
 	return acp.LoadSessionResponse{Meta: response.Meta, ConfigOptions: response.ConfigOptions, Modes: response.Modes}, nil
 }
 
@@ -70,15 +74,15 @@ func (agent *Agent) ResumeSession(ctx context.Context, request acp.ResumeSession
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	agent.normalizeSession(&response, request.SessionId)
+	agent.normalizeSession(&response, request.SessionId, request.Cwd)
 	return acp.ResumeSessionResponse{Meta: response.Meta, ConfigOptions: response.ConfigOptions, Modes: response.Modes}, nil
 }
 
 // normalizeSession 为一个会话保存原生配置标识和旧版模型目录。
-func (agent *Agent) normalizeSession(response *nativeSessionResponse, id acp.SessionId) {
+func (agent *Agent) normalizeSession(response *nativeSessionResponse, id acp.SessionId, cwd string) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
-	state := &sessionOptions{ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
+	state := &sessionOptions{cwd: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
 	response.ConfigOptions = normalizeOptions(response.ConfigOptions, state.ids)
 	if response.Models != nil && !hasConfig(response.ConfigOptions, "model") {
 		values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(response.Models.AvailableModels))
@@ -90,6 +94,7 @@ func (agent *Agent) normalizeSession(response *nativeSessionResponse, id acp.Ses
 		state.ids["model"] = "model"
 		state.legacyModel = true
 	}
+	state.legacyPermissions = response.Modes != nil && len(response.Modes.AvailableModes) == 1 && response.Modes.AvailableModes[0].Id == "default"
 	state.options = response.ConfigOptions
 	agent.sessions[id] = state
 }
@@ -182,9 +187,25 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	defer agent.mutex.Unlock()
 	if update := request.Update.ToolCall; update != nil {
 		agent.toolSessions[update.ToolCallId] = request.SessionId
+		agent.toolDetails[update.ToolCallId] = acp.ToolCallUpdate{ToolCallId: update.ToolCallId, Title: acp.Ptr(update.Title), Kind: acp.Ptr(update.Kind), RawInput: update.RawInput, Content: update.Content}
 	}
 	if update := request.Update.ToolCallUpdate; update != nil {
 		agent.toolSessions[update.ToolCallId] = request.SessionId
+		previous := agent.toolDetails[update.ToolCallId]
+		if update.RawInput != nil {
+			previous.RawInput = update.RawInput
+		}
+		if update.Title != nil {
+			previous.Title = update.Title
+		}
+		if update.Kind != nil {
+			previous.Kind = update.Kind
+		}
+		if update.Content != nil {
+			previous.Content = update.Content
+		}
+		previous.ToolCallId = update.ToolCallId
+		agent.toolDetails[update.ToolCallId] = previous
 	}
 	if update := request.Update.ConfigOptionUpdate; update != nil {
 		if state := agent.sessions[request.SessionId]; state != nil {
@@ -198,11 +219,20 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 func (agent *Agent) interactionSession(toolID string, explicit string) acp.SessionId {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
-	if explicit != "" && agent.active[acp.SessionId(explicit)] {
-		return acp.SessionId(explicit)
+	if explicit != "" {
+		if agent.active[acp.SessionId(explicit)] {
+			if owner := agent.toolSessions[acp.ToolCallId(toolID)]; owner != "" && owner != acp.SessionId(explicit) {
+				return ""
+			}
+			return acp.SessionId(explicit)
+		}
+		return ""
 	}
-	if sid := agent.toolSessions[acp.ToolCallId(toolID)]; sid != "" && agent.active[sid] {
-		return sid
+	if sid := agent.toolSessions[acp.ToolCallId(toolID)]; sid != "" {
+		if agent.active[sid] {
+			return sid
+		}
+		return ""
 	}
 	if len(agent.active) == 1 {
 		for sid := range agent.active {

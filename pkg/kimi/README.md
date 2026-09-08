@@ -6,6 +6,11 @@
 
 Python 实现通过官方 `KIMI_SHARE_DIR` 使用私有配置副本，模型/思考选择不会保存到用户真实 config.toml。会话与刷新凭据保存在适配器拥有的缓存目录；关闭只删除临时配置。`StateDirectory` 可显式指定持久根。新进程会复制更新的用户凭据，同时保留受管目录中更新的刷新结果。仅迁移已知凭据、配置和设备标识，不复制整个用户目录或历史会话。
 
-`PermissionMode=default/full-access` 为 Python 副本设置 default_yolo。TypeScript 使用原生 default/auto/yolo 会话模式，调用方仍需发送标准 set_mode；旧实现不支持 auto 或只读时宿主必须拒绝这些等级。TypeScript 的 `KIMI_CODE_HOME` 不受 Python 隔离变量影响。
+`PermissionMode` 提供 default/auto/full-access。Python 副本设置 default_yolo，自动档在原生执行前门禁里使用当前所选模型进行无工具审查；复用 pi-auto-approval 的提示和决策协议，失败或不明确时继续转人工，审查临时历史不混入用户会话。TypeScript 使用原生 default/auto/yolo 会话模式，调用方仍需发送标准 set_mode。TypeScript 的 `KIMI_CODE_HOME` 不受 Python 隔离变量影响。
 
 隔离会话目录使用符号链接；macOS 已测试，Windows 需要允许创建符号链接，尚未实机验证。启动目录应与所恢复会话的 cwd 一致。来源见 [UPSTREAM](../nativeacp/UPSTREAM.md)。
+
+
+使用 `acpserver.NewWithUserInput` 接入统一问答。TypeScript 原生 elicitation 的顶层 sessionId 被保留到宿主元数据；Python ACP 的原生 AskUserQuestion 会丢弃答案，因此使用进程内 MCP 提供同名工具。执行前确认该目录已经被 CLI 发现，失败会阻止执行。受管进程允许长时间 MCP 问答等待，不修改用户真实配置；取消仍立即传播。Python 的 MCP 工具访问可能先触发原生工具审批，实际问题仍走独立表单，任何权限档位都不能代答。
+
+真实 Python CLI 三档权限、模型选择、风险审查、问答和外部 MCP 拒绝副作用，已由 `scripts/unified-integration/` 的 loopback 模型覆盖；另有超过一分钟的真实问答等待回归。线上供应商认证和真实模型质量不属于这个离线测试的结论。

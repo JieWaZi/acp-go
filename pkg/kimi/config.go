@@ -101,6 +101,18 @@ func isolatedEnvironment(config Config) (directory string, environment []string,
 		return "", nil, errors.New("Kimi configuration must be an object")
 	}
 	values["default_yolo"] = config.PermissionMode == "full-access"
+	// FastMCP 的单次调用超时不能提前结束用户问答；断开和取消仍由 ACP 生命周期控制。
+	mcpConfig, _ := values["mcp"].(map[string]any)
+	if mcpConfig == nil {
+		mcpConfig = map[string]any{}
+	}
+	clientConfig, _ := mcpConfig["client"].(map[string]any)
+	if clientConfig == nil {
+		clientConfig = map[string]any{}
+	}
+	clientConfig["tool_call_timeout_ms"] = int64(2147483647)
+	mcpConfig["client"] = clientConfig
+	values["mcp"] = mcpConfig
 	data, err = toml.Marshal(values)
 	if err != nil {
 		return "", nil, err
@@ -121,7 +133,7 @@ func isolatedEnvironment(config Config) (directory string, environment []string,
 	if err != nil {
 		return "", nil, err
 	}
-	return directory, nativeacp.WithEnvironment(config.Environment, "KIMI_SHARE_DIR", directory), nil
+	return directory, nativeacp.WithEnvironment(nativeacp.WithEnvironment(config.Environment, "KIMI_MCP_TOOL_TIMEOUT_MS", "2147483647"), "KIMI_SHARE_DIR", directory), nil
 }
 
 // copyCredentials 只复制官方凭据文件；保留受管目录中更新的刷新结果。

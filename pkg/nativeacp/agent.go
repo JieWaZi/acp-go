@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -30,6 +31,8 @@ type Config struct {
 	Logger *slog.Logger
 	// CursorExtensions 表示需要把 Cursor 交互请求转换为标准 ACP 交互。
 	CursorExtensions bool
+	// LegacyPermissionReviewer 仅补充只有 default 模式的上游；错误和拒绝继续交给宿主审批。
+	LegacyPermissionReviewer func(context.Context, autoreview.Request) (autoreview.Decision, error)
 }
 
 // Agent 实现标准 ACP Agent，协议传输、请求关联和通知排序全部由 Go SDK 拥有。
@@ -66,6 +69,14 @@ type Agent struct {
 	toolSessions map[acp.ToolCallId]acp.SessionId
 	// config 保存协议特性开关。
 	config Config
+	// prompts 保存当前执行的用户证据，执行结束后立即移除。
+	prompts map[acp.SessionId][]acp.ContentBlock
+	// toolDetails 保存上游增量工具参数，供执行前风险审查使用。
+	toolDetails map[acp.ToolCallId]acp.ToolCallUpdate
+	// turnContexts 把阻塞交互限定到所属执行。
+	turnContexts map[acp.SessionId]context.Context
+	// turnCancels 使 session/cancel 在原生回复前撤销待审查授权。
+	turnCancels map[acp.SessionId]context.CancelFunc
 }
 
 var _ acp.Agent = (*Agent)(nil)
@@ -107,7 +118,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		_ = output.Close()
 		return nil, fmt.Errorf("starting native ACP: %w", err)
 	}
-	agent := &Agent{command: command, input: input, output: output, cancel: cancel, done: make(chan struct{}), closed: make(chan struct{}), bound: make(chan struct{}), sessions: make(map[acp.SessionId]*sessionOptions), active: make(map[acp.SessionId]bool), toolSessions: make(map[acp.ToolCallId]acp.SessionId), config: config}
+	agent := &Agent{command: command, input: input, output: output, cancel: cancel, done: make(chan struct{}), closed: make(chan struct{}), bound: make(chan struct{}), sessions: make(map[acp.SessionId]*sessionOptions), active: make(map[acp.SessionId]bool), toolSessions: make(map[acp.ToolCallId]acp.SessionId), config: config, prompts: make(map[acp.SessionId][]acp.ContentBlock), toolDetails: make(map[acp.ToolCallId]acp.ToolCallUpdate), turnContexts: make(map[acp.SessionId]context.Context), turnCancels: make(map[acp.SessionId]context.CancelFunc)}
 	agent.conn = acp.NewConnection(agent.handle, input, output)
 	go func() { <-agent.conn.Done(); cancel(); _ = command.Wait(); close(agent.done) }()
 	return agent, nil
@@ -170,14 +181,27 @@ func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeReques
 // Prompt 原样转发内容，取消时补发标准 session/cancel。
 func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
 	agent.mutex.Lock()
+	if agent.active[request.SessionId] {
+		agent.mutex.Unlock()
+		return acp.PromptResponse{}, acp.NewInvalidParams(nil)
+	}
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	defer turnCancel()
+	agent.turnContexts[request.SessionId] = turnCtx
+	agent.turnCancels[request.SessionId] = turnCancel
 	agent.active[request.SessionId] = true
+	agent.prompts[request.SessionId] = append([]acp.ContentBlock{}, request.Prompt...)
 	agent.mutex.Unlock()
 	defer func() {
 		agent.mutex.Lock()
 		delete(agent.active, request.SessionId)
+		delete(agent.prompts, request.SessionId)
+		delete(agent.turnContexts, request.SessionId)
+		delete(agent.turnCancels, request.SessionId)
 		for id, sid := range agent.toolSessions {
 			if sid == request.SessionId {
 				delete(agent.toolSessions, id)
+				delete(agent.toolDetails, id)
 			}
 		}
 		agent.mutex.Unlock()
@@ -193,6 +217,12 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 
 // Cancel 请求原生 Agent 中断当前 Session 的执行。
 func (agent *Agent) Cancel(ctx context.Context, request acp.CancelNotification) error {
+	agent.mutex.Lock()
+	cancel := agent.turnCancels[request.SessionId]
+	agent.mutex.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	return agent.conn.SendNotification(ctx, "session/cancel", request)
 }
 

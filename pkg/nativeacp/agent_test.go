@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
+	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -101,13 +102,17 @@ func (*hostClient) UnstableDisconnectMcp(context.Context, acp.UnstableDisconnect
 }
 
 // startAgent 通过 acpserver 和双向管道连接实际子进程。
-func startAgent(t *testing.T, variant string) (*nativeacp.Agent, *acp.ClientSideConnection, *hostClient) {
+func startAgent(t *testing.T, variant string, reviewers ...func(context.Context, autoreview.Request) (autoreview.Decision, error)) (*nativeacp.Agent, *acp.ClientSideConnection, *hostClient) {
 	t.Helper()
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := nativeacp.NewAgent(context.Background(), nativeacp.Config{Command: binary, Args: []string{"-test.run=^TestACPProcess$"}, Environment: append(os.Environ(), "NATIVE_ACP_TEST="+variant), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CursorExtensions: true})
+	config := nativeacp.Config{Command: binary, Args: []string{"-test.run=^TestACPProcess$"}, Environment: append(os.Environ(), "NATIVE_ACP_TEST="+variant), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CursorExtensions: true}
+	if len(reviewers) > 0 {
+		config.LegacyPermissionReviewer = reviewers[0]
+	}
+	agent, err := nativeacp.NewAgent(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +266,21 @@ func TestACPProcess(t *testing.T) {
 		case "session/prompt":
 			var prompt acp.PromptRequest
 			_ = json.Unmarshal(data, &prompt)
+			if prompt.Prompt[0].Text.Text == "review-operation" {
+				_ = connection.SendNotification(ctx, "session/update", map[string]any{"sessionId": "session", "update": map[string]any{"sessionUpdate": "tool_call", "toolCallId": "reviewed-tool", "title": "Write file", "kind": "edit", "status": "pending", "rawInput": map[string]any{"path": "test.txt", "content": "owned"}}})
+				response, err := acp.SendRequest[acp.RequestPermissionResponse](connection, ctx, "session/request_permission", acp.RequestPermissionRequest{SessionId: "session", ToolCall: acp.ToolCallUpdate{ToolCallId: "reviewed-tool"}, Options: []acp.PermissionOption{{OptionId: "once", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce}, {OptionId: "always", Name: "Allow session", Kind: acp.PermissionOptionKindAllowAlways}}})
+				if err != nil || response.Outcome.Selected == nil || response.Outcome.Selected.OptionId != "once" {
+					return nil, acp.NewInvalidParams(nil)
+				}
+				return map[string]any{"stopReason": "end_turn"}, nil
+			}
+			if prompt.Prompt[0].Text.Text == "kimi-question" {
+				response, err := acp.SendRequest[map[string]any](connection, ctx, "elicitation/create", map[string]any{"sessionId": "session", "toolCallId": "kimi-question", "mode": "form", "message": "Kimi question", "requestedSchema": map[string]any{"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}}, "required": []string{"choice"}}})
+				if err != nil || response["action"] != "accept" {
+					return nil, acp.NewInvalidParams(map[string]any{"message": "question did not reach the host"})
+				}
+				return map[string]any{"stopReason": "end_turn"}, nil
+			}
 			if prompt.Prompt[0].Text.Text == "wait" {
 				<-ctx.Done()
 				return nil, acp.NewInternalError(nil)
@@ -321,5 +341,68 @@ func TestNativeMCPPreservesTransportAndFreshHeaders(t *testing.T) {
 	servers[1].Http.Headers[0].Value = "updated-token"
 	if _, err := connection.LoadSession(ctx, acp.LoadSessionRequest{SessionId: session.SessionId, Cwd: cwd, McpServers: servers}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestNativeKimiQuestionRoutesSession 验证 Kimi 顶层会话身份经过 SDK 转发仍能抵达宿主输入端口。
+func TestNativeKimiQuestionRoutesSession(t *testing.T) {
+	_, connection, host := startAgent(t, "config")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := connection.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := connection.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Prompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("kimi-question")}}); err != nil {
+		t.Fatal(err)
+	}
+	host.mutex.Lock()
+	defer host.mutex.Unlock()
+	if host.questions != 1 {
+		t.Fatal("question not delivered")
+	}
+}
+
+// TestLegacyAutoReviewFallsBackToHost 验证真实 ACP 回调携带完整证据，且审查失败不会放行。
+func TestLegacyAutoReviewFallsBackToHost(t *testing.T) {
+	for _, outcome := range []string{"allow", "deny", "error"} {
+		t.Run(outcome, func(t *testing.T) {
+			reviewed := false
+			reviewer := func(_ context.Context, r autoreview.Request) (autoreview.Decision, error) {
+				reviewed = true
+				if r.WorkingDirectory == "" || len(r.Prompt) != 1 || r.Prompt[0].Text.Text != "review-operation" || r.Tool.RawInput == nil || r.Model != "provider/model-a" {
+					t.Errorf("incomplete evidence: %#v", r)
+				}
+				if outcome == "error" {
+					return autoreview.Decision{}, errors.New("classifier unavailable")
+				}
+				return autoreview.Decision{Outcome: outcome}, nil
+			}
+			_, connection, host := startAgent(t, "legacy", reviewer)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := connection.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+				t.Fatal(err)
+			}
+			session, err := connection.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connection.Prompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("review-operation")}}); err != nil {
+				t.Fatal(err)
+			}
+			host.mutex.Lock()
+			defer host.mutex.Unlock()
+			expected := 1
+			if outcome == "allow" {
+				expected = 0
+			}
+			if !reviewed || host.approvals != expected {
+				t.Fatalf("reviewed=%v approvals=%d", reviewed, host.approvals)
+			}
+		})
 	}
 }

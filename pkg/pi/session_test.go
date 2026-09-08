@@ -33,7 +33,7 @@ func TestMCPConfigSnapshotPreservesLiteralsAndReplacesCredentials(t *testing.T) 
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, expected := range []string{secret, `"literalEnv":true`, `"httpTransport":"streamable-http"`, `"httpTransport":"sse"`, "const manual = true;"} {
+	for _, expected := range []string{secret, `"literalEnv":true`, `"httpTransport":"streamable-http"`, `"httpTransport":"sse"`, `const permissionMode = "default";`} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("snapshot lost %q", expected)
 		}

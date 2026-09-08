@@ -28,7 +28,7 @@ type Config struct {
 	WorkingDirectory string
 	// Logger 接收不包含凭据的诊断。
 	Logger *slog.Logger
-	// PermissionMode 选择 default 逐次审批或 full-access。
+	// PermissionMode 选择 default 人工审批、auto 风险审查或 full-access。
 	PermissionMode string
 	// MCPModulePath 仅供显式开发覆盖；默认使用内置开源 MCP 扩展。
 	MCPModulePath string
@@ -120,7 +120,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if config.PermissionMode == "" {
 		config.PermissionMode = "default"
 	}
-	if config.PermissionMode != "default" && config.PermissionMode != "full-access" {
+	if config.PermissionMode != "default" && config.PermissionMode != "auto" && config.PermissionMode != "full-access" {
 		return nil, errors.New("unsupported Pi permission mode")
 	}
 	if config.Environment == nil {

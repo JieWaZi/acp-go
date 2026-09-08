@@ -348,6 +348,7 @@ createInterface({ input: child.stdout }).on("line", (line) => {
       pending.delete(value.id);
     }
     if (value.method === "elicitation/create") {
+      if (value.params.message === "Fixture timeout") return;
       child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:value.id,result:value.params.message==="Fixture declined" ? {action:"decline"} : {action:"accept",content:{value:value.params.message==="Fixture input" ? "entered input" : "edited\ntext"}}})+"\n");
     }
     if (value.method === "session/request_permission") {

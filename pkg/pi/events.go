@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -49,6 +51,18 @@ func (a *Agent) events(s *session) {
 		s.mutex.Unlock()
 		kind := text(event["type"])
 		if kind == "extension_ui_request" {
+			if event["method"] == "setStatus" && event["statusKey"] == "acp-go.permission-review" {
+				var record map[string]any
+				if json.Unmarshal([]byte(text(event["statusText"])), &record) == nil && text(record["toolCallId"]) != "" {
+					metadata := autoreview.Metadata(autoreview.Decision{Outcome: text(record["outcome"]), RiskLevel: text(record["risk_level"])}, record["failed"] == true)
+					if err := a.emit(ctx, s, map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": record["toolCallId"], "_meta": map[string]any{"acp-go/permission-review": metadata}}); err != nil {
+						s.mutex.Lock()
+						s.failure = err
+						s.mutex.Unlock()
+					}
+				}
+				continue
+			}
 			s.callbacks.Add(1)
 			go func(event map[string]any) { defer s.callbacks.Done(); a.extensionUI(ctx, s, event) }(event)
 			continue
@@ -259,12 +273,42 @@ func (a *Agent) extensionUI(ctx context.Context, s *session, event map[string]an
 	method := text(event["method"])
 	switch method {
 	case "confirm", "select":
+		if method == "select" && !mcpApprovalSelection(event) {
+			if !formUI {
+				return
+			}
+			choices := []string{}
+			for _, value := range list(event["options"]) {
+				choices = append(choices, text(value))
+			}
+			if len(choices) == 0 {
+				return
+			}
+			result, err := host.UnstableCreateElicitation(ctx, acp.UnstableCreateElicitationRequest{Form: &acp.UnstableCreateElicitationForm{Mode: "form", Message: text(event["title"]), Meta: map[string]any{"sessionId": s.id}, RequestedSchema: acp.UnstableElicitationSchema{Type: acp.UnstableElicitationSchemaTypeObject, Properties: map[string]any{"value": map[string]any{"type": "string", "enum": choices}}, Required: []string{"value"}}}})
+			if err == nil && ctx.Err() == nil && result.Accept != nil {
+				for _, value := range choices {
+					if result.Accept.Content["value"] == value {
+						delete(response, "cancelled")
+						response["value"] = value
+						return
+					}
+				}
+			}
+			return
+		}
 		options := []acp.PermissionOption{}
 		if method == "confirm" {
 			options = []acp.PermissionOption{{OptionId: "yes", Name: "Yes", Kind: acp.PermissionOptionKindAllowOnce}, {OptionId: "no", Name: "No", Kind: acp.PermissionOptionKindRejectOnce}}
 		} else {
 			for i, name := range list(event["options"]) {
-				options = append(options, acp.PermissionOption{OptionId: acp.PermissionOptionId("choice-" + strconv.Itoa(i)), Name: text(name), Kind: acp.PermissionOptionKindAllowOnce})
+				kind := acp.PermissionOptionKindAllowOnce
+				if i == 1 {
+					kind = acp.PermissionOptionKindAllowAlways
+				}
+				if i == 2 {
+					kind = acp.PermissionOptionKindRejectOnce
+				}
+				options = append(options, acp.PermissionOption{OptionId: acp.PermissionOptionId("choice-" + strconv.Itoa(i)), Name: text(name), Kind: kind})
 			}
 		}
 		if len(options) == 0 {
@@ -310,4 +354,10 @@ func (a *Agent) extensionUI(ctx context.Context, s *session, event map[string]an
 	case "notify":
 		_ = a.emit(ctx, s, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text(event["message"])}})
 	}
+}
+
+// mcpApprovalSelection 识别固定上游工厂的审批选项；普通扩展选择属于问答而非授权。
+func mcpApprovalSelection(event map[string]any) bool {
+	options := list(event["options"])
+	return strings.HasPrefix(text(event["title"]), "MCP: ") && len(options) == 3 && options[0] == "Allow once" && options[1] == "Allow for session" && options[2] == "Deny"
 }

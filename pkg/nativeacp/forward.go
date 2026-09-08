@@ -35,7 +35,7 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 	case "fs/write_text_file":
 		return decodeCall(ctx, params, agent.host.WriteTextFile)
 	case "session/request_permission":
-		return decodeCall(ctx, params, agent.host.RequestPermission)
+		return decodeCall(ctx, params, agent.requestPermission)
 	case "terminal/create":
 		return decodeCall(ctx, params, agent.host.CreateTerminal)
 	case "terminal/kill":
@@ -47,7 +47,7 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 	case "terminal/wait_for_exit":
 		return decodeCall(ctx, params, agent.host.WaitForTerminalExit)
 	case "elicitation/create":
-		return decodeCall(ctx, params, agent.host.UnstableCreateElicitation)
+		return agent.elicitation(ctx, params)
 	case "mcp/connect":
 		return decodeCall(ctx, params, agent.host.UnstableConnectMcp)
 	case "mcp/disconnect":
@@ -78,4 +78,53 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 		return agent.host.CallExtension(ctx, method, params)
 	}
 	return nil, acp.NewMethodNotFound(method)
+}
+
+// elicitation 将原生 ACP 顶层会话归属保存在宿主 SDK 支持的元数据中。
+func (agent *Agent) elicitation(ctx context.Context, params json.RawMessage) (acp.UnstableCreateElicitationResponse, error) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(params, &fields) != nil {
+		return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
+	}
+	meta := map[string]any{}
+	if raw := fields["_meta"]; len(raw) != 0 && json.Unmarshal(raw, &meta) != nil {
+		return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
+	}
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	for _, key := range []string{"sessionId", "toolCallId"} {
+		if value, exists := meta[key]; exists {
+			if _, ok := value.(string); !ok {
+				return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
+			}
+		}
+		if raw := fields[key]; len(raw) != 0 {
+			var value string
+			if json.Unmarshal(raw, &value) != nil {
+				return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
+			}
+			if previous, exists := meta[key]; exists && previous != value {
+				return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
+			}
+			meta[key] = value
+		}
+	}
+	sessionID, _ := meta["sessionId"].(string)
+	toolID, _ := meta["toolCallId"].(string)
+	sid := agent.interactionSession(toolID, sessionID)
+	if sid == "" {
+		return acp.NewUnstableCreateElicitationResponseCancel(), nil
+	}
+	meta["sessionId"] = sid
+	fields["_meta"], _ = json.Marshal(meta)
+	normalized, err := json.Marshal(fields)
+	if err != nil {
+		return acp.UnstableCreateElicitationResponse{}, err
+	}
+	var request acp.UnstableCreateElicitationRequest
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
+	}
+	return agent.host.UnstableCreateElicitation(ctx, request)
 }

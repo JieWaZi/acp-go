@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
+	acp "github.com/coder/acp-go-sdk"
 )
 
 // Config 保存 kimi 的受控启动配置。
@@ -35,6 +37,8 @@ type Agent struct {
 	*nativeacp.Agent
 	// directory 是可删除的本次配置目录，不包含持久会话的真实文件。
 	directory string
+	// pythonACP 标识原生问答会被丢弃、必须等待受管工具就绪的 Python 实现。
+	pythonACP atomic.Bool
 }
 
 // NewAgent 启动 kimi 的现成 ACP 实现。
@@ -57,13 +61,27 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if command == "" {
 		command = "kimi"
 	}
+	resolved, err := nativeacp.ResolveCommand(command, config.Environment)
+	if err != nil {
+		return nil, err
+	}
+	command = resolved
+	config.KimiPath = resolved
 	args := append([]string(nil), config.PrefixArgs...)
 	args = append(args, "acp")
 	directory, environment, err := isolatedEnvironment(config)
 	if err != nil {
 		return nil, err
 	}
-	upstream, err := nativeacp.NewAgent(ctx, nativeacp.Config{Command: command, Args: args, Environment: environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger})
+	nativeConfig := nativeacp.Config{Command: command, Args: args, Environment: environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger}
+	if config.PermissionMode == "auto" {
+		nativeConfig.LegacyPermissionReviewer, err = permissionReviewer(config, directory, environment)
+		if err != nil {
+			_ = os.RemoveAll(directory)
+			return nil, err
+		}
+	}
+	upstream, err := nativeacp.NewAgent(ctx, nativeConfig)
 	if err != nil {
 		_ = os.RemoveAll(directory)
 		return nil, err
@@ -78,3 +96,15 @@ func (agent *Agent) Close(ctx context.Context) error {
 	}
 	return os.RemoveAll(agent.directory)
 }
+
+// Initialize 保留原生握手，并识别需要强制问答工具就绪检查的实现。
+func (agent *Agent) Initialize(ctx context.Context, r acp.InitializeRequest) (acp.InitializeResponse, error) {
+	response, err := agent.Agent.Initialize(ctx, r)
+	if err == nil && response.AgentInfo != nil {
+		agent.pythonACP.Store(response.AgentInfo.Name == "Kimi Code CLI")
+	}
+	return response, err
+}
+
+// UserInputRequiresReady 防止 Python ACP 在受管工具加载失败时回到静默空答案。
+func (agent *Agent) UserInputRequiresReady() bool { return agent.pythonACP.Load() }

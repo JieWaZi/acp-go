@@ -92,7 +92,7 @@ func runAgent(ctx context.Context, args []string, streams processIO) error {
 		return fmt.Errorf("selecting startup adapter: %w", err)
 	}
 
-	server, err := acpserver.New(selection.Agent, streams.input, streams.output)
+	server, err := acpserver.NewWithUserInput(selection.Agent, streams.input, streams.output)
 	if err != nil {
 		return fmt.Errorf("creating protocol server: %w", err)
 	}
