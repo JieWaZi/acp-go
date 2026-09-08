@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 
 	acp "github.com/coder/acp-go-sdk"
 )
 
 // sessionOptions 将宿主统一配置标识映射到上游声明的实际标识。
 type sessionOptions struct {
+	// configMutex 串行化一次配置操作中的多项原生参数更新。
+	configMutex sync.Mutex
+	// cursorNativeOptions 保存原生思考开关与强度，避免规范化丢失组合。
+	cursorNativeOptions []acp.SessionConfigOption
 	// ids 按 model/reasoning 等规范化标识保存原生配置标识。
 	ids map[acp.SessionConfigId]acp.SessionConfigId
 	// options 是最后一次会话返回的配置目录。
@@ -54,6 +59,7 @@ func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionReques
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	agent.loadCursorModels(ctx)
 	agent.normalizeSession(&response, response.SessionId, request.Cwd)
 	return response.NewSessionResponse, nil
 }
@@ -64,6 +70,7 @@ func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequ
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
+	agent.loadCursorModels(ctx)
 	agent.normalizeSession(&response, request.SessionId, request.Cwd)
 	return acp.LoadSessionResponse{Meta: response.Meta, ConfigOptions: response.ConfigOptions, Modes: response.Modes}, nil
 }
@@ -74,6 +81,7 @@ func (agent *Agent) ResumeSession(ctx context.Context, request acp.ResumeSession
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
+	agent.loadCursorModels(ctx)
 	agent.normalizeSession(&response, request.SessionId, request.Cwd)
 	return acp.ResumeSessionResponse{Meta: response.Meta, ConfigOptions: response.ConfigOptions, Modes: response.Modes}, nil
 }
@@ -83,7 +91,7 @@ func (agent *Agent) normalizeSession(response *nativeSessionResponse, id acp.Ses
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state := &sessionOptions{cwd: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
-	response.ConfigOptions = normalizeOptions(response.ConfigOptions, state.ids)
+	response.ConfigOptions = agent.normalizeSessionOptions(response.ConfigOptions, state)
 	if response.Models != nil && !hasConfig(response.ConfigOptions, "model") {
 		values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(response.Models.AvailableModels))
 		for _, model := range response.Models.AvailableModels {
@@ -146,6 +154,24 @@ func (agent *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetS
 		agent.mutex.Unlock()
 		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(nil)
 	}
+	agent.mutex.Unlock()
+	state.configMutex.Lock()
+	defer state.configMutex.Unlock()
+	agent.mutex.Lock()
+	if agent.config.CursorExtensions {
+		for _, option := range state.options {
+			if option.Select != nil && option.Select.Id == value.ConfigId && option.Select.CurrentValue == value.Value {
+				response := acp.SetSessionConfigOptionResponse{ConfigOptions: append([]acp.SessionConfigOption(nil), state.options...)}
+				agent.mutex.Unlock()
+				return response, nil
+			}
+		}
+	}
+	composite := agent.config.CursorExtensions && value.ConfigId == "reasoning" && len(thoughtSelects(state.cursorNativeOptions)) > 1
+	if composite {
+		agent.mutex.Unlock()
+		return agent.setCursorThinking(ctx, state, value)
+	}
 	nativeID, ok := state.ids[value.ConfigId]
 	legacy := state.legacyModel && value.ConfigId == "model"
 	agent.mutex.Unlock()
@@ -176,7 +202,7 @@ func (agent *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetS
 	}
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
-	response.ConfigOptions = normalizeOptions(response.ConfigOptions, state.ids)
+	response.ConfigOptions = agent.normalizeSessionOptions(response.ConfigOptions, state)
 	state.options = response.ConfigOptions
 	return response, nil
 }
@@ -209,7 +235,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	}
 	if update := request.Update.ConfigOptionUpdate; update != nil {
 		if state := agent.sessions[request.SessionId]; state != nil {
-			update.ConfigOptions = normalizeOptions(update.ConfigOptions, state.ids)
+			update.ConfigOptions = agent.normalizeSessionOptions(update.ConfigOptions, state)
 			state.options = update.ConfigOptions
 		}
 	}

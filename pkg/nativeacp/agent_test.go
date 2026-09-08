@@ -234,6 +234,10 @@ func TestACPProcess(t *testing.T) {
 		fmt.Println("2026.09.02-c22c1a3")
 		os.Exit(0)
 	}
+	if variant == "parameters" {
+		runCursorParameterProcess()
+		os.Exit(0)
+	}
 	ready := make(chan struct{})
 	var connection *acp.Connection
 	options := func(model string) []map[string]any {

@@ -69,6 +69,8 @@ type Agent struct {
 	bound chan struct{}
 	// capabilities 保存上游的实际能力。
 	capabilities acp.AgentCapabilities
+	// cursorModels 缓存当前 CLI 官方模型参数目录，nil 表示尚未成功读取。
+	cursorModels map[string][]acp.SessionConfigOption
 	// sessions 保存配置标识与原生模型协议的会话映射。
 	sessions map[acp.SessionId]*sessionOptions
 	// active 保存活跃 Prompt，用于路由缺少 sessionId 的 Cursor 回调。
@@ -177,6 +179,14 @@ func (agent *Agent) Close(ctx context.Context) error {
 
 // Initialize 保留真实能力，不伪造上游不支持的 Session 或授权功能。
 func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
+	if agent.config.CursorExtensions {
+		meta := make(map[string]any, len(request.ClientCapabilities.Meta)+1)
+		for key, value := range request.ClientCapabilities.Meta {
+			meta[key] = value
+		}
+		meta["parameterizedModelPicker"] = true
+		request.ClientCapabilities.Meta = meta
+	}
 	response, err := acp.SendRequest[acp.InitializeResponse](agent.conn, ctx, "initialize", request)
 	if err == nil {
 		agent.completeRuntimeVersion(ctx, &response)
