@@ -117,7 +117,11 @@ func startAgent(t *testing.T, variant string, reviewers ...func(context.Context,
 	}
 	var agent *nativeacp.Agent
 	if variant == "version" {
-		agent, err = cursor.NewAgent(context.Background(), cursor.Config{CursorPath: binary, PrefixArgs: []string{"-test.run=^TestACPProcess$", "--"}, Environment: config.Environment, Logger: config.Logger})
+		var wrapped *cursor.Agent
+		wrapped, err = cursor.NewAgent(context.Background(), cursor.Config{CursorPath: binary, PrefixArgs: []string{"-test.run=^TestACPProcess$", "--"}, Environment: config.Environment, Logger: config.Logger})
+		if err == nil {
+			agent = wrapped.Agent
+		}
 	} else {
 		agent, err = nativeacp.NewAgent(context.Background(), config)
 	}

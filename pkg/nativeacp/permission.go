@@ -3,6 +3,7 @@ package nativeacp
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	acp "github.com/coder/acp-go-sdk"
@@ -10,6 +11,7 @@ import (
 
 // requestPermission 在旧版上游的执行前门禁内补充自动审查，其余请求原样交给宿主。
 func (agent *Agent) requestPermission(ctx context.Context, request acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	agent.awaitToolEvidence(ctx, request)
 	agent.mutex.Lock()
 	state := agent.sessions[request.SessionId]
 	legacy := state != nil && state.legacyPermissions
@@ -79,4 +81,33 @@ func (agent *Agent) requestPermission(ctx context.Context, request acp.RequestPe
 		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 	}
 	return agent.host.RequestPermission(ctx, request)
+}
+
+// awaitToolEvidence 允许先到线上的工具通知完成入账；超时仍转人工，不凭缺失证据放行。
+func (agent *Agent) awaitToolEvidence(ctx context.Context, request acp.RequestPermissionRequest) {
+	if agent.config.LegacyPermissionReviewer == nil {
+		return
+	}
+	wait, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	for {
+		agent.mutex.Lock()
+		state := agent.sessions[request.SessionId]
+		ready := state == nil || !state.legacyPermissions || !agent.active[request.SessionId] || agent.toolSessions[request.ToolCall.ToolCallId] == request.SessionId
+		if agent.toolChanged == nil {
+			agent.toolChanged = make(chan struct{})
+		}
+		changed := agent.toolChanged
+		agent.mutex.Unlock()
+		if ready {
+			return
+		}
+		select {
+		case <-changed:
+		case <-wait.Done():
+			return
+		case <-agent.closed:
+			return
+		}
+	}
 }

@@ -83,6 +83,10 @@ type Agent struct {
 	prompts map[acp.SessionId][]acp.ContentBlock
 	// toolDetails 保存上游增量工具参数，供执行前风险审查使用。
 	toolDetails map[acp.ToolCallId]acp.ToolCallUpdate
+	// toolChanged 在先行工具通知入账时唤醒并发到达的审批请求。
+	toolChanged chan struct{}
+	// silentLoads 屏蔽只用于恢复配置的历史回放，宿主 Resume 不重复展示旧消息。
+	silentLoads map[acp.SessionId]bool
 	// turnContexts 把阻塞交互限定到所属执行。
 	turnContexts map[acp.SessionId]context.Context
 	// turnCancels 使 session/cancel 在原生回复前撤销待审查授权。

@@ -64,6 +64,12 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 			return nil, acp.NewInvalidParams(nil)
 		}
 		agent.normalizeUpdate(&request)
+		agent.mutex.Lock()
+		silent := agent.silentLoads[request.SessionId]
+		agent.mutex.Unlock()
+		if silent {
+			return nil, nil
+		}
 		return nil, agent.host.SessionUpdate(ctx, request)
 	case "cursor/ask_question", "cursor/create_plan":
 		if agent.config.CursorExtensions {

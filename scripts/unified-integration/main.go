@@ -26,7 +26,7 @@ func main() {
 	case "kimi":
 		agent, err = kimi.NewAgent(ctx, kimi.Config{KimiPath: os.Getenv("KIMI_PATH"), Logger: logger, WorkingDirectory: cwd, PermissionMode: os.Getenv("ACP_TEST_PERMISSION"), StateDirectory: os.Getenv("ACP_TEST_STATE")})
 	case "cursor":
-		agent, err = cursor.NewAgent(ctx, cursor.Config{CursorPath: os.Getenv("CURSOR_PATH"), Logger: logger, WorkingDirectory: cwd, PermissionMode: os.Getenv("ACP_TEST_PERMISSION")})
+		agent, err = cursor.NewAgent(ctx, cursor.Config{Interactive: os.Getenv("ACP_TEST_CURSOR_INTERACTIVE") == "1", StateDirectory: os.Getenv("ACP_TEST_STATE"), CursorPath: os.Getenv("CURSOR_PATH"), Logger: logger, WorkingDirectory: cwd, PermissionMode: os.Getenv("ACP_TEST_PERMISSION")})
 	case "pi":
 		agent, err = pi.NewAgent(ctx, pi.Config{PiPath: os.Getenv("PI_PATH"), Logger: logger, WorkingDirectory: cwd, PermissionMode: os.Getenv("ACP_TEST_PERMISSION")})
 	default:

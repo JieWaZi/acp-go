@@ -1,16 +1,21 @@
-// Package cursor 复用已安装的 cursor ACP 入口，不实现厂商私有协议。
+// Package cursor 在 Go 内统一官方 ACP 配置、交互终端与会话事件。
 package cursor
 
 import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 )
 
 // Config 保存 cursor 的受控启动配置。
 type Config struct {
+	// Interactive 启用受管交互终端、原生审批和真实用量；在 cwd 临时登记可回收的官方 Hook。
+	Interactive bool
+	// StateDirectory 保存受管 Cursor 会话；空值使用用户缓存目录。
+	StateDirectory string
 	// CursorPath 是已安装程序的路径；空值使用默认命令。
 	CursorPath string
 	// PrefixArgs 是协议子命令前的参数。
@@ -25,9 +30,6 @@ type Config struct {
 	PermissionMode string
 }
 
-// Agent 复用统一原生 ACP 进程连接。
-type Agent = nativeacp.Agent
-
 // NewAgent 启动 cursor 的现成 ACP 实现。
 func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	command := config.CursorPath
@@ -38,6 +40,14 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		if _, err := nativeacp.ResolveCommand(command, config.Environment); err != nil {
 			command = "agent"
 		}
+	}
+	resolved, err := nativeacp.ResolveCommand(command, config.Environment)
+	if err != nil {
+		return nil, err
+	}
+	command, err = filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return nil, err
 	}
 	args := append([]string(nil), config.PrefixArgs...)
 	switch config.PermissionMode {
@@ -50,5 +60,5 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, errors.New("unsupported Cursor permission mode")
 	}
 	args = append(args, "acp")
-	return nativeacp.NewAgent(ctx, nativeacp.Config{Command: command, Args: args, Environment: config.Environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger, CursorExtensions: true, RuntimeName: "cursor", VersionArgs: append(append([]string{}, config.PrefixArgs...), "--version")})
+	return newCursorAgent(ctx, config, nativeacp.Config{Command: command, Args: args, Environment: config.Environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger, CursorExtensions: true, RuntimeName: "cursor", VersionArgs: append(append([]string{}, config.PrefixArgs...), "--version")})
 }

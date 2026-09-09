@@ -239,6 +239,12 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 			state.options = update.ConfigOptions
 		}
 	}
+	if request.Update.ToolCall != nil || request.Update.ToolCallUpdate != nil {
+		if agent.toolChanged != nil {
+			close(agent.toolChanged)
+		}
+		agent.toolChanged = make(chan struct{})
+	}
 }
 
 // interactionSession 只在会话归属唯一时路由缺少会话标识的请求。

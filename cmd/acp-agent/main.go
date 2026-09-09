@@ -162,7 +162,7 @@ func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
 	}
 
 	if err := registry.Register(acpserver.Registration{Name: "cursor", Factory: func(ctx context.Context) (acp.Agent, error) {
-		return cursor.NewAgent(ctx, cursor.Config{Logger: logger, CursorPath: os.Getenv("CURSOR_PATH")})
+		return cursor.NewAgent(ctx, cursor.Config{Interactive: true, Logger: logger, CursorPath: os.Getenv("CURSOR_PATH")})
 	}}); err != nil {
 		return nil, err
 	}

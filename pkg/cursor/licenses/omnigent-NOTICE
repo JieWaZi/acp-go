@@ -1,0 +1,11 @@
+Copyright (2026) Databricks, Inc.
+
+This Software includes software developed at Databricks (https://www.databricks.com/) and its use is subject to the included LICENSE file.
+
+acp-go references and adapts the Cursor transcript, pending-tool detection,
+interactive approval and question-navigation design in Omnigent's
+omnigent/harnesses/cursor_native package, commit
+45601bae8d98a25bf4d193187481e0a79d49dde5.
+The Go transport, lifecycle, hook leases, ACP projection and tests are modified
+implementations maintained by acp-go. Omnigent's Python dependencies are not
+included in this port.
