@@ -28,5 +28,5 @@ Cursor 2026.09.08 的普通交互路径尚未触发插件范围 stop Hook，因�
 ## 参考与许可
 
 - [Omnigent](https://github.com/omnigent-ai/omnigent/tree/45601bae8d98a25bf4d193187481e0a79d49dde5/omnigent/harnesses/cursor_native)：原生日志、pending 检查点、审批与问答设计；Go 改写。Apache-2.0，保留 [LICENSE](licenses/omnigent-LICENSE) 和相关 [NOTICE](licenses/omnigent-NOTICE)。
-- [cursor-local-acp](https://github.com/fat-huu/cursor-local-acp/tree/b932be54e244bfdba4b2a5f66135bdd9e08ca70e)：交互桥与用量来源对照。MIT，见 [LICENSE](licenses/cursor-local-acp-LICENSE)。
+- [cursor-local-acp](https://github.com/fat-huhu/cursor-local-acp/tree/b932be54e244bfdba4b2a5f66135bdd9e08ca70e)：交互桥与用量来源对照。MIT，见 [LICENSE](licenses/cursor-local-acp-LICENSE)。
 - VT 模拟、PTY 和 SQLite 分别直接使用 Charm x/vt、creack/pty、modernc.org/sqlite，不自行实现终端或数据库。
