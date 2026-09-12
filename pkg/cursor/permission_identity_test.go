@@ -32,3 +32,11 @@ func TestVisibleMCPPermissionUsesServerAndTool(t *testing.T) {
 		t.Fatalf("wrong MCP approval: %+v %t", got, ok)
 	}
 }
+
+// TestUnknownMCPApprovalFailsClosed 未知旧工具名称不能仅凭 MCP 标题匹配到当前审批。
+func TestUnknownMCPApprovalFailsClosed(t *testing.T) {
+	call := pendingCall{id: "unknown", name: "mcp_other_tool", args: map[string]any{}}
+	if permissionMatches("────────────────────────\nplugin-expected: echo\nRun this MCP tool?\nRun (once) (y)", call) {
+		t.Fatal("unknown MCP identity accepted")
+	}
+}

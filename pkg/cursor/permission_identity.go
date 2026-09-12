@@ -46,7 +46,7 @@ func permissionMatches(screen string, call pendingCall) bool {
 	case "webfetch":
 		return strings.Contains(panel, "Allow this web fetch?") && contains(text("url"))
 	default:
-		return strings.HasPrefix(strings.ToLower(call.name), "mcp_") && strings.Contains(panel, "Run this MCP tool?")
+		return false
 	}
 }
 
