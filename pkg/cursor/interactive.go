@@ -259,7 +259,7 @@ func (a *Agent) start(ctx context.Context, s *interactiveSession) error {
 		case <-s.terminal.done:
 			s.stop()
 		default:
-			return nil
+			return a.ensurePermission(ctx, s)
 		}
 	}
 	if err = s.stop(); err != nil {
@@ -299,15 +299,15 @@ func (a *Agent) start(ctx context.Context, s *interactiveSession) error {
 	if err != nil {
 		return err
 	}
-	s.terminal, err = startTerminal(a.lifetime, a.command, args, environment, s.cwd)
+	startCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	s.terminal, err = startSelectedTerminal(startCtx, a.lifetime, a.command, args, environment, s.cwd, modelArgument)
 	if err != nil {
-		_ = s.stop()
+		s.stop()
 		return err
 	}
 	s.model = model
-	startCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if err = s.terminal.ready(startCtx); err != nil {
+	if err = a.ensurePermission(startCtx, s); err != nil {
 		s.stop()
 		return err
 	}

@@ -121,6 +121,7 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var idleSince time.Time
+	var unknownApprovalSince time.Time
 	for {
 		batch, err := s.store.read(ctx)
 		if err != nil {
@@ -183,9 +184,24 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 				return response, cursorTurnError(s.terminal.text(), fmt.Sprintf("Cursor generation ended with status %s", p.ended))
 			}
 		}
+		screen := s.terminal.text()
+		if permissionScreen(screen) {
+			if _, ok := visiblePermission(screen, batch.pending); ok {
+				unknownApprovalSince = time.Time{}
+			} else {
+				if unknownApprovalSince.IsZero() {
+					unknownApprovalSince = time.Now()
+				}
+				if time.Since(unknownApprovalSince) > 2*time.Second {
+					return acp.PromptResponse{Usage: p.usage}, errors.New("Cursor approval cannot be uniquely matched to a pending operation")
+				}
+			}
+		} else {
+			unknownApprovalSince = time.Time{}
+		}
 		for _, pending := range batch.pending {
 			if p.handled[pending.id] {
-				break
+				continue
 			}
 			screen := s.terminal.text()
 			question := strings.EqualFold(pending.name, "AskQuestion")
@@ -193,8 +209,11 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 				if !questionScreen(screen, pending) {
 					continue
 				}
-			} else if !permissionScreen(screen) {
-				continue
+			} else {
+				visible, ok := visiblePermission(screen, batch.pending)
+				if !ok || visible.id != pending.id {
+					continue
+				}
 			}
 			if err = a.startTool(ctx, s, p, pending.id, pending.name, pending.args, acp.ToolCallStatusPending); err != nil {
 				return acp.PromptResponse{Usage: p.usage}, err
@@ -255,7 +274,7 @@ func (a *Agent) approve(ctx context.Context, s *interactiveSession, call pending
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if !permissionScreen(s.terminal.text()) {
+	if !permissionMatches(s.terminal.text(), call) {
 		return errors.New("Cursor approval prompt changed before response")
 	}
 	if err = pendingUnchanged(ctx, s, call); err != nil {
@@ -269,10 +288,15 @@ func (a *Agent) approve(ctx context.Context, s *interactiveSession, call pending
 	}
 	transition, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err = s.terminal.wait(transition, func(screen string) bool { return strings.Contains(screen, "empty to skip") }); err != nil {
+	if err = s.terminal.wait(transition, func(screen string) bool {
+		return strings.Contains(screen, "empty to skip") || !permissionMatches(screen, call)
+	}); err != nil {
 		return err
 	}
-	return s.terminal.write("\r")
+	if strings.Contains(s.terminal.text(), "empty to skip") {
+		return s.terminal.write("\r")
+	}
+	return nil
 }
 
 // pendingUnchanged 在回填前独立核对当前原生检查点，不消耗主投影的增量游标。
@@ -281,10 +305,18 @@ func pendingUnchanged(ctx context.Context, s *interactiveSession, call pendingCa
 	if err != nil {
 		return err
 	}
-	if len(batch.pending) == 0 || batch.pending[0].id != call.id || batch.pending[0].name != call.name || !reflect.DeepEqual(batch.pending[0].args, call.args) {
-		return errors.New("Cursor interaction is no longer pending")
+	for _, pending := range batch.pending {
+		if pending.id == call.id && pending.name == call.name && reflect.DeepEqual(pending.args, call.args) {
+			if strings.EqualFold(call.name, "AskQuestion") {
+				return nil
+			}
+			visible, ok := visiblePermission(s.terminal.text(), batch.pending)
+			if ok && visible.id == call.id {
+				return nil
+			}
+		}
 	}
-	return nil
+	return errors.New("Cursor interaction is no longer uniquely pending")
 }
 
 // cursorTurnError 保留官方已明确显示的套餐失败分类，供宿主在同一聊天切换模型重试。

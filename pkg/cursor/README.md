@@ -6,8 +6,8 @@ Ally 只对接 acp-go。`cursor.Config{Interactive: true}` 和 `acp-agent --adap
 
 ## 执行与统一语义
 
-- 连续轮次复用同一个交互进程；模型或工作模式改变时重启终端并恢复原生聊天身份。原生模型和参数回执写入会话独立配置，不猜测组合模型字符串。
-- 三档权限为 `default`（原生逐工具门禁）、`auto`（官方 `--auto-review`）、`full-access`（官方 `--force`）。`agent/plan/ask` 是独立工作模式。宿主收到的审批携带原始工具身份和参数；只有回执到达且当前检查点仍一致时才发送批准或拒绝键。
+- 连续轮次复用同一个交互进程；模型或工作模式改变时重启终端并恢复原生聊天身份。原生模型和参数回执写入会话独立配置，并通过官方参数式 `--model` 覆盖历史模型。目录暂时退回旧格式时，只在发送消息前以相同参数最多重启三次；不猜测别名或降级模型。
+- 三档权限为 `default`（原生逐工具门禁）、`auto`（官方 `--auto-review`）、`full-access`（官方 `--force`）。`agent/plan/ask` 是独立工作模式。恢复时通过官方 `/run-everything`、`/auto-review` 本地命令同步历史权限，并只读核对实际元数据，防止从全权限切回默认后仍自动执行。宿主收到的审批携带当前界面与检查点唯一对应的原始工具身份和参数；只有回执到达且当前检查点仍一致时才发送批准或拒绝键。
 - 原生 AskQuestion 使用共享 `userinput` / ACP Elicitation 语义，支持单选、多选及自由文本。工具参数、结果和拒绝事实进入同一 ACP 工具事件流，供宿主审计。
 - MCP 通过会话私有插件注入 STDIO 和 Streamable HTTP，包括环境和请求头。不会修改用户 MCP 配置。旧 SSE 当前不声明支持。
 - 原生 SQLite 日志只读增量投影。冷恢复使用 SQLite 一致快照把已提交 WAL 内容交给官方 ACP 读取；跨连接文件锁防止同一身份被同时恢复或写入。Resume 不重放历史，Load 使用官方历史回放。
@@ -22,6 +22,8 @@ Cursor 2026.09.08 的普通交互路径尚未触发插件范围 stop Hook，因�
 ## 已验证与边界
 
 2026-09-09，macOS、官方 Cursor `2026.09.08-6caf4ff`：真实拒绝不产生文件、批准产生文件、连续轮次、进程退出后记住前轮内容、中文自由回答、多选、真实 HTTP MCP 审批与一次实际调用、逐轮 Token 回填均已通过。库测试还覆盖 PTY/SQLite/ACP 往返、取消及进程回收、WAL 快照、所有权、Hook 并发清理和数据竞争。
+
+2026-09-12 的回归新增批量工具审批身份核对、MCP 命名空间匹配、同前缀连续粘贴、目录缺失限次重启，以及真实 CLI 跨进程 `full-access → default → auto → default` 权限状态核对。`ALLY_CURSOR_REAL_PROBE=1 go test ./pkg/cursor -run TestCursorRealPermissionTransitions -count=1 -v` 只操作本地权限命令，不调用模型；普通测试默认跳过此入口。
 
 当前交互提示只支持文本；二进制图片/音频附件没有实现，能力声明不承诺支持。上下文精确快照仅来自官方 preCompact Hook，不能提供每轮连续上下文计量，也不拿累计计费 Token 冒充上下文。Windows PTY 尚未实现。SQLite 私有结构与终端交互存在上游版本敏感性；不匹配时返回明确失败，不伪造审批、用量或完成。尚不能把所有 Claude/Codex 的专有能力视为等价支持。
 

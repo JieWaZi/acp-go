@@ -111,13 +111,24 @@ func (t *cursorTerminal) submit(ctx context.Context, value string) error {
 	if err := t.ready(ctx); err != nil {
 		return err
 	}
-	t.screen.Paste(value)
+	before := t.text()
+	t.screen.Paste(value + "\n")
 	needle := strings.TrimSpace(strings.SplitN(strings.TrimSpace(value), "\n", 2)[0])
 	if len([]rune(needle)) > 32 {
 		needle = string([]rune(needle)[:32])
 	}
-	if err := t.wait(ctx, func(text string) bool { return strings.Contains(text, needle) }); err != nil {
+	if err := t.wait(ctx, func(text string) bool { return text != before && strings.Contains(text, needle) }); err != nil {
 		return err
+	}
+	// Omnigent 保留 300ms 粘贴提交间隔：Cursor 会把紧邻粘贴的 Enter 合并为输入换行。
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.done:
+		return errors.New("Cursor terminal exited before prompt submission")
+	case <-timer.C:
 	}
 	return t.write("\r")
 }

@@ -166,20 +166,25 @@ func TestCursorTerminalProcess(t *testing.T) {
 	}
 	for round := 0; ; round++ {
 		screen("Plan, search, build anything")
+		lastPaste := time.Now()
 		for {
 			b, err := input.ReadByte()
 			if err != nil {
 				os.Exit(0)
 			}
 			if b == '\r' {
+				if time.Since(lastPaste) < 250*time.Millisecond {
+					panic("submit coalesced into paste")
+				}
 				break
 			}
+			lastPaste = time.Now()
 			fmt.Print(string([]byte{b}))
 		}
 		id := fmt.Sprintf("tool-%d", round)
 		call := map[string]any{"type": "tool-call", "toolCallId": id, "toolName": "Shell", "args": map[string]any{"command": "printf allowed > allowed.txt"}}
 		put(id+"-pending", map[string]any{"role": "assistant", "content": []any{call}, "providerOptions": map[string]any{"cursor": map[string]any{"pendingToolCallStartedAtMs": 123}}}, true)
-		screen("Run (once) (y)\r\nSkip & tell the agent what to do instead (esc or n)")
+		screen("────────────────────────\r\n$ printf allowed > allowed.txt in .\r\nRun this command?\r\nRun (once) (y)\r\nSkip & tell the agent what to do instead (esc or n)")
 		b, err := input.ReadByte()
 		if err != nil {
 			os.Exit(0)
@@ -286,4 +291,58 @@ func TestCursorCancelPendingApproval(t *testing.T) {
 	if _, err = os.Stat(filepath.Join(root, "allowed.txt")); !os.IsNotExist(err) {
 		t.Fatalf("cancel allowed side effect: %v", err)
 	}
+}
+
+// TestCursorModelCatalogStartup 验证目录错误只重启启动阶段，保留同一参数，并严格限制重试次数。
+func TestCursorModelCatalogStartup(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fail := range []string{"once", "always", "auth"} {
+		t.Run(fail, func(t *testing.T) {
+			root := t.TempDir()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			terminal, err := startSelectedTerminal(ctx, ctx, binary, []string{"-test.run=^TestCursorModelCatalogProcess$"}, append(os.Environ(), "CURSOR_CATALOG_TEST="+root, "CURSOR_CATALOG_FAILURE="+fail), root, "composer-2.5[fast=true]")
+			if terminal != nil {
+				defer terminal.close(context.Background())
+			}
+			if (err == nil) != (fail == "once") {
+				t.Fatalf("unexpected result: %v", err)
+			}
+			data, readErr := os.ReadFile(filepath.Join(root, "attempts"))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if len(data) != map[string]int{"once": 2, "always": 3, "auth": 1}[fail] {
+				t.Fatalf("attempts=%d", len(data))
+			}
+		})
+	}
+}
+
+// TestCursorModelCatalogProcess 模拟 CLI 在参数目录尚未加载时退出，不读取或接收任何用户消息。
+func TestCursorModelCatalogProcess(t *testing.T) {
+	root := os.Getenv("CURSOR_CATALOG_TEST")
+	if root == "" {
+		t.Skip("subprocess fixture")
+	}
+	path := filepath.Join(root, "attempts")
+	data, _ := os.ReadFile(path)
+	if err := os.WriteFile(path, append(data, 'x'), 0600); err != nil {
+		panic(err)
+	}
+	mode := os.Getenv("CURSOR_CATALOG_FAILURE")
+	if mode == "auth" {
+		fmt.Print("Authentication required")
+	} else if mode == "always" || len(data) == 0 {
+		fmt.Print("Cannot use this model: composer-2.5[fast=true]. Available models: auto, composer-2.5-fast")
+	} else {
+		fmt.Print("Plan, search, build anything")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+	}
+	time.Sleep(100 * time.Millisecond)
+	os.Exit(1)
 }

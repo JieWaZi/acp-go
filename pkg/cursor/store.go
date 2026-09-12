@@ -9,7 +9,6 @@ import (
 	"os"
 
 	sqlite3 "github.com/ncruces/go-sqlite3"
-	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
 // storePart 保留官方消息中与宿主展示有关的内容。
