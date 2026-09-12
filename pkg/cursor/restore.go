@@ -28,7 +28,7 @@ func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd 
 	}
 	sum := md5.Sum([]byte(path)) // 与官方工作目录索引一致，不用于安全校验。
 	source := newStoreCursor(filepath.Join(a.state, "chats", hex.EncodeToString(sum[:]), string(id), "store.db"))
-	db, err := source.open()
+	db, err := source.open(ctx)
 	if err != nil {
 		return err
 	}
@@ -46,7 +46,15 @@ func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd 
 		return err
 	}
 	defer os.Remove(name)
-	if _, err = db.ExecContext(ctx, `VACUUM INTO ?`, name); err != nil {
+	snapshot, _, err := db.Prepare(`VACUUM INTO ?`)
+	if err != nil {
+		return err
+	}
+	defer snapshot.Close()
+	if err = snapshot.BindText(1, name); err != nil {
+		return err
+	}
+	if err = snapshot.Exec(); err != nil {
 		return err
 	}
 	return os.Rename(name, filepath.Join(destination, "store.db"))

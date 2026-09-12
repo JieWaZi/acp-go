@@ -3,6 +3,7 @@ package cursor
 import (
 	"context"
 	"database/sql"
+	_ "github.com/ncruces/go-sqlite3/driver"
 	"path/filepath"
 	"testing"
 )
@@ -10,7 +11,7 @@ import (
 // TestCursorStorePendingAndResume 验证二进制待审查标记、工具结果消解和恢复边界。
 func TestCursorStorePendingAndResume(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,5 +48,14 @@ func TestCursorStorePendingAndResume(t *testing.T) {
 	batch, err = resumed.read(context.Background())
 	if err != nil || len(batch.messages) != 1 || batch.messages[0].content[0].text != "新回合" {
 		t.Fatalf("resume repeated history: %+v %v", batch, err)
+	}
+}
+
+// TestCursorDoesNotClaimHostSQLiteDriver 防止库依赖重新注册宿主使用的 sqlite 名称并导致 Ally 初始化崩溃。
+func TestCursorDoesNotClaimHostSQLiteDriver(t *testing.T) {
+	for _, name := range sql.Drivers() {
+		if name == "sqlite" {
+			t.Fatal("Cursor claimed the host SQLite driver name")
+		}
 	}
 }

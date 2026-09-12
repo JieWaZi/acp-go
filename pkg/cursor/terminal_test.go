@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	_ "github.com/ncruces/go-sqlite3/driver"
 	"io"
 	"os"
 	"path/filepath"
@@ -137,7 +138,7 @@ func TestCursorTerminalProcess(t *testing.T) {
 	if _, err := term.MakeRaw(os.Stdin.Fd()); err != nil {
 		panic(err)
 	}
-	db, err := sql.Open("sqlite", filepath.Join(root, "store.db"))
+	db, err := sql.Open("sqlite3", filepath.Join(root, "store.db"))
 	if err != nil {
 		panic(err)
 	}

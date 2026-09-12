@@ -3,13 +3,13 @@ package cursor
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
 
-	_ "modernc.org/sqlite"
+	sqlite3 "github.com/ncruces/go-sqlite3"
+	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
 // storePart 保留官方消息中与宿主展示有关的内容。
@@ -76,7 +76,7 @@ func newStoreCursor(path string) *storeCursor {
 }
 
 // open 只读打开官方会话库，保留 WAL 可见性，不创建或修改库。
-func (s *storeCursor) open() (*sql.DB, error) {
+func (s *storeCursor) open(ctx context.Context) (*sqlite3.Conn, error) {
 	if _, err := os.Stat(s.path); err != nil {
 		return nil, err
 	}
@@ -85,9 +85,9 @@ func (s *storeCursor) open() (*sql.DB, error) {
 	q.Set("mode", "ro")
 	q.Add("_pragma", "busy_timeout(1000)")
 	u.RawQuery = q.Encode()
-	db, err := sql.Open("sqlite", u.String())
+	db, err := sqlite3.OpenContext(ctx, u.String())
 	if err == nil {
-		db.SetMaxOpenConns(1)
+		db.SetInterrupt(ctx)
 	}
 	return db, err
 }
@@ -98,7 +98,7 @@ func (s *storeCursor) seed(ctx context.Context) error { _, err := s.read(ctx); r
 // read 借鉴 Omnigent 的 rowid 增量与 pending/committed/resolved 判据。
 func (s *storeCursor) read(ctx context.Context) (storeBatch, error) {
 	var batch storeBatch
-	db, err := s.open()
+	db, err := s.open(ctx)
 	if errors.Is(err, os.ErrNotExist) {
 		return batch, nil
 	}
@@ -106,18 +106,18 @@ func (s *storeCursor) read(ctx context.Context) (storeBatch, error) {
 		return batch, err
 	}
 	defer db.Close()
-	rows, err := db.QueryContext(ctx, `SELECT rowid,id,data FROM blobs WHERE rowid > ? ORDER BY rowid`, s.row)
+	rows, _, err := db.Prepare(`SELECT rowid,id,data FROM blobs WHERE rowid > ? ORDER BY rowid`)
 	if err != nil {
 		return batch, err
 	}
 	defer rows.Close()
-	for rows.Next() {
-		var row int64
-		var id string
-		var data []byte
-		if err = rows.Scan(&row, &id, &data); err != nil {
-			return batch, err
-		}
+	if err = rows.BindInt64(1, s.row); err != nil {
+		return batch, err
+	}
+	for rows.Step() {
+		row := rows.ColumnInt64(0)
+		id := rows.ColumnText(1)
+		data := rows.ColumnBlob(2, nil)
 		var plain map[string]any
 		isPlain := json.Unmarshal(data, &plain) == nil
 		objects := embeddedObjects(data)

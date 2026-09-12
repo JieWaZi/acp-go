@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
+	_ "github.com/ncruces/go-sqlite3/driver"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,7 +31,7 @@ func TestCursorRestoreIncludesWAL(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(destination, "meta.json"), []byte(`{}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", source)
+	db, err := sql.Open("sqlite3", source)
 	if err != nil {
 		t.Fatal(err)
 	}

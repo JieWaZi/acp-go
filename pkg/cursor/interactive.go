@@ -382,6 +382,9 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 	if _, err = readHooks(turn, filepath.Join(s.directory, "events")); err != nil {
 		return response, err
 	}
+	if s.terminal.outcome != nil {
+		_ = s.terminal.outcome.failure()
+	}
 	if err = s.terminal.submit(turn, prompt); err != nil {
 		return response, err
 	}

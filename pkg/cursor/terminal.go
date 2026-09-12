@@ -17,6 +17,8 @@ import (
 
 // cursorTerminal 拥有一条交互终端及其屏幕状态，不创建 tmux 或 Python 包装进程。
 type cursorTerminal struct {
+	// outcome 读取当前进程的官方结构化失败终态。
+	outcome *outcomeCursor
 	// screen 使用成熟 VT 模拟器解释终端重绘与输入协议。
 	screen *vt.SafeEmulator
 	// process 是唯一 Cursor 交互进程。
@@ -42,12 +44,13 @@ func startTerminal(ctx context.Context, command string, args, env []string, cwd 
 	cmd.Env = env
 	cmd.Dir = cwd
 	prepareTerminalProcess(cmd)
+	started := time.Now()
 	tty, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 70, Cols: 180})
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	t := &cursorTerminal{screen: vt.NewSafeEmulator(180, 70), process: cmd, tty: tty, cancel: cancel, done: make(chan struct{})}
+	t := &cursorTerminal{outcome: newOutcomeCursor(cmd.Process.Pid, started, env), screen: vt.NewSafeEmulator(180, 70), process: cmd, tty: tty, cancel: cancel, done: make(chan struct{})}
 	t.workers.Add(2)
 	go func() { defer t.workers.Done(); _, _ = io.Copy(t.screen, tty) }()
 	go func() { defer t.workers.Done(); _, _ = io.Copy(tty, t.screen) }()

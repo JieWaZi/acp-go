@@ -159,6 +159,11 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 				}
 			}
 		}
+		if s.terminal.outcome != nil {
+			if err := s.terminal.outcome.failure(); err != nil {
+				return acp.PromptResponse{Usage: p.usage}, err
+			}
+		}
 		if p.ended != "" && terminalReady(s.terminal.text()) && len(batch.pending) == 0 {
 			batch, err = s.store.read(ctx)
 			if err == nil {
