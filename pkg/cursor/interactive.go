@@ -362,7 +362,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 				_ = s.terminal.wait(settle, func(screen string) bool { return screen != before && terminalReady(screen) })
 				stop()
 			}
-			err = errors.Join(err, s.stop())
+			err = cursorPromptError(err, s.stop())
 		}
 	}()
 	parts := []string{}
@@ -525,4 +525,16 @@ func (a *Agent) Close(ctx context.Context) error {
 		err = errors.Join(err, os.RemoveAll(a.directory))
 	}
 	return err
+}
+
+// cursorPromptError 保留 SDK 必须直接识别的协议错误类型，清理错误仅在没有主错误时决定本轮结果。
+func cursorPromptError(primary, cleanup error) error {
+	if primary == nil {
+		return cleanup
+	}
+	var request *acp.RequestError
+	if errors.As(primary, &request) {
+		return request
+	}
+	return errors.Join(primary, cleanup)
 }

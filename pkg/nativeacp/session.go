@@ -55,6 +55,9 @@ type nativeModel struct {
 
 // NewSession 创建原生会话，并统一模型与思考配置的入口。
 func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	if request.McpServers == nil {
+		request.McpServers = []acp.McpServer{}
+	}
 	response, err := acp.SendRequest[nativeSessionResponse](agent.conn, ctx, "session/new", request)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
@@ -66,6 +69,9 @@ func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionReques
 
 // LoadSession 恢复上游历史，保留其真实模型与模式目录。
 func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	if request.McpServers == nil {
+		request.McpServers = []acp.McpServer{}
+	}
 	response, err := acp.SendRequest[nativeSessionResponse](agent.conn, ctx, "session/load", request)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err

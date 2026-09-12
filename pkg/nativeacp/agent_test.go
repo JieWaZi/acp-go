@@ -257,7 +257,12 @@ func TestACPProcess(t *testing.T) {
 				return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{}}, nil
 			}
 			return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}}, "authMethods": []any{}, "agentInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
-		case "session/new", "session/load":
+		case "session/new", "session/load", "session/resume":
+			if variant == "empty-mcp" && method != "session/resume" {
+				if _, ok := request["mcpServers"].([]any); !ok {
+					return nil, acp.NewInvalidParams(map[string]any{"message": "mcpServers must be an array"})
+				}
+			}
 			if variant == "mcp" {
 				var input acp.NewSessionRequest
 				_ = json.Unmarshal(data, &input)
@@ -439,5 +444,22 @@ func TestCursorVersionWithoutAgentInfo(t *testing.T) {
 	}
 	if response.AgentInfo == nil || acpmeta.RuntimeVersion(response.AgentInfo.Meta) != "2026.09.02-c22c1a3" {
 		t.Fatalf("Cursor CLI version missing: %+v", response.AgentInfo)
+	}
+}
+
+// TestNativeEmptyMCPLists 验证未配置 MCP 时，创建和两种恢复请求仍发送上游要求的空数组。
+func TestNativeEmptyMCPLists(t *testing.T) {
+	agent, _, _ := startAgent(t, "empty-mcp")
+	ctx := context.Background()
+	cwd := t.TempDir()
+	created, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = agent.LoadSession(ctx, acp.LoadSessionRequest{SessionId: created.SessionId, Cwd: cwd}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = agent.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: created.SessionId, Cwd: cwd}); err != nil {
+		t.Fatal(err)
 	}
 }

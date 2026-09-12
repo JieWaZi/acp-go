@@ -86,3 +86,18 @@ func TestCursorOutcomePartialAndForeignLogs(t *testing.T) {
 		t.Fatalf("old process log replayed: %v", err)
 	}
 }
+
+// TestCursorPromptPreservesProtocolError 验证清理后仍直接返回 SDK 可识别的错误，避免额度类型被包装成普通内部错误。
+func TestCursorPromptPreservesProtocolError(t *testing.T) {
+	original := acp.NewInternalError(map[string]any{"errorKind": "billing_error"})
+	for _, cleanup := range []error{nil, errors.New("cleanup failed")} {
+		got := cursorPromptError(original, cleanup)
+		if got != original {
+			t.Fatalf("protocol error wrapped: %T %v", got, got)
+		}
+	}
+	cleanup := errors.New("cleanup failed")
+	if cursorPromptError(nil, cleanup) != cleanup {
+		t.Fatal("cleanup failure lost")
+	}
+}
