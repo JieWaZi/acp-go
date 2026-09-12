@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 )
@@ -146,4 +147,23 @@ func verifySelection(directory string, expected nativeacp.CursorModelSelection) 
 		}
 	}
 	return nil
+}
+
+// executionModelArgument 使用官方 --model 的参数式语法覆盖恢复历史中的旧模型，不猜测模型别名或思考后缀。
+func executionModelArgument(selection nativeacp.CursorModelSelection) (string, error) {
+	valid := func(value string) bool { return value != "" && !strings.ContainsAny(value, "[],=\x00\r\n") }
+	if !valid(selection.ModelID) {
+		return "", errors.New("invalid Cursor execution model")
+	}
+	if len(selection.Parameters) == 0 {
+		return selection.ModelID, nil
+	}
+	parameters := make([]string, 0, len(selection.Parameters))
+	for _, parameter := range selection.Parameters {
+		if !valid(parameter.ID) || !valid(parameter.Value) {
+			return "", errors.New("invalid Cursor execution model parameter")
+		}
+		parameters = append(parameters, parameter.ID+"="+parameter.Value)
+	}
+	return selection.ModelID + "[" + strings.Join(parameters, ",") + "]", nil
 }

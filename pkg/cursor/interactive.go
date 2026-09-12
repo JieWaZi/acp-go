@@ -269,7 +269,12 @@ func (a *Agent) start(ctx context.Context, s *interactiveSession) error {
 	if err != nil {
 		return err
 	}
+	modelArgument, err := executionModelArgument(selection)
+	if err != nil {
+		return err
+	}
 	args := append([]string{}, a.config.PrefixArgs...)
+	args = append(args, "--model", modelArgument)
 	environment, err := sessionEnvironment(a.directory, a.state, s.directory, a.config.Environment, selection)
 	if err != nil {
 		return err
