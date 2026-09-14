@@ -25,7 +25,7 @@ Cursor 2026.09.08 的普通交互路径尚未触发插件范围 stop Hook，因�
 
 2026-09-12 的回归新增批量工具审批身份核对、MCP 命名空间匹配、同前缀连续粘贴、目录缺失限次重启，以及真实 CLI 跨进程 `full-access → default → auto → default` 权限状态核对。`ALLY_CURSOR_REAL_PROBE=1 go test ./pkg/cursor -run TestCursorRealPermissionTransitions -count=1 -v` 只操作本地权限命令，不调用模型；普通测试默认跳过此入口。
 
-当前交互提示只支持文本；二进制图片/音频附件没有实现，能力声明不承诺支持。上下文精确快照仅来自官方 preCompact Hook，不能提供每轮连续上下文计量，也不拿累计计费 Token 冒充上下文。Windows PTY 尚未实现。SQLite 私有结构与终端交互存在上游版本敏感性；不匹配时返回明确失败，不伪造审批、用量或完成。尚不能把所有 Claude/Codex 的专有能力视为等价支持。
+当前交互提示只支持文本；二进制图片/音频附件没有实现，能力声明不承诺支持。每轮完成后通过官方 `/context` 本地命令读取界面展示精度的当前上下文占用；命令不可用或格式不匹配时不产生快照，压缩前仍以官方 preCompact Hook 的精确值为准，也不拿累计计费 Token 冒充上下文。Windows PTY 尚未实现。SQLite 私有结构与终端交互存在上游版本敏感性；不匹配时返回明确失败，不伪造审批、用量或完成。尚不能把所有 Claude/Codex 的专有能力视为等价支持。
 
 ## 参考与许可
 

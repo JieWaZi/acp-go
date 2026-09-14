@@ -62,6 +62,19 @@ func (h *terminalHost) SessionUpdate(_ context.Context, r acp.SessionNotificatio
 	return nil
 }
 
+// contextUpdateCount 返回测试宿主已经异步接收的上下文事件数。
+func (h *terminalHost) contextUpdateCount() int {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	count := 0
+	for _, update := range h.updates {
+		if update.Update.UsageUpdate != nil {
+			count++
+		}
+	}
+	return count
+}
+
 // TestCursorTerminalRoundTrip 通过真实 PTY、SQLite 和 ACP 回调验证拒绝、批准、常驻复用及逐轮用量。
 func TestCursorTerminalRoundTrip(t *testing.T) {
 	root := t.TempDir()
@@ -96,7 +109,7 @@ func TestCursorTerminalRoundTrip(t *testing.T) {
 		h.allow = round == 1
 		h.mutex.Unlock()
 		if err = terminal.submit(ctx, fmt.Sprintf("测试第 %d 轮", round)); err != nil {
-			t.Fatal(err)
+			t.Fatalf("submit round %d: %v; screen=%s", round, err, terminal.text())
 		}
 		response, runErr := a.runTurn(ctx, s)
 		if runErr != nil {
@@ -110,6 +123,13 @@ func TestCursorTerminalRoundTrip(t *testing.T) {
 			t.Fatalf("round %d side effect: %v", round, statErr)
 		}
 	}
+	for h.contextUpdateCount() < 2 {
+		select {
+		case <-ctx.Done():
+			t.Fatal("context usage notifications not delivered")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 	if len(h.calls) != 2 {
@@ -119,13 +139,23 @@ func TestCursorTerminalRoundTrip(t *testing.T) {
 		t.Fatal("missing permission evidence")
 	}
 	messages := 0
+	contextUpdates := 0
 	for _, update := range h.updates {
 		if update.Update.AgentMessageChunk != nil {
 			messages++
 		}
+		if update.Update.UsageUpdate != nil {
+			contextUpdates++
+			if update.Update.UsageUpdate.Used != 25_000 || update.Update.UsageUpdate.Size != 200_000 {
+				t.Fatalf("context usage=%+v", update.Update.UsageUpdate)
+			}
+		}
 	}
 	if messages != 2 {
 		t.Fatalf("repeated or missing transcript: %d", messages)
+	}
+	if contextUpdates != 2 {
+		t.Fatalf("context usage updates=%d", contextUpdates)
 	}
 }
 
@@ -164,22 +194,39 @@ func TestCursorTerminalProcess(t *testing.T) {
 			panic(err)
 		}
 	}
-	for round := 0; ; round++ {
+	for round := 0; ; {
 		screen("Plan, search, build anything")
 		lastPaste := time.Now()
+		var inputText strings.Builder
 		for {
 			b, err := input.ReadByte()
 			if err != nil {
 				os.Exit(0)
 			}
 			if b == '\r' {
-				if time.Since(lastPaste) < 250*time.Millisecond {
+				if inputText.String() != contextCommand && time.Since(lastPaste) < 250*time.Millisecond {
 					panic("submit coalesced into paste")
 				}
 				break
 			}
 			lastPaste = time.Now()
-			fmt.Print(string([]byte{b}))
+			inputText.WriteByte(b)
+			if inputText.String() == contextCommand {
+				screen("Plan, search, build anything\r\n/context\r\nShow context usage breakdown")
+			} else {
+				fmt.Print(string([]byte{b}))
+			}
+		}
+		if inputText.String() == contextCommand {
+			screen(
+				"Context  composer-2.5                                 25K / 200K  12.5%\r\n" +
+					"Current context usage by category.\r\n\r\nEsc to close",
+			)
+			b, err := input.ReadByte()
+			if err != nil || b != 27 {
+				panic("context pager not closed")
+			}
+			continue
 		}
 		id := fmt.Sprintf("tool-%d", round)
 		call := map[string]any{"type": "tool-call", "toolCallId": id, "toolName": "Shell", "args": map[string]any{"command": "printf allowed > allowed.txt"}}
@@ -215,6 +262,7 @@ func TestCursorTerminalProcess(t *testing.T) {
 		if err = os.Rename(file+".tmp", file); err != nil {
 			panic(err)
 		}
+		round++
 	}
 }
 
@@ -224,6 +272,62 @@ func TestCursorPromptControls(t *testing.T) {
 	for _, value := range []string{"hello\x1by", "hello\x00"} {
 		if err := terminal.submit(context.Background(), value); err == nil || !strings.Contains(err.Error(), "control") {
 			t.Fatalf("control accepted: %v", err)
+		}
+	}
+}
+
+// TestCursorContextUnavailableDoesNotSubmit 验证旧版 CLI 未确认命令时只清空输入，不触发模型。
+func TestCursorContextUnavailableDoesNotSubmit(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	terminal, err := startTerminal(
+		ctx,
+		binary,
+		[]string{"-test.run=^TestCursorContextUnavailableProcess$"},
+		append(os.Environ(), "CURSOR_CONTEXT_UNAVAILABLE=1"),
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer terminal.close(context.Background())
+	usage, err := terminal.contextUsage(ctx)
+	if err == nil || !strings.Contains(err.Error(), "command unavailable") || usage != nil {
+		t.Fatalf("usage=%+v err=%v", usage, err)
+	}
+	if screen := terminal.text(); !terminalReady(screen) || strings.Contains(screen, contextCommand) {
+		t.Fatalf("context input not restored: %q", screen)
+	}
+}
+
+// TestCursorContextUnavailableProcess 模拟没有 `/context` 的旧版交互终端。
+func TestCursorContextUnavailableProcess(t *testing.T) {
+	if os.Getenv("CURSOR_CONTEXT_UNAVAILABLE") == "" {
+		t.Skip("subprocess fixture")
+	}
+	if _, err := term.MakeRaw(os.Stdin.Fd()); err != nil {
+		panic(err)
+	}
+	input := bufio.NewReader(os.Stdin)
+	screen := func(value string) { fmt.Print("\x1b[2J\x1b[H" + value) }
+	screen("Plan, search, build anything")
+	for {
+		b, err := input.ReadByte()
+		if err != nil {
+			os.Exit(0)
+		}
+		switch b {
+		case '\r':
+			panic("unknown context command submitted")
+		case 21:
+			screen("Plan, search, build anything")
+		case 27:
+		default:
+			fmt.Print(string([]byte{b}))
 		}
 	}
 }

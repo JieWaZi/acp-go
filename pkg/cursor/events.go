@@ -173,6 +173,7 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 			if err != nil {
 				return acp.PromptResponse{Usage: p.usage}, err
 			}
+			a.refreshContextUsage(ctx, s)
 			response := acp.PromptResponse{StopReason: acp.StopReasonEndTurn, Usage: p.usage}
 			switch p.ended {
 			case "completed":
