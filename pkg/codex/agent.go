@@ -49,6 +49,8 @@ type Config struct {
 	PrefixArgs []string
 	// Environment 是 Adapter、版本探测和 app-server 使用的完整环境；nil 表示继承当前进程。
 	Environment []string
+	// DefaultModeRequestUserInput 在用户未配置对应 feature 时默认启用普通模式提问；false 保留 Codex 默认行为。
+	DefaultModeRequestUserInput bool
 }
 
 // appServerRouter 解决 transport 必须先启动 reader，而 typed client/Agent 随后才可构造的依赖环。
@@ -104,6 +106,8 @@ type Agent struct {
 	executable executable
 	// getenv 读取调用方完整环境中的 Adapter 开关与认证信息。
 	getenv environmentLookup
+	// defaultModeRequestUserInput 是调用方选择的普通模式提问默认策略，不覆盖 Codex 显式配置。
+	defaultModeRequestUserInput bool
 	// runtimeCtx 跨单次 ACP 请求存活，直到 Adapter Close。
 	runtimeCtx context.Context
 	// runtimeCancel 终止所有后台 turn、steering 和通知任务。
@@ -219,6 +223,7 @@ func newAgentWithVersionRunner(ctx context.Context, config Config, runVersion co
 	agent := newAgentWithClient(config.Logger, runtimeCtx, runtimeCancel, client)
 	agent.executable = executable
 	agent.setEnvironment(config.Environment)
+	agent.defaultModeRequestUserInput = config.DefaultModeRequestUserInput
 	agent.transport = transport
 	agent.process = process
 	router.publishAgent(agent)

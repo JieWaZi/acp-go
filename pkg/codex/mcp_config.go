@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -14,7 +15,10 @@ import (
 
 const disableMCPConfigFilteringEnv = "DISABLE_MCP_CONFIG_FILTERING"
 
-// sessionConfig 合并工作范围与 ACP stdio/http server，并返回清洗后的 MCP 请求名称。
+// defaultModeRequestUserInputFeature 是 Codex 普通协作模式下结构化提问的功能开关。
+const defaultModeRequestUserInputFeature = "default_mode_request_user_input"
+
+// sessionConfig 合并工作范围、调用方提问默认策略与 ACP server，并返回清洗后的 MCP 请求名称。
 // 同名用户或项目配置默认保留，避免 Codex 深合并不同 transport 字段。
 func (a *Agent) sessionConfig(
 	ctx context.Context,
@@ -25,19 +29,23 @@ func (a *Agent) sessionConfig(
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(servers) == 0 {
-		return config, []string{}, nil
-	}
-
 	existing := map[string]struct{}{}
-	if a.getenv(disableMCPConfigFilteringEnv) != "true" {
+	filterMCP := len(servers) > 0 && a.getenv(disableMCPConfigFilteringEnv) != "true"
+	if a.defaultModeRequestUserInput || filterMCP {
 		includeLayers := true
 		cwd := workspace.CWD
 		response, err := a.client.ConfigRead(ctx, protocol.ConfigReadParams{Cwd: &cwd, IncludeLayers: &includeLayers})
 		if err != nil {
-			return nil, nil, fmt.Errorf("reading Codex config for MCP conflicts: %w", err)
+			return nil, nil, fmt.Errorf("reading Codex session config: %w", err)
 		}
-		existing = configuredMCPServerNames(response)
+		if a.defaultModeRequestUserInput {
+			if err := applyDefaultModeRequestUserInput(config, response.Config); err != nil {
+				return nil, nil, err
+			}
+		}
+		if filterMCP {
+			existing = configuredMCPServerNames(response)
+		}
 	}
 
 	requestedNames := make([]string, 0, len(servers))
@@ -67,6 +75,29 @@ func (a *Agent) sessionConfig(
 	}
 	config["mcp_servers"] = rawServers
 	return config, requestedNames, nil
+}
+
+// applyDefaultModeRequestUserInput 只在上游有效配置未声明 feature 时补调用方默认值。
+// config/read 序列化的是 ConfigToml，features 不注入运行时默认布尔值；按键存在性保留显式 false。
+// 使用点路径覆盖单项，避免替换其他 features；读取失败时绝不猜测用户未配置。
+func applyDefaultModeRequestUserInput(config map[string]json.RawMessage, effective json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(effective, &fields); err != nil {
+		return fmt.Errorf("decoding Codex effective config: %w", err)
+	}
+	if fields == nil {
+		return errors.New("decoding Codex effective config: expected object")
+	}
+	features := map[string]json.RawMessage{}
+	if raw, ok := fields["features"]; ok {
+		if err := json.Unmarshal(raw, &features); err != nil {
+			return fmt.Errorf("decoding Codex features config: %w", err)
+		}
+	}
+	if _, configured := features[defaultModeRequestUserInputFeature]; !configured {
+		config["features."+defaultModeRequestUserInputFeature] = json.RawMessage(`true`)
+	}
+	return nil
 }
 
 // codexMCPServerConfig 实现 codex-acp 的 transport 映射；stdio 是 ACP 必选能力，HTTP 显式声明支持。
