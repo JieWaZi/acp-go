@@ -20,6 +20,14 @@ git -C .upstream/codex-acp rev-parse HEAD
 
 结果必须为 `ba5bcc3d7759250dde9d4d2286a1bec11b363208`。`.upstream/` 由仓库 `.gitignore` 排除，完整 TypeScript 仓库不进入本项目提交。
 
+## 调用方的普通模式提问默认策略
+
+`Config.DefaultModeRequestUserInput` 默认为 `false`，保留其他调用方的 Codex 行为。调用方启用后，新建和恢复会话都会通过 `config/read` 按当前 cwd 读取有效配置；只有 `features` 未声明 `default_mode_request_user_input` 时，才向 thread 请求补入 `features.default_mode_request_user_input = true`。有效配置中的显式 `true`/`false` 均不覆盖，也不写入配置文件。读取或解析失败会阻止会话打开，不把失败当成未配置。
+
+该策略与 initialize 的 `experimentalApi` 独立：后者只允许接收实验请求，并不启用 Default 模式的提问工具。已核对 Codex `rust-v0.149.1`（`ff29a44391deccde0aba0f8390337d7f3c319ea4`）的 `core/src/tools/handlers/request_user_input.rs`、`features/src/lib.rs` 与 `app-server/src/config_manager_service.rs`：工具执行前检查模式，功能默认关闭；`config/read` 序列化 `ConfigToml`，features 保留键存在性而不填入运行时默认布尔值。此核对不改变上表的协议生成基线。
+
+回归入口：`session_config_test.go` 覆盖新建/恢复、未设置、显式开/关、调用方零值、无 MCP、关闭 MCP 过滤及配置读取异常。
+
 ## Schema 与生成命令
 
 固定输入为 `pkg/codex/protocol/schema/codex_app_server_protocol.schemas.json`。它由以下等价命令产生，刻意不传 `--experimental`：
