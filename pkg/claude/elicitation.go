@@ -211,3 +211,6 @@ func applyAskUserQuestionResponse(
 func askUserQuestionField(index int) string {
 	return fmt.Sprintf("question_%d", index)
 }
+
+// ProvidesUserInput 表示 Claude 的原生 AskUserQuestion 在三个权限档位均走表单桥。
+func (a *Agent) ProvidesUserInput() bool { return true }

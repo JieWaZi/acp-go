@@ -15,6 +15,9 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
 	"github.com/JieWaZi/acp-go/pkg/claude"
 	"github.com/JieWaZi/acp-go/pkg/codex"
+	"github.com/JieWaZi/acp-go/pkg/cursor"
+	"github.com/JieWaZi/acp-go/pkg/kimi"
+	"github.com/JieWaZi/acp-go/pkg/pi"
 
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -89,7 +92,7 @@ func runAgent(ctx context.Context, args []string, streams processIO) error {
 		return fmt.Errorf("selecting startup adapter: %w", err)
 	}
 
-	server, err := acpserver.New(selection.Agent, streams.input, streams.output)
+	server, err := acpserver.NewWithUserInput(selection.Agent, streams.input, streams.output)
 	if err != nil {
 		return fmt.Errorf("creating protocol server: %w", err)
 	}
@@ -152,5 +155,23 @@ func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := registry.Register(acpserver.Registration{Name: "kimi", Factory: func(ctx context.Context) (acp.Agent, error) {
+		return kimi.NewAgent(ctx, kimi.Config{Logger: logger, KimiPath: os.Getenv("KIMI_PATH")})
+	}}); err != nil {
+		return nil, err
+	}
+
+	if err := registry.Register(acpserver.Registration{Name: "cursor", Factory: func(ctx context.Context) (acp.Agent, error) {
+		return cursor.NewAgent(ctx, cursor.Config{Logger: logger, CursorPath: os.Getenv("CURSOR_PATH")})
+	}}); err != nil {
+		return nil, err
+	}
+
+	if err := registry.Register(acpserver.Registration{Name: "pi", Factory: func(ctx context.Context) (acp.Agent, error) {
+		return pi.NewAgent(ctx, pi.Config{Logger: logger, PiPath: os.Getenv("PI_PATH")})
+	}}); err != nil {
+		return nil, err
+	}
+
 	return registry, nil
 }

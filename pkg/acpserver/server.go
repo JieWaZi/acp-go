@@ -8,6 +8,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/userinput"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -99,4 +100,12 @@ func (s *Server) closeAdapter(ctx context.Context) error {
 		return fmt.Errorf("closing adapter: %w", err)
 	}
 	return nil
+}
+
+// NewWithUserInput 在唯一 ACP 边界补充受管问答，适用于需要统一交互语义的宿主。
+func NewWithUserInput(agent acp.Agent, input io.Reader, output io.Writer) (*Server, error) {
+	if agent == nil {
+		return New(agent, input, output)
+	}
+	return New(userinput.Wrap(agent), input, output)
 }

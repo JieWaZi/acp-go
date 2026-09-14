@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
+	"github.com/JieWaZi/acp-go/pkg/userinput"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -134,7 +135,15 @@ func codexMCPServerConfig(server acp.McpServer) (string, json.RawMessage, error)
 	if err != nil {
 		return "", nil, fmt.Errorf("encoding MCP server %q: %w", name, err)
 	}
-	return name, raw, nil
+	if userinput.IsServer(server) {
+		var fields map[string]any
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return "", nil, err
+		}
+		fields["tool_timeout_sec"] = 2147483
+		raw, err = json.Marshal(fields)
+	}
+	return name, raw, err
 }
 
 // sanitizeMCPServerName 与 codex-acp 一致，把 Unicode 空白替换为下划线。
