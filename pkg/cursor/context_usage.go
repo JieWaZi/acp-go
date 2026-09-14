@@ -21,8 +21,8 @@ const (
 )
 
 var contextUsageHeader = regexp.MustCompile(
-	`(?m)^Context[^\r\n]*?\s(` + contextTokenPattern + `)\s*/\s*(` +
-		contextTokenPattern + `)\s+([0-9]+(?:\.[0-9]+)?)%\s*$`,
+	`(?m)^[ \t]*Context[^\r\n]*?[ \t]+(` + contextTokenPattern + `)[ \t]*/[ \t]*(` +
+		contextTokenPattern + `)[ \t]+([0-9]+(?:\.[0-9]+)?)[ \t]*%[ \t]*$`,
 )
 
 // refreshContextUsage 从官方本地命令读取当前窗口占用；不可用时不影响已经完成的生成。

@@ -25,7 +25,7 @@ func TestParseContextUsage(t *testing.T) {
 	}{
 		{
 			name:   "thousands",
-			screen: "Context  composer-2.5  87.4K / 200K  43.7%\nCurrent context usage by category.",
+			screen: " Context • Composer 2.5 Fast   87.4K / 200K  43.7%\nCurrent context usage by category.",
 			used:   87_400,
 			size:   200_000,
 		},
