@@ -252,7 +252,7 @@ func TestCursorCancelPendingApproval(t *testing.T) {
 	defer hostIn.Close()
 	defer agentOut.Close()
 	h := &terminalHost{waiting: make(chan struct{})}
-	a := &Agent{config: Config{Interactive: true}, sessions: map[acp.SessionId]*interactiveSession{}}
+	a := &Agent{config: Config{}, sessions: map[acp.SessionId]*interactiveSession{}}
 	a.host = acp.NewAgentSideConnection(a, agentOut, agentIn)
 	_ = acp.NewClientSideConnection(h, hostOut, hostIn)
 	ctx, cancel := context.WithCancel(lifetime)

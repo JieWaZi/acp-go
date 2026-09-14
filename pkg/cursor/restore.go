@@ -13,7 +13,8 @@ import (
 	"github.com/gofrs/flock"
 )
 
-// snapshotControlStore 通过 SQLite 一致快照把真实历史交给官方 ACP 读取，避免跨路径遗漏 WAL 或双进程改写执行日志。
+// snapshotControlStore 通过 SQLite 一致快照把真实历史交给官方 ACP 读取。
+// 快照避免跨路径遗漏 WAL，也避免双进程改写执行日志。
 func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd string) error {
 	if id == "" || strings.ContainsAny(string(id), "/\\\x00") || id == "." || id == ".." {
 		return errors.New("invalid Cursor session identity")
@@ -27,7 +28,13 @@ func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd 
 		return err
 	}
 	sum := md5.Sum([]byte(path)) // 与官方工作目录索引一致，不用于安全校验。
-	source := newStoreCursor(filepath.Join(a.state, "chats", hex.EncodeToString(sum[:]), string(id), "store.db"))
+	source := newStoreCursor(filepath.Join(
+		a.state,
+		"chats",
+		hex.EncodeToString(sum[:]),
+		string(id),
+		"store.db",
+	))
 	db, err := source.open(ctx)
 	if err != nil {
 		return err
@@ -62,9 +69,6 @@ func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd 
 
 // claim 在读取或恢复日志之前独占原生身份；锁文件不删除，避免 inode 替换使互斥失效。
 func (a *Agent) claim(id acp.SessionId) (*flock.Flock, error) {
-	if !a.config.Interactive {
-		return nil, nil
-	}
 	if id == "" || strings.ContainsAny(string(id), "/\\\x00") || id == "." || id == ".." {
 		return nil, errors.New("invalid Cursor session identity")
 	}

@@ -2,13 +2,11 @@ package pi
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	acp "github.com/coder/acp-go-sdk"
 )
-
-// thinkingLevels 是 pi-acp 公开的官方思考等级，与执行权限无关。
-var thinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh"}
 
 // configuration 对照 pi-acp 从 Pi 实际状态与已认证模型构建选项。
 func (s *session) configuration(ctx context.Context) (map[string]any, error) {
@@ -17,6 +15,10 @@ func (s *session) configuration(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	if err := s.process.call(ctx, "get_available_models", nil, &available); err != nil {
+		return nil, err
+	}
+	thinkingLevels, err := s.availableThinkingLevels(ctx)
+	if err != nil {
 		return nil, err
 	}
 	models := []any{}
@@ -41,15 +43,67 @@ func (s *session) configuration(ctx context.Context) (map[string]any, error) {
 		current = text(object(models[0])["value"])
 	}
 	level := text(state["thinkingLevel"])
-	if level == "" {
-		level = "off"
+	if !contains(thinkingLevels, level) {
+		level = thinkingLevels[0]
 	}
 	thoughts, modes := []any{}, []any{}
 	for _, value := range thinkingLevels {
 		thoughts = append(thoughts, map[string]any{"value": value, "name": value})
 		modes = append(modes, map[string]any{"id": value, "name": "Thinking: " + value})
 	}
-	return map[string]any{"configOptions": []any{map[string]any{"id": "model", "category": "model", "type": "select", "name": "Model", "currentValue": current, "options": models}, map[string]any{"id": "reasoning", "category": "thought_level", "type": "select", "name": "Thinking", "currentValue": level, "options": thoughts}}, "modes": map[string]any{"currentModeId": level, "availableModes": modes}}, nil
+	configOptions := []any{
+		map[string]any{
+			"id":           "model",
+			"category":     "model",
+			"type":         "select",
+			"name":         "Model",
+			"currentValue": current,
+			"options":      models,
+		},
+		map[string]any{
+			"id":           "reasoning",
+			"category":     "thought_level",
+			"type":         "select",
+			"name":         "Thinking",
+			"currentValue": level,
+			"options":      thoughts,
+		},
+	}
+	return map[string]any{
+		"configOptions": configOptions,
+		"modes": map[string]any{
+			"currentModeId":  level,
+			"availableModes": modes,
+		},
+	}, nil
+}
+
+// availableThinkingLevels 从当前模型读取 Pi 权威思考等级，并过滤无效值。
+func (s *session) availableThinkingLevels(ctx context.Context) ([]string, error) {
+	var result map[string]any
+	if err := s.process.call(ctx, "get_available_thinking_levels", nil, &result); err != nil {
+		return nil, err
+	}
+	levels := make([]string, 0, len(list(result["levels"])))
+	for _, entry := range list(result["levels"]) {
+		if level := text(entry); level != "" && !contains(levels, level) {
+			levels = append(levels, level)
+		}
+	}
+	if len(levels) == 0 {
+		return nil, errors.New("Pi did not return available thinking levels")
+	}
+	return levels, nil
+}
+
+// contains 判断字符串是否在当前模型返回的有序集合中。
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // setModel 校验模型来自 Pi 实际目录，再按原生 provider/modelId 切换。
@@ -61,18 +115,25 @@ func (s *session) setModel(ctx context.Context, value string) error {
 	for _, entry := range list(available["models"]) {
 		m := object(entry)
 		if text(m["provider"])+"/"+text(m["id"]) == value {
-			return s.process.call(ctx, "set_model", map[string]any{"provider": m["provider"], "modelId": m["id"]}, nil)
+			params := map[string]any{
+				"provider": m["provider"],
+				"modelId":  m["id"],
+			}
+			return s.process.call(ctx, "set_model", params, nil)
 		}
 	}
 	return acp.NewInvalidParams(map[string]any{"message": "unknown Pi model"})
 }
 
-// setThinking 只接受官方枚举，不允许把权限名发给思考配置。
+// setThinking 只接受当前模型实时公布的等级，不允许把权限名发给思考配置。
 func (s *session) setThinking(ctx context.Context, value string) error {
-	for _, level := range thinkingLevels {
-		if value == level {
-			return s.process.call(ctx, "set_thinking_level", map[string]any{"level": value}, nil)
-		}
+	levels, err := s.availableThinkingLevels(ctx)
+	if err != nil {
+		return err
+	}
+	if contains(levels, value) {
+		params := map[string]any{"level": value}
+		return s.process.call(ctx, "set_thinking_level", params, nil)
 	}
 	return acp.NewInvalidParams(nil)
 }
@@ -83,14 +144,25 @@ func (a *Agent) configurationUpdate(ctx context.Context, s *session) error {
 	if err != nil {
 		return err
 	}
-	if err = a.emit(ctx, s, map[string]any{"sessionUpdate": "current_mode_update", "currentModeId": object(options["modes"])["currentModeId"]}); err != nil {
+	modeUpdate := map[string]any{
+		"sessionUpdate": "current_mode_update",
+		"currentModeId": object(options["modes"])["currentModeId"],
+	}
+	if err = a.emit(ctx, s, modeUpdate); err != nil {
 		return err
 	}
-	return a.emit(ctx, s, map[string]any{"sessionUpdate": "config_option_update", "configOptions": options["configOptions"]})
+	configUpdate := map[string]any{
+		"sessionUpdate": "config_option_update",
+		"configOptions": options["configOptions"],
+	}
+	return a.emit(ctx, s, configUpdate)
 }
 
 // SetSessionConfigOption 切换当前会话模型或思考等级，保留其独立 MCP 配置。
-func (a *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+func (a *Agent) SetSessionConfigOption(
+	ctx context.Context,
+	request acp.SetSessionConfigOptionRequest,
+) (acp.SetSessionConfigOptionResponse, error) {
 	if request.ValueId == nil {
 		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(nil)
 	}

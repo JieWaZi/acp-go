@@ -71,13 +71,11 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 			return nil, nil
 		}
 		return nil, agent.host.SessionUpdate(ctx, request)
-	case "cursor/ask_question", "cursor/create_plan":
-		if agent.config.CursorExtensions {
-			return agent.cursorInteraction(ctx, method, params)
-		}
-	case "cursor/update_todos", "cursor/task", "cursor/generate_image":
-		if agent.config.CursorExtensions {
-			return nil, agent.cursorNotification(ctx, method, params)
+	}
+	if agent.config.CallbackAdapter != nil {
+		result, handled, err := agent.config.CallbackAdapter.HandleCallback(ctx, agent, method, params)
+		if handled {
+			return result, err
 		}
 	}
 	if len(method) > 0 && method[0] == '_' {

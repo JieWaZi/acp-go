@@ -60,8 +60,8 @@ func TestCursorRestoreIncludesWAL(t *testing.T) {
 // TestCursorSessionOwnership 验证第二连接和重复加载不能在快照前取得同一身份。
 func TestCursorSessionOwnership(t *testing.T) {
 	state := t.TempDir()
-	a := &Agent{state: state, config: Config{Interactive: true}, sessions: map[acp.SessionId]*interactiveSession{}}
-	b := &Agent{state: state, config: Config{Interactive: true}}
+	a := &Agent{state: state, config: Config{}, sessions: map[acp.SessionId]*interactiveSession{}}
+	b := &Agent{state: state, config: Config{}}
 	first, err := a.claim("session")
 	if err != nil {
 		t.Fatal(err)

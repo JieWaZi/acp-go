@@ -12,8 +12,6 @@ import (
 
 // Config 保存 cursor 的受控启动配置。
 type Config struct {
-	// Interactive 启用受管交互终端、原生审批和真实用量；在 cwd 临时登记可回收的官方 Hook。
-	Interactive bool
 	// StateDirectory 保存受管 Cursor 会话；空值使用用户缓存目录。
 	StateDirectory string
 	// CursorPath 是已安装程序的路径；空值使用默认命令。
@@ -60,5 +58,17 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, errors.New("unsupported Cursor permission mode")
 	}
 	args = append(args, "acp")
-	return newCursorAgent(ctx, config, nativeacp.Config{Command: command, Args: args, Environment: config.Environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger, CursorExtensions: true, RuntimeName: "cursor", VersionArgs: append(append([]string{}, config.PrefixArgs...), "--version")})
+	options := newCursorSessionAdapter()
+	nativeConfig := nativeacp.Config{
+		Command:          command,
+		Args:             args,
+		Environment:      config.Environment,
+		WorkingDirectory: config.WorkingDirectory,
+		Logger:           config.Logger,
+		CallbackAdapter:  NewCallbackAdapter(),
+		SessionAdapter:   options,
+		RuntimeName:      "cursor",
+		VersionArgs:      append(append([]string{}, config.PrefixArgs...), "--version"),
+	}
+	return newCursorAgent(ctx, config, nativeConfig, options)
 }

@@ -1,4 +1,4 @@
-// Package kimi 复用已安装的 kimi ACP 入口，不实现厂商私有协议。
+// Package kimi 复用已安装的 Kimi ACP 入口，并在本包内封装版本兼容与执行语义。
 package kimi
 
 import (
@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -56,7 +57,11 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if config.PermissionMode != "" && config.PermissionMode != "default" && config.PermissionMode != "auto" && config.PermissionMode != "full-access" {
+	validPermissionMode := config.PermissionMode == "" ||
+		config.PermissionMode == "default" ||
+		config.PermissionMode == "auto" ||
+		config.PermissionMode == "full-access"
+	if !validPermissionMode {
 		return nil, errors.New("unsupported Kimi permission mode")
 	}
 	cwd, err := filepath.Abs(config.WorkingDirectory)
@@ -80,13 +85,23 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	nativeConfig := nativeacp.Config{Command: command, Args: args, Environment: environment, WorkingDirectory: config.WorkingDirectory, Logger: config.Logger}
+	var reviewer func(context.Context, autoreview.Request) (autoreview.Decision, error)
 	if config.PermissionMode == "auto" {
-		nativeConfig.LegacyPermissionReviewer, err = permissionReviewer(config, directory, environment)
+		reviewer, err = permissionReviewer(config, directory, environment)
 		if err != nil {
 			_ = os.RemoveAll(directory)
 			return nil, err
 		}
+	}
+	sessionAdapter, permissionAdapter := NewCompatibilityAdapters(reviewer, config.Logger)
+	nativeConfig := nativeacp.Config{
+		Command:           command,
+		Args:              args,
+		Environment:       environment,
+		WorkingDirectory:  config.WorkingDirectory,
+		Logger:            config.Logger,
+		SessionAdapter:    sessionAdapter,
+		PermissionAdapter: permissionAdapter,
 	}
 	upstream, err := nativeacp.NewAgent(ctx, nativeConfig)
 	if err != nil {

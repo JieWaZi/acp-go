@@ -49,7 +49,7 @@ func TestCursorRealPermissionTransitions(t *testing.T) {
 	cwd, state := t.TempDir(), t.TempDir()
 	var id acp.SessionId
 	for _, mode := range []string{"full-access", "default", "auto", "default"} {
-		a, err := NewAgent(ctx, Config{Interactive: true, StateDirectory: state, Environment: os.Environ(), Logger: slog.Default(), PermissionMode: mode})
+		a, err := NewAgent(ctx, Config{StateDirectory: state, Environment: os.Environ(), Logger: slog.Default(), PermissionMode: mode})
 		if err != nil {
 			t.Fatal(err)
 		}

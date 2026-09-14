@@ -84,14 +84,20 @@ func cursorEnvironment(config Config) (directory, state string, environment []st
 		return
 	}
 	environment = config.Environment
-	for key, value := range map[string]string{"CURSOR_CONFIG_DIR": directory, "CURSOR_DATA_DIR": filepath.Join(state, "data"), "NO_OPEN_BROWSER": "1", "TERM": "xterm-256color"} {
+	variables := map[string]string{
+		"CURSOR_CONFIG_DIR": directory,
+		"CURSOR_DATA_DIR":   filepath.Join(state, "data"),
+		"NO_OPEN_BROWSER":   "1",
+		"TERM":              "xterm-256color",
+	}
+	for key, value := range variables {
 		environment = nativeacp.WithEnvironment(environment, key, value)
 	}
 	return
 }
 
 // sessionEnvironment 隔离每个交互会话的模型选择，避免并发会话覆盖彼此的配置。
-func sessionEnvironment(source, state, directory string, environment []string, selection nativeacp.CursorModelSelection) ([]string, error) {
+func sessionEnvironment(source, state, directory string, environment []string, selection CursorModelSelection) ([]string, error) {
 	config := filepath.Join(directory, "config")
 	if err := os.MkdirAll(config, 0700); err != nil {
 		return nil, err
@@ -124,7 +130,7 @@ func sessionEnvironment(source, state, directory string, environment []string, s
 }
 
 // verifySelection 只比较已声明的模型参数；终端未采用指定配置时禁止发送提示。
-func verifySelection(directory string, expected nativeacp.CursorModelSelection) error {
+func verifySelection(directory string, expected CursorModelSelection) error {
 	data, err := os.ReadFile(filepath.Join(directory, "config", "cli-config.json"))
 	if err != nil {
 		return err
@@ -133,7 +139,7 @@ func verifySelection(directory string, expected nativeacp.CursorModelSelection) 
 	if json.Unmarshal(data, &fields) != nil {
 		return errors.New("invalid Cursor execution configuration")
 	}
-	var actual nativeacp.CursorModelSelection
+	var actual CursorModelSelection
 	if json.Unmarshal(fields["selectedModel"], &actual) != nil || actual.ModelID != expected.ModelID {
 		return errors.New("Cursor did not retain the selected execution model")
 	}
@@ -150,7 +156,7 @@ func verifySelection(directory string, expected nativeacp.CursorModelSelection) 
 }
 
 // executionModelArgument 使用官方 --model 的参数式语法覆盖恢复历史中的旧模型，不猜测模型别名或思考后缀。
-func executionModelArgument(selection nativeacp.CursorModelSelection) (string, error) {
+func executionModelArgument(selection CursorModelSelection) (string, error) {
 	valid := func(value string) bool { return value != "" && !strings.ContainsAny(value, "[],=\x00\r\n") }
 	if !valid(selection.ModelID) {
 		return "", errors.New("invalid Cursor execution model")

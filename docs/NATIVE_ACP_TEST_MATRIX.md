@@ -17,7 +17,7 @@
 ```sh
 go vet ./...
 go test ./...
-go test -race ./pkg/nativeacp ./pkg/pi ./pkg/kimi
+go test -race ./pkg/nativeacp ./pkg/cursor ./pkg/pi ./pkg/kimi
 ```
 
 真实 Pi 集成（Node >=22.19，安装目录与测试产物由调用者选择）：

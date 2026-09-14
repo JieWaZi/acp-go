@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -105,7 +106,27 @@ func promptContent(blocks []acp.ContentBlock) (string, []any, error) {
 			fmt.Fprintf(&message, "\n[Context] %s", text(block["uri"]))
 		case "resource":
 			resource := object(block["resource"])
-			fmt.Fprintf(&message, "\n[Embedded Context] %s\n%s", text(resource["uri"]), text(resource["text"]))
+			uri := text(resource["uri"])
+			switch {
+			case resource["text"] != nil:
+				mimeType := text(resource["mimeType"])
+				if mimeType == "" {
+					mimeType = "text/plain"
+				}
+				fmt.Fprintf(&message, "\n[Embedded Context] %s (%s)\n%s", uri, mimeType, text(resource["text"]))
+			case resource["blob"] != nil:
+				mimeType := text(resource["mimeType"])
+				if mimeType == "" {
+					mimeType = "application/octet-stream"
+				}
+				decoded, decodeErr := base64.StdEncoding.DecodeString(text(resource["blob"]))
+				if decodeErr != nil {
+					return "", nil, acp.NewInvalidParams(map[string]any{"message": "invalid embedded resource blob"})
+				}
+				fmt.Fprintf(&message, "\n[Embedded Context] %s (%s, %d bytes)", uri, mimeType, len(decoded))
+			default:
+				fmt.Fprintf(&message, "\n[Embedded Context] %s", uri)
+			}
 		case "audio":
 			return "", nil, acp.NewInvalidParams(map[string]any{"message": "Pi does not support audio"})
 		default:
@@ -171,7 +192,10 @@ func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages
 		params["enabled"] = enabled
 	case "export":
 		if _, err := os.Stat(s.file); err != nil {
-			return true, a.emit(ctx, s, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "Nothing to export yet."}})
+			return true, a.emitAgentMessage(ctx, s, map[string]any{
+				"type": "text",
+				"text": "Nothing to export yet.",
+			})
 		}
 		command = "export_html"
 		params["outputPath"] = filepath.Join(s.cwd, "pi-session-"+string(s.id)+".html")
@@ -185,7 +209,11 @@ func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages
 		if err != nil {
 			return true, err
 		}
-		return true, a.emit(ctx, s, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": string([]rune(string(data))[:min(20000, len([]rune(string(data))))])}})
+		content := []rune(string(data))
+		return true, a.emitAgentMessage(ctx, s, map[string]any{
+			"type": "text",
+			"text": string(content[:min(20000, len(content))]),
+		})
 	default:
 		return false, nil
 	}
@@ -193,7 +221,12 @@ func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages
 		return true, err
 	}
 	if name == "name" {
-		if err := a.emit(ctx, s, map[string]any{"sessionUpdate": "session_info_update", "title": arg, "updatedAt": time.Now().UTC().Format(time.RFC3339)}); err != nil {
+		update := map[string]any{
+			"sessionUpdate": "session_info_update",
+			"title":         arg,
+			"updatedAt":     time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := a.emit(ctx, s, update); err != nil {
 			return true, err
 		}
 	}
@@ -203,14 +236,23 @@ func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages
 			path = text(params["outputPath"])
 		}
 		uri := (&url.URL{Scheme: "file", Path: path}).String()
-		return true, a.emit(ctx, s, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "resource_link", "uri": uri, "name": filepath.Base(path), "mimeType": "text/html"}})
+		return true, a.emitAgentMessage(ctx, s, map[string]any{
+			"type":     "resource_link",
+			"uri":      uri,
+			"name":     filepath.Base(path),
+			"mimeType": "text/html",
+		})
 	}
 	encoded, _ := json.Marshal(result)
 	switch name {
 	case "name":
 		encoded = []byte("Session name set to: " + arg)
 	case "compact":
-		encoded = []byte(fmt.Sprintf("Compaction completed. Tokens before: %v\n%s", result["tokensBefore"], text(result["summary"])))
+		encoded = []byte(fmt.Sprintf(
+			"Compaction completed. Tokens before: %v\n%s",
+			result["tokensBefore"],
+			text(result["summary"]),
+		))
 	case "steering", "follow-up":
 		value := arg
 		if value == "" {
@@ -228,7 +270,18 @@ func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages
 			encoded = []byte("Pi /" + name + " complete")
 		}
 	}
-	return true, a.emit(ctx, s, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": string(encoded)}})
+	return true, a.emitAgentMessage(ctx, s, map[string]any{
+		"type": "text",
+		"text": string(encoded),
+	})
+}
+
+// emitAgentMessage 发布一个标准 Agent 消息内容块。
+func (a *Agent) emitAgentMessage(ctx context.Context, s *session, content map[string]any) error {
+	return a.emit(ctx, s, map[string]any{
+		"sessionUpdate": "agent_message_chunk",
+		"content":       content,
+	})
 }
 
 // abortTurn 等待被取消的回合清空事件，避免上一轮终态误结束下一轮。

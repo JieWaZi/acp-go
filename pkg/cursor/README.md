@@ -1,6 +1,6 @@
 # Cursor Adapter
 
-Ally 只对接 acp-go。`cursor.Config{Interactive: true}` 和 `acp-agent --adapter cursor` 在 Go 内管理官方 Cursor 交互终端，使用官方 `cursor-agent acp` 获取认证、模型目录与配置回执。无需安装另一个 ACP 桥、Python 或 tmux。官方 Cursor 自身使用其附带的 Node；用量 Hook 的内置小脚本只传输白名单字段，不承载审批或业务语义。
+Ally 只对接 acp-go。`cursor.NewAgent` 和 `acp-agent --adapter cursor` 始终在 Go 内管理官方 Cursor 交互终端，并使用官方 `cursor-agent acp` 获取认证、模型目录与配置回执。不存在绕过受管交互语义的第二种公开模式，也无需安装另一个 ACP 桥、Python 或 tmux。官方 Cursor 自身使用其附带的 Node；用量 Hook 的内置小脚本只传输白名单字段，不承载审批或业务语义。
 
 `CursorPath`（命令入口的 `CURSOR_PATH`）指定安装路径，默认发现 `cursor-agent`，不存在时尝试 `agent`。同一连接固定解析后的 CLI 版本，避免后台自动更新使控制与执行进程版本不同。调用者须关闭 Agent 以回收进程和临时配置。
 

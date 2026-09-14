@@ -54,7 +54,7 @@ func TestNativeProcessTreeClose(t *testing.T) {
 	t.Fatal("adapter descendant survived Close")
 }
 
-// TestNativeDescendantProcess 模拟 Pi 适配器持有独立执行进程的生命周期。
+// TestNativeDescendantProcess 模拟外部适配器持有独立执行进程的生命周期。
 func TestNativeDescendantProcess(t *testing.T) {
 	marker := os.Getenv("NATIVE_ACP_DESCENDANT")
 	if marker == "" {

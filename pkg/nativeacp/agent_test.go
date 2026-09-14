@@ -1,6 +1,7 @@
 package nativeacp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	"github.com/JieWaZi/acp-go/pkg/cursor"
+	"github.com/JieWaZi/acp-go/pkg/kimi"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -111,9 +113,15 @@ func startAgent(t *testing.T, variant string, reviewers ...func(context.Context,
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := nativeacp.Config{Command: binary, Args: []string{"-test.run=^TestACPProcess$"}, Environment: append(os.Environ(), "NATIVE_ACP_TEST="+variant), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CursorExtensions: true}
-	if len(reviewers) > 0 {
-		config.LegacyPermissionReviewer = reviewers[0]
+	config := nativeacp.Config{Command: binary, Args: []string{"-test.run=^TestACPProcess$"}, Environment: append(os.Environ(), "NATIVE_ACP_TEST="+variant), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), CallbackAdapter: cursor.NewCallbackAdapter()}
+	if variant == "legacy" {
+		var reviewer func(context.Context, autoreview.Request) (autoreview.Decision, error)
+		if len(reviewers) > 0 {
+			reviewer = reviewers[0]
+		}
+		config.SessionAdapter, config.PermissionAdapter = kimi.NewCompatibilityAdapters(reviewer, config.Logger)
+	} else {
+		config.SessionAdapter = cursor.NewSessionAdapter()
 	}
 	var agent *nativeacp.Agent
 	if variant == "version" {
@@ -228,6 +236,36 @@ func TestNativeStartFailure(t *testing.T) {
 	}
 }
 
+// TestNativeStderrIsVisibleAndRedacted 验证原生 ACP 失败诊断可见，但常见凭据不会进入日志。
+func TestNativeStderrIsVisibleAndRedacted(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	agent, err := nativeacp.NewAgent(context.Background(), nativeacp.Config{
+		Command:     binary,
+		Args:        []string{"-test.run=^TestACPProcess$"},
+		Environment: append(os.Environ(), "NATIVE_ACP_TEST=stderr"),
+		Logger:      slog.New(slog.NewTextHandler(&output, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := agent.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := output.String()
+	if !strings.Contains(diagnostic, "fixture failure") {
+		t.Fatalf("stderr 诊断不可见：%q", diagnostic)
+	}
+	if strings.Contains(diagnostic, "secret-value") || !strings.Contains(diagnostic, "[REDACTED]") {
+		t.Fatalf("stderr 凭据未脱敏：%q", diagnostic)
+	}
+}
+
 // TestACPProcess 在隔离子进程内运行 SDK 驱动的协议对照 Agent。
 func TestACPProcess(t *testing.T) {
 	variant := os.Getenv("NATIVE_ACP_TEST")
@@ -241,6 +279,10 @@ func TestACPProcess(t *testing.T) {
 	if variant == "parameters" {
 		runCursorParameterProcess()
 		os.Exit(0)
+	}
+	if variant == "stderr" {
+		fmt.Fprintln(os.Stderr, "fixture failure api_key=secret-value")
+		os.Exit(9)
 	}
 	ready := make(chan struct{})
 	var connection *acp.Connection

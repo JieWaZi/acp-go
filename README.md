@@ -211,8 +211,8 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | [`pkg/acpserver`](pkg/acpserver) | Adapter 注册、选择和 ACP 服务生命周期 |
 | [`pkg/codex`](pkg/codex) | Codex 公开包、运行时与协议类型 |
 | [`pkg/claude`](pkg/claude) | Claude 公开包、运行时与协议类型 |
-| [`pkg/nativeacp`](pkg/nativeacp) | 原生 stdio 连接、配置规范化与 Cursor 交互转换 |
-| [`pkg/kimi`](pkg/kimi)、[`pkg/cursor`](pkg/cursor)、[`pkg/pi`](pkg/pi) | 原生 CLI 与开源适配器启动入口 |
+| [`pkg/nativeacp`](pkg/nativeacp) | 原生 stdio 连接、生命周期与厂商扩展窄接口 |
+| [`pkg/kimi`](pkg/kimi)、[`pkg/cursor`](pkg/cursor)、[`pkg/pi`](pkg/pi) | 各 CLI 的模型、审批、交互与执行适配 |
 | [`tools/protocolgen`](tools/protocolgen) | Codex 协议生成与新鲜度检查 |
 | [`docs`](docs) | 测试矩阵和维护规格 |
 
@@ -222,7 +222,9 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | --- | --- | --- | --- |
 | Codex | [`pkg/codex/README.md`](pkg/codex/README.md) | [`pkg/codex/UPSTREAM.md`](pkg/codex/UPSTREAM.md) | [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md) |
 | Claude | [`pkg/claude/README.md`](pkg/claude/README.md) | [`pkg/claude/UPSTREAM.md`](pkg/claude/UPSTREAM.md) | [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md) |
-| Kimi / Cursor / Pi | [`pkg/nativeacp/README.md`](pkg/nativeacp/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
+| Kimi | [`pkg/kimi/README.md`](pkg/kimi/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
+| Cursor | [`pkg/cursor/README.md`](pkg/cursor/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
+| Pi | [`pkg/pi/README.md`](pkg/pi/README.md) | [`pkg/pi/UPSTREAM.md`](pkg/pi/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
 
 ## 开发与验证
 

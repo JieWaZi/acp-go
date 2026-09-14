@@ -38,6 +38,15 @@ func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequ
 	return result, err
 }
 
+// ResumeSession 恢复当前进程中的原生会话，并重新绑定受管统计路径。
+func (agent *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	result, err := agent.Agent.ResumeSession(ctx, request)
+	if err == nil {
+		agent.rememberWire(request.SessionId, request.Cwd)
+	}
+	return result, err
+}
+
 // rememberWire 对照 Kimi WorkDirMeta.sessions_dir，不扫描其他会话或用户数据。
 func (agent *Agent) rememberWire(id acp.SessionId, cwd string) {
 	if !agent.pythonACP.Load() || string(id) == "." || filepath.Base(string(id)) != string(id) || !filepath.IsAbs(cwd) {

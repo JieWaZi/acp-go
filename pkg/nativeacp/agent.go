@@ -9,13 +9,17 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	acp "github.com/coder/acp-go-sdk"
 )
+
+const maxNativeDiagnosticBytes = 4 << 10
+
+var nativeSecretDiagnosticPattern = regexp.MustCompile(`(?i)(authorization|api[_-]?key|access[_-]?token|secret)([=: ]+)([^\s,;]+)`)
 
 // Config 描述外部 ACP 进程；不会下载程序或修改用户配置。
 type Config struct {
@@ -33,10 +37,12 @@ type Config struct {
 	WorkingDirectory string
 	// Logger 接收独立于协议 stdout 的诊断。
 	Logger *slog.Logger
-	// CursorExtensions 表示需要把 Cursor 交互请求转换为标准 ACP 交互。
-	CursorExtensions bool
-	// LegacyPermissionReviewer 仅补充只有 default 模式的上游；错误和拒绝继续交给宿主审批。
-	LegacyPermissionReviewer func(context.Context, autoreview.Request) (autoreview.Decision, error)
+	// CallbackAdapter 处理当前 CLI 的私有反向请求；nil 表示只接受标准 ACP。
+	CallbackAdapter CallbackAdapter
+	// SessionAdapter 处理当前 CLI 的非标准模型或思考配置；nil 表示标准 ACP。
+	SessionAdapter SessionAdapter
+	// PermissionAdapter 处理当前 CLI 的非标准审批策略；nil 表示完全交给宿主。
+	PermissionAdapter PermissionAdapter
 }
 
 // Agent 实现标准 ACP Agent，协议传输、请求关联和通知排序全部由 Go SDK 拥有。
@@ -69,11 +75,9 @@ type Agent struct {
 	bound chan struct{}
 	// capabilities 保存上游的实际能力。
 	capabilities acp.AgentCapabilities
-	// cursorModels 缓存当前 CLI 官方模型参数目录，nil 表示尚未成功读取。
-	cursorModels map[string][]acp.SessionConfigOption
 	// sessions 保存配置标识与原生模型协议的会话映射。
 	sessions map[acp.SessionId]*sessionOptions
-	// active 保存活跃 Prompt，用于路由缺少 sessionId 的 Cursor 回调。
+	// active 保存活跃 Prompt，用于路由缺少 sessionId 的厂商回调。
 	active map[acp.SessionId]bool
 	// toolSessions 保存已收到工具更新的所属会话。
 	toolSessions map[acp.ToolCallId]acp.SessionId
@@ -132,9 +136,30 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		_ = output.Close()
 		return nil, fmt.Errorf("starting native ACP: %w", err)
 	}
-	agent := &Agent{command: command, input: input, output: output, cancel: cancel, done: make(chan struct{}), closed: make(chan struct{}), bound: make(chan struct{}), sessions: make(map[acp.SessionId]*sessionOptions), active: make(map[acp.SessionId]bool), toolSessions: make(map[acp.ToolCallId]acp.SessionId), config: config, prompts: make(map[acp.SessionId][]acp.ContentBlock), toolDetails: make(map[acp.ToolCallId]acp.ToolCallUpdate), turnContexts: make(map[acp.SessionId]context.Context), turnCancels: make(map[acp.SessionId]context.CancelFunc)}
+	agent := &Agent{
+		command:      command,
+		input:        input,
+		output:       output,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		closed:       make(chan struct{}),
+		bound:        make(chan struct{}),
+		sessions:     make(map[acp.SessionId]*sessionOptions),
+		active:       make(map[acp.SessionId]bool),
+		toolSessions: make(map[acp.ToolCallId]acp.SessionId),
+		config:       config,
+		prompts:      make(map[acp.SessionId][]acp.ContentBlock),
+		toolDetails:  make(map[acp.ToolCallId]acp.ToolCallUpdate),
+		turnContexts: make(map[acp.SessionId]context.Context),
+		turnCancels:  make(map[acp.SessionId]context.CancelFunc),
+	}
 	agent.conn = acp.NewConnection(agent.handle, input, output)
-	go func() { <-agent.conn.Done(); cancel(); _ = command.Wait(); close(agent.done) }()
+	go func() {
+		<-agent.conn.Done()
+		cancel()
+		_ = command.Wait()
+		close(agent.done)
+	}()
 	return agent, nil
 }
 
@@ -144,9 +169,22 @@ type diagnosticWriter struct {
 	logger *slog.Logger
 }
 
-// Write 消费原生进程诊断并仅记录数据量。
+// Write 消费原生进程诊断，脱敏并限制单次日志大小后交给宿主日志通道。
 func (writer *diagnosticWriter) Write(data []byte) (int, error) {
-	writer.logger.Debug("native ACP stderr", "bytes", len(data))
+	diagnostic := strings.Map(func(value rune) rune {
+		if value == '\n' || value == '\r' || value == '\t' || value >= 0x20 {
+			return value
+		}
+		return -1
+	}, string(data))
+	diagnostic = nativeSecretDiagnosticPattern.ReplaceAllString(diagnostic, "$1$2[REDACTED]")
+	diagnostic = strings.TrimSpace(diagnostic)
+	if len(diagnostic) > maxNativeDiagnosticBytes {
+		diagnostic = diagnostic[len(diagnostic)-maxNativeDiagnosticBytes:]
+	}
+	if diagnostic != "" {
+		writer.logger.Warn("native ACP stderr", "stderr", strings.ToValidUTF8(diagnostic, "�"))
+	}
 	return len(data), nil
 }
 
@@ -183,13 +221,8 @@ func (agent *Agent) Close(ctx context.Context) error {
 
 // Initialize 保留真实能力，不伪造上游不支持的 Session 或授权功能。
 func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
-	if agent.config.CursorExtensions {
-		meta := make(map[string]any, len(request.ClientCapabilities.Meta)+1)
-		for key, value := range request.ClientCapabilities.Meta {
-			meta[key] = value
-		}
-		meta["parameterizedModelPicker"] = true
-		request.ClientCapabilities.Meta = meta
+	if agent.config.CallbackAdapter != nil {
+		agent.config.CallbackAdapter.PrepareInitialize(&request)
 	}
 	response, err := acp.SendRequest[acp.InitializeResponse](agent.conn, ctx, "initialize", request)
 	if err == nil {
@@ -255,6 +288,9 @@ func (agent *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRe
 	supported := agent.capabilities.SessionCapabilities.Close != nil
 	delete(agent.sessions, request.SessionId)
 	agent.mutex.Unlock()
+	if agent.config.SessionAdapter != nil {
+		agent.config.SessionAdapter.ForgetSession(request.SessionId)
+	}
 	if supported {
 		return acp.SendRequest[acp.CloseSessionResponse](agent.conn, ctx, "session/close", request)
 	}

@@ -29,6 +29,8 @@ type Agent struct {
 	host *acp.AgentSideConnection
 	// config 保存调用方明确选择的执行方式。
 	config Config
+	// options 拥有 Cursor 参数化模型与会话配置状态。
+	options *cursorSessionAdapter
 	// command 是已经解析的官方 CLI。
 	command string
 	// directory 是本次连接独占的临时配置目录。
@@ -44,6 +46,9 @@ type Agent struct {
 	// closed 阻止关闭后创建新会话。
 	closed bool
 }
+
+// ProvidesUserInput 表示 Cursor 私有交互已转换为标准 ACP 表单，无需重复注入问答工具。
+func (*Agent) ProvidesUserInput() bool { return true }
 
 // interactiveSession 串行拥有一个原生会话的进程、日志与配置。
 type interactiveSession struct {
@@ -80,16 +85,18 @@ type interactiveSession struct {
 }
 
 // newCursorAgent 创建官方配置连接，并将交互终端归属同一个可取消生命周期。
-func newCursorAgent(ctx context.Context, config Config, native nativeacp.Config) (*Agent, error) {
-	var directory, state string
-	var err error
-	if config.Interactive {
-		directory, state, native.Environment, err = cursorEnvironment(config)
-		if err != nil {
-			return nil, err
-		}
-		config.Environment = native.Environment
+func newCursorAgent(
+	ctx context.Context,
+	config Config,
+	native nativeacp.Config,
+	options *cursorSessionAdapter,
+) (*Agent, error) {
+	directory, state, environment, err := cursorEnvironment(config)
+	if err != nil {
+		return nil, err
 	}
+	native.Environment = environment
+	config.Environment = environment
 	child, err := nativeacp.NewAgent(ctx, native)
 	if err != nil {
 		if directory != "" {
@@ -103,7 +110,17 @@ func newCursorAgent(ctx context.Context, config Config, native nativeacp.Config)
 		return nil, err
 	}
 	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	return &Agent{Agent: child, config: config, command: command, directory: directory, state: state, sessions: map[acp.SessionId]*interactiveSession{}, lifetime: lifetime, cancel: cancel}, nil
+	return &Agent{
+		Agent:     child,
+		config:    config,
+		options:   options,
+		command:   command,
+		directory: directory,
+		state:     state,
+		sessions:  map[acp.SessionId]*interactiveSession{},
+		lifetime:  lifetime,
+		cancel:    cancel,
+	}, nil
 }
 
 // SetAgentConnection 将两条内部传输绑定到同一个宿主连接。
@@ -117,7 +134,7 @@ func (a *Agent) SetAgentConnection(host *acp.AgentSideConnection) {
 // Initialize 交互模式仅声明已实现的文本、恢复与会话关闭能力。
 func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	response, err := a.Agent.Initialize(ctx, request)
-	if err == nil && a.config.Interactive {
+	if err == nil {
 		response.AgentCapabilities.PromptCapabilities = acp.PromptCapabilities{}
 		response.AgentCapabilities.McpCapabilities.Sse = false
 		response.AgentCapabilities.McpCapabilities.Acp = false
@@ -128,10 +145,13 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 }
 
 // register 登记真实工作目录、原生身份及本连接持有的会话资源。
-func (a *Agent) register(id acp.SessionId, cwd string, servers []acp.McpServer, directories []string, owner *flock.Flock) error {
-	if !a.config.Interactive {
-		return nil
-	}
+func (a *Agent) register(
+	id acp.SessionId,
+	cwd string,
+	servers []acp.McpServer,
+	directories []string,
+	owner *flock.Flock,
+) error {
 	if id == "" || strings.ContainsAny(string(id), "/\\\x00") || id == "." || id == ".." {
 		return errors.New("invalid Cursor session identity")
 	}
@@ -156,7 +176,22 @@ func (a *Agent) register(id acp.SessionId, cwd string, servers []acp.McpServer, 
 	if a.sessions[id] != nil {
 		return errors.New("Cursor session already loaded")
 	}
-	a.sessions[id] = &interactiveSession{owner: owner, id: id, cwd: path, servers: servers, directories: directories, mode: a.config.PermissionMode, directory: directory, store: newStoreCursor(filepath.Join(a.state, "chats", hex.EncodeToString(sum[:]), string(id), "store.db"))}
+	a.sessions[id] = &interactiveSession{
+		owner:       owner,
+		id:          id,
+		cwd:         path,
+		servers:     servers,
+		directories: directories,
+		mode:        a.config.PermissionMode,
+		directory:   directory,
+		store: newStoreCursor(filepath.Join(
+			a.state,
+			"chats",
+			hex.EncodeToString(sum[:]),
+			string(id),
+			"store.db",
+		)),
+	}
 	return nil
 }
 
@@ -191,10 +226,8 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 			_ = owner.Unlock()
 		}
 	}()
-	if a.config.Interactive {
-		if err := a.snapshotControlStore(ctx, request.SessionId, request.Cwd); err != nil {
-			return acp.LoadSessionResponse{}, err
-		}
+	if err := a.snapshotControlStore(ctx, request.SessionId, request.Cwd); err != nil {
+		return acp.LoadSessionResponse{}, err
 	}
 	response, err := a.Agent.LoadSession(ctx, request)
 	if err == nil {
@@ -209,9 +242,6 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 
 // ResumeSession 使用官方加载建立配置，但不更换原生聊天身份。
 func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	if !a.config.Interactive {
-		return a.Agent.ResumeSession(ctx, request)
-	}
 	a.lifecycleMutex.Lock()
 	defer a.lifecycleMutex.Unlock()
 	owner, err := a.claim(request.SessionId)
@@ -226,7 +256,13 @@ func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequ
 	if err := a.snapshotControlStore(ctx, request.SessionId, request.Cwd); err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	response, err := a.Agent.LoadCursorSessionConfiguration(ctx, acp.LoadSessionRequest{SessionId: request.SessionId, Cwd: request.Cwd, McpServers: request.McpServers, AdditionalDirectories: request.AdditionalDirectories})
+	loadRequest := acp.LoadSessionRequest{
+		SessionId:             request.SessionId,
+		Cwd:                   request.Cwd,
+		McpServers:            request.McpServers,
+		AdditionalDirectories: request.AdditionalDirectories,
+	}
+	response, err := a.Agent.LoadSessionConfiguration(ctx, loadRequest)
 	if err == nil {
 		err = a.register(request.SessionId, request.Cwd, request.McpServers, request.AdditionalDirectories, owner)
 		if err == nil {
@@ -248,7 +284,7 @@ func (a *Agent) session(id acp.SessionId) (*interactiveSession, error) {
 
 // start 按已确认模型和权限启动终端，配置相同时复用现有进程。
 func (a *Agent) start(ctx context.Context, s *interactiveSession) error {
-	selection, err := a.Agent.CursorExecutionModel(s.id)
+	selection, err := a.options.ExecutionModel(s.id)
 	if err != nil {
 		return err
 	}
@@ -339,9 +375,6 @@ func (s *interactiveSession) stop() error {
 
 // Prompt 在同一常驻终端中提交新轮，审批完成前不会发送允许按键。
 func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response acp.PromptResponse, err error) {
-	if !a.config.Interactive {
-		return a.Agent.Prompt(ctx, request)
-	}
 	s, err := a.session(request.SessionId)
 	if err != nil {
 		return response, err
@@ -403,9 +436,6 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 
 // Cancel 同时撤销待回填审批与本轮终端执行。
 func (a *Agent) Cancel(ctx context.Context, request acp.CancelNotification) error {
-	if !a.config.Interactive {
-		return a.Agent.Cancel(ctx, request)
-	}
 	s, err := a.session(request.SessionId)
 	if err != nil {
 		return err
@@ -419,10 +449,10 @@ func (a *Agent) Cancel(ctx context.Context, request acp.CancelNotification) erro
 }
 
 // SetSessionConfigOption 在回执确认后由下一轮重启终端并恢复同一原生聊天。
-func (a *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
-	if !a.config.Interactive {
-		return a.Agent.SetSessionConfigOption(ctx, request)
-	}
+func (a *Agent) SetSessionConfigOption(
+	ctx context.Context,
+	request acp.SetSessionConfigOptionRequest,
+) (acp.SetSessionConfigOptionResponse, error) {
 	if request.ValueId == nil {
 		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(nil)
 	}
@@ -451,9 +481,6 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, request acp.SetSessi
 
 // SetSessionMode 切换官方工作模式，三档权限始终由独立启动策略控制。
 func (a *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	if !a.config.Interactive {
-		return a.Agent.SetSessionMode(ctx, request)
-	}
 	mode := string(request.ModeId)
 	if mode != "agent" && mode != "plan" && mode != "ask" {
 		return acp.SetSessionModeResponse{}, acp.NewInvalidParams(nil)
@@ -476,9 +503,6 @@ func (a *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionModeRe
 
 // CloseSession 只释放当前连接的进程，持久聊天仍可恢复。
 func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	if !a.config.Interactive {
-		return a.Agent.CloseSession(ctx, request)
-	}
 	a.lifecycleMutex.Lock()
 	defer a.lifecycleMutex.Unlock()
 	_ = a.Cancel(ctx, acp.CancelNotification{SessionId: request.SessionId})

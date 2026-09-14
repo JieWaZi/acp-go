@@ -17,9 +17,9 @@ return server.Serve(ctx)
 
 WorkingDirectory 是进程启动目录，session/new.cwd 是会话目录；需要固定 cwd 的进程应对应一个工作区。命令从所传完整环境的 PATH 解析，nil 环境继承宿主。PrefixArgs 位于 Kimi/Cursor 的 acp 子命令前，Pi 独立包将参数放在官方 RPC 参数之前。不会安装、升级程序或登录。
 
-模型 category=model 规范化为 model，思考规范化为 reasoning，选项值保持原样。旧 Kimi models 兼容 set_model，但只有显式选择才切换；Kimi 包负责隔离 Python 默认配置。发现过程不循环切换模型。
+公共层只规范化标准 `category=model` 和思考类别，并通过窄接口组合厂商适配器，不保存任何 CLI 私有状态。Cursor 的参数化模型、私有回调与交互通知全部由 `pkg/cursor` 拥有；旧 Kimi `models/set_model`、Python 工具参数和自动审批全部由 `pkg/kimi` 拥有。发现过程不循环切换模型。
 
-Cursor 问答经标准表单 Elicitation，计划经一次性审批并包含完整正文。无法唯一关联活跃会话时取消。待办、task/image 通知投影到标准会话更新。Pi 包将 pi-acp 的协议行为移植为 Go 并内置开源 MCP 工厂，具体权限边界见各包 README。
+各厂商包对外统一返回标准 ACP：Cursor 问答经标准表单 Elicitation，计划经一次性审批并包含完整正文；无法唯一关联活跃会话时取消。待办、task/image 通知投影到标准会话更新。Pi 包将 pi-acp 的协议行为移植为 Go 并内置开源 MCP 工厂，具体权限边界见各包 README。
 
 会话列表、load、resume、additionalDirectories、图片等沿用上游 initialize，不能把方法存在当作能力支持。MCP HTTP/SSE 以握手为准；Pi 声明内置扩展提供的传输。宿主必须展示并如实回传审批选项。
 

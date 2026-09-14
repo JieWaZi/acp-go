@@ -42,6 +42,62 @@ func testAgent(t *testing.T) (*Agent, acp.SessionId) {
 	return agent, result.SessionId
 }
 
+// TestPiConfigurationUsesModelThinkingLevels 验证会话只公布当前模型真实支持的思考等级。
+func TestPiConfigurationUsesModelThinkingLevels(t *testing.T) {
+	agent, id := testAgent(t)
+	s, err := agent.get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err := s.configuration(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := convert[acp.NewSessionResponse](map[string]any{
+		"sessionId":     id,
+		"configOptions": options["configOptions"],
+		"modes":         options["modes"],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.ConfigOptions) != 2 || response.ConfigOptions[1].Select == nil || response.ConfigOptions[1].Select.Options.Ungrouped == nil {
+		t.Fatalf("缺少 Pi 思考配置：%+v", response.ConfigOptions)
+	}
+	got := *response.ConfigOptions[1].Select.Options.Ungrouped
+	want := []acp.SessionConfigValueId{"off", "high", "max"}
+	if len(got) != len(want) {
+		t.Fatalf("思考等级数量错误：got=%+v want=%+v", got, want)
+	}
+	for index, value := range want {
+		if got[index].Value != value {
+			t.Fatalf("思考等级错误：got=%+v want=%+v", got, want)
+		}
+	}
+}
+
+// TestPiBlobResourceMarker 验证二进制嵌入上下文不会被静默丢弃。
+func TestPiBlobResourceMarker(t *testing.T) {
+	agent, id := testAgent(t)
+	mimeType := "application/octet-stream"
+	result, err := agent.Prompt(context.Background(), acp.PromptRequest{
+		SessionId: id,
+		Prompt: []acp.ContentBlock{acp.ResourceBlock(acp.EmbeddedResourceResource{
+			BlobResourceContents: &acp.BlobResourceContents{
+				Blob:     "AAEC",
+				MimeType: &mimeType,
+				Uri:      "file:///tmp/a.bin",
+			},
+		})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("BlobResource 提示未完成：%+v", result)
+	}
+}
+
 // TestPiSettledAndQueueCancellation 验证中间 agent_end 不结束提示，取消会阻止已排队提示迟到执行。
 func TestPiSettledAndQueueCancellation(t *testing.T) {
 	a, id := testAgent(t)
@@ -181,9 +237,11 @@ func TestPiRPCProcess(t *testing.T) {
 		result := any(map[string]any{})
 		switch request["type"] {
 		case "get_state":
-			result = map[string]any{"sessionId": "fixture-session", "sessionFile": file, "model": map[string]any{"provider": "fixture", "id": "model"}, "thinkingLevel": "low"}
+			result = map[string]any{"sessionId": "fixture-session", "sessionFile": file, "model": map[string]any{"provider": "fixture", "id": "model"}, "thinkingLevel": "high"}
 		case "get_available_models":
 			result = map[string]any{"models": []any{map[string]any{"provider": "fixture", "id": "model"}}}
+		case "get_available_thinking_levels":
+			result = map[string]any{"levels": []any{"off", "high", "max"}}
 		case "get_commands":
 			result = map[string]any{"commands": []any{}}
 		case "compact":
@@ -192,6 +250,9 @@ func TestPiRPCProcess(t *testing.T) {
 			}
 			result = map[string]any{"tokensBefore": 100, "summary": "compacted"}
 		case "prompt":
+			if strings.Contains(text(request["message"]), "file:///tmp/a.bin") && request["message"] != "\n[Embedded Context] file:///tmp/a.bin (application/octet-stream, 3 bytes)" {
+				os.Exit(7)
+			}
 			if request["message"] == "must-not-run" {
 				os.Exit(5)
 			}
