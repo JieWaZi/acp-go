@@ -36,6 +36,35 @@ func connectEndpoint(t *testing.T, ep *endpoint) *mcp.ClientSession {
 	return session
 }
 
+// TestQuestionMCPKeepsPromptIdentityStable 验证端点轮换只更新地址和凭据，不改变模型可见服务身份。
+func TestQuestionMCPKeepsPromptIdentityStable(t *testing.T) {
+	first, err := newEndpoint(questionHost{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.stop()
+	second, err := newEndpoint(questionHost{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.stop()
+
+	if first.config.Http.Name != serverName || second.config.Http.Name != serverName {
+		t.Fatalf(
+			"managed MCP names = %q, %q, want stable %q",
+			first.config.Http.Name,
+			second.config.Http.Name,
+			serverName,
+		)
+	}
+	if first.config.Http.Url == second.config.Http.Url {
+		t.Fatal("managed MCP endpoints reused the same address")
+	}
+	if first.config.Http.Headers[0].Value == second.config.Http.Headers[0].Value {
+		t.Fatal("managed MCP endpoints reused the same credential")
+	}
+}
+
 // TestQuestionMCPIsScopedAndCancelled 验证鉴权、会话外拒绝和取消向 HTTP 问答传播。
 func TestQuestionMCPIsScopedAndCancelled(t *testing.T) {
 	entered := make(chan struct{})
