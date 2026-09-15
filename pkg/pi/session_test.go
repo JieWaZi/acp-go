@@ -82,7 +82,7 @@ func TestManagedUserInputUsesStableManualTool(t *testing.T) {
 	extension := filepath.Join(t.TempDir(), "extension.ts")
 	server := acp.McpServer{Http: &acp.McpServerHttpInline{
 		Meta: map[string]any{"acp-go/user-input": true},
-		Name: "acp_go_user_input_fixture",
+		Name: "acp_go_user_input",
 		Url:  "http://127.0.0.1/mcp",
 	}}
 	if err := writeExtension(extension, "/installed package/index.ts", "full-access", []acp.McpServer{server}); err != nil {
@@ -93,7 +93,7 @@ func TestManagedUserInputUsesStableManualTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	if !strings.Contains(text, `const questionServers = ["acp_go_user_input_fixture"];`) {
+	if !strings.Contains(text, `const questionServers = ["acp_go_user_input"];`) {
 		t.Fatal("managed user input server was not bound to the stable tool")
 	}
 	if strings.Contains(text, `"directTools":true`) {

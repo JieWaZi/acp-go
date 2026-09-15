@@ -50,7 +50,7 @@ func newEndpoint(host Requester) (*endpoint, error) {
 		return nil, err
 	}
 	token := "Bearer " + hex.EncodeToString(tokenBytes)
-	ep := &endpoint{ready: make(chan struct{}), config: acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Type: "http", Name: serverName + "_" + hex.EncodeToString(tokenBytes[:8]), Url: "http://" + listener.Addr().String() + "/mcp", Headers: []acp.HttpHeader{{Name: "Authorization", Value: token}}}}}
+	ep := &endpoint{ready: make(chan struct{}), config: acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Type: "http", Name: serverName, Url: "http://" + listener.Addr().String() + "/mcp", Headers: []acp.HttpHeader{{Name: "Authorization", Value: token}}}}}
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: "1.0.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "AskUserQuestion", Description: "Ask the user a clarification or preference and wait for their answer. Available in every permission and working mode. Do not invent answers or treat permission approval as an answer. Supports text, single and multiple choices.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: acp.Ptr(false)}}, func(ctx context.Context, _ *mcp.CallToolRequest, input Questions) (*mcp.CallToolResult, Result, error) {
 		ep.mutex.Lock()
