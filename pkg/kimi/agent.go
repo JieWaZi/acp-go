@@ -39,14 +39,16 @@ type Agent struct {
 	*nativeacp.Agent
 	// directory 是可删除的本次配置目录，不包含持久会话的真实文件。
 	directory string
+	// codeDirectory 是新版 Kimi Code 保存会话索引、统计和模型配置的用户目录。
+	codeDirectory string
 	// host 是用于发布补充用量通知的标准宿主连接。
 	host atomic.Pointer[acp.AgentSideConnection]
 	// usagePrompts 阻止同一会话并发提示读取到彼此的统计。
 	usagePrompts sync.Map
 	// wirePaths 将会话标识映射到受管目录中的官方 wire.jsonl。
 	wirePaths sync.Map
-	// pythonACP 标识原生问答会被丢弃、必须等待受管工具就绪的 Python 实现。
-	pythonACP atomic.Bool
+	// kimiCodeCLI 标识需要补齐问答就绪和用量兼容语义的官方 Kimi Code ACP。
+	kimiCodeCLI atomic.Bool
 }
 
 // NewAgent 启动 kimi 的现成 ACP 实现。
@@ -79,6 +81,10 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	}
 	command = resolved
 	config.KimiPath = resolved
+	codeDirectory, err := resolveKimiCodeDirectory(config)
+	if err != nil {
+		return nil, err
+	}
 	args := append([]string(nil), config.PrefixArgs...)
 	args = append(args, "acp")
 	directory, environment, err := isolatedEnvironment(config)
@@ -108,7 +114,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		_ = os.RemoveAll(directory)
 		return nil, err
 	}
-	return &Agent{Agent: upstream, directory: directory}, nil
+	return &Agent{Agent: upstream, directory: directory, codeDirectory: codeDirectory}, nil
 }
 
 // Close 在原生进程结束后移除本次模型配置，持久会话保留供 load 使用。
@@ -119,14 +125,14 @@ func (agent *Agent) Close(ctx context.Context) error {
 	return os.RemoveAll(agent.directory)
 }
 
-// Initialize 保留原生握手，并识别需要强制问答工具就绪检查的实现。
+// Initialize 保留原生握手，并识别需要补齐兼容语义的官方 Kimi Code ACP。
 func (agent *Agent) Initialize(ctx context.Context, r acp.InitializeRequest) (acp.InitializeResponse, error) {
 	response, err := agent.Agent.Initialize(ctx, r)
 	if err == nil && response.AgentInfo != nil {
-		agent.pythonACP.Store(response.AgentInfo.Name == "Kimi Code CLI")
+		agent.kimiCodeCLI.Store(response.AgentInfo.Name == "Kimi Code CLI")
 	}
 	return response, err
 }
 
-// UserInputRequiresReady 防止 Python ACP 在受管工具加载失败时回到静默空答案。
-func (agent *Agent) UserInputRequiresReady() bool { return agent.pythonACP.Load() }
+// UserInputRequiresReady 防止 Kimi ACP 在受管工具加载失败时回到静默空答案。
+func (agent *Agent) UserInputRequiresReady() bool { return agent.kimiCodeCLI.Load() }
