@@ -22,7 +22,8 @@ func writeExtension(path, modulePath, permissionMode string, servers []acp.McpSe
 	questions := []string{}
 	for _, server := range servers {
 		var name string
-		entry := map[string]any{"auth": false, "oauth": false}
+		// ACP 注入的服务必须在首轮工具检索前完成连接，不能依赖 Pi 的本地元数据缓存。
+		entry := map[string]any{"auth": false, "oauth": false, "lifecycle": "eager"}
 		switch {
 		case server.Stdio != nil:
 			value := server.Stdio
@@ -51,13 +52,12 @@ func writeExtension(path, modulePath, permissionMode string, servers []acp.McpSe
 		}
 		if userinput.IsServer(server) {
 			entry["requestTimeoutMs"] = 2147483647
-			entry["directTools"] = true
 			entry["approveTools"] = false
 			questions = append(questions, name)
 		}
 		entries[name] = entry
 	}
-	config := map[string]any{"mcpServers": entries, "settings": map[string]any{"autoAuth": false, "directTools": false, "approveTools": permissionMode == "default"}}
+	config := map[string]any{"mcpServers": entries, "settings": map[string]any{"autoAuth": false, "directTools": false, "scriptMode": false, "approveTools": permissionMode == "default"}}
 	encoded, err := json.Marshal(config)
 	if err != nil {
 		return err

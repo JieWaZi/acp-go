@@ -369,7 +369,18 @@ func (a *Agent) extensionUI(ctx context.Context, s *session, event map[string]an
 			}
 		}
 	case "notify":
-		_ = a.emit(ctx, s, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text(event["message"])}})
+		message := text(event["message"])
+		if message == "" || a.config.Logger == nil {
+			return
+		}
+		switch text(event["notifyType"]) {
+		case "error":
+			a.config.Logger.Error("Pi extension notification", "message", message)
+		case "warning":
+			a.config.Logger.Warn("Pi extension notification", "message", message)
+		default:
+			a.config.Logger.Info("Pi extension notification", "message", message)
+		}
 	}
 }
 
