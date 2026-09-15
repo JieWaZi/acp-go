@@ -205,6 +205,9 @@ const server = createServer(async (req, res) => {
       marker: task.marker,
       alreadyCalled,
       tools: (body.tools ?? []).map((x) => x.function?.name),
+      toolResult: body.messages
+        .slice(index + 1)
+        .findLast((message) => message.role === "tool")?.content,
     });
     const tool = ["bash","write","edit"].includes(task.kind) ? task.kind : task.kind === "ui" ? "fixture_ui" : "mcp";
     const args =
@@ -214,7 +217,9 @@ const server = createServer(async (req, res) => {
           }
         : tool === "write" ? {path:"diff.txt",content:"before\n"}
         : tool === "edit" ? {path:"diff.txt",oldText:"before",newText:"after"}
-        : tool === "fixture_ui" ? {} : {
+        : tool === "fixture_ui" ? {}
+        : task.kind === "list" ? { server: task.transport }
+        : {
             server: task.transport,
             tool: "record",
             args: { marker: task.marker },
@@ -279,7 +284,9 @@ writeFileSync(
         baseUrl: `http://127.0.0.1:${port}/v1`,
         api: "openai-completions",
         apiKey: "dummy-local-only",
-        models: [{ id: "local-model", name: "Local fixture" }],
+        models: [
+          { id: "local-model", name: "Local fixture", reasoning: true },
+        ],
       },
     },
   }),
@@ -464,6 +471,12 @@ try {
   await rpc("session/set_config_option",{sessionId:a.sessionId,configId:"model",value:"ally-local-fixture/local-model"});
   await rpc("session/set_mode",{sessionId:a.sessionId,modeId:"high"});
   await rpc("session/set_config_option",{sessionId:a.sessionId,configId:"reasoning",value:"off"});
+  await prompt(a.sessionId, "MCP_DISCOVERY", "http", "allow", "list");
+  const discovery = modelRequests.find(
+    (request) => request.marker === "MCP_DISCOVERY" && request.alreadyCalled,
+  );
+  assert.match(String(discovery?.toolResult), /http \(1 tools\)/);
+  assert.doesNotMatch(String(discovery?.toolResult), /not connected/i);
   await prompt(a.sessionId, "A_FIRST");
   const b = await rpc("session/new", {
     cwd: workspace,
@@ -538,6 +551,10 @@ try {
   const resumeStart=events.length;
   await rpc("session/resume",{sessionId:a.sessionId,cwd:workspace,mcpServers:[]});
   assert.ok(!events.slice(resumeStart).some(x=>x.params?.update?.sessionUpdate==="user_message_chunk"));
+  assert.ok(!events.some((event) =>
+    event.params?.update?.sessionUpdate === "agent_message_chunk" &&
+    event.params.update.content?.text?.includes("will be available after restart")
+  ));
   const starts = records.filter((x) => x.event === "stdio_start");
   assert.ok(starts.length >= 3);
   assert.ok(

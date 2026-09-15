@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -33,7 +34,7 @@ func TestMCPConfigSnapshotPreservesLiteralsAndReplacesCredentials(t *testing.T) 
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, expected := range []string{secret, `"literalEnv":true`, `"httpTransport":"streamable-http"`, `"httpTransport":"sse"`, `const permissionMode = "default";`} {
+	for _, expected := range []string{secret, `"lifecycle":"eager"`, `"scriptMode":false`, `"literalEnv":true`, `"httpTransport":"streamable-http"`, `"httpTransport":"sse"`, `const permissionMode = "default";`} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("snapshot lost %q", expected)
 		}
@@ -73,5 +74,51 @@ func TestPiDiscoveryNeedsOnlyPi(t *testing.T) {
 	}
 	if _, err := os.Stat(module); !os.IsNotExist(err) {
 		t.Fatal("extension not cleaned up")
+	}
+}
+
+// TestManagedUserInputUsesStableManualTool 验证受管问答只暴露稳定工具，不触发随机直连工具重启提示。
+func TestManagedUserInputUsesStableManualTool(t *testing.T) {
+	extension := filepath.Join(t.TempDir(), "extension.ts")
+	server := acp.McpServer{Http: &acp.McpServerHttpInline{
+		Meta: map[string]any{"acp-go/user-input": true},
+		Name: "acp_go_user_input_fixture",
+		Url:  "http://127.0.0.1/mcp",
+	}}
+	if err := writeExtension(extension, "/installed package/index.ts", "full-access", []acp.McpServer{server}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(extension)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `const questionServers = ["acp_go_user_input_fixture"];`) {
+		t.Fatal("managed user input server was not bound to the stable tool")
+	}
+	if strings.Contains(text, `"directTools":true`) {
+		t.Fatal("managed user input enabled random direct tools")
+	}
+}
+
+// TestPiNotificationDoesNotBecomeAssistantMessage 验证扩展 UI 通知不会污染助手正文。
+func TestPiNotificationDoesNotBecomeAssistantMessage(t *testing.T) {
+	var output bytes.Buffer
+	agent := &Agent{config: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	agent.SetAgentConnection(acp.NewAgentSideConnection(agent, &output, strings.NewReader("")))
+	response, err := os.CreateTemp(t.TempDir(), "extension-response-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Close()
+	session := &session{id: "fixture", process: &rpcProcess{input: response}}
+	agent.extensionUI(context.Background(), session, map[string]any{
+		"id":         "notification-1",
+		"method":     "notify",
+		"message":    "MCP: direct tools will be available after restart",
+		"notifyType": "info",
+	})
+	if strings.Contains(output.String(), "session/update") || strings.Contains(output.String(), "available after restart") {
+		t.Fatalf("extension notification leaked into assistant output: %s", output.String())
 	}
 }
