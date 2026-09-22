@@ -1,13 +1,7 @@
 .agents
 .codegraph
 skills-lock.json
-.comet
 .upstream/
 node_modules/
 .codex
 .idea
-# >>> Comet managed project state >>>
-!/.comet/
-/.comet/*
-!/.comet/config.yaml
-# <<< Comet managed project state <<<

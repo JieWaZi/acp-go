@@ -214,17 +214,16 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | [`pkg/nativeacp`](pkg/nativeacp) | 原生 stdio 连接、生命周期与厂商扩展窄接口 |
 | [`pkg/kimi`](pkg/kimi)、[`pkg/cursor`](pkg/cursor)、[`pkg/pi`](pkg/pi) | 各 CLI 的模型、审批、交互与执行适配 |
 | [`tools/protocolgen`](tools/protocolgen) | Codex 协议生成与新鲜度检查 |
-| [`docs`](docs) | 测试矩阵和维护规格 |
 
 每个 Adapter 独立维护使用说明和协议基线：
 
-| Adapter | 开发说明 | 协议基线与同步记录 | 测试矩阵 |
-| --- | --- | --- | --- |
-| Codex | [`pkg/codex/README.md`](pkg/codex/README.md) | [`pkg/codex/UPSTREAM.md`](pkg/codex/UPSTREAM.md) | [`docs/V1_TEST_MATRIX.md`](docs/V1_TEST_MATRIX.md) |
-| Claude | [`pkg/claude/README.md`](pkg/claude/README.md) | [`pkg/claude/UPSTREAM.md`](pkg/claude/UPSTREAM.md) | [`docs/CLAUDE_V1_TEST_MATRIX.md`](docs/CLAUDE_V1_TEST_MATRIX.md) |
-| Kimi | [`pkg/kimi/README.md`](pkg/kimi/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
-| Cursor | [`pkg/cursor/README.md`](pkg/cursor/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
-| Pi | [`pkg/pi/README.md`](pkg/pi/README.md) | [`pkg/pi/UPSTREAM.md`](pkg/pi/UPSTREAM.md) | [`docs/NATIVE_ACP_TEST_MATRIX.md`](docs/NATIVE_ACP_TEST_MATRIX.md) |
+| Adapter | 开发说明 | 协议基线与同步记录 |
+| --- | --- | --- |
+| Codex | [`pkg/codex/README.md`](pkg/codex/README.md) | [`pkg/codex/UPSTREAM.md`](pkg/codex/UPSTREAM.md) |
+| Claude | [`pkg/claude/README.md`](pkg/claude/README.md) | [`pkg/claude/UPSTREAM.md`](pkg/claude/UPSTREAM.md) |
+| Kimi | [`pkg/kimi/README.md`](pkg/kimi/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) |
+| Cursor | [`pkg/cursor/README.md`](pkg/cursor/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) |
+| Pi | [`pkg/pi/README.md`](pkg/pi/README.md) | [`pkg/pi/UPSTREAM.md`](pkg/pi/UPSTREAM.md) |
 
 ## 开发与验证
 
@@ -245,7 +244,7 @@ go generate ./pkg/codex/protocol
 go run ./tools/protocolgen --check
 ```
 
-真实 CLI 测试可能联网或计费，必须显式开启；执行方式和证据边界记录在对应测试矩阵中。
+真实 CLI 测试可能联网或计费，必须显式开启；执行方式与证据边界见各 Adapter README 与 `UPSTREAM.md`。
 
 ## 维护约定
 
@@ -256,7 +255,7 @@ go run ./tools/protocolgen --check
 - 厂商无状态模型接口需要由 CLI 重建上下文时，Adapter 不得再复制一份；重建出的不变前缀必须保持可缓存。新增或升级 Adapter 时必须用至少两个连续回合验证当前消息不重复、静态前缀不漂移。
 - 手写 Go 的类型、字段、函数和关键逻辑使用中文注释；注释只描述当前代码的职责和约束。
 - 协议版本、源码映射、fixture 证据、差异和升级步骤只记录在各自的 `UPSTREAM.md`。
-- 新能力必须同时更新实现、测试、Adapter README、对应测试矩阵；协议基线变化还要更新对应 `UPSTREAM.md`。
+- 新能力必须同时更新实现、测试与 Adapter README；协议基线变化还要更新对应 `UPSTREAM.md`。
 - stdout 永远只写 ACP 协议消息，任何诊断、警告和子进程 stderr 都必须进入 stderr。
 
 ## 当前边界
