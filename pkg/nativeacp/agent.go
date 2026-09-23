@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,8 +17,6 @@ import (
 )
 
 const maxNativeDiagnosticBytes = 4 << 10
-
-var nativeSecretDiagnosticPattern = regexp.MustCompile(`(?i)(authorization|api[_-]?key|access[_-]?token|secret)([=: ]+)([^\s,;]+)`)
 
 // Config 描述外部 ACP 进程；不会下载程序或修改用户配置。
 type Config struct {
@@ -59,6 +56,12 @@ type Agent struct {
 	cancel context.CancelFunc
 	// done 在进程被回收后关闭。
 	done chan struct{}
+	// waitErr 保存外部进程的最终退出状态。
+	waitErr error
+	// waitMu 保护 waitErr。
+	waitMu sync.Mutex
+	// stderr 保存 CLI 原始诊断尾部。
+	stderr *diagnosticWriter
 	// closed 在主动关闭开始时关闭，解除回调等待。
 	closed chan struct{}
 	// versionOnce 保证版本只在初始化时探测一次。
@@ -118,7 +121,8 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	command.Env = config.Environment
 	command.Dir = config.WorkingDirectory
 	command.WaitDelay = 2 * time.Second
-	command.Stderr = &diagnosticWriter{logger: config.Logger}
+	stderr := &diagnosticWriter{logger: config.Logger}
+	command.Stderr = stderr
 	input, err := command.StdinPipe()
 	if err != nil {
 		cancel()
@@ -142,6 +146,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		output:       output,
 		cancel:       cancel,
 		done:         make(chan struct{}),
+		stderr:       stderr,
 		closed:       make(chan struct{}),
 		bound:        make(chan struct{}),
 		sessions:     make(map[acp.SessionId]*sessionOptions),
@@ -157,35 +162,53 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	go func() {
 		<-agent.conn.Done()
 		cancel()
-		_ = command.Wait()
+		waitErr := command.Wait()
+		agent.waitMu.Lock()
+		agent.waitErr = waitErr
+		agent.waitMu.Unlock()
 		close(agent.done)
 	}()
 	return agent, nil
 }
 
-// diagnosticWriter 不保存 CLI 的完整诊断，避免将凭据或模型原文放进返回错误。
+// diagnosticWriter 将 CLI 原始诊断写入日志。
 type diagnosticWriter struct {
 	// logger 是只写诊断通道的结构化日志器。
 	logger *slog.Logger
+	// mutex 保护原始 stderr 尾部。
+	mutex sync.Mutex
+	// tail 最多保留最近 64 KiB 错误诊断。
+	tail []byte
 }
 
-// Write 消费原生进程诊断，脱敏并限制单次日志大小后交给宿主日志通道。
+// Write 消费原生进程诊断，限制单次日志大小后交给宿主日志通道。
 func (writer *diagnosticWriter) Write(data []byte) (int, error) {
-	diagnostic := strings.Map(func(value rune) rune {
-		if value == '\n' || value == '\r' || value == '\t' || value >= 0x20 {
-			return value
+	writer.mutex.Lock()
+	const maxTailBytes = 64 << 10
+	if len(data) >= maxTailBytes {
+		writer.tail = append(writer.tail[:0], data[len(data)-maxTailBytes:]...)
+	} else {
+		writer.tail = append(writer.tail, data...)
+		if len(writer.tail) > maxTailBytes {
+			writer.tail = append([]byte(nil), writer.tail[len(writer.tail)-maxTailBytes:]...)
 		}
-		return -1
-	}, string(data))
-	diagnostic = nativeSecretDiagnosticPattern.ReplaceAllString(diagnostic, "$1$2[REDACTED]")
-	diagnostic = strings.TrimSpace(diagnostic)
+	}
+	writer.mutex.Unlock()
+	diagnostic := string(data)
 	if len(diagnostic) > maxNativeDiagnosticBytes {
 		diagnostic = diagnostic[len(diagnostic)-maxNativeDiagnosticBytes:]
 	}
 	if diagnostic != "" {
-		writer.logger.Warn("native ACP stderr", "stderr", strings.ToValidUTF8(diagnostic, "�"))
+		writer.logger.Warn("native ACP stderr", "stderr", diagnostic)
 	}
 	return len(data), nil
+}
+
+// String 返回已收集的 CLI 原始 stderr 尾部。
+func (writer *diagnosticWriter) String() string {
+	writer.mutex.Lock()
+	defer writer.mutex.Unlock()
+	return string(writer.tail)
 }
 
 // SetAgentConnection 绑定一次宿主连接，并释放启动期间的回调。
@@ -200,6 +223,21 @@ func (agent *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 
 // Close 先关闭 stdin，再在有界窗口内终止并回收程序；重复关闭安全。
 func (agent *Agent) Close(ctx context.Context) error {
+	select {
+	case <-agent.closed:
+		select {
+		case <-agent.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	default:
+	}
+	select {
+	case <-agent.done:
+		return agent.exitError()
+	default:
+	}
 	agent.closeOnce.Do(func() { close(agent.closed); _ = agent.input.Close() })
 	timer := time.NewTimer(500 * time.Millisecond)
 	defer timer.Stop()
@@ -219,12 +257,50 @@ func (agent *Agent) Close(ctx context.Context) error {
 	}
 }
 
+// exitError 仅在非主动关闭时报告真实退出错误。
+func (agent *Agent) exitError() error {
+	agent.waitMu.Lock()
+	defer agent.waitMu.Unlock()
+	if agent.waitErr == nil {
+		return nil
+	}
+	if detail := strings.TrimSpace(agent.stderr.String()); detail != "" {
+		return fmt.Errorf("native ACP process exited: %w: %s", agent.waitErr, detail)
+	}
+	return fmt.Errorf("native ACP process exited: %w", agent.waitErr)
+}
+
+// transportError 在连接结束时附加 CLI 退出状态和原始 stderr。
+func (agent *Agent) transportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	select {
+	case <-agent.conn.Done():
+		timer := time.NewTimer(200 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-agent.done:
+			return errors.Join(err, agent.exitError())
+		case <-timer.C:
+		}
+	default:
+	}
+	return err
+}
+
+// sendNativeRequest 保留 SDK 协议错误，并在进程退出时附加原始 CLI 诊断。
+func sendNativeRequest[T any](agent *Agent, ctx context.Context, method string, request any) (T, error) {
+	response, err := acp.SendRequest[T](agent.conn, ctx, method, request)
+	return response, agent.transportError(err)
+}
+
 // Initialize 保留真实能力，不伪造上游不支持的 Session 或授权功能。
 func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	if agent.config.CallbackAdapter != nil {
 		agent.config.CallbackAdapter.PrepareInitialize(&request)
 	}
-	response, err := acp.SendRequest[acp.InitializeResponse](agent.conn, ctx, "initialize", request)
+	response, err := sendNativeRequest[acp.InitializeResponse](agent, ctx, "initialize", request)
 	if err == nil {
 		agent.completeRuntimeVersion(ctx, &response)
 		agent.mutex.Lock()
@@ -262,7 +338,7 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 		}
 		agent.mutex.Unlock()
 	}()
-	response, err := acp.SendRequest[acp.PromptResponse](agent.conn, ctx, "session/prompt", request)
+	response, err := sendNativeRequest[acp.PromptResponse](agent, ctx, "session/prompt", request)
 	if ctx.Err() != nil {
 		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		defer cancel()
@@ -292,14 +368,14 @@ func (agent *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRe
 		agent.config.SessionAdapter.ForgetSession(request.SessionId)
 	}
 	if supported {
-		return acp.SendRequest[acp.CloseSessionResponse](agent.conn, ctx, "session/close", request)
+		return sendNativeRequest[acp.CloseSessionResponse](agent, ctx, "session/close", request)
 	}
 	return acp.CloseSessionResponse{}, agent.Cancel(ctx, acp.CancelNotification{SessionId: request.SessionId})
 }
 
 // HandleExtensionMethod 转发调用者显式发出的 ACP 扩展。
 func (agent *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
-	return acp.SendRequest[json.RawMessage](agent.conn, ctx, method, params)
+	return sendNativeRequest[json.RawMessage](agent, ctx, method, params)
 }
 
 // handle 只负责类型化转交 SDK 回调；JSON-RPC、排序、取消和背压由 SDK 处理。

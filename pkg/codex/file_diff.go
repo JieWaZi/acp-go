@@ -2,6 +2,7 @@ package codex
 
 import (
 	"errors"
+	"io"
 	"os"
 	"regexp"
 	"strconv"
@@ -15,6 +16,8 @@ import (
 var (
 	// errInvalidUnifiedPatch 表示 Codex update diff 不能安全应用到当前文件内容。
 	errInvalidUnifiedPatch = errors.New("invalid Codex unified patch")
+	// errDiffFileTooLarge 表示完整文件差异超出可安全缓存的大小。
+	errDiffFileTooLarge = errors.New("Codex diff file exceeds 8 MiB")
 	// unifiedHunkHeaderPattern 解析 unified diff 的标准 hunk 区间。
 	unifiedHunkHeaderPattern = regexp.MustCompile(
 		`^@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@`,
@@ -74,7 +77,7 @@ func createUpdatedFileDiffContent(change protocol.ChangeElement) (acp.ToolCallCo
 		return acp.ToolCallContent{}, false
 	}
 
-	oldContent, err := os.ReadFile(change.Path)
+	oldContent, err := readDiffFile(change.Path)
 	if err == nil {
 		current := string(oldContent)
 		if patched, applyErr := applyUnifiedPatch(current, patch, false); applyErr == nil {
@@ -94,7 +97,7 @@ func createUpdatedFileDiffContent(change protocol.ChangeElement) (acp.ToolCallCo
 	if change.Kind.MovePath == nil || *change.Kind.MovePath == "" {
 		return acp.ToolCallContent{}, false
 	}
-	newContent, err := os.ReadFile(*change.Kind.MovePath)
+	newContent, err := readDiffFile(*change.Kind.MovePath)
 	if err != nil {
 		return acp.ToolCallContent{}, false
 	}
@@ -104,6 +107,24 @@ func createUpdatedFileDiffContent(change protocol.ChangeElement) (acp.ToolCallCo
 		return acp.ToolCallContent{}, false
 	}
 	return updateDiffContent(*change.Kind.MovePath, reverted, current), true
+}
+
+// readDiffFile 限制补丁还原前读取的文件大小，超限时退回普通工具内容。
+func readDiffFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	const maxDiffFileBytes = 8 << 20
+	data, err := io.ReadAll(io.LimitReader(file, maxDiffFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxDiffFileBytes {
+		return nil, errDiffFileTooLarge
+	}
+	return data, nil
 }
 
 // updateDiffContent 创建携带 update 元数据的标准 ACP diff 内容。

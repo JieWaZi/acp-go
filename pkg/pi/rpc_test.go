@@ -180,11 +180,76 @@ func TestPiDirectoryAliasesAndPagination(t *testing.T) {
 	if err != nil || len(second.Sessions) != 2 || second.NextCursor != nil {
 		t.Fatalf("last page: %+v %v", second, err)
 	}
+	header, _ := json.Marshal(map[string]any{"type": "session", "id": "duplicate", "cwd": s.cwd})
+	oldFile := filepath.Join(a.sessionRoot(), "a-duplicate.jsonl")
+	newFile := filepath.Join(a.sessionRoot(), "z-duplicate.jsonl")
+	for _, path := range []string{oldFile, newFile} {
+		if err := os.WriteFile(path, append(header, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	if err := os.Chtimes(oldFile, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := a.findSession("duplicate", s.cwd); err != nil || got != newFile {
+		t.Fatalf("duplicate session selected %q, %v", got, err)
+	}
+}
+
+// TestPiHistoryCacheRefreshesOnChange 验证原生历史追加后列表摘要会刷新。
+func TestPiHistoryCacheRefreshesOnChange(t *testing.T) {
+	a, id := testAgent(t)
+	s, err := a.get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.stored(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(s.file, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.WriteString("{\"type\":\"session_info\",\"name\":\"updated title\"}\n")
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := a.stored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.id == string(id) {
+			if entry.title != "updated title" {
+				t.Fatalf("cached history title = %q", entry.title)
+			}
+			file, err := os.OpenFile(s.file, os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := file.WriteString(strings.Repeat("x", (16<<20)+1) + "\n{\"type\":\"session_info\",\"name\":\"after oversized\"}\n")
+			if err := errors.Join(writeErr, file.Close()); err != nil {
+				t.Fatal(err)
+			}
+			again, err := a.stored()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, refreshed := range again {
+				if refreshed.id == string(id) && refreshed.title == "after oversized" {
+					return
+				}
+			}
+			t.Fatal("oversized history line hid a later title")
+		}
+	}
+	t.Fatal("Pi history disappeared from listing")
 }
 
 // TestPiFileDiffAndTerminalDeltas 验证结构化差异、行号、终端增量与退出状态不丢失。
 func TestPiFileDiffAndTerminalDeltas(t *testing.T) {
-	s := &session{cwd: t.TempDir(), tools: map[string]string{}, snapshots: map[string]fileSnapshot{}, bashOutput: map[string]string{}}
+	s := &session{cwd: t.TempDir(), tools: map[string]string{}, snapshots: map[string]fileSnapshot{}, bashOutput: map[string]bashOutputState{}}
 	file := filepath.Join(s.cwd, "file.txt")
 	_ = os.WriteFile(file, []byte("first\nbefore\n"), 0600)
 	args := map[string]any{"path": "file.txt", "oldText": "before"}
@@ -208,13 +273,75 @@ func TestPiFileDiffAndTerminalDeltas(t *testing.T) {
 	if object(meta["terminal_output"])["data"] != " two" || object(meta["terminal_exit"])["exit_code"] != 7 {
 		t.Fatalf("terminal: %v", output)
 	}
+	s.toolUpdate("bash-2", "bash", "in_progress", map[string]any{"command": "fixture"}, nil, false)
+	large := strings.Repeat("x", 1<<20)
+	s.toolUpdate("bash-2", "bash", "in_progress", nil, map[string]any{"content": large}, false)
+	if s.bashOutput["bash-2"].length != len(large) {
+		t.Fatal("Bash output state lost cumulative length")
+	}
+	reset := s.toolUpdate("bash-2", "bash", "completed", nil, map[string]any{"content": "reset"}, true)
+	if object(object(reset["_meta"])["terminal_output"])["data"] != "reset" {
+		t.Fatal("Bash output reset did not produce a full delta")
+	}
 	if len(s.tools) != 0 || len(s.snapshots) != 0 || len(s.bashOutput) != 0 {
 		t.Fatal("tool state retained after completion")
 	}
 }
 
+// TestPiBadFramePreservesRawError 验证协议坏帧与 CLI 原始 stderr 一起返回。
+func TestPiBadFramePreservesRawError(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := startRPC(Config{PiPath: binary, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=bad-frame")}, t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Pi bad-frame process did not exit")
+	}
+	detail := p.exitError().Error()
+	if !strings.Contains(detail, "invalid JSON") || !strings.Contains(detail, "api_key=literal-secret") {
+		t.Fatalf("Pi failure lost raw diagnostics: %q", detail)
+	}
+}
+
+// TestPiEventQueueOverloadTerminatesBoundedly 验证宿主停止消费事件时不会永久卡住 RPC reader。
+func TestPiEventQueueOverloadTerminatesBoundedly(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := startRPC(Config{PiPath: binary, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=event-overflow")}, t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Pi reader blocked on a full event queue")
+	}
+	if detail := p.exitError().Error(); !strings.Contains(detail, "queue stalled") {
+		t.Fatalf("Pi overload reason = %q", detail)
+	}
+}
+
 // TestPiRPCProcess 为直接 RPC 测试提供权威响应、错误和 settled 时序。
 func TestPiRPCProcess(t *testing.T) {
+	if os.Getenv("ACP_GO_PI_FIXTURE") == "event-overflow" {
+		for range 257 {
+			_, _ = os.Stdout.WriteString("{\"type\":\"agent_start\"}\n")
+		}
+		os.Exit(0)
+	}
+	if os.Getenv("ACP_GO_PI_FIXTURE") == "bad-frame" {
+		_, _ = os.Stdout.WriteString("{\"type\":\"response\",\"id\":\"1\",\"success\":true,\"data\":{}}\n{invalid\n")
+		_, _ = os.Stderr.WriteString("api_key=literal-secret\n")
+		os.Exit(7)
+	}
 	if os.Getenv("ACP_GO_PI_FIXTURE") != "1" {
 		return
 	}

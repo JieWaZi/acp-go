@@ -32,6 +32,10 @@ type rpcProcess struct {
 	writeMutex sync.Mutex
 	// pending 保存尚未完成的官方 RPC 请求。
 	pending map[string]chan rpcResponse
+	// failure 保存协议、扫描或进程退出的原始诊断。
+	failure error
+	// stderr 保存 CLI 原始诊断尾部。
+	stderr *rpcTail
 	// sequence 为请求分配唯一标识。
 	sequence atomic.Uint64
 	// events 按 Pi 发出顺序交付事件，不静默丢弃。
@@ -69,7 +73,8 @@ func startRPC(config Config, cwd, extension, sessionPath string) (*rpcProcess, e
 	cmd := exec.CommandContext(ctx, config.PiPath, args...)
 	prepareProcess(cmd)
 	cmd.Dir, cmd.Env, cmd.WaitDelay = cwd, config.Environment, 2*time.Second
-	cmd.Stderr = io.Discard
+	stderr := &rpcTail{}
+	cmd.Stderr = stderr
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -87,22 +92,38 @@ func startRPC(config Config, cwd, extension, sessionPath string) (*rpcProcess, e
 		_ = output.Close()
 		return nil, err
 	}
-	p := &rpcProcess{command: cmd, input: input, output: output, cancel: cancel, pending: map[string]chan rpcResponse{}, events: make(chan map[string]any, 256), done: make(chan struct{}), stop: make(chan struct{})}
+	p := &rpcProcess{command: cmd, input: input, output: output, cancel: cancel, pending: map[string]chan rpcResponse{}, events: make(chan map[string]any, 256), done: make(chan struct{}), stop: make(chan struct{}), stderr: stderr}
 	go p.read()
 	return p, nil
 }
 
 // read 关联响应并按序投递事件，退出时解除所有等待。
 func (p *rpcProcess) read() {
-	defer func() { p.cancel(); _ = p.command.Wait(); close(p.events); close(p.done) }()
+	defer func() {
+		p.cancel()
+		waitErr := p.command.Wait()
+		p.mutex.Lock()
+		if p.failure == nil {
+			p.failure = waitErr
+		}
+		p.mutex.Unlock()
+		close(p.events)
+		close(p.done)
+	}()
 	scanner := bufio.NewScanner(p.output)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	started := false
 	for scanner.Scan() {
 		var response rpcResponse
-		if json.Unmarshal(scanner.Bytes(), &response) != nil {
-			continue
-		} // Pi 启动前导文本不是协议结果。
+		if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
+			if started {
+				p.setFailure(fmt.Errorf("Pi RPC invalid JSON: %w", err))
+				return
+			}
+			continue // Pi 启动前导文本不是协议结果。
+		}
 		if response.Type == "response" && response.ID != "" {
+			started = true
 			p.mutex.Lock()
 			ch := p.pending[response.ID]
 			delete(p.pending, response.ID)
@@ -113,15 +134,84 @@ func (p *rpcProcess) read() {
 			continue
 		}
 		var event map[string]any
-		if json.Unmarshal(scanner.Bytes(), &event) != nil {
-			continue
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			p.setFailure(fmt.Errorf("Pi RPC invalid event: %w", err))
+			return
 		}
 		select {
 		case p.events <- event:
 		case <-p.stop:
 			return
+		default:
+			// 短暂突发允许背压；持续不消费时有界失败，避免永久阻塞响应读取器。
+			timer := time.NewTimer(time.Second)
+			select {
+			case p.events <- event:
+				timer.Stop()
+			case <-p.stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+				p.setFailure(errors.New("Pi RPC event queue stalled for 1s"))
+				return
+			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		p.setFailure(fmt.Errorf("Pi RPC stdout: %w", err))
+	}
+}
+
+// setFailure 保存第一个读取错误，供等待中的请求共享。
+func (p *rpcProcess) setFailure(err error) {
+	p.mutex.Lock()
+	if p.failure == nil {
+		p.failure = err
+	}
+	p.mutex.Unlock()
+}
+
+// exitError 合并读取或退出错误及 CLI 原始 stderr 尾部。
+func (p *rpcProcess) exitError() error {
+	p.mutex.Lock()
+	err := p.failure
+	p.mutex.Unlock()
+	if err == nil {
+		err = errors.New("Pi process exited")
+	}
+	if p.stderr != nil {
+		if detail := p.stderr.String(); detail != "" {
+			return fmt.Errorf("%w: %s", err, detail)
+		}
+	}
+	return err
+}
+
+// rpcTail 仅保留最近的原始 stderr，防止长时间运行无限占用内存。
+type rpcTail struct {
+	// mu 保护诊断尾部。
+	mu sync.Mutex
+	// data 保存最近的原始 stderr 字节。
+	data []byte
+}
+
+// Write 保留最近的诊断尾部。
+func (b *rpcTail) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	const limit = 64 << 10
+	b.data = append(b.data, data...)
+	if len(b.data) > limit {
+		b.data = append([]byte(nil), b.data[len(b.data)-limit:]...)
+	}
+	return len(data), nil
+}
+
+// String 返回稳定的原始诊断快照。
+func (b *rpcTail) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.data)
 }
 
 // write 原子写入一条官方 RPC 消息。
@@ -198,7 +288,7 @@ func (call *rpcCall) wait(ctx context.Context, output any) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-call.process.done:
-		return errors.New("Pi process exited")
+		return call.process.exitError()
 	}
 }
 

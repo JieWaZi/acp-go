@@ -93,11 +93,11 @@ func TestManagedUserInputUsesStableManualTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	if !strings.Contains(text, `const questionServers = ["acp_go_user_input"];`) {
-		t.Fatal("managed user input server was not bound to the stable tool")
+	if strings.Contains(text, `const questionServers = ["acp_go_user_input"];`) {
+		t.Fatal("forged user input metadata bypassed the managed endpoint boundary")
 	}
-	if strings.Contains(text, `"directTools":true`) {
-		t.Fatal("managed user input enabled random direct tools")
+	if strings.Contains(text, `"requestTimeoutMs":2147483647`) {
+		t.Fatal("forged MCP received the managed tool timeout")
 	}
 }
 

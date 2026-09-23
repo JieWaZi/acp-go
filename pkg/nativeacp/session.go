@@ -32,7 +32,7 @@ func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionReques
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
 	}
-	response, err := acp.SendRequest[nativeSessionResponse](agent.conn, ctx, "session/new", request)
+	response, err := sendNativeRequest[nativeSessionResponse](agent, ctx, "session/new", request)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -47,7 +47,7 @@ func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequ
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
 	}
-	response, err := acp.SendRequest[nativeSessionResponse](agent.conn, ctx, "session/load", request)
+	response, err := sendNativeRequest[nativeSessionResponse](agent, ctx, "session/load", request)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
@@ -62,7 +62,7 @@ func (agent *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
 ) (acp.ResumeSessionResponse, error) {
-	response, err := acp.SendRequest[nativeSessionResponse](agent.conn, ctx, "session/resume", request)
+	response, err := sendNativeRequest[nativeSessionResponse](agent, ctx, "session/resume", request)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
@@ -139,7 +139,7 @@ func (agent *Agent) SetSessionConfigOption(
 	request acp.SetSessionConfigOptionRequest,
 ) (acp.SetSessionConfigOptionResponse, error) {
 	if request.ValueId == nil {
-		return acp.SendRequest[acp.SetSessionConfigOptionResponse](agent.conn, ctx, "session/set_config_option", request)
+		return sendNativeRequest[acp.SetSessionConfigOptionResponse](agent, ctx, "session/set_config_option", request)
 	}
 	value := *request.ValueId
 	agent.mutex.Lock()
@@ -172,7 +172,7 @@ func (agent *Agent) SetSessionConfigOption(
 	}
 	value.ConfigId = nativeID
 	request.ValueId = &value
-	response, err := acp.SendRequest[acp.SetSessionConfigOptionResponse](agent.conn, ctx, "session/set_config_option", request)
+	response, err := sendNativeRequest[acp.SetSessionConfigOptionResponse](agent, ctx, "session/set_config_option", request)
 	if err != nil {
 		return response, err
 	}

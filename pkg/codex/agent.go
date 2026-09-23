@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -823,6 +824,14 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 			case protocol.FluffyCompleted:
 				return codexPromptResponse(prompt, acp.StopReasonEndTurn, request.MessageId), nil
 			case protocol.Failed:
+				if turnError := result.completion.Turn.Error; turnError != nil {
+					if message := strings.TrimSpace(turnError.Message); message != "" {
+						return acp.PromptResponse{}, &acp.RequestError{
+							Code:    -32603,
+							Message: message,
+						}
+					}
+				}
 				return acp.PromptResponse{}, fmt.Errorf("codex turn %q failed", result.completion.Turn.ID)
 			default:
 				return acp.PromptResponse{}, fmt.Errorf(

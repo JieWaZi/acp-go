@@ -67,6 +67,7 @@ func startAppServer(ctx context.Context, path string, options processOptions) (*
 	arguments := append([]string{}, options.PrefixArgs...)
 	arguments = append(arguments, "app-server")
 	command := exec.CommandContext(ctx, path, arguments...)
+	prepareProcess(command)
 	command.Env = options.Environment
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -153,9 +154,7 @@ func (p *appServerProcess) Close(ctx context.Context) error {
 			p.closeErr = p.Err()
 			return
 		case <-ctx.Done():
-			if p.command.Process != nil {
-				_ = p.command.Process.Kill()
-			}
+			killProcessTree(p.command)
 			<-p.done
 			p.closeErr = ctx.Err()
 		}

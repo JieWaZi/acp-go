@@ -93,8 +93,16 @@ type Agent struct {
 	contextWindowsMu sync.RWMutex
 	// contextWindows 保存当前 Agent 环境内已由 result.modelUsage 确认的模型窗口。
 	contextWindows map[string]int64
-	// openMu 串行化同一 ID 的恢复、替换和安装边界。
+	// openMu 只保护按 Session ID 分配的打开锁。
 	openMu sync.Mutex
+	// openLocks 仅保留仍有使用者的 Session 打开锁。
+	openLocks map[string]*sessionOpenLock
+	// closing 禁止关闭开始后注册新 Session。
+	closing bool
+	// activeOpens 统计仍在准备或握手的 Session 打开操作。
+	activeOpens int
+	// opensDone 在所有已进入的打开操作结束时关闭。
+	opensDone chan struct{}
 	// initializedMu 保护 initialized。
 	initializedMu sync.RWMutex
 	// initialized 表示 ACP initialize 已成功完成。
@@ -382,16 +390,35 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 // Close 幂等移除并关闭全部 Session。
 func (a *Agent) Close(ctx context.Context) error {
 	a.closeOnce.Do(func() {
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), sessionCloseTimeout)
-		defer cancelCleanup()
-		sessions := a.sessions.removeAll()
-		for _, session := range sessions {
-			err := session.close(cleanupCtx)
-			if err != nil && !errors.Is(err, ErrClaudeTransportClosed) && a.closeErr == nil {
-				a.closeErr = err
+		a.openMu.Lock()
+		a.closing = true
+		opensDone := a.opensDone
+		a.openMu.Unlock()
+		if opensDone != nil {
+			select {
+			case <-opensDone:
+			case <-ctx.Done():
 			}
 		}
-		// 所有 Session 已获得温和关闭窗口后，再取消进程级兜底上下文。
+		sessions := a.sessions.removeAll()
+		failures := make(chan error, len(sessions))
+		var wait sync.WaitGroup
+		for _, session := range sessions {
+			wait.Add(1)
+			go func(session *claudeSession) {
+				defer wait.Done()
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCloseTimeout)
+				defer cancel()
+				if err := session.close(cleanupCtx); err != nil && !errors.Is(err, ErrClaudeTransportClosed) {
+					failures <- err
+				}
+			}(session)
+		}
+		wait.Wait()
+		close(failures)
+		for err := range failures {
+			a.closeErr = errors.Join(a.closeErr, err)
+		}
 		a.runtimeCancel()
 	})
 	return a.closeErr

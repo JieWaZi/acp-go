@@ -160,11 +160,12 @@ func (a *Agent) events(s *session) {
 			}
 		}
 	}
+	<-s.process.done
 	s.mutex.Lock()
 	turn := s.turn
 	s.turn = nil
 	if s.failure == nil {
-		s.failure = errors.New("Pi process exited during prompt")
+		s.failure = s.process.exitError()
 	}
 	s.mutex.Unlock()
 	if turn != nil {

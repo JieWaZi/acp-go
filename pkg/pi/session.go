@@ -4,11 +4,12 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"github.com/JieWaZi/acp-go/pkg/userinput"
-	acp "github.com/coder/acp-go-sdk"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/JieWaZi/acp-go/pkg/userinput"
+	acp "github.com/coder/acp-go-sdk"
 )
 
 // extensionTemplate 组合现有 MCP 工厂与官方审批 hook。

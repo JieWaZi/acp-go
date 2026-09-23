@@ -107,6 +107,7 @@ func newCursorAgent(
 	command, err := nativeacp.ResolveCommand(native.Command, native.Environment)
 	if err != nil {
 		_ = child.Close(ctx)
+		_ = os.RemoveAll(directory)
 		return nil, err
 	}
 	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -351,7 +352,10 @@ func (a *Agent) start(ctx context.Context, s *interactiveSession) error {
 		s.stop()
 		return err
 	}
-	return s.store.seed(ctx)
+	if err := s.store.seed(ctx); err != nil {
+		return errors.Join(err, s.stop())
+	}
+	return nil
 }
 
 // stop 回收当前终端并撤回本会话的项目 Hook。
@@ -516,14 +520,22 @@ func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionReques
 	if cleanupErr != nil {
 		return acp.CloseSessionResponse{}, cleanupErr
 	}
+	response, err := a.Agent.CloseSession(ctx, request)
+	if s.owner != nil {
+		ownerErr := s.owner.Unlock()
+		err = errors.Join(err, ownerErr)
+		if ownerErr == nil {
+			s.owner = nil
+		}
+	}
+	err = errors.Join(err, os.RemoveAll(s.directory))
+	if err != nil {
+		return response, err
+	}
 	a.mutex.Lock()
 	delete(a.sessions, request.SessionId)
 	a.mutex.Unlock()
-	response, err := a.Agent.CloseSession(ctx, request)
-	if s.owner != nil {
-		err = errors.Join(err, s.owner.Unlock())
-	}
-	return response, err
+	return response, nil
 }
 
 // Close 先撤销交互并回收进程，再删除包含临时凭据的隔离目录。
@@ -541,16 +553,32 @@ func (a *Agent) Close(ctx context.Context) error {
 	var cleanupErr error
 	for _, s := range sessions {
 		s.mutex.Lock()
-		cleanupErr = errors.Join(cleanupErr, s.stop())
+		err := s.stop()
 		s.mutex.Unlock()
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		if s.owner != nil {
+			err = s.owner.Unlock()
+			if err == nil {
+				s.owner = nil
+			}
+		}
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		if err = os.RemoveAll(s.directory); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		a.mutex.Lock()
+		delete(a.sessions, s.id)
+		a.mutex.Unlock()
 	}
 	err := errors.Join(cleanupErr, a.Agent.Close(ctx))
-	for _, s := range sessions {
-		if s.owner != nil {
-			err = errors.Join(err, s.owner.Unlock())
-		}
-	}
-	if a.directory != "" {
+	if cleanupErr == nil && a.directory != "" {
 		err = errors.Join(err, os.RemoveAll(a.directory))
 	}
 	return err

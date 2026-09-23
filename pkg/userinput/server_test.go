@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,9 +15,38 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// TestBasicSecretPersists 验证独立读取复用同一个 0600 凭据文件。
+func TestBasicSecretPersists(t *testing.T) {
+	first, err := loadBasicSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := loadBasicSecret()
+	if err != nil || first != second {
+		t.Fatalf("Basic credential changed between reads: %v", err)
+	}
+	root, _ := basicConfigDir()
+	info, err := os.Stat(filepath.Join(root, "acp-go", "user-input-basic-secret"))
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("Basic credential permissions: %v %v", info, err)
+	}
+}
+
+// TestMain 将持久 Basic 凭据限制在测试私有目录并在结束时删除。
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "acp-go-userinput-test-")
+	if err != nil {
+		panic(err)
+	}
+	basicConfigDir = func() (string, error) { return root, nil }
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
+
 // authenticatedTransport 只给测试拥有的 MCP 端点附加会话凭据。
 type authenticatedTransport struct {
-	// token 是从受管配置读取的随机 Bearer 凭据。
+	// token 是从受管配置读取的 Basic 凭据。
 	token string
 }
 
@@ -60,8 +93,36 @@ func TestQuestionMCPKeepsPromptIdentityStable(t *testing.T) {
 	if first.config.Http.Url == second.config.Http.Url {
 		t.Fatal("managed MCP endpoints reused the same address")
 	}
-	if first.config.Http.Headers[0].Value == second.config.Http.Headers[0].Value {
-		t.Fatal("managed MCP endpoints reused the same credential")
+	if first.config.Http.Headers[0].Value != second.config.Http.Headers[0].Value {
+		t.Fatal("managed MCP credential changed between sessions")
+	}
+	if !strings.HasPrefix(first.config.Http.Headers[0].Value, "Basic ") {
+		t.Fatal("managed MCP must use Basic authentication")
+	}
+	if !IsServer(first.config) {
+		t.Fatal("managed endpoint not recognized")
+	}
+	forged := acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Name: serverName, Url: first.config.Http.Url, Headers: first.config.Http.Headers}}
+	if IsServer(forged) {
+		t.Fatal("client-provided MCP impersonated the managed endpoint")
+	}
+	wrong, err := url.Parse(first.config.Http.Url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong.Path = "/mcp"
+	request, err := http.NewRequest(http.MethodGet, wrong.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", first.config.Http.Headers[0].Value)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatal("managed MCP accepted a guessed path")
 	}
 }
 

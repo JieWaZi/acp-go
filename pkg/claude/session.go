@@ -232,8 +232,68 @@ func (s *claudeSessionStore) removeAll() []*claudeSession {
 	return result
 }
 
+// sessionOpenLock 只串行同一 Session ID，并在最后一个等待者离开后释放索引。
+type sessionOpenLock struct {
+	// mu 串行同一 Session 的启动和替换。
+	mu sync.Mutex
+	// users 统计等待或持有该锁的调用。
+	users int
+}
+
+// lockSessionOpen 获取指定 Session 的打开锁，并返回负责释放索引的函数。
+func (a *Agent) lockSessionOpen(id string) func() {
+	a.openMu.Lock()
+	if a.openLocks == nil {
+		a.openLocks = make(map[string]*sessionOpenLock)
+	}
+	lock := a.openLocks[id]
+	if lock == nil {
+		lock = &sessionOpenLock{}
+		a.openLocks[id] = lock
+	}
+	lock.users++
+	a.openMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		a.openMu.Lock()
+		lock.users--
+		if lock.users == 0 {
+			delete(a.openLocks, id)
+		}
+		a.openMu.Unlock()
+	}
+}
+
+// beginSessionOpen 建立关闭栅栏，并统计在途的会话握手。
+func (a *Agent) beginSessionOpen() (func(), error) {
+	a.openMu.Lock()
+	defer a.openMu.Unlock()
+	if a.closing {
+		return nil, errors.New("Claude agent closed")
+	}
+	if a.activeOpens == 0 {
+		a.opensDone = make(chan struct{})
+	}
+	a.activeOpens++
+	return func() {
+		a.openMu.Lock()
+		a.activeOpens--
+		if a.activeOpens == 0 {
+			close(a.opensDone)
+			a.opensDone = nil
+		}
+		a.openMu.Unlock()
+	}, nil
+}
+
 // openSession 校验参数、完成进程握手，并在成功后原子发布 Session。
 func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*claudeSession, error) {
+	endOpen, err := a.beginSessionOpen()
+	if err != nil {
+		return nil, err
+	}
+	defer endOpen()
 	options, err := prepareLaunchOptions(
 		request.CWD,
 		request.SessionID,
@@ -248,8 +308,8 @@ func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*c
 	fingerprint := launchFingerprint(options)
 
 	// 同一 Session ID 的检查、关闭和新安装必须形成一个全序，否则迟到握手可能覆盖更新参数。
-	a.openMu.Lock()
-	defer a.openMu.Unlock()
+	unlock := a.lockSessionOpen(request.SessionID)
+	defer unlock()
 	if existing, ok := a.sessions.get(request.SessionID); ok && existing.fingerprint == fingerprint && existing.isOpen() {
 		return existing, nil
 	} else if ok {
@@ -292,8 +352,17 @@ func (a *Agent) openSession(ctx context.Context, request openSessionRequest) (*c
 		cancel()
 		return nil, fmt.Errorf("opening Claude session: %w", err)
 	}
-	go session.runTurns()
+	a.openMu.Lock()
+	if a.closing {
+		a.openMu.Unlock()
+		closeCtx, cancel := context.WithTimeout(context.Background(), sessionCloseTimeout)
+		_ = session.close(closeCtx)
+		cancel()
+		return nil, errors.New("Claude agent closed")
+	}
 	previous := a.sessions.install(session)
+	a.openMu.Unlock()
+	go session.runTurns()
 	if previous != nil && previous != session {
 		closeCtx, cancel := context.WithTimeout(context.Background(), sessionCloseTimeout)
 		_ = previous.close(closeCtx)

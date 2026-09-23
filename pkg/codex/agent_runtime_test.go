@@ -752,6 +752,50 @@ func TestAgentPromptSupportsMultipleTurnsAndIgnoresOldCompletion(t *testing.T) {
 	}
 }
 
+// TestAgentPromptReturnsFailedTurnError 验证失败 turn 的 app-server 原始错误进入 ACP 响应。
+func TestAgentPromptReturnsFailedTurnError(t *testing.T) {
+	t.Parallel()
+	rpc := newFakeAppServerRPC()
+	turnStarted := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread-1"
+			return nil
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{
+				ID: "turn-1", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress,
+			}
+			close(turnStarted)
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: "/tmp", McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatalf("创建 session 失败: %v", err)
+	}
+	promptError := make(chan error, 1)
+	go func() {
+		_, err := agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: "thread-1",
+			Prompt:    []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}},
+		})
+		promptError <- err
+	}()
+	<-turnStarted
+	notification := completeNotification(t, "thread-1", "turn-1", protocol.Failed).(*protocol.TurnCompletedEnvelope)
+	notification.Params.Turn.Error = &protocol.Error{Message: "API Error: 402 Insufficient Balance"}
+	agent.client.HandleNotification(context.Background(), notification)
+	var requestError *acp.RequestError
+	if err := <-promptError; !errors.As(err, &requestError) || requestError.Message != "API Error: 402 Insufficient Balance" {
+		t.Fatalf("Prompt() error = %v，期望 app-server 原始错误", err)
+	}
+}
+
 // TestAgentPromptWaitsForConnectionBinder 验证 SDK connection 注入前不会启动可能产生事件的 turn。
 func TestAgentPromptWaitsForConnectionBinder(t *testing.T) {
 	t.Parallel()

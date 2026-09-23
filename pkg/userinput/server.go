@@ -4,11 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +22,72 @@ import (
 )
 
 const serverName = "acp_go_user_input"
+
+// basicConfigDir 解析本机用户配置目录，测试使用私有临时目录。
+var basicConfigDir = os.UserConfigDir
+
+// basicAuthorization 在本机用户配置中保持稳定，避免会话或进程轮换改变 MCP 鉴权配置。
+var basicAuthorization = sync.OnceValues(func() (string, error) {
+	secret, err := loadBasicSecret()
+	if err != nil {
+		return "", err
+	}
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte("acp-go:"+secret)), nil
+})
+
+// loadBasicSecret 只从当前用户可读的私有文件读取或生成固定凭据。
+func loadBasicSecret() (string, error) {
+	root, err := basicConfigDir()
+	if err != nil {
+		return "", err
+	}
+	directory := filepath.Join(root, "acp-go")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(directory, "user-input-basic-secret")
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(directory, ".user-input-basic-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(file.Name())
+	if _, err := file.WriteString(hex.EncodeToString(secret)); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Link(file.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+		return "", fmt.Errorf("user input Basic credential file must be private: %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(data))
+	if len(value) != 64 {
+		return "", errors.New("invalid user input Basic credential")
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// activeEndpoints 只记录本进程创建的端点；ACP 请求中的元数据不能证明受管身份。
+var activeEndpoints sync.Map
 
 // endpoint 将受管 MCP 问答绑定到唯一会话和当前执行，令牌不进入 Prompt。
 type endpoint struct {
@@ -30,7 +101,7 @@ type endpoint struct {
 	cancel context.CancelFunc
 	// http 是只监听本机回环的受管 MCP 服务。
 	http *http.Server
-	// config 是仅该会话拥有的地址与随机凭据。
+	// config 是仅该会话拥有的地址与本机用户稳定的 Basic 凭据。
 	config acp.McpServer
 	// ready 在真实 CLI 成功读取工具目录时关闭。
 	ready chan struct{}
@@ -44,13 +115,18 @@ func newEndpoint(host Requester) (*endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	tokenBytes := make([]byte, 32)
-	if _, err = rand.Read(tokenBytes); err != nil {
+	authorization, err := basicAuthorization()
+	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
-	token := "Bearer " + hex.EncodeToString(tokenBytes)
-	ep := &endpoint{ready: make(chan struct{}), config: acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Type: "http", Name: serverName, Url: "http://" + listener.Addr().String() + "/mcp", Headers: []acp.HttpHeader{{Name: "Authorization", Value: token}}}}}
+	pathSecret := make([]byte, 16)
+	if _, err := rand.Read(pathSecret); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	endpointPath := "/mcp/" + hex.EncodeToString(pathSecret)
+	ep := &endpoint{ready: make(chan struct{}), config: acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Type: "http", Name: serverName, Url: "http://" + listener.Addr().String() + endpointPath, Headers: []acp.HttpHeader{{Name: "Authorization", Value: authorization}}}}}
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: "1.0.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "AskUserQuestion", Description: "Ask the user a clarification or preference and wait for their answer. Available in every permission and working mode. Do not invent answers or treat permission approval as an answer. Supports text, single and multiple choices.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: acp.Ptr(false)}}, func(ctx context.Context, _ *mcp.CallToolRequest, input Questions) (*mcp.CallToolResult, Result, error) {
 		ep.mutex.Lock()
@@ -81,7 +157,7 @@ func newEndpoint(host Requester) (*endpoint, error) {
 	})
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true})
 	ep.http = &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/mcp" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(token)) != 1 {
+		if r.URL.Path != endpointPath || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(authorization)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -92,12 +168,17 @@ func newEndpoint(host Requester) (*endpoint, error) {
 		r.Body = http.MaxBytesReader(w, r.Body, 65536)
 		handler.ServeHTTP(w, r)
 	})}
+	activeEndpoints.Store(ep.config.Http.Url, ep.config.Http)
 	go func() { _ = ep.http.Serve(listener) }()
 	return ep, nil
 }
 
 // stop 先取消交互再释放本机会话端口。
-func (ep *endpoint) stop() { ep.endTurn(); _ = ep.http.Close() }
+func (ep *endpoint) stop() {
+	activeEndpoints.Delete(ep.config.Http.Url)
+	ep.endTurn()
+	_ = ep.http.Close()
+}
 
 // endTurn 取消执行并使迟到的问答请求失效。
 func (ep *endpoint) endTurn() {
@@ -119,7 +200,11 @@ func (ep *endpoint) cancelTurn() {
 	}
 }
 
-// IsServer 识别由协议边界注入的受管问答配置，供适配器配置交互等待期限。
+// IsServer 只识别本进程实际创建的端点，不能信任调用方可伪造的 MCP 元数据。
 func IsServer(server acp.McpServer) bool {
-	return server.Http != nil && server.Http.Meta["acp-go/user-input"] == true
+	if server.Http == nil {
+		return false
+	}
+	owned, ok := activeEndpoints.Load(server.Http.Url)
+	return ok && owned == server.Http
 }

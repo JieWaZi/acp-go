@@ -9,22 +9,22 @@ import (
 
 // Authenticate 原样转发标准 ACP 请求。
 func (agent *Agent) Authenticate(ctx context.Context, request acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
-	return acp.SendRequest[acp.AuthenticateResponse](agent.conn, ctx, "authenticate", request)
+	return sendNativeRequest[acp.AuthenticateResponse](agent, ctx, "authenticate", request)
 }
 
 // Logout 原样转发标准 ACP 请求。
 func (agent *Agent) Logout(ctx context.Context, request acp.LogoutRequest) (acp.LogoutResponse, error) {
-	return acp.SendRequest[acp.LogoutResponse](agent.conn, ctx, "logout", request)
+	return sendNativeRequest[acp.LogoutResponse](agent, ctx, "logout", request)
 }
 
 // ListSessions 原样转发标准 ACP 请求。
 func (agent *Agent) ListSessions(ctx context.Context, request acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
-	return acp.SendRequest[acp.ListSessionsResponse](agent.conn, ctx, "session/list", request)
+	return sendNativeRequest[acp.ListSessionsResponse](agent, ctx, "session/list", request)
 }
 
 // SetSessionMode 原样转发标准 ACP 请求。
 func (agent *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	return acp.SendRequest[acp.SetSessionModeResponse](agent.conn, ctx, "session/set_mode", request)
+	return sendNativeRequest[acp.SetSessionModeResponse](agent, ctx, "session/set_mode", request)
 }
 
 // dispatch 将上游的标准回调交给宿主 SDK，并处理已知扩展。

@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -26,8 +25,6 @@ const (
 var (
 	// ErrClaudeProcessExited 表示某个 Session 拥有的 Claude CLI 异常退出。
 	ErrClaudeProcessExited = errors.New("claude process exited")
-	// secretDiagnosticPattern 屏蔽 stderr 中常见凭据键值，不记录原始协议输入输出。
-	secretDiagnosticPattern = regexp.MustCompile(`(?i)(authorization|api[_-]?key|access[_-]?token|secret)([=: ]+)([^\s,;]+)`)
 )
 
 // processOptions 保存 Session CLI 启动和诊断选项。
@@ -38,7 +35,7 @@ type processOptions struct {
 	Args []string
 	// Env 是 CLI 进程的完整环境变量列表。
 	Env []string
-	// Logger 接收经过脱敏的诊断日志。
+	// Logger 接收 CLI 原始诊断日志。
 	Logger *slog.Logger
 	// MaxStderrBytes 是失败诊断保留的 stderr 尾部上限。
 	MaxStderrBytes int
@@ -52,7 +49,7 @@ type claudeProcess struct {
 	stdin io.WriteCloser
 	// stdout 是接收 JSONL 消息的输出流。
 	stdout io.ReadCloser
-	// stderr 保存已脱敏诊断的有限尾部。
+	// stderr 保存原始诊断的有限尾部。
 	stderr *tailBuffer
 	// done 在唯一等待协程完成进程回收后关闭。
 	done chan struct{}
@@ -75,6 +72,7 @@ func startClaudeProcess(ctx context.Context, path string, options processOptions
 		options.MaxStderrBytes = defaultClaudeStderrBytes
 	}
 	command := exec.CommandContext(ctx, path, options.Args...)
+	prepareProcess(command)
 	command.Dir = options.CWD
 	command.Env = options.Env
 	stdin, err := command.StdinPipe()
@@ -87,7 +85,7 @@ func startClaudeProcess(ctx context.Context, path string, options processOptions
 		return nil, fmt.Errorf("creating Claude stdout: %w", err)
 	}
 	stderr := &tailBuffer{limit: options.MaxStderrBytes}
-	command.Stderr = &sanitizedStderrWriter{tail: stderr, logger: options.Logger}
+	command.Stderr = &stderrWriter{tail: stderr, logger: options.Logger}
 	if err := command.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
@@ -120,7 +118,7 @@ func (p *claudeProcess) Err() error {
 	return p.waitErr
 }
 
-// FinalError 等待进程退出并返回包含退出状态与脱敏 stderr 尾部的错误。
+// FinalError 等待进程退出并返回包含退出状态与原始 stderr 尾部的错误。
 func (p *claudeProcess) FinalError() error {
 	timer := time.NewTimer(processFinalErrorGrace)
 	defer timer.Stop()
@@ -140,9 +138,7 @@ func (p *claudeProcess) Close(ctx context.Context) error {
 		case <-p.done:
 			p.closeErr = p.Err()
 		case <-ctx.Done():
-			if p.command.Process != nil {
-				_ = p.command.Process.Kill()
-			}
+			killProcessTree(p.command)
 			<-p.done
 			p.closeErr = ctx.Err()
 		}
@@ -170,35 +166,23 @@ func (p *claudeProcess) wait() {
 	close(p.done)
 }
 
-// sanitizedStderrWriter 只保存并记录脱敏后的 Claude stderr。
-type sanitizedStderrWriter struct {
-	// tail 接收经过脱敏后的诊断尾部。
+// stderrWriter 保存并记录 Claude 的原始 stderr。
+type stderrWriter struct {
+	// tail 接收原始诊断尾部。
 	tail *tailBuffer
-	// logger 接收可安全展示的诊断行。
+	// logger 接收原始诊断行。
 	logger *slog.Logger
 }
 
-// Write 屏蔽常见 secret，再写入有界尾部；日志只包含脱敏诊断。
-func (w *sanitizedStderrWriter) Write(data []byte) (int, error) {
-	sanitized := sanitizeDiagnostic(string(data))
-	_, _ = w.tail.Write([]byte(sanitized))
+// Write 把原始输出写入有界尾部和日志。
+func (w *stderrWriter) Write(data []byte) (int, error) {
+	_, _ = w.tail.Write(data)
 	if w.logger != nil {
-		if diagnostic := strings.TrimSpace(sanitized); diagnostic != "" {
+		if diagnostic := string(data); diagnostic != "" {
 			w.logger.Warn("Claude CLI stderr", "stderr", diagnostic)
 		}
 	}
 	return len(data), nil
-}
-
-// sanitizeDiagnostic 去掉控制字符并覆盖常见凭据值。
-func sanitizeDiagnostic(value string) string {
-	value = strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' || r == '\t' || r >= 0x20 {
-			return r
-		}
-		return -1
-	}, value)
-	return secretDiagnosticPattern.ReplaceAllString(value, "$1$2[REDACTED]")
 }
 
 // tailBuffer 是并发安全的固定容量尾部缓冲。

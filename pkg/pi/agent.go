@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/internal/buildinfo"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
@@ -27,7 +28,7 @@ type Config struct {
 	Environment []string
 	// WorkingDirectory 是探测和会话的默认工作目录。
 	WorkingDirectory string
-	// Logger 接收不包含凭据的诊断。
+	// Logger 接收 CLI 原始诊断。
 	Logger *slog.Logger
 	// PermissionMode 选择 default 人工审批、auto 风险审查或 full-access。
 	PermissionMode string
@@ -58,6 +59,10 @@ type Agent struct {
 	mutex sync.Mutex
 	// sessions 保存仍可交互的独立 Pi 会话。
 	sessions map[acp.SessionId]*session
+	// historyMu 保护用于列表展示的原生历史摘要缓存。
+	historyMu sync.Mutex
+	// historyCache 按文件大小和修改时间复用未变化的历史摘要。
+	historyCache map[string]storedCacheEntry
 	// host 是 ACP SDK 提供的宿主回调。
 	host *acp.AgentSideConnection
 	// formUI 表示宿主是否声明标准表单输入能力。
@@ -100,8 +105,8 @@ type session struct {
 	tools map[string]string
 	// snapshots 保存文件变更前的文本，用于 ACP 差异展示。
 	snapshots map[string]fileSnapshot
-	// bashOutput 保存 Bash 累计输出，以计算终端增量。
-	bashOutput map[string]string
+	// bashOutput 保存 Bash 输出长度与摘要，以计算终端增量。
+	bashOutput map[string]bashOutputState
 	// eventsDone 在事件消费与所有扩展回调结束后关闭。
 	eventsDone chan struct{}
 	// callbacks 跟踪本会话发起的扩展 UI 回调。
@@ -164,7 +169,7 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	a.versionOnce.Do(func() {
 		a.version = nativeacp.RuntimeVersion(ctx, a.config.PiPath, append(append([]string{}, a.config.PrefixArgs...), "--version"), a.config.Environment, a.config.WorkingDirectory)
 	})
-	return convert[acp.InitializeResponse](map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "pi", "title": "Pi", "version": a.version, "_meta": acpmeta.RuntimeVersionMetadata(a.version)}, "authMethods": []any{map[string]any{"id": "pi_terminal_login", "name": "Launch Pi to configure credentials", "_meta": map[string]any{"terminal-auth": map[string]any{"command": a.config.PiPath, "args": []string{}, "label": "Launch Pi"}}}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]bool{"http": true, "sse": true}, "promptCapabilities": map[string]bool{"image": true, "embeddedContext": true}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "close": map[string]any{}, "resume": map[string]any{}, "delete": map[string]any{}}}})
+	return convert[acp.InitializeResponse](map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "pi", "title": "Pi", "version": buildinfo.Current(), "_meta": acpmeta.RuntimeVersionMetadata(a.version)}, "authMethods": []any{map[string]any{"id": "pi_terminal_login", "name": "Launch Pi to configure credentials", "_meta": map[string]any{"terminal-auth": map[string]any{"command": a.config.PiPath, "args": []string{}, "label": "Launch Pi"}}}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]bool{"http": true, "sse": true}, "promptCapabilities": map[string]bool{"image": true, "embeddedContext": true}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "close": map[string]any{}, "resume": map[string]any{}, "delete": map[string]any{}}}})
 }
 
 // Authenticate 由用户在 Pi 原生终端配置提供方，本方法不自动执行登录。
@@ -202,15 +207,14 @@ func (s *session) close(ctx context.Context) error {
 		s.cancelTurn()
 	}
 	s.mutex.Unlock()
-	if err := s.process.close(ctx); err != nil {
-		return err
-	}
+	processErr := s.process.close(ctx)
+	var eventErr error
 	select {
 	case <-s.eventsDone:
 	case <-ctx.Done():
-		return ctx.Err()
+		eventErr = ctx.Err()
 	}
-	return os.RemoveAll(s.directory)
+	return errors.Join(processErr, eventErr, os.RemoveAll(s.directory))
 }
 
 // get 返回仍存活的会话，未知身份使用标准错误。

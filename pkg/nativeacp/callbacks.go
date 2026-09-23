@@ -135,7 +135,7 @@ func (agent *Agent) CreateElicitation(
 
 // SendRequest 实现 SessionBridge，协议编解码仍由 nativeacp 统一拥有。
 func (agent *Agent) SendRequest(ctx context.Context, method string, request any, response any) error {
-	raw, err := acp.SendRequest[json.RawMessage](agent.conn, ctx, method, request)
+	raw, err := sendNativeRequest[json.RawMessage](agent, ctx, method, request)
 	if err != nil {
 		return err
 	}

@@ -1,9 +1,25 @@
 package claude
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 )
+
+// TestClaudeStderrKeepsRawCLIError 验证错误尾部与日志保留 CLI 原始内容。
+func TestClaudeStderrKeepsRawCLIError(t *testing.T) {
+	var output bytes.Buffer
+	tail := &tailBuffer{limit: 1024}
+	writer := &stderrWriter{tail: tail, logger: slog.New(slog.NewTextHandler(&output, nil))}
+	const detail = "api_key=literal-secret\n"
+	if _, err := writer.Write([]byte(detail)); err != nil {
+		t.Fatal(err)
+	}
+	if tail.String() != detail || !strings.Contains(output.String(), detail[:len(detail)-1]) {
+		t.Fatalf("CLI 原始错误被修改：tail=%q log=%q", tail.String(), output.String())
+	}
+}
 
 // TestClaudeProcessEnvUsesExplicitBase 验证 Session 环境基于调用方快照并覆盖 Adapter 固有变量。
 func TestClaudeProcessEnvUsesExplicitBase(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,12 +20,19 @@ import (
 
 // NewSession 创建独立 Pi 原生会话及其 MCP 快照。
 func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+	if len(request.AdditionalDirectories) != 0 {
+		return acp.NewSessionResponse{}, acp.NewInvalidParams(map[string]any{"message": "Pi does not support additionalDirectories"})
+	}
 	s, options, err := a.open(ctx, request.Cwd, "", request.McpServers)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
 	options["sessionId"] = s.id
-	return convert[acp.NewSessionResponse](options)
+	response, err := convert[acp.NewSessionResponse](options)
+	if err != nil {
+		a.closeFailedSession(s)
+	}
+	return response, err
 }
 
 // open 对照 pi-acp 的创建/加载语义，直接启动 Pi 并读取真实模型目录。
@@ -94,7 +102,7 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 	if err = os.MkdirAll(filepath.Dir(file), 0700); err != nil {
 		return nil, nil, err
 	}
-	s := &session{id: acp.SessionId(id), cwd: cwd, file: file, directory: directory, process: p, tools: map[string]string{}, snapshots: map[string]fileSnapshot{}, bashOutput: map[string]string{}, eventsDone: make(chan struct{})}
+	s := &session{id: acp.SessionId(id), cwd: cwd, file: file, directory: directory, process: p, tools: map[string]string{}, snapshots: map[string]fileSnapshot{}, bashOutput: map[string]bashOutputState{}, eventsDone: make(chan struct{})}
 	options, err := s.configuration(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -104,13 +112,19 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 		a.mutex.Unlock()
 		return nil, nil, errors.New("Pi agent closed")
 	}
+	previous := a.sessions[s.id]
 	a.sessions[s.id] = s
 	a.mutex.Unlock()
 	go a.events(s)
+	if previous != nil && previous != s {
+		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = previous.close(cleanup)
+		cancel()
+	}
 	failed = false
 
 	if err = a.commands(ctx, s); err != nil {
-		_, _ = a.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: s.id})
+		a.closeFailedSession(s)
 		return nil, nil, err
 	}
 	return s, options, nil
@@ -118,6 +132,9 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 
 // LoadSession 使用真实历史文件恢复，并重建本次 MCP 快照及历史消息。
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	if len(request.AdditionalDirectories) != 0 {
+		return acp.LoadSessionResponse{}, acp.NewInvalidParams(map[string]any{"message": "Pi does not support additionalDirectories"})
+	}
 	file, err := a.findSession(request.SessionId, request.Cwd)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
@@ -126,6 +143,12 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
+	loaded := false
+	defer func() {
+		if !loaded {
+			a.closeFailedSession(s)
+		}
+	}()
 	var history map[string]any
 	if err = s.process.call(ctx, "get_messages", nil, &history); err != nil {
 		return acp.LoadSessionResponse{}, err
@@ -151,20 +174,43 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 			}
 		}
 	}
-	return convert[acp.LoadSessionResponse](options)
+	response, err := convert[acp.LoadSessionResponse](options)
+	loaded = err == nil
+	return response, err
 }
 
 // ResumeSession 与 load 使用相同的配置刷新，但不回放历史。
 func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	if len(request.AdditionalDirectories) != 0 {
+		return acp.ResumeSessionResponse{}, acp.NewInvalidParams(map[string]any{"message": "Pi does not support additionalDirectories"})
+	}
 	file, err := a.findSession(request.SessionId, request.Cwd)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	_, options, err := a.open(ctx, request.Cwd, file, request.McpServers)
+	s, options, err := a.open(ctx, request.Cwd, file, request.McpServers)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	return convert[acp.ResumeSessionResponse](options)
+	response, err := convert[acp.ResumeSessionResponse](options)
+	if err != nil {
+		a.closeFailedSession(s)
+	}
+	return response, err
+}
+
+// closeFailedSession 只移除仍指向失败实例的注册项，避免并发恢复覆盖新 Session。
+func (a *Agent) closeFailedSession(s *session) {
+	a.mutex.Lock()
+	if a.sessions[s.id] != s {
+		a.mutex.Unlock()
+		return
+	}
+	delete(a.sessions, s.id)
+	a.mutex.Unlock()
+	cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = s.close(cleanup)
 }
 
 // storedSession 是读取 Pi 原生文件所得的索引，不复制或维护第二份历史。
@@ -179,6 +225,53 @@ type storedSession struct {
 	title string
 	// updated 是文件修改时间。
 	updated time.Time
+}
+
+// storedCacheEntry 缓存文件摘要；加载会话时仍重新核对原生文件头。
+type storedCacheEntry struct {
+	// item 是一次完整扫描取得的列表摘要。
+	item storedSession
+	// size 与 item.updated 一起判定原生文件是否变化。
+	size int64
+}
+
+// errHistoryLineTooLarge 表示单条历史记录过大，但读取器已跳到下一行。
+var errHistoryLineTooLarge = errors.New("Pi history line exceeds 16 MiB")
+
+// readHistoryLine 有界读取一行，并跳过超大记录以继续扫描后续会话元数据。
+func readHistoryLine(reader *bufio.Reader) ([]byte, error) {
+	const maxHistoryLineBytes = 16 << 20
+	var line []byte
+	tooLarge := false
+	for {
+		part, err := reader.ReadSlice('\n')
+		if !tooLarge {
+			if len(line)+len(part) > maxHistoryLineBytes {
+				tooLarge = true
+			} else {
+				line = append(line, part...)
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			if len(part) == 0 && len(line) == 0 && !tooLarge {
+				return nil, io.EOF
+			}
+			if tooLarge {
+				return nil, errHistoryLineTooLarge
+			}
+			return line, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if tooLarge {
+			return nil, errHistoryLineTooLarge
+		}
+		return line, nil
+	}
 }
 
 // sessionRoot 对照 pi-acp 读取 Pi 原生目录和官方 sessionDir 设置。
@@ -212,6 +305,7 @@ func (a *Agent) sessionRoot() string {
 // stored 只扫描原生 session 头，不把任意文件名当作可加载路径。
 func (a *Agent) stored() ([]storedSession, error) {
 	result := []storedSession{}
+	seen := map[string]bool{}
 	err := filepath.WalkDir(a.sessionRoot(), func(path string, entry fs.DirEntry, err error) error {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -222,28 +316,54 @@ func (a *Agent) stored() ([]storedSession, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			return nil
 		}
+		seen[path] = true
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			a.historyMu.Lock()
+			cached, ok := a.historyCache[path]
+			a.historyMu.Unlock()
+			if ok && cached.size == info.Size() && cached.item.updated.Equal(info.ModTime()) {
+				result = append(result, cached.item)
+				return nil
+			}
+		}
+		a.historyMu.Lock()
+		delete(a.historyCache, path)
+		a.historyMu.Unlock()
 		f, err := os.Open(path)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-		if !scanner.Scan() {
+		reader := bufio.NewReaderSize(f, 64*1024)
+		first, err := readHistoryLine(reader)
+		if errors.Is(err, io.EOF) || errors.Is(err, errHistoryLineTooLarge) {
 			return nil
 		}
-		var header map[string]any
-		if json.Unmarshal(scanner.Bytes(), &header) != nil || header["type"] != "session" {
-			return nil
-		}
-		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
+		var header map[string]any
+		if json.Unmarshal(first, &header) != nil || header["type"] != "session" {
+			return nil
+		}
 		item := storedSession{id: text(header["id"]), cwd: text(header["cwd"]), file: path, updated: info.ModTime()}
-		for scanner.Scan() {
+		for {
+			line, err := readHistoryLine(reader)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if errors.Is(err, errHistoryLineTooLarge) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
 			var value map[string]any
-			if json.Unmarshal(scanner.Bytes(), &value) != nil {
+			if json.Unmarshal(line, &value) != nil {
 				continue
 			}
 			if value["type"] == "session_info" && text(value["name"]) != "" {
@@ -261,9 +381,26 @@ func (a *Agent) stored() ([]storedSession, error) {
 		}
 		if item.id != "" && filepath.IsAbs(item.cwd) {
 			result = append(result, item)
+			if entry.Type()&os.ModeSymlink == 0 {
+				a.historyMu.Lock()
+				if a.historyCache == nil {
+					a.historyCache = map[string]storedCacheEntry{}
+				}
+				a.historyCache[path] = storedCacheEntry{item: item, size: info.Size()}
+				a.historyMu.Unlock()
+			}
 		}
-		return scanner.Err()
+		return nil
 	})
+	if err == nil {
+		a.historyMu.Lock()
+		for path := range a.historyCache {
+			if !seen[path] {
+				delete(a.historyCache, path)
+			}
+		}
+		a.historyMu.Unlock()
+	}
 	sort.Slice(result, func(i, j int) bool { return result[i].updated.After(result[j].updated) })
 	return result, err
 }
@@ -276,14 +413,50 @@ func (a *Agent) findSession(id acp.SessionId, cwd string) (string, error) {
 	if active != nil && sameDirectory(active.cwd, cwd) {
 		return active.file, nil
 	}
-	entries, err := a.stored()
+	var file string
+	var newest time.Time
+	err := filepath.WalkDir(a.sessionRoot(), func(path string, entry fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		reader := bufio.NewReaderSize(f, 64*1024)
+		first, readErr := readHistoryLine(reader)
+		closeErr := f.Close()
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, errHistoryLineTooLarge) {
+			return closeErr
+		}
+		if joined := errors.Join(readErr, closeErr); joined != nil {
+			return joined
+		}
+		var header map[string]any
+		_ = json.Unmarshal(first, &header)
+		headerCWD := text(header["cwd"])
+		if header["type"] == "session" && text(header["id"]) == string(id) && filepath.IsAbs(headerCWD) && sameDirectory(headerCWD, cwd) {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if file == "" || info.ModTime().After(newest) {
+				file, newest = path, info.ModTime()
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
-	for _, entry := range entries {
-		if entry.id == string(id) && sameDirectory(entry.cwd, cwd) {
-			return entry.file, nil
-		}
+	if file != "" {
+		return file, nil
 	}
 	return "", acp.NewInvalidParams(map[string]any{"message": "Pi session not found in this workspace"})
 }

@@ -236,8 +236,8 @@ func TestNativeStartFailure(t *testing.T) {
 	}
 }
 
-// TestNativeStderrIsVisibleAndRedacted 验证原生 ACP 失败诊断可见，但常见凭据不会进入日志。
-func TestNativeStderrIsVisibleAndRedacted(t *testing.T) {
+// TestNativeStderrIsVisibleRaw 验证原生 ACP 失败诊断保留 CLI 原始内容。
+func TestNativeStderrIsVisibleRaw(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -261,9 +261,33 @@ func TestNativeStderrIsVisibleAndRedacted(t *testing.T) {
 	if !strings.Contains(diagnostic, "fixture failure") {
 		t.Fatalf("stderr 诊断不可见：%q", diagnostic)
 	}
-	if strings.Contains(diagnostic, "secret-value") || !strings.Contains(diagnostic, "[REDACTED]") {
-		t.Fatalf("stderr 凭据未脱敏：%q", diagnostic)
+	if !strings.Contains(diagnostic, "api_key=secret-value") {
+		t.Fatalf("stderr 原始诊断丢失：%q", diagnostic)
 	}
+}
+
+// TestNativeRequestReportsRawCLIExit 验证请求失败时附加原始 CLI 退出诊断。
+func TestNativeRequestReportsRawCLIExit(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := nativeacp.NewAgent(context.Background(), nativeacp.Config{
+		Command:     binary,
+		Args:        []string{"-test.run=^TestACPProcess$"},
+		Environment: append(os.Environ(), "NATIVE_ACP_TEST=stderr"),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = agent.Initialize(ctx, acp.InitializeRequest{})
+	if err == nil || !strings.Contains(err.Error(), "api_key=secret-value") {
+		t.Fatalf("native CLI raw error missing: %v", err)
+	}
+	_ = agent.Close(ctx)
 }
 
 // TestACPProcess 在隔离子进程内运行 SDK 驱动的协议对照 Agent。

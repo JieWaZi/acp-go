@@ -119,10 +119,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 
 // Close 在原生进程结束后移除本次模型配置，持久会话保留供 load 使用。
 func (agent *Agent) Close(ctx context.Context) error {
-	if err := agent.Agent.Close(ctx); err != nil {
-		return err
-	}
-	return os.RemoveAll(agent.directory)
+	return errors.Join(agent.Agent.Close(ctx), os.RemoveAll(agent.directory))
 }
 
 // Initialize 保留原生握手，并识别需要补齐兼容语义的官方 Kimi Code ACP。
