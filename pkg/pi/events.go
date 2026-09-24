@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -59,7 +58,7 @@ func (a *Agent) events(s *session) {
 					if tokensOK && windowOK && tokens >= 0 && window > 0 {
 						if err := a.emit(ctx, s, map[string]any{"sessionUpdate": "usage_update", "used": int(tokens), "size": int(window)}); err != nil {
 							s.mutex.Lock()
-							s.failure = err
+							s.failure = errors.Join(s.failure, err)
 							s.mutex.Unlock()
 						}
 					}
@@ -73,7 +72,7 @@ func (a *Agent) events(s *session) {
 					metadata := autoreview.Metadata(autoreview.Decision{Outcome: text(record["outcome"]), RiskLevel: text(record["risk_level"])}, record["failed"] == true)
 					if err := a.emit(ctx, s, map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": record["toolCallId"], "_meta": map[string]any{"acp-go/permission-review": metadata}}); err != nil {
 						s.mutex.Lock()
-						s.failure = err
+						s.failure = errors.Join(s.failure, err)
 						s.mutex.Unlock()
 					}
 				}
@@ -127,7 +126,7 @@ func (a *Agent) events(s *session) {
 				s.accumulateUsage(object(message["usage"]))
 				if reason := text(message["stopReason"]); reason == "error" {
 					s.mutex.Lock()
-					s.failure = errors.New("Pi model request failed: " + text(message["errorMessage"]))
+					s.modelFailure = errors.New("Pi model request failed: " + text(message["errorMessage"]))
 					s.mutex.Unlock()
 				}
 			}
@@ -143,19 +142,36 @@ func (a *Agent) events(s *session) {
 				status = "failed"
 			}
 			update = s.toolUpdate(text(event["toolCallId"]), text(event["toolName"]), status, nil, event["result"], true)
-		case "auto_retry_start", "auto_retry_end", "auto_compaction_start", "auto_compaction_end", "extension_error":
-			messages := map[string]string{"auto_retry_start": fmt.Sprintf("Retrying model request (attempt %v).", event["attempt"]), "auto_retry_end": "Retry finished.", "auto_compaction_start": "Compacting session context…", "auto_compaction_end": "Session compaction finished.", "extension_error": "Pi extension error: " + text(event["error"])}
-			if kind == "auto_retry_end" && event["success"] == true {
-				s.mutex.Lock()
-				s.failure = nil
+		case "extension_error":
+			s.mutex.Lock()
+			s.failure = errors.Join(s.failure, errors.New("Pi extension error: "+text(event["error"])))
+			s.mutex.Unlock()
+		case "auto_retry_end":
+			s.mutex.Lock()
+			if s.cancelled || ctx.Err() != nil {
+				// 取消重试也携带 finalError；以宿主取消或期限事实为准，不保留中间模型失败。
+				s.modelFailure = nil
 				s.mutex.Unlock()
+				continue
 			}
-			update = map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": messages[kind]}}
+			switch event["success"] {
+			case true:
+				s.modelFailure = nil
+			case false:
+				if finalError := strings.TrimSpace(text(event["finalError"])); finalError != "" {
+					s.modelFailure = errors.New("Pi model request failed: " + finalError)
+				} else if s.modelFailure == nil {
+					s.modelFailure = errors.New("Pi model request failed after automatic retries")
+				}
+			}
+			s.mutex.Unlock()
+		case "auto_retry_start", "auto_compaction_start", "auto_compaction_end", "compaction_start", "compaction_end":
+			// 重试与压缩状态不属于助手正文，不能制造可见输出或影响安全重放资格。
 		}
 		if update != nil {
 			if err := a.emit(context.WithoutCancel(ctx), s, update); err != nil {
 				s.mutex.Lock()
-				s.failure = err
+				s.failure = errors.Join(s.failure, err)
 				s.mutex.Unlock()
 			}
 		}

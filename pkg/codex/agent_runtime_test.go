@@ -788,11 +788,16 @@ func TestAgentPromptReturnsFailedTurnError(t *testing.T) {
 	}()
 	<-turnStarted
 	notification := completeNotification(t, "thread-1", "turn-1", protocol.Failed).(*protocol.TurnCompletedEnvelope)
-	notification.Params.Turn.Error = &protocol.Error{Message: "API Error: 402 Insufficient Balance"}
+	kind := protocol.Unauthorized
+	notification.Params.Turn.Error = &protocol.Error{Message: "API Error: 402 Insufficient Balance", CodexErrorInfo: &protocol.CodexErrorInfoUnion{Enum: &kind}}
 	agent.client.HandleNotification(context.Background(), notification)
 	var requestError *acp.RequestError
 	if err := <-promptError; !errors.As(err, &requestError) || requestError.Message != "API Error: 402 Insufficient Balance" {
 		t.Fatalf("Prompt() error = %v，期望 app-server 原始错误", err)
+	}
+	data, _ := requestError.Data.(map[string]any)
+	if data["errorKind"] != "authentication_failed" {
+		t.Fatalf("结构化类别丢失：%+v", requestError)
 	}
 }
 

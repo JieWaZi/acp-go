@@ -103,6 +103,8 @@ type claudeTurn struct {
 	assistantModel string
 	// assistantError 保存固定 Agent SDK 声明的最近一次顶层 Provider 错误类别。
 	assistantError string
+	// assistantErrorMessage 保存错误消息正文，供缺少结果诊断的终态展示。
+	assistantErrorMessage string
 }
 
 // claudeSession 保存一个 ACP Session 独占的 CLI、transport、FIFO 与事件状态。

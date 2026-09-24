@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -54,6 +55,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	s.cancelTurn = cancel
 	s.cancelled = false
 	s.failure = nil
+	s.modelFailure = nil
 	s.usage = nil
 	s.mutex.Unlock()
 	defer func() {
@@ -78,8 +80,12 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	}
 	select {
 	case reason := <-turn:
+		// settled 与上下文结束可能同时就绪，期限或取消仍须返回原始原因。
+		if err := ctx.Err(); err != nil {
+			return acp.PromptResponse{}, err
+		}
 		s.mutex.Lock()
-		failure, usage := s.failure, s.usage
+		failure, usage := errors.Join(s.failure, s.modelFailure), s.usage
 		s.mutex.Unlock()
 		return acp.PromptResponse{StopReason: reason, Usage: usage}, failure
 	case <-ctx.Done():

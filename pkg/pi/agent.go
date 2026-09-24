@@ -99,8 +99,10 @@ type session struct {
 	cancelled bool
 	// usage 保存本次提示内各模型调用累计的真实用量。
 	usage *acp.Usage
-	// failure 保存模型或协议错误，不把上游失败伪装为完成。
+	// failure 保存协议、扩展和交付错误，不能由模型自动重试清除。
 	failure error
+	// modelFailure 保存模型请求失败，仅在模型自动重试成功后清除。
+	modelFailure error
 	// tools 记录当前回合的工具状态，避免重复创建与状态倒退。
 	tools map[string]string
 	// snapshots 保存文件变更前的文本，用于 ACP 差异展示。

@@ -386,6 +386,17 @@ func TestPiRPCProcess(t *testing.T) {
 			if request["message"] == "wait" {
 				_ = os.WriteFile(filepath.Join(cwd, "waiting"), nil, 0600)
 			} else {
+				switch request["message"] {
+				case "model failure", "model recovered":
+					write(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "provider unavailable"}})
+					if request["message"] == "model recovered" {
+						write(map[string]any{"type": "auto_retry_end", "success": true})
+					}
+				case "retry failure":
+					write(map[string]any{"type": "auto_retry_end", "success": false, "finalError": "529 overloaded_error: Overloaded"})
+				case "extension failure":
+					write(map[string]any{"type": "extension_error", "error": "extension rejected operation"})
+				}
 				if request["message"] == "usage" {
 					for _, usage := range []map[string]any{{"input": 10, "output": 5, "cacheRead": 3, "cacheWrite": 2, "totalTokens": 20}, {"input": 20, "output": 6, "cacheRead": 4, "cacheWrite": 1, "totalTokens": 31}} {
 						write(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "stop", "usage": usage}})
@@ -447,5 +458,22 @@ func TestPiPromptUsagePerTurn(t *testing.T) {
 	result, err = a.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("normal")}})
 	if err != nil || result.Usage != nil {
 		t.Fatalf("previous turn usage leaked: %+v, %v", result.Usage, err)
+	}
+}
+
+// TestPiPromptErrorContract 验证错误经完整 RPC 回合返回，恢复后的下一轮仍可正常完成。
+func TestPiPromptErrorContract(t *testing.T) {
+	agent, id := testAgent(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, message := range []string{"model failure", "extension failure", "retry failure", "model recovered", "explain error handling"} {
+		response, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock(message)}})
+		if message == "model failure" || message == "extension failure" || message == "retry failure" {
+			if err == nil {
+				t.Fatalf("%s 伪装为成功：%+v", message, response)
+			}
+		} else if err != nil || response.StopReason != acp.StopReasonEndTurn {
+			t.Fatalf("%s 误判失败：%+v %v", message, response, err)
+		}
 	}
 }

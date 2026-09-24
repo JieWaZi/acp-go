@@ -20,7 +20,7 @@ func TestCursorApprovalHints(t *testing.T) {
 	}
 }
 
-// TestCursorPlanErrorMapping 验证官方套餐失败保留统一计费错误分类，未知错误不伪造分类。
+// TestCursorPlanErrorMapping 验证官方套餐失败保留套餐升级分类，未知错误不伪造分类。
 func TestCursorPlanErrorMapping(t *testing.T) {
 	var request *acp.RequestError
 	err := cursorTurnError("Please upgrade your plan to use this model", "generation failed")
@@ -28,7 +28,7 @@ func TestCursorPlanErrorMapping(t *testing.T) {
 		t.Fatalf("missing ACP error: %v", err)
 	}
 	data, ok := request.Data.(map[string]any)
-	if !ok || data["errorKind"] != "billing_error" {
+	if !ok || data["errorKind"] != "plan_upgrade_required" {
 		t.Fatalf("wrong error: %+v", request)
 	}
 	if err := cursorTurnError("unknown failure", "generation failed"); err.Error() != "generation failed" {

@@ -58,7 +58,7 @@ func (agent *Agent) rememberWire(id acp.SessionId, cwd string) {
 	agent.wirePaths.Store(id, resolveWirePath(agent.codeDirectory, agent.directory, id, cwd))
 }
 
-// Prompt 保留原生 ACP 审批与交互，只补齐当前轮 Kimi Wire 中已有的统计。
+// Prompt 保留原生 ACP 审批与交互，补齐当前轮 Wire 的真实终态与统计。
 func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
 	if _, active := agent.usagePrompts.LoadOrStore(request.SessionId, true); active {
 		return acp.PromptResponse{}, acp.NewInvalidParams(nil)
@@ -74,6 +74,9 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 	result, err := agent.Agent.Prompt(ctx, request)
 	if path == nil {
 		return result, err
+	}
+	if err == nil && ctx.Err() == nil && result.StopReason != acp.StopReasonCancelled {
+		err = readWireFailure(ctx, path.(string), offset)
 	}
 	usage, update := readWireUsage(
 		path.(string),

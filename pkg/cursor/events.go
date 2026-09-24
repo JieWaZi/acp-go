@@ -320,11 +320,11 @@ func pendingUnchanged(ctx context.Context, s *interactiveSession, call pendingCa
 	return errors.New("Cursor interaction is no longer uniquely pending")
 }
 
-// cursorTurnError 保留官方已明确显示的套餐失败分类，供宿主在同一聊天切换模型重试。
+// cursorTurnError 保留官方已明确显示的套餐失败分类，供宿主提示用户调整套餐或模型。
 func cursorTurnError(screen, fallback string) error {
 	lower := strings.ToLower(screen)
 	if strings.Contains(lower, "upgrade your plan") || strings.Contains(lower, "upgrade plan") {
-		return acp.NewInternalError(map[string]any{"errorKind": "billing_error", "message": "Cursor requires a plan upgrade for the selected model"})
+		return acp.NewInternalError(map[string]any{"errorKind": "plan_upgrade_required", "message": "Cursor requires a plan upgrade for the selected model"})
 	}
 	return errors.New(fallback)
 }

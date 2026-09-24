@@ -104,14 +104,18 @@ func (c *outcomeCursor) failure() error {
 			if json.Unmarshal([]byte(line[index+len(marker):]), &event) != nil || event.Message != "agent_cli.turn.outcome" || event.Metadata.Outcome != "error" {
 				continue
 			}
-			kind := "server_error"
+			kind := ""
 			switch {
 			case event.Metadata.ErrorCode == "upgrade":
-				kind = "billing_error"
+				kind = "plan_upgrade_required"
 			case event.Metadata.GRPCCode == "resource_exhausted":
 				kind = "rate_limit"
 			case event.Metadata.GRPCCode == "unauthenticated":
 				kind = "authentication_failed"
+			case event.Metadata.GRPCCode == "unavailable":
+				kind = "server_error"
+			case event.Metadata.GRPCCode == "deadline_exceeded":
+				kind = "timeout"
 			}
 			failure = acp.NewInternalError(map[string]any{"errorKind": kind, "message": "Cursor reported an unsuccessful interactive turn", "cursorErrorCode": event.Metadata.ErrorCode})
 		}

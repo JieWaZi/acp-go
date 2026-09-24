@@ -12,7 +12,7 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 )
 
-// TestCursorMissingStopHookFailure 回放真实额度错误，验证没有 stop Hook 时仍及时结束当前轮且保留可重试分类。
+// TestCursorMissingStopHookFailure 回放真实额度错误，验证没有 stop Hook 时仍及时结束当前轮且保留套餐升级分类。
 func TestCursorMissingStopHookFailure(t *testing.T) {
 	root := t.TempDir()
 	events := filepath.Join(root, "events")
@@ -35,7 +35,7 @@ func TestCursorMissingStopHookFailure(t *testing.T) {
 		t.Fatalf("missing failure: %+v %v", response, err)
 	}
 	data, ok := request.Data.(map[string]any)
-	if !ok || data["errorKind"] != "billing_error" {
+	if !ok || data["errorKind"] != "plan_upgrade_required" {
 		t.Fatalf("wrong classification: %+v", request)
 	}
 	if strings.Contains(err.Error(), "private") {
@@ -99,5 +99,23 @@ func TestCursorPromptPreservesProtocolError(t *testing.T) {
 	cleanup := errors.New("cleanup failed")
 	if cursorPromptError(nil, cleanup) != cleanup {
 		t.Fatal("cleanup failure lost")
+	}
+}
+
+// TestCursorUnknownOutcomeDoesNotInventRetryability 验证未知供应商错误不伪造为可重试服务故障。
+func TestCursorUnknownOutcomeDoesNotInventRetryability(t *testing.T) {
+	root := t.TempDir()
+	cursor := &outcomeCursor{directory: root, pid: 123, started: time.Now().Add(-time.Second), offsets: map[string]int64{}}
+	raw := `structured-log.info {"message":"agent_cli.turn.outcome","metadata":{"outcome":"error","error_code":"future_error","grpc_code":"permission_denied"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(root, "session-date-123-1.log"), []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var request *acp.RequestError
+	if err := cursor.failure(); !errors.As(err, &request) {
+		t.Fatalf("错误被吞掉：%v", err)
+	}
+	data, _ := request.Data.(map[string]any)
+	if kind, _ := data["errorKind"].(string); kind != "" {
+		t.Fatalf("未知错误被赋予类别：%s", kind)
 	}
 }

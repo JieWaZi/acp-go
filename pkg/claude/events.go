@@ -164,13 +164,25 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
 		return nil
 	}
+	if message.Error != "" {
+		var details []string
+		for _, block := range message.Message.Content {
+			if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+				details = append(details, block.Text)
+			}
+		}
+		turn.mu.Lock()
+		if message.ParentToolUseID == nil {
+			turn.assistantError = message.Error
+			turn.assistantErrorMessage = strings.Join(details, "\n")
+		}
+		delete(turn.streamedBlocks, streamedBlockOwner(message.ParentToolUseID))
+		turn.mu.Unlock()
+		// 错误正文不交付；顶层错误由 result 结算，子代理错误由后续 user.tool_result 结算对应工具。
+		return nil
+	}
 	if message.ParentToolUseID == nil {
 		s.useAssistantModel(message.Message.Model)
-		if message.Error != "" {
-			turn.mu.Lock()
-			turn.assistantError = message.Error
-			turn.mu.Unlock()
-		}
 		if message.Message.Usage != nil {
 			recordContextUsage(turn, *message.Message.Usage, message.Message.Model)
 		}
@@ -306,7 +318,13 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 	}
 	turn.mu.Lock()
 	assistantError := turn.assistantError
+	assistantErrorMessage := turn.assistantErrorMessage
 	turn.mu.Unlock()
+	if assistantError != "" && assistantErrorMessage != "" && (!message.IsError || strings.TrimSpace(message.Result) == "") {
+		copy := *message
+		copy.Result = assistantErrorMessage
+		message = &copy
+	}
 	response, err := promptResponseFromResult(message, assistantError)
 	turn.mu.Lock()
 	turn.gotResult = true
@@ -366,10 +384,14 @@ func (s *claudeSession) handleSystem(ctx context.Context, message *protocol.Syst
 	cancelled := turn.cancelled
 	steered := turn.steered
 	steeredResult := turn.steeredResult
+	assistantError := turn.assistantError
+	assistantErrorMessage := turn.assistantErrorMessage
 	turn.mu.Unlock()
 	switch {
 	case cancelled:
 		turn.settle(acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil)
+	case assistantError != "":
+		turn.settle(acp.PromptResponse{}, claudeResultRequestError(&protocol.ResultMessage{Result: assistantErrorMessage}, assistantError))
 	case steered && steeredResult != nil:
 		turn.settle(*steeredResult, nil)
 	case !gotResult:
@@ -558,6 +580,9 @@ func promptResponseFromResult(
 	message *protocol.ResultMessage,
 	assistantError string,
 ) (acp.PromptResponse, error) {
+	if message.IsError || assistantError != "" {
+		return acp.PromptResponse{}, claudeResultRequestError(message, assistantError)
+	}
 	stopReason := acp.StopReasonEndTurn
 	if message.StopReason != nil {
 		switch *message.StopReason {
@@ -568,11 +593,8 @@ func promptResponseFromResult(
 		}
 	}
 	if stopReason != acp.StopReasonMaxTokens && stopReason != acp.StopReasonRefusal {
-		if message.Subtype == "success" && strings.Contains(message.Result, "Please run /login") {
+		if message.Subtype == "success" && strings.HasPrefix(strings.TrimSpace(message.Result), "Not logged in") && strings.Contains(message.Result, "Please run /login") {
 			return acp.PromptResponse{}, acp.NewAuthRequired(claudeErrorKindData("authentication_failed"))
-		}
-		if message.IsError {
-			return acp.PromptResponse{}, claudeResultRequestError(message, assistantError)
 		}
 		switch message.Subtype {
 		case "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
@@ -597,6 +619,9 @@ func claudeResultRequestError(
 	detail := strings.TrimSpace(message.Result)
 	if detail == "" {
 		detail = strings.Join(message.Errors, "; ")
+	}
+	if detail == "" {
+		detail = assistantError
 	}
 	if detail == "" {
 		detail = message.Subtype
