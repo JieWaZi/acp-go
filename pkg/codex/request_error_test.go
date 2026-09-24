@@ -2,9 +2,27 @@ package codex
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
+	acp "github.com/coder/acp-go-sdk"
 	"testing"
 )
+
+// TestCodexMissingRolloutMapsToSessionNotFound 验证丢失的 rollout 只映射为会话缺失。
+func TestCodexMissingRolloutMapsToSessionNotFound(t *testing.T) {
+	err := fmt.Errorf("resuming codex thread abc: %w", &rpcError{
+		Code:    -32600,
+		Message: "no rollout found for thread id abc",
+	})
+	got, ok := mapCodexSessionOpenError("abc", err).(*acp.RequestError)
+	if !ok || got.Code != acpResourceNotFoundCode {
+		t.Fatalf("mapCodexSessionOpenError() = %v, want session not found", got)
+	}
+	other := &rpcError{Code: -32600, Message: "invalid thread resume arguments"}
+	if mapped := mapCodexSessionOpenError("abc", other); mapped != other {
+		t.Fatalf("unrelated invalid request was rewritten: %v", mapped)
+	}
+}
 
 // TestCodexProviderErrorContract 验证稳定类别、HTTP 状态与未知错误不依赖消息文案。
 func TestCodexProviderErrorContract(t *testing.T) {

@@ -23,10 +23,12 @@ func codexSessionNotFoundError(sessionID string) *acp.RequestError {
 	}
 }
 
-// mapCodexSessionOpenError 保留普通 app-server 错误，只提升稳定的资源缺失码。
+// mapCodexSessionOpenError 把 app-server 找不到 rollout 的错误提升为会话缺失。
 func mapCodexSessionOpenError(sessionID string, err error) error {
 	var rpcErr *rpcError
-	if errors.As(err, &rpcErr) && rpcErr.Code == acpResourceNotFoundCode {
+	if errors.As(err, &rpcErr) &&
+		(rpcErr.Code == acpResourceNotFoundCode ||
+			(rpcErr.Code == -32600 && strings.Contains(strings.ToLower(rpcErr.Message), "no rollout found for thread id"))) {
 		return codexSessionNotFoundError(sessionID)
 	}
 	return err
