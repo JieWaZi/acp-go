@@ -189,6 +189,7 @@ func (a *Agent) Initialize(_ context.Context, request acp.InitializeRequest) (ac
 			},
 			McpCapabilities: acp.McpCapabilities{Http: true, Sse: true},
 			SessionCapabilities: acp.SessionCapabilities{
+				Fork:                  acpmeta.ForkCapability(acpmeta.VerifiedForkModeInMinor(a.executable.Version, "2.1.159", acpmeta.ForkLatest)),
 				AdditionalDirectories: &acp.SessionAdditionalDirectoriesCapabilities{},
 				Close:                 &acp.SessionCloseCapabilities{},
 				Resume:                &acp.SessionResumeCapabilities{},
@@ -203,6 +204,7 @@ func (a *Agent) Initialize(_ context.Context, request acp.InitializeRequest) (ac
 		AuthMethods: []acp.AuthMethod{},
 		Meta: map[string]any{
 			"steering": map[string]any{"supported": true},
+			"fork":     map[string]any{"mode": acpmeta.VerifiedForkModeInMinor(a.executable.Version, "2.1.159", acpmeta.ForkLatest)},
 		},
 	}, nil
 }
@@ -307,6 +309,8 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
+	session.forkMu.RLock()
+	defer session.forkMu.RUnlock()
 	return session.prompt(ctx, message)
 }
 
@@ -384,6 +388,8 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 	if err != nil {
 		return nil, err
 	}
+	session.forkMu.RLock()
+	defer session.forkMu.RUnlock()
 	return session.steer(ctx, message, request.PromptRequired)
 }
 

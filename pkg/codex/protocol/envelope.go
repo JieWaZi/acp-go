@@ -14,6 +14,7 @@ const (
 	MethodInitialize                      = "initialize"
 	MethodThreadStart                     = "thread/start"
 	MethodThreadResume                    = "thread/resume"
+	MethodThreadFork                      = "thread/fork"
 	MethodThreadRead                      = "thread/read"
 	MethodThreadUnsubscribe               = "thread/unsubscribe"
 	MethodTurnStart                       = "turn/start"
@@ -142,6 +143,17 @@ type ThreadStartRequest struct {
 // NewThreadStartRequest 创建 thread/start 请求。
 func NewThreadStartRequest(id RequestID, params ThreadStartParams) ThreadStartRequest {
 	return ThreadStartRequest{newClientRequest(id, MethodThreadStart, params)}
+}
+
+// ThreadForkRequest 表示固定 method 为 thread/fork 的请求。
+type ThreadForkRequest struct {
+	// clientRequestEnvelope 提供固定方法和 ThreadForkParams 的耦合。
+	clientRequestEnvelope[ThreadForkParams]
+}
+
+// NewThreadForkRequest 创建 thread/fork 请求。
+func NewThreadForkRequest(id RequestID, params ThreadForkParams) ThreadForkRequest {
+	return ThreadForkRequest{newClientRequest(id, MethodThreadFork, params)}
 }
 
 // ThreadResumeRequest 表示固定 method 为 thread/resume 的请求。
@@ -326,6 +338,9 @@ func DecodeClientRequest(data []byte) (ClientRequest, error) {
 	case MethodThreadStart:
 		request, err := decodeClientRequest[ThreadStartParams](wire, true)
 		return clientRequestResult(&ThreadStartRequest{request}, err)
+	case MethodThreadFork:
+		request, err := decodeClientRequest[ThreadForkParams](wire, true)
+		return clientRequestResult(&ThreadForkRequest{request}, err)
 	case MethodThreadResume:
 		request, err := decodeClientRequest[ThreadResumeParams](wire, true)
 		return clientRequestResult(&ThreadResumeRequest{request}, err)

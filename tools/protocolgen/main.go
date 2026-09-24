@@ -303,14 +303,19 @@ func preserveOpenJSONFields(generated []byte) ([]byte, error) {
 	result := generated
 	for _, replacement := range replacements {
 		oldValue := []byte(replacement.source)
-		if count := bytes.Count(result, oldValue); count != 1 {
+		expected := 1
+		// thread/start 与 thread/fork 的配置字段拥有相同的生成声明。
+		if replacement.source == "Config                map[string]interface{} `json:\"config,omitempty\"`" {
+			expected = 2
+		}
+		if count := bytes.Count(result, oldValue); count != expected {
 			return nil, fmt.Errorf(
-				"open JSON source field %q occurred %d times, want exactly once",
+				"open JSON source field %q occurred %d times, unexpected count",
 				replacement.source,
 				count,
 			)
 		}
-		result = bytes.Replace(result, oldValue, []byte(replacement.replacement), 1)
+		result = bytes.ReplaceAll(result, oldValue, []byte(replacement.replacement))
 	}
 	return result, nil
 }

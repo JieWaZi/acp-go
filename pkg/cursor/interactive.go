@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 	"github.com/gofrs/flock"
@@ -136,6 +137,16 @@ func (a *Agent) SetAgentConnection(host *acp.AgentSideConnection) {
 func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	response, err := a.Agent.Initialize(ctx, request)
 	if err == nil {
+		if response.Meta == nil {
+			response.Meta = map[string]any{}
+		}
+		version := ""
+		if response.AgentInfo != nil {
+			version = acpmeta.RuntimeVersion(response.AgentInfo.Meta)
+		}
+		mode := acpmeta.VerifiedForkModeInMinor(version, "2026.09.10", acpmeta.ForkLatest)
+		response.AgentCapabilities.SessionCapabilities.Fork = acpmeta.ForkCapability(mode)
+		response.Meta["fork"] = map[string]any{"mode": mode}
 		response.AgentCapabilities.PromptCapabilities = acp.PromptCapabilities{}
 		response.AgentCapabilities.McpCapabilities.Sse = false
 		response.AgentCapabilities.McpCapabilities.Acp = false
@@ -186,7 +197,7 @@ func (a *Agent) register(
 		mode:        a.config.PermissionMode,
 		directory:   directory,
 		store: newStoreCursor(filepath.Join(
-			a.state,
+			a.stateForWorkspace(path),
 			"chats",
 			hex.EncodeToString(sum[:]),
 			string(id),
@@ -203,7 +214,7 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	response, err := a.Agent.NewSession(ctx, request)
 	if err == nil {
 		var owner *flock.Flock
-		owner, err = a.claim(response.SessionId)
+		owner, err = a.claim(response.SessionId, request.Cwd)
 		if err == nil {
 			err = a.register(response.SessionId, request.Cwd, request.McpServers, request.AdditionalDirectories, owner)
 			if err != nil && owner != nil {
@@ -218,7 +229,7 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	a.lifecycleMutex.Lock()
 	defer a.lifecycleMutex.Unlock()
-	owner, err := a.claim(request.SessionId)
+	owner, err := a.claim(request.SessionId, request.Cwd)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
@@ -245,7 +256,7 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
 	a.lifecycleMutex.Lock()
 	defer a.lifecycleMutex.Unlock()
-	owner, err := a.claim(request.SessionId)
+	owner, err := a.claim(request.SessionId, request.Cwd)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
@@ -312,7 +323,7 @@ func (a *Agent) start(ctx context.Context, s *interactiveSession) error {
 	}
 	args := append([]string{}, a.config.PrefixArgs...)
 	args = append(args, "--model", modelArgument)
-	environment, err := sessionEnvironment(a.directory, a.state, s.directory, a.config.Environment, selection)
+	environment, err := sessionEnvironment(a.directory, a.stateForWorkspace(s.cwd), s.directory, a.config.Environment, selection)
 	if err != nil {
 		return err
 	}

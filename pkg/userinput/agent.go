@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/coder/acp-go-sdk"
 )
 
@@ -167,6 +168,37 @@ func (a *Agent) ResumeSession(ctx context.Context, r acp.ResumeSessionRequest) (
 	r.McpServers = servers
 	response, err := a.Agent.ResumeSession(ctx, r)
 	return response, a.attach(ep, r.SessionId, err)
+}
+
+// UnstableForkSession 保留可选原生分叉能力，并为子会话分配独立问答端点。
+func (a *Agent) UnstableForkSession(ctx context.Context, r acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
+	agent, ok := a.Agent.(interface {
+		// UnstableForkSession 创建独立原生上下文。
+		UnstableForkSession(context.Context, acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error)
+	})
+	if !ok {
+		return acp.UnstableForkSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionFork)
+	}
+	if acpmeta.ReconcileOnly(r) {
+		return agent.UnstableForkSession(ctx, r)
+	}
+	servers, err := acpmeta.ForkMCPServers(r.McpServers)
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, err
+	}
+	servers, ep, err := a.prepare(servers)
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, err
+	}
+	encoded, err := json.Marshal(servers)
+	if err == nil {
+		err = json.Unmarshal(encoded, &r.McpServers)
+	}
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, a.attach(ep, "", err)
+	}
+	response, err := agent.UnstableForkSession(ctx, r)
+	return response, a.attach(ep, response.SessionId, err)
 }
 
 // Prompt 将问答等待限定在当前执行中，不修改用户消息或原生历史。

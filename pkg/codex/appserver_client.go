@@ -385,6 +385,15 @@ func (c *appServerClient) ThreadStart(ctx context.Context, params protocol.Threa
 	return response, err
 }
 
+// ThreadFork 分叉并订阅一个独立 Codex thread。
+func (c *appServerClient) ThreadFork(ctx context.Context, params protocol.ThreadForkParams) (protocol.ThreadForkResponse, error) {
+	var response protocol.ThreadForkResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewThreadForkRequest(id, params)
+	}, &response)
+	return response, err
+}
+
 // ThreadResume 恢复并订阅一个现有 Codex thread。
 func (c *appServerClient) ThreadResume(ctx context.Context, params protocol.ThreadResumeParams) (protocol.ThreadResumeResponse, error) {
 	var response protocol.ThreadResumeResponse

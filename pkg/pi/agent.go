@@ -3,9 +3,9 @@ package pi
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -32,14 +32,9 @@ type Config struct {
 	Logger *slog.Logger
 	// PermissionMode 选择 default 人工审批、auto 风险审查或 full-access。
 	PermissionMode string
-	// MCPModulePath 仅供显式开发覆盖；默认使用内置开源 MCP 扩展。
+	// MCPModulePath 是宿主提供的绝对 bridge 模块路径，所有 Pi 会话均需要。
 	MCPModulePath string
 }
-
-// bundledMCP 是通过固定 npm 依赖与生成命令构建的开源工厂。
-//
-//go:embed mcp.generated.ts
-var bundledMCP []byte
 
 // Agent 实现唯一的 ACP 接口，每个会话直接拥有一个 Pi 进程。
 type Agent struct {
@@ -51,7 +46,7 @@ type Agent struct {
 	version string
 	// directory 保存生命周期内的私有扩展文件。
 	directory string
-	// modulePath 是内置或显式覆盖的 MCP 工厂路径。
+	// modulePath 是宿主提供的固定 bridge 模块路径。
 	modulePath string
 	// opening 串行化创建和恢复，避免同一历史文件被重复打开。
 	opening contextLock
@@ -83,6 +78,8 @@ type session struct {
 	directory string
 	// process 是直接运行的 Pi CLI。
 	process *rpcProcess
+	// startupEvents 保留扩展就绪前发出的事件，交给会话处理器按原顺序消费。
+	startupEvents []map[string]any
 	// operation 串行化提示与配置变更，取消不获取此锁。
 	operation contextLock
 	// mutex 保护当前回合状态。
@@ -115,7 +112,7 @@ type session struct {
 	callbacks sync.WaitGroup
 }
 
-// NewAgent 解析 Pi 本身并准备内置扩展，不启动额外 ACP 程序。
+// NewAgent 解析 Pi 和宿主 bridge，不启动额外 ACP 程序。
 func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if ctx == nil || config.Logger == nil {
 		return nil, errors.New("Pi requires context and logger")
@@ -140,20 +137,21 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if config.Environment == nil {
 		config.Environment = os.Environ()
 	}
+	if !filepath.IsAbs(config.MCPModulePath) {
+		return nil, errors.New("Pi bridge requires an absolute MCPModulePath")
+	}
+	moduleInfo, err := os.Stat(config.MCPModulePath)
+	if err != nil {
+		return nil, fmt.Errorf("Pi bridge module unavailable: %w", err)
+	}
+	if !moduleInfo.Mode().IsRegular() {
+		return nil, errors.New("Pi bridge module must be a regular file")
+	}
 	directory, err := os.MkdirTemp("", "acp-go-pi-")
 	if err != nil {
 		return nil, err
 	}
-	module := config.MCPModulePath
-	if module == "" {
-		module = filepath.Join(directory, "mcp.ts")
-		err = os.WriteFile(module, bundledMCP, 0600)
-	}
-	if err != nil {
-		_ = os.RemoveAll(directory)
-		return nil, err
-	}
-	return &Agent{config: config, directory: directory, modulePath: module, sessions: map[acp.SessionId]*session{}}, nil
+	return &Agent{config: config, directory: directory, modulePath: config.MCPModulePath, sessions: map[acp.SessionId]*session{}}, nil
 }
 
 // SetAgentConnection 绑定 SDK 拥有的宿主连接。
@@ -171,7 +169,7 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	a.versionOnce.Do(func() {
 		a.version = nativeacp.RuntimeVersion(ctx, a.config.PiPath, append(append([]string{}, a.config.PrefixArgs...), "--version"), a.config.Environment, a.config.WorkingDirectory)
 	})
-	return convert[acp.InitializeResponse](map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "pi", "title": "Pi", "version": buildinfo.Current(), "_meta": acpmeta.RuntimeVersionMetadata(a.version)}, "authMethods": []any{map[string]any{"id": "pi_terminal_login", "name": "Launch Pi to configure credentials", "_meta": map[string]any{"terminal-auth": map[string]any{"command": a.config.PiPath, "args": []string{}, "label": "Launch Pi"}}}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]bool{"http": true, "sse": true}, "promptCapabilities": map[string]bool{"image": true, "embeddedContext": true}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "close": map[string]any{}, "resume": map[string]any{}, "delete": map[string]any{}}}})
+	return convert[acp.InitializeResponse](map[string]any{"protocolVersion": 1, "_meta": acpmeta.ForkMetadata(acpmeta.VerifiedForkMode(a.version, "0.85.1", acpmeta.ForkLatest)), "agentInfo": map[string]any{"name": "pi", "title": "Pi", "version": buildinfo.Current(), "_meta": acpmeta.RuntimeVersionMetadata(a.version)}, "authMethods": []any{map[string]any{"id": "pi_terminal_login", "name": "Launch Pi to configure credentials", "_meta": map[string]any{"terminal-auth": map[string]any{"command": a.config.PiPath, "args": []string{}, "label": "Launch Pi"}}}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]bool{"http": true, "sse": true}, "promptCapabilities": map[string]bool{"image": true, "embeddedContext": true}, "sessionCapabilities": map[string]any{"additionalDirectories": map[string]any{}, "fork": acpmeta.ForkCapability(acpmeta.VerifiedForkMode(a.version, "0.85.1", acpmeta.ForkLatest)), "list": map[string]any{}, "close": map[string]any{}, "resume": map[string]any{}, "delete": map[string]any{}}}})
 }
 
 // Authenticate 由用户在 Pi 原生终端配置提供方，本方法不自动执行登录。

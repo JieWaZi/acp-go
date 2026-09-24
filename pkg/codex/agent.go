@@ -354,6 +354,7 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 				Image: true, EmbeddedContext: true,
 			},
 			SessionCapabilities: acp.SessionCapabilities{
+				Fork:                  acpmeta.ForkCapability(acpmeta.VerifiedForkMode(a.executable.Version, "0.155.1", acpmeta.ForkTurn)),
 				AdditionalDirectories: &acp.SessionAdditionalDirectoriesCapabilities{},
 				Close:                 &acp.SessionCloseCapabilities{},
 				Resume:                &acp.SessionResumeCapabilities{},
@@ -368,6 +369,7 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 		AuthMethods: codexAuthMethods(a.auth.browserAuthEnabled()),
 		Meta: map[string]any{
 			"steering": map[string]any{"supported": true},
+			"fork":     map[string]any{"mode": acpmeta.VerifiedForkMode(a.executable.Version, "0.155.1", acpmeta.ForkTurn)},
 		},
 	}, nil
 }
@@ -866,6 +868,8 @@ func codexPromptResponse(
 		StopReason:    stopReason,
 		UserMessageId: messageID,
 	}
+	turnID, _ := prompt.currentTurn()
+	response.Meta = acpmeta.PositionMetadata(turnID)
 	router := prompt.currentEventRouter()
 	if router == nil {
 		return response

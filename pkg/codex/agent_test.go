@@ -48,6 +48,7 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 	}
 	wantMeta := map[string]any{
 		"steering": map[string]any{"supported": true},
+		"fork":     map[string]any{"mode": "unsupported"},
 	}
 	if !reflect.DeepEqual(response.Meta, wantMeta) {
 		t.Fatalf("initialize meta 为 %#v，期望 %#v", response.Meta, wantMeta)

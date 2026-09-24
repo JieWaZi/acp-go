@@ -45,6 +45,7 @@ func main() {
 			Logger:           logger,
 			WorkingDirectory: cwd,
 			PermissionMode:   os.Getenv("ACP_TEST_PERMISSION"),
+			MCPModulePath:    os.Getenv("PI_MCP_MODULE_PATH"),
 		})
 	default:
 		panic("only offline Kimi, Pi and Cursor fixtures are supported")

@@ -109,6 +109,8 @@ type claudeTurn struct {
 
 // claudeSession 保存一个 ACP Session 独占的 CLI、transport、FIFO 与事件状态。
 type claudeSession struct {
+	// forkMu 让 Prompt、steering 与原生历史复制互斥，避免分叉读取未结束的回合。
+	forkMu sync.RWMutex
 	// agent 提供 ACP update 与 permission connection。
 	agent *Agent
 	// id 是 ACP 与 Claude 共用的 Session ID。

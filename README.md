@@ -111,6 +111,7 @@ Claude 配置示例：
 | `KIMI_PATH` | Kimi | 指定已安装的 `kimi` 路径 |
 | `CURSOR_PATH` | Cursor | 指定 `cursor-agent` 或 `agent` 路径 |
 | `PI_PATH` | Pi | 指定 Pi CLI 路径，默认发现 `pi` |
+| `PI_MCP_MODULE_PATH` | Pi | 宿主提供的 bridge 单文件绝对路径，所有 Pi 会话必需 |
 | `CLAUDE_CODE_EXECUTABLE` | Claude | 指定 Claude CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
 | `CLAUDE_CONFIG_DIR` | Claude | 指定读取本地 Session 历史的 Claude 配置目录 |
 | `CODEX_API_KEY` | Codex | 提供 API Key，优先级高于 `OPENAI_API_KEY` |
@@ -260,7 +261,7 @@ go run ./tools/protocolgen --check
 
 ## 当前边界
 
-- Codex 与 Claude Adapter 不提供 `session/list`、fork、delete 等会话管理能力。
+- Codex 与 Claude Adapter 仍不提供 `session/list` 和 delete；原生 fork 仅在运行时版本核验通过后声明。调用 fork 的宿主须在 `_meta.forkReceiptDirectory` 提供每次操作唯一的绝对持久目录；Adapter 会在原生命令前占用该目录。结果不明时使用同一目录和 `_meta.reconcileOnly=true` 对账，不得重新创建分支。
 - Audio 输入尚未支持，收到请求时会明确失败。
 - Claude 不提供 ACP 认证/登出、terminal、MCP Elicitation、provider 或 goal 能力；当前 Elicitation 只用于内置 `AskUserQuestion` 的 Form 桥接。
 - Codex 不公开 Review、Goal、Realtime、动态客户端工具、Apps、Plugins 或 Marketplace 管理能力。

@@ -24,7 +24,11 @@ func testAgent(t *testing.T) (*Agent, acp.SessionId) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	agent, err := NewAgent(context.Background(), Config{PiPath: executable, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=1", "PI_CODING_AGENT_DIR="+root), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	module := filepath.Join(root, "bridge.mjs")
+	if err := os.WriteFile(module, []byte("export const createMcpAdapter = () => {};"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := NewAgent(context.Background(), Config{PiPath: executable, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=1", "PI_CODING_AGENT_DIR="+root), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MCPModulePath: module})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,14 +351,35 @@ func TestPiRPCProcess(t *testing.T) {
 	}
 	cwd, _ := os.Getwd()
 	file := filepath.Join(os.Getenv("PI_CODING_AGENT_DIR"), "sessions", "fixture.jsonl")
+	id := "fixture-session"
+	resumed := false
+	for i, arg := range os.Args {
+		if arg == "--session" && i+1 < len(os.Args) {
+			file = os.Args[i+1]
+			resumed = true
+		}
+	}
 	_ = os.MkdirAll(filepath.Dir(file), 0700)
-	header, _ := json.Marshal(map[string]any{"type": "session", "id": "fixture-session", "cwd": cwd})
-	_ = os.WriteFile(file, append(header, '\n'), 0600)
+	if resumed {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			os.Exit(9)
+		}
+		var header map[string]any
+		if json.Unmarshal([]byte(strings.SplitN(string(data), "\n", 2)[0]), &header) != nil {
+			os.Exit(9)
+		}
+		id = text(header["id"])
+	} else {
+		header, _ := json.Marshal(map[string]any{"type": "session", "id": id, "cwd": cwd})
+		_ = os.WriteFile(file, append(header, '\n'), 0600)
+	}
 	write := func(value any) {
 		if err := json.NewEncoder(os.Stdout).Encode(value); err != nil {
 			os.Exit(2)
 		}
 	}
+	write(map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.extension-ready", "statusText": "ready"})
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var request map[string]any
@@ -363,8 +388,22 @@ func TestPiRPCProcess(t *testing.T) {
 		}
 		result := any(map[string]any{})
 		switch request["type"] {
+		case "clone":
+			data, err := os.ReadFile(file)
+			if err != nil {
+				os.Exit(9)
+			}
+			parts := strings.SplitN(string(data), "\n", 2)
+			var header map[string]any
+			_ = json.Unmarshal([]byte(parts[0]), &header)
+			id = "fixture-child"
+			header["id"] = id
+			header["parentSession"] = file
+			encoded, _ := json.Marshal(header)
+			file = filepath.Join(filepath.Dir(file), "child.jsonl")
+			_ = os.WriteFile(file, []byte(string(encoded)+"\n"+parts[1]), 0600)
 		case "get_state":
-			result = map[string]any{"sessionId": "fixture-session", "sessionFile": file, "model": map[string]any{"provider": "fixture", "id": "model"}, "thinkingLevel": "high"}
+			result = map[string]any{"sessionId": id, "sessionFile": file, "model": map[string]any{"provider": "fixture", "id": "model"}, "thinkingLevel": "high"}
 		case "get_available_models":
 			result = map[string]any{"models": []any{map[string]any{"provider": "fixture", "id": "model"}}}
 		case "get_available_thinking_levels":
@@ -377,6 +416,12 @@ func TestPiRPCProcess(t *testing.T) {
 			}
 			result = map[string]any{"tokensBefore": 100, "summary": "compacted"}
 		case "prompt":
+			if message := text(request["message"]); message == "before-fork" || message == "child-only" {
+				entry, _ := json.Marshal(map[string]any{"type": "message", "message": map[string]any{"role": "user", "content": message}})
+				history, _ := os.OpenFile(file, os.O_APPEND|os.O_WRONLY, 0600)
+				_, _ = history.Write(append(entry, '\n'))
+				_ = history.Close()
+			}
 			if strings.Contains(text(request["message"]), "file:///tmp/a.bin") && request["message"] != "\n[Embedded Context] file:///tmp/a.bin (application/octet-stream, 3 bytes)" {
 				os.Exit(7)
 			}
@@ -414,6 +459,26 @@ func TestPiRPCProcess(t *testing.T) {
 		write(map[string]any{"type": "response", "id": request["id"], "success": true, "data": result})
 	}
 	os.Exit(0)
+}
+
+// TestPiExtensionLoadFailure 验证 Pi 接受 RPC 命令时仍拒绝未加载成功的扩展。
+func TestPiExtensionLoadFailure(t *testing.T) {
+	p := &rpcProcess{events: make(chan map[string]any, 1)}
+	p.events <- map[string]any{"type": "extension_error", "error": "bridge import failed"}
+	if _, err := p.awaitExtensionReady(context.Background()); err == nil || !strings.Contains(err.Error(), "bridge import failed") {
+		t.Fatalf("extension failure was accepted: %v", err)
+	}
+}
+
+// TestPiExtensionReadyKeepsStartupEvents 验证握手不丢失先于就绪信号的上下文事件。
+func TestPiExtensionReadyKeepsStartupEvents(t *testing.T) {
+	p := &rpcProcess{events: make(chan map[string]any, 2)}
+	p.events <- map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.context-usage", "statusText": "{}"}
+	p.events <- map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.extension-ready", "statusText": "ready"}
+	events, err := p.awaitExtensionReady(context.Background())
+	if err != nil || len(events) != 1 || events[0]["statusKey"] != "acp-go.context-usage" {
+		t.Fatalf("startup events lost: %+v %v", events, err)
+	}
 }
 
 // TestPiBlockedWriteCancellation 验证 Pi 不读 stdin 时，大提示写入仍能有界取消。

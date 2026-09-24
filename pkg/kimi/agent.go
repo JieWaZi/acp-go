@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
@@ -127,6 +128,20 @@ func (agent *Agent) Initialize(ctx context.Context, r acp.InitializeRequest) (ac
 	response, err := agent.Agent.Initialize(ctx, r)
 	if err == nil && response.AgentInfo != nil {
 		agent.kimiCodeCLI.Store(response.AgentInfo.Name == "Kimi Code CLI")
+	}
+	verified := err == nil && response.AgentInfo != nil &&
+		acpmeta.VerifiedForkModeInMinor(response.AgentInfo.Version, "2.0.2", acpmeta.ForkLatest) == acpmeta.ForkLatest
+	if verified && agent.kimiCodeCLI.Load() && response.AgentCapabilities.SessionCapabilities.Fork != nil && response.AgentCapabilities.SessionCapabilities.Close != nil {
+		if response.Meta == nil {
+			response.Meta = map[string]any{}
+		}
+		response.Meta["fork"] = map[string]any{"mode": acpmeta.ForkLatest}
+	} else if err == nil && agent.kimiCodeCLI.Load() {
+		response.AgentCapabilities.SessionCapabilities.Fork = nil
+		if response.Meta == nil {
+			response.Meta = map[string]any{}
+		}
+		response.Meta["fork"] = map[string]any{"mode": acpmeta.ForkUnsupported}
 	}
 	return response, err
 }

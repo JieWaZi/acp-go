@@ -301,6 +301,32 @@ func (p *rpcProcess) call(ctx context.Context, command string, params map[string
 	return call.wait(ctx, output)
 }
 
+// awaitExtensionReady 确认扩展注册成功，并保留此前到达的启动事件供会话按序处理。
+func (p *rpcProcess) awaitExtensionReady(ctx context.Context) ([]map[string]any, error) {
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	var startupEvents []map[string]any
+	for {
+		select {
+		case event, ok := <-p.events:
+			if !ok {
+				return nil, fmt.Errorf("Pi extension failed to load: %w", p.exitError())
+			}
+			if event["type"] == "extension_ui_request" && event["method"] == "setStatus" && event["statusKey"] == "acp-go.extension-ready" && event["statusText"] == "ready" {
+				return startupEvents, nil
+			}
+			if event["type"] == "extension_error" {
+				return nil, fmt.Errorf("Pi extension failed to load: %v", event["error"])
+			}
+			startupEvents = append(startupEvents, event)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			return nil, errors.New("Pi extension did not register within 10s; check MCPModulePath and bridge dependencies")
+		}
+	}
+}
+
 // close 先结束 stdin，超时后回收整个 Pi 进程组。
 func (p *rpcProcess) close(ctx context.Context) error {
 	p.once.Do(func() { close(p.stop); _ = p.input.Close() })

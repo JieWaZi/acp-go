@@ -55,25 +55,40 @@ func TestMCPConfigSnapshotPreservesLiteralsAndReplacesCredentials(t *testing.T) 
 	}
 }
 
-// TestPiDiscoveryNeedsOnlyPi 验证只安装 Pi 即可构造适配器，MCP 工厂来自 Go 内置资源。
-func TestPiDiscoveryNeedsOnlyPi(t *testing.T) {
+// TestPiDiscoveryRequiresHostBridge 验证 Pi 适配器要求宿主提供可读取的绝对模块路径。
+func TestPiDiscoveryRequiresHostBridge(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := NewAgent(context.Background(), Config{PiPath: binary, Environment: []string{"PATH=/no-pi-acp"}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	config := Config{PiPath: binary, Environment: []string{"PATH=/no-pi-acp"}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if _, err := NewAgent(context.Background(), config); err == nil || !strings.Contains(err.Error(), "MCPModulePath") {
+		t.Fatalf("missing bridge must fail clearly: %v", err)
+	}
+	config.MCPModulePath = "relative/bridge.mjs"
+	if _, err := NewAgent(context.Background(), config); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("relative bridge must fail clearly: %v", err)
+	}
+	config.MCPModulePath = filepath.Join(t.TempDir(), "missing.mjs")
+	if _, err := NewAgent(context.Background(), config); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("missing bridge file must fail clearly: %v", err)
+	}
+	config.MCPModulePath = filepath.Join(t.TempDir(), "bridge.mjs")
+	if err := os.WriteFile(config.MCPModulePath, []byte("export const createMcpAdapter = () => {};"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := NewAgent(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	module := agent.modulePath
-	if data, err := os.ReadFile(module); err != nil || len(data) < 1000 {
-		t.Fatalf("missing embedded module: %v", err)
+	if agent.modulePath != config.MCPModulePath {
+		t.Fatal("host bridge path was not retained")
 	}
 	if err := agent.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(module); !os.IsNotExist(err) {
-		t.Fatal("extension not cleaned up")
+	if _, err := os.Stat(config.MCPModulePath); err != nil {
+		t.Fatalf("adapter removed host-owned bridge: %v", err)
 	}
 }
 

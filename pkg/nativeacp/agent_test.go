@@ -323,6 +323,11 @@ func TestACPProcess(t *testing.T) {
 				return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{}}, nil
 			}
 			return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}}, "authMethods": []any{}, "agentInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
+		case "session/fork":
+			if request["sessionId"] != "session" || request["cwd"] != "/fork-target" {
+				return nil, acp.NewInvalidParams(nil)
+			}
+			return map[string]any{"sessionId": "native-child", "configOptions": options("provider/model-a")}, nil
 		case "session/new", "session/load", "session/resume":
 			if variant == "empty-mcp" && method != "session/resume" {
 				if _, ok := request["mcpServers"].([]any); !ok {
@@ -527,5 +532,29 @@ func TestNativeEmptyMCPLists(t *testing.T) {
 	}
 	if _, err = agent.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: created.SessionId, Cwd: cwd}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestNativeForkUsesDedicatedProtocol 验证 Kimi 复用的标准 session/fork 原样传递身份和 cwd。
+func TestNativeForkUsesDedicatedProtocol(t *testing.T) {
+	_, connection, _ := startAgent(t, "fork")
+	if _, err := connection.Initialize(context.Background(), acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	fork, err := connection.UnstableForkSession(context.Background(), acp.UnstableForkSessionRequest{SessionId: "session", Cwd: "/fork-target"})
+	if err != nil || fork.SessionId != "native-child" {
+		t.Fatalf("%+v %v", fork, err)
+	}
+	if _, err := connection.UnstableForkSession(context.Background(), acp.UnstableForkSessionRequest{SessionId: "session", Cwd: "/fork-target", Meta: map[string]any{"forkPosition": "older"}}); err == nil {
+		t.Fatal("unverified historical position accepted")
+	}
+}
+
+// TestNativeForkReconcileDoesNotCreate 验证对账请求不会再次执行原生分叉。
+func TestNativeForkReconcileDoesNotCreate(t *testing.T) {
+	agent := &nativeacp.Agent{}
+	_, err := agent.UnstableForkSession(context.Background(), acp.UnstableForkSessionRequest{SessionId: "session", Cwd: t.TempDir(), Meta: map[string]any{"reconcileOnly": true}})
+	if !errors.Is(err, acpmeta.ErrForkUnconfirmed) {
+		t.Fatalf("reconcile must not create another native fork: %v", err)
 	}
 }

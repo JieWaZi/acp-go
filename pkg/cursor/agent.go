@@ -12,6 +12,8 @@ import (
 
 // Config 保存 cursor 的受控启动配置。
 type Config struct {
+	// StateDirectoryForWorkspace 为分叉目标选择持久状态目录；为空时沿用本 Adapter 的根目录。
+	StateDirectoryForWorkspace func(string) string
 	// StateDirectory 保存受管 Cursor 会话；空值使用用户缓存目录。
 	StateDirectory string
 	// CursorPath 是已安装程序的路径；空值使用默认命令。

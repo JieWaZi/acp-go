@@ -64,6 +64,8 @@ type Protocol struct {
 	SkillsListParams                        *SkillsListParams                        `json:"skillsListParams,omitempty"`
 	SkillsListResponse                      *SkillsListResponse                      `json:"skillsListResponse,omitempty"`
 	TerminalInteractionNotification         *TerminalInteractionNotification         `json:"terminalInteractionNotification,omitempty"`
+	ThreadForkParams                        *ThreadForkParams                        `json:"threadForkParams,omitempty"`
+	ThreadForkResponse                      *ThreadForkResponse                      `json:"threadForkResponse,omitempty"`
 	ThreadReadParams                        *ThreadReadParams                        `json:"threadReadParams,omitempty"`
 	ThreadReadResponse                      *ThreadReadResponse                      `json:"threadReadResponse,omitempty"`
 	ThreadResumeParams                      *ThreadResumeParams                      `json:"threadResumeParams,omitempty"`
@@ -964,14 +966,64 @@ type TerminalInteractionNotification struct {
 	TurnID    string `json:"turnId"`
 }
 
-type ThreadReadParams struct {
-	// When true, include turns and their items from rollout history.
-	IncludeTurns *bool  `json:"includeTurns,omitempty"`
-	ThreadID     string `json:"threadId"`
+// There are two ways to fork a thread: 1. By thread_id: load the thread from disk by
+// thread_id and fork it into a new thread. 2. By path: load the thread from disk by path
+// and fork it into a new thread.
+//
+// If using a non-empty path, the thread_id param will be ignored. Empty string path values
+// are treated as absent.
+//
+// Prefer using thread_id whenever possible.
+type ThreadForkParams struct {
+	ApprovalPolicy *ApprovalPolicy `json:"approvalPolicy,omitempty"`
+	// Override where approval requests are routed for review on this thread and subsequent
+	// turns.
+	ApprovalsReviewer     *ApprovalsReviewerEnum     `json:"approvalsReviewer,omitempty"`
+	BaseInstructions      *string                    `json:"baseInstructions,omitempty"`
+	Config                map[string]json.RawMessage `json:"config,omitempty"`
+	Cwd                   *string                    `json:"cwd,omitempty"`
+	DeveloperInstructions *string                    `json:"developerInstructions,omitempty"`
+	Ephemeral             *bool                      `json:"ephemeral,omitempty"`
+	// Optional last turn id to fork through, inclusive.
+	//
+	// When specified, turns after `last_turn_id` are omitted from the fork. The referenced turn
+	// cannot be in progress.
+	LastTurnID *string `json:"lastTurnId,omitempty"`
+	// Configuration overrides for the forked thread, if any.
+	Model         *string      `json:"model,omitempty"`
+	ModelProvider *string      `json:"modelProvider,omitempty"`
+	Sandbox       *SandboxEnum `json:"sandbox,omitempty"`
+	ServiceTier   *string      `json:"serviceTier,omitempty"`
+	ThreadID      string       `json:"threadId"`
+	// Optional client-supplied analytics source classification for this forked thread.
+	ThreadSource *string `json:"threadSource,omitempty"`
 }
 
-type ThreadReadResponse struct {
-	Thread Thread `json:"thread"`
+type ThreadForkResponse struct {
+	ApprovalPolicy *ApprovalPolicyUnion `json:"approvalPolicy"`
+	// Reviewer currently used for approval requests on this thread.
+	ApprovalsReviewer ApprovalsReviewerEnum `json:"approvalsReviewer"`
+	Cwd               string                `json:"cwd"`
+	// Environment-native paths to instruction source files currently loaded for this thread.
+	InstructionSources []string `json:"instructionSources,omitempty"`
+	Model              string   `json:"model"`
+	ModelProvider      string   `json:"modelProvider"`
+	ReasoningEffort    *string  `json:"reasoningEffort,omitempty"`
+	// Legacy sandbox policy retained for compatibility. Experimental clients should prefer
+	// `activePermissionProfile` for profile provenance.
+	Sandbox     SandboxClass `json:"sandbox"`
+	ServiceTier *string      `json:"serviceTier,omitempty"`
+	Thread      Thread       `json:"thread"`
+}
+
+// Legacy sandbox policy retained for compatibility. Experimental clients should prefer
+// `activePermissionProfile` for profile provenance.
+type SandboxClass struct {
+	Type                SandboxPolicyType   `json:"type"`
+	NetworkAccess       *NetworkAccessUnion `json:"networkAccess,omitempty"`
+	ExcludeSlashTmp     *bool               `json:"excludeSlashTmp,omitempty"`
+	ExcludeTmpdirEnvVar *bool               `json:"excludeTmpdirEnvVar,omitempty"`
+	WritableRoots       []string            `json:"writableRoots,omitempty"`
 }
 
 type Thread struct {
@@ -1089,6 +1141,16 @@ type TurnElement struct {
 	Status    TurnStatus `json:"status"`
 }
 
+type ThreadReadParams struct {
+	// When true, include turns and their items from rollout history.
+	IncludeTurns *bool  `json:"includeTurns,omitempty"`
+	ThreadID     string `json:"threadId"`
+}
+
+type ThreadReadResponse struct {
+	Thread Thread `json:"thread"`
+}
+
 // There are three ways to resume a thread: 1. By thread_id: load the thread from disk by
 // thread_id and resume it. 2. By history: instantiate the thread from memory and resume it.
 // 3. By path: load the thread from disk by path and resume it.
@@ -1135,16 +1197,6 @@ type ThreadResumeResponse struct {
 	Sandbox     SandboxClass `json:"sandbox"`
 	ServiceTier *string      `json:"serviceTier,omitempty"`
 	Thread      Thread       `json:"thread"`
-}
-
-// Legacy sandbox policy retained for compatibility. Experimental clients should prefer
-// `activePermissionProfile` for profile provenance.
-type SandboxClass struct {
-	Type                SandboxPolicyType   `json:"type"`
-	NetworkAccess       *NetworkAccessUnion `json:"networkAccess,omitempty"`
-	ExcludeSlashTmp     *bool               `json:"excludeSlashTmp,omitempty"`
-	ExcludeTmpdirEnvVar *bool               `json:"excludeTmpdirEnvVar,omitempty"`
-	WritableRoots       []string            `json:"writableRoots,omitempty"`
 }
 
 type ThreadStartParams struct {
@@ -1796,6 +1848,22 @@ const (
 	ScopeUser   Scope = "user"
 )
 
+type NetworkAccess string
+
+const (
+	Enabled    NetworkAccess = "enabled"
+	Restricted NetworkAccess = "restricted"
+)
+
+type SandboxPolicyType string
+
+const (
+	ExternalSandbox                   SandboxPolicyType = "externalSandbox"
+	SandboxPolicyTypeDangerFullAccess SandboxPolicyType = "dangerFullAccess"
+	SandboxPolicyTypeReadOnly         SandboxPolicyType = "readOnly"
+	SandboxPolicyTypeWorkspaceWrite   SandboxPolicyType = "workspaceWrite"
+)
+
 type SubAgentEnum string
 
 const (
@@ -1861,22 +1929,6 @@ const (
 	FluffyNone PersonalityEnum = "none"
 	Friendly   PersonalityEnum = "friendly"
 	Pragmatic  PersonalityEnum = "pragmatic"
-)
-
-type NetworkAccess string
-
-const (
-	Enabled    NetworkAccess = "enabled"
-	Restricted NetworkAccess = "restricted"
-)
-
-type SandboxPolicyType string
-
-const (
-	ExternalSandbox                   SandboxPolicyType = "externalSandbox"
-	SandboxPolicyTypeDangerFullAccess SandboxPolicyType = "dangerFullAccess"
-	SandboxPolicyTypeReadOnly         SandboxPolicyType = "readOnly"
-	SandboxPolicyTypeWorkspaceWrite   SandboxPolicyType = "workspaceWrite"
 )
 
 type SessionStartSourceEnum string
@@ -2054,6 +2106,49 @@ func (x *RequestID) MarshalJSON() ([]byte, error) {
 	return marshalUnion(x.Integer, nil, nil, x.String, false, nil, false, nil, false, nil, false, nil, false)
 }
 
+type ApprovalPolicyUnion struct {
+	Enum                   *ApprovalPolicyEnum
+	GranularAskForApproval *GranularAskForApproval
+}
+
+func (x *ApprovalPolicyUnion) UnmarshalJSON(data []byte) error {
+	x.GranularAskForApproval = nil
+	x.Enum = nil
+	var c GranularAskForApproval
+	object, err := unmarshalUnion(data, nil, nil, nil, nil, false, nil, true, &c, false, nil, true, &x.Enum, false)
+	if err != nil {
+		return err
+	}
+	if object {
+		x.GranularAskForApproval = &c
+	}
+	return nil
+}
+
+func (x *ApprovalPolicyUnion) MarshalJSON() ([]byte, error) {
+	return marshalUnion(nil, nil, nil, nil, false, nil, x.GranularAskForApproval != nil, x.GranularAskForApproval, false, nil, x.Enum != nil, x.Enum, false)
+}
+
+type NetworkAccessUnion struct {
+	Bool *bool
+	Enum *NetworkAccess
+}
+
+func (x *NetworkAccessUnion) UnmarshalJSON(data []byte) error {
+	x.Enum = nil
+	object, err := unmarshalUnion(data, nil, nil, &x.Bool, nil, false, nil, false, nil, false, nil, true, &x.Enum, false)
+	if err != nil {
+		return err
+	}
+	if object {
+	}
+	return nil
+}
+
+func (x *NetworkAccessUnion) MarshalJSON() ([]byte, error) {
+	return marshalUnion(nil, nil, x.Bool, nil, false, nil, false, nil, false, nil, x.Enum != nil, x.Enum, false)
+}
+
 // Origin of the thread (CLI, VSCode, codex exec, codex app-server, etc.).
 type SourceUnion struct {
 	Enum          *SourceEnum
@@ -2099,49 +2194,6 @@ func (x *SubAgent) UnmarshalJSON(data []byte) error {
 
 func (x *SubAgent) MarshalJSON() ([]byte, error) {
 	return marshalUnion(nil, nil, nil, nil, false, nil, x.SubAgentSource != nil, x.SubAgentSource, false, nil, x.Enum != nil, x.Enum, false)
-}
-
-type ApprovalPolicyUnion struct {
-	Enum                   *ApprovalPolicyEnum
-	GranularAskForApproval *GranularAskForApproval
-}
-
-func (x *ApprovalPolicyUnion) UnmarshalJSON(data []byte) error {
-	x.GranularAskForApproval = nil
-	x.Enum = nil
-	var c GranularAskForApproval
-	object, err := unmarshalUnion(data, nil, nil, nil, nil, false, nil, true, &c, false, nil, true, &x.Enum, false)
-	if err != nil {
-		return err
-	}
-	if object {
-		x.GranularAskForApproval = &c
-	}
-	return nil
-}
-
-func (x *ApprovalPolicyUnion) MarshalJSON() ([]byte, error) {
-	return marshalUnion(nil, nil, nil, nil, false, nil, x.GranularAskForApproval != nil, x.GranularAskForApproval, false, nil, x.Enum != nil, x.Enum, false)
-}
-
-type NetworkAccessUnion struct {
-	Bool *bool
-	Enum *NetworkAccess
-}
-
-func (x *NetworkAccessUnion) UnmarshalJSON(data []byte) error {
-	x.Enum = nil
-	object, err := unmarshalUnion(data, nil, nil, &x.Bool, nil, false, nil, false, nil, false, nil, true, &x.Enum, false)
-	if err != nil {
-		return err
-	}
-	if object {
-	}
-	return nil
-}
-
-func (x *NetworkAccessUnion) MarshalJSON() ([]byte, error) {
-	return marshalUnion(nil, nil, x.Bool, nil, false, nil, false, nil, false, nil, x.Enum != nil, x.Enum, false)
 }
 
 func unmarshalUnion(data []byte, pi **int64, pf **float64, pb **bool, ps **string, haveArray bool, pa interface{}, haveObject bool, pc interface{}, haveMap bool, pm interface{}, haveEnum bool, pe interface{}, nullable bool) (bool, error) {

@@ -16,12 +16,13 @@ import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 // Runs only loopback model/MCP fixtures; never uses a personal provider or credentials.
-if (!process.argv[2] || !process.argv[3])
+if (!process.argv[2] || !process.argv[3] || !process.argv[4])
   throw new Error(
-    "Usage: node scripts/pi-integration/run.mjs <npm-install-directory> <acp-agent-binary>",
+    "Usage: node scripts/pi-integration/run.mjs <npm-install-directory> <acp-agent-binary> <bridge-module>",
   );
 const dependencies = resolve(process.argv[2]);
 const binary = resolve(process.argv[3]);
+const bridge = resolve(process.argv[4]);
 const requireDependency = createRequire(join(dependencies, "package.json"));
 const { Server } = requireDependency(
   "@modelcontextprotocol/sdk/server/index.js",
@@ -325,7 +326,7 @@ const env = {
   PI_CODING_AGENT_DIR: configDir,
   PI_PATH: dependencies + "/node_modules/.bin/pi",
   PI_ACP_PATH: "/must-not-launch-pi-acp",
-  PI_MCP_ADAPTER_PATH: "/must-use-embedded-module",
+  PI_MCP_MODULE_PATH: bridge,
   XDG_CONFIG_HOME: configDir,
   NO_COLOR: "1",
   PI_SKIP_VERSION_CHECK: "1",

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
@@ -100,7 +99,11 @@ func findHistoryPath(sessionID string, environment []string) (string, error) {
 	}
 	configDirectory := claudeEnvironmentValue(environment, "CLAUDE_CONFIG_DIR")
 	if configDirectory == "" {
-		home, err := os.UserHomeDir()
+		home := claudeEnvironmentValue(environment, "HOME")
+		var err error
+		if home == "" {
+			home, err = os.UserHomeDir()
+		}
 		if err != nil {
 			return "", err
 		}
@@ -113,8 +116,10 @@ func findHistoryPath(sessionID string, environment []string) (string, error) {
 	if len(matches) == 0 {
 		return "", ErrClaudeHistoryNotFound
 	}
-	// 多个 project 意外包含同一 ID 时使用排序首项，避免文件系统遍历顺序造成不确定回放。
-	sort.Strings(matches)
+	// 身份歧义不能依赖目录排序猜测，尤其不能把错误上下文用于分叉。
+	if len(matches) != 1 {
+		return "", errors.New("ambiguous Claude session history identity")
+	}
 	return matches[0], nil
 }
 

@@ -216,8 +216,8 @@ func TestRunProductionCompositionSessionFlow(t *testing.T) {
 		t.Fatalf("认证能力为 %#v，methods=%#v", initialized.AgentCapabilities.Auth, initialized.AuthMethods)
 	}
 	steering, ok := initialized.Meta["steering"].(map[string]any)
-	if !ok || len(initialized.Meta) != 1 || steering["supported"] != true {
-		t.Fatalf("initialize meta 为 %#v，期望仅 steering.supported=true", initialized.Meta)
+	if !ok || len(initialized.Meta) != 2 || steering["supported"] != true {
+		t.Fatalf("initialize meta 为 %#v，期望 steering.supported=true 及版本限定的 fork 能力", initialized.Meta)
 	}
 
 	if _, err = connection.Authenticate(ctx, acp.AuthenticateRequest{

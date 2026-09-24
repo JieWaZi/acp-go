@@ -41,7 +41,18 @@ func (a *Agent) events(s *session) {
 		s.callbacks.Wait()
 		close(s.eventsDone)
 	}()
-	for event := range s.process.events {
+	startupEvents := s.startupEvents
+	for {
+		var event map[string]any
+		if len(startupEvents) > 0 {
+			event, startupEvents = startupEvents[0], startupEvents[1:]
+		} else {
+			var ok bool
+			event, ok = <-s.process.events
+			if !ok {
+				break
+			}
+		}
 		s.mutex.Lock()
 		ctx := s.turnContext
 		if ctx == nil {

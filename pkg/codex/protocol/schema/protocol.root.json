@@ -9,6 +9,8 @@
     "initializeResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/InitializeResponse" },
     "threadStartParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadStartParams" },
     "threadStartResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadStartResponse" },
+    "threadForkParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadForkParams" },
+    "threadForkResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadForkResponse" },
     "threadResumeParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadResumeParams" },
     "threadResumeResponse": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadResumeResponse" },
     "threadReadParams": { "$ref": "./codex_app_server_protocol.schemas.json#/definitions/v2/ThreadReadParams" },

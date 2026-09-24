@@ -29,7 +29,7 @@ func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd 
 	}
 	sum := md5.Sum([]byte(path)) // 与官方工作目录索引一致，不用于安全校验。
 	source := newStoreCursor(filepath.Join(
-		a.state,
+		a.stateForWorkspace(cwd),
 		"chats",
 		hex.EncodeToString(sum[:]),
 		string(id),
@@ -68,7 +68,7 @@ func (a *Agent) snapshotControlStore(ctx context.Context, id acp.SessionId, cwd 
 }
 
 // claim 在读取或恢复日志之前独占原生身份；锁文件不删除，避免 inode 替换使互斥失效。
-func (a *Agent) claim(id acp.SessionId) (*flock.Flock, error) {
+func (a *Agent) claim(id acp.SessionId, cwd ...string) (*flock.Flock, error) {
 	if id == "" || strings.ContainsAny(string(id), "/\\\x00") || id == "." || id == ".." {
 		return nil, errors.New("invalid Cursor session identity")
 	}
@@ -78,7 +78,11 @@ func (a *Agent) claim(id acp.SessionId) (*flock.Flock, error) {
 	if unavailable {
 		return nil, errors.New("Cursor session already loaded or agent closed")
 	}
-	directory := filepath.Join(a.state, "locks")
+	state := a.state
+	if len(cwd) > 0 {
+		state = a.stateForWorkspace(cwd[0])
+	}
+	directory := filepath.Join(state, "locks")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return nil, err
 	}

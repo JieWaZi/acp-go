@@ -20,8 +20,8 @@ import (
 
 // NewSession 创建独立 Pi 原生会话及其 MCP 快照。
 func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	if len(request.AdditionalDirectories) != 0 {
-		return acp.NewSessionResponse{}, acp.NewInvalidParams(map[string]any{"message": "Pi does not support additionalDirectories"})
+	if err := validateAdditionalDirectories(request.AdditionalDirectories); err != nil {
+		return acp.NewSessionResponse{}, err
 	}
 	s, options, err := a.open(ctx, request.Cwd, "", request.McpServers)
 	if err != nil {
@@ -94,6 +94,10 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 	if err = p.call(ctx, "get_state", nil, &state); err != nil {
 		return nil, nil, err
 	}
+	startupEvents, err := p.awaitExtensionReady(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	id := text(state["sessionId"])
 	file = text(state["sessionFile"])
 	if id == "" || file == "" {
@@ -102,7 +106,7 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 	if err = os.MkdirAll(filepath.Dir(file), 0700); err != nil {
 		return nil, nil, err
 	}
-	s := &session{id: acp.SessionId(id), cwd: cwd, file: file, directory: directory, process: p, tools: map[string]string{}, snapshots: map[string]fileSnapshot{}, bashOutput: map[string]bashOutputState{}, eventsDone: make(chan struct{})}
+	s := &session{id: acp.SessionId(id), cwd: cwd, file: file, directory: directory, process: p, startupEvents: startupEvents, tools: map[string]string{}, snapshots: map[string]fileSnapshot{}, bashOutput: map[string]bashOutputState{}, eventsDone: make(chan struct{})}
 	options, err := s.configuration(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -132,8 +136,8 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 
 // LoadSession 使用真实历史文件恢复，并重建本次 MCP 快照及历史消息。
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	if len(request.AdditionalDirectories) != 0 {
-		return acp.LoadSessionResponse{}, acp.NewInvalidParams(map[string]any{"message": "Pi does not support additionalDirectories"})
+	if err := validateAdditionalDirectories(request.AdditionalDirectories); err != nil {
+		return acp.LoadSessionResponse{}, err
 	}
 	file, err := a.findSession(request.SessionId, request.Cwd)
 	if err != nil {
@@ -181,8 +185,8 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 
 // ResumeSession 与 load 使用相同的配置刷新，但不回放历史。
 func (a *Agent) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	if len(request.AdditionalDirectories) != 0 {
-		return acp.ResumeSessionResponse{}, acp.NewInvalidParams(map[string]any{"message": "Pi does not support additionalDirectories"})
+	if err := validateAdditionalDirectories(request.AdditionalDirectories); err != nil {
+		return acp.ResumeSessionResponse{}, err
 	}
 	file, err := a.findSession(request.SessionId, request.Cwd)
 	if err != nil {
@@ -565,4 +569,19 @@ func sameDirectory(left, right string) bool {
 	a, errA := os.Stat(left)
 	b, errB := os.Stat(right)
 	return errA == nil && errB == nil && os.SameFile(a, b)
+}
+
+// validateAdditionalDirectories 校验宿主冻结的项目范围，不伪造 Pi 不存在的沙箱参数。
+// Pi 原生文件工具支持工作区外绝对路径，读写仍经过现有扩展审批。
+func validateAdditionalDirectories(directories []string) error {
+	for _, directory := range directories {
+		if !filepath.IsAbs(directory) {
+			return acp.NewInvalidParams(map[string]any{"message": "additional directory must be absolute"})
+		}
+		info, err := os.Stat(directory)
+		if err != nil || !info.IsDir() {
+			return acp.NewInvalidParams(map[string]any{"message": "additional directory is unavailable"})
+		}
+	}
+	return nil
 }

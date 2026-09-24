@@ -30,3 +30,14 @@ func (l *contextLock) Lock(ctx context.Context) error {
 
 // Unlock 释放会话令牌。
 func (l *contextLock) Unlock() { <-l.token }
+
+// TryLock 用于必须立即拒绝活跃会话的管理操作。
+func (l *contextLock) TryLock() bool {
+	l.once.Do(func() { l.token = make(chan struct{}, 1) })
+	select {
+	case l.token <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
