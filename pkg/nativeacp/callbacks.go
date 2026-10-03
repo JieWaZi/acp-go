@@ -135,7 +135,7 @@ func (agent *Agent) CreateElicitation(
 
 // SendRequest 实现 SessionBridge，协议编解码仍由 nativeacp 统一拥有。
 func (agent *Agent) SendRequest(ctx context.Context, method string, request any, response any) error {
-	raw, err := sendNativeRequest[json.RawMessage](agent, ctx, method, request)
+	raw, err := agent.CallNative(ctx, method, request)
 	if err != nil {
 		return err
 	}
@@ -143,4 +143,9 @@ func (agent *Agent) SendRequest(ctx context.Context, method string, request any,
 		return nil
 	}
 	return json.Unmarshal(raw, response)
+}
+
+// CallNative 为兼容层提供窄原生请求入口，保留 SDK 的原始结果和协议错误。
+func (agent *Agent) CallNative(ctx context.Context, method string, request any) (json.RawMessage, error) {
+	return sendNativeRequest[json.RawMessage](agent, ctx, method, request)
 }

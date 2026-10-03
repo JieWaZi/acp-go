@@ -11,6 +11,8 @@ import (
 
 // sessionOptions 将宿主统一配置标识映射到上游声明的实际标识。
 type sessionOptions struct {
+	// queue 保存显式开启的会话执行队列。
+	queue *promptQueue
 	// configMutex 串行化一次配置操作中的多项原生参数更新。
 	configMutex sync.Mutex
 	// ids 按 model/reasoning 等规范化标识保存原生配置标识。
@@ -98,6 +100,12 @@ func (agent *Agent) normalizeSession(
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state.options = response.ConfigOptions
+	if agent.config.PromptFIFO {
+		if old := agent.sessions[id]; old != nil && old.queue != nil {
+			old.queue.close()
+		}
+		state.queue = &promptQueue{waiting: []*promptWaiter{}}
+	}
 	agent.sessions[id] = state
 	return nil
 }

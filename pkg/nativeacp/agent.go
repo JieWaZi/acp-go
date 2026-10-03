@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,10 @@ const maxNativeDiagnosticBytes = 4 << 10
 
 // Config 描述外部 ACP 进程；不会下载程序或修改用户配置。
 type Config struct {
+	// PromptFIFO 为新适配器开启每会话排队与可取消的执行生命周期。
+	PromptFIFO bool
+	// StrictCloseSession 原样调用原生 close，保留不支持时的方法错误。
+	StrictCloseSession bool
 	// Command 是已安装可执行文件的路径或名称。
 	Command string
 	// Args 是包含 ACP 子命令的完整参数列表。
@@ -82,6 +87,8 @@ type Agent struct {
 	sessions map[acp.SessionId]*sessionOptions
 	// active 保存活跃 Prompt，用于路由缺少 sessionId 的厂商回调。
 	active map[acp.SessionId]bool
+	// turnOwners 防止已关闭队列的清理删除恢复后新一轮的状态。
+	turnOwners map[acp.SessionId]*promptWaiter
 	// toolSessions 保存已收到工具更新的所属会话。
 	toolSessions map[acp.ToolCallId]acp.SessionId
 	// config 保存协议特性开关。
@@ -111,6 +118,9 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	config.Args = slices.Clone(config.Args)
+	config.VersionArgs = slices.Clone(config.VersionArgs)
+	config.Environment = slices.Clone(config.Environment)
 	resolved, err := ResolveCommand(config.Command, config.Environment)
 	if err != nil {
 		return nil, err
@@ -151,6 +161,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		bound:        make(chan struct{}),
 		sessions:     make(map[acp.SessionId]*sessionOptions),
 		active:       make(map[acp.SessionId]bool),
+		turnOwners:   make(map[acp.SessionId]*promptWaiter),
 		toolSessions: make(map[acp.ToolCallId]acp.SessionId),
 		config:       config,
 		prompts:      make(map[acp.SessionId][]acp.ContentBlock),
@@ -238,7 +249,11 @@ func (agent *Agent) Close(ctx context.Context) error {
 		return agent.exitError()
 	default:
 	}
-	agent.closeOnce.Do(func() { close(agent.closed); _ = agent.input.Close() })
+	agent.closeOnce.Do(func() {
+		close(agent.closed)
+		agent.closePromptQueues()
+		_ = agent.input.Close()
+	})
 	timer := time.NewTimer(500 * time.Millisecond)
 	defer timer.Stop()
 	select {
@@ -312,6 +327,9 @@ func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeReques
 
 // Prompt 原样转发内容，取消时补发标准 session/cancel。
 func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
+	if agent.config.PromptFIFO {
+		return agent.promptFIFO(ctx, request)
+	}
 	agent.mutex.Lock()
 	if agent.active[request.SessionId] {
 		agent.mutex.Unlock()
@@ -349,6 +367,9 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 
 // Cancel 请求原生 Agent 中断当前 Session 的执行。
 func (agent *Agent) Cancel(ctx context.Context, request acp.CancelNotification) error {
+	if agent.config.PromptFIFO {
+		return agent.cancelFIFO(ctx, request)
+	}
 	agent.mutex.Lock()
 	cancel := agent.turnCancels[request.SessionId]
 	agent.mutex.Unlock()
@@ -362,12 +383,15 @@ func (agent *Agent) Cancel(ctx context.Context, request acp.CancelNotification) 
 func (agent *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	agent.mutex.Lock()
 	supported := agent.capabilities.SessionCapabilities.Close != nil
+	if state := agent.sessions[request.SessionId]; state != nil && state.queue != nil {
+		state.queue.close()
+	}
 	delete(agent.sessions, request.SessionId)
 	agent.mutex.Unlock()
 	if agent.config.SessionAdapter != nil {
 		agent.config.SessionAdapter.ForgetSession(request.SessionId)
 	}
-	if supported {
+	if supported || agent.config.StrictCloseSession {
 		return sendNativeRequest[acp.CloseSessionResponse](agent, ctx, "session/close", request)
 	}
 	return acp.CloseSessionResponse{}, agent.Cancel(ctx, acp.CancelNotification{SessionId: request.SessionId})
