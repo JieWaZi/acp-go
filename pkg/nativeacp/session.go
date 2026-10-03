@@ -21,6 +21,8 @@ type sessionOptions struct {
 	ids map[acp.SessionConfigId]acp.SessionConfigId
 	// options 是最后一次会话返回的配置目录。
 	options []acp.SessionConfigOption
+	// models 保存当前会话代的旧版模型目录，恢复时以新响应克隆替换。
+	models json.RawMessage
 }
 
 // nativeSessionResponse 兼容当前仍提供 models 的外部 ACP 实现。
@@ -84,6 +86,7 @@ func (agent *Agent) normalizeSession(
 	cwd string,
 ) error {
 	state := &sessionOptions{workingDirectory: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
+	state.models = append(json.RawMessage{}, response.Models...)
 	if agent.config.SessionAdapter != nil {
 		snapshot := SessionSnapshot{
 			ConfigOptions:    response.ConfigOptions,
@@ -99,6 +102,7 @@ func (agent *Agent) normalizeSession(
 	} else {
 		response.ConfigOptions = NormalizeOptions(response.ConfigOptions, state.ids)
 	}
+	response.ConfigOptions = agent.enrichConfigOptions(state, response.ConfigOptions)
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state.options = response.ConfigOptions
@@ -189,6 +193,7 @@ func (agent *Agent) SetSessionConfigOption(
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	response.ConfigOptions = NormalizeOptions(response.ConfigOptions, state.ids)
+	response.ConfigOptions = agent.enrichConfigOptions(state, response.ConfigOptions)
 	state.options = response.ConfigOptions
 	return response, nil
 }
@@ -232,6 +237,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 			} else {
 				update.ConfigOptions = NormalizeOptions(update.ConfigOptions, state.ids)
 			}
+			update.ConfigOptions = agent.enrichConfigOptions(state, update.ConfigOptions)
 			state.options = update.ConfigOptions
 		}
 	}
@@ -241,6 +247,21 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 		}
 		agent.toolChanged = make(chan struct{})
 	}
+}
+
+// enrichConfigOptions 仅向显式启用的纯投影提供当前会话代事实；模型原文克隆避免外部修改保存的目录。
+func (agent *Agent) enrichConfigOptions(
+	state *sessionOptions,
+	options []acp.SessionConfigOption,
+) []acp.SessionConfigOption {
+	if agent.config.EnrichConfigOptions == nil {
+		return options
+	}
+	return agent.config.EnrichConfigOptions(SessionSnapshot{
+		ConfigOptions:    options,
+		Models:           append(json.RawMessage{}, state.models...),
+		WorkingDirectory: state.workingDirectory,
+	})
 }
 
 // interactionSession 只在会话归属唯一时路由缺少会话标识的请求。

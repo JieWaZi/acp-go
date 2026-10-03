@@ -45,6 +45,8 @@ type Config struct {
 	CallbackAdapter CallbackAdapter
 	// SessionAdapter 处理当前 CLI 的非标准模型或思考配置；nil 表示标准 ACP。
 	SessionAdapter SessionAdapter
+	// EnrichConfigOptions 纯函数补充已规范化目录；nil 保持原行为。可能持锁调用，禁止 RPC 或重入 Agent。
+	EnrichConfigOptions func(SessionSnapshot) []acp.SessionConfigOption
 	// PermissionAdapter 处理当前 CLI 的非标准审批策略；nil 表示完全交给宿主。
 	PermissionAdapter PermissionAdapter
 }

@@ -26,7 +26,7 @@
 | Cursor | `--adapter cursor` | 复用 `cursor-agent acp`，默认命令缺失时尝试 `agent acp` | 原生会话、模型、MCP、审批、提问与计划/待办投影 |
 | OpenCode | `--adapter opencode` | 复用 `opencode acp` | 原生 provider/model、variants/thinking、会话、MCP、审批与附加目录；即时 steering 不支持 |
 | Gemini CLI | `--adapter gemini` | 复用 `gemini --acp` | 每会话原生进程；模型/精确 thinking、MCP、本轮 usage、auto 审查/yolo、真实恢复与关闭；配置仅空闲时重建，steering 不支持 |
-| Grok Build | `--adapter grok` | 复用 `grok agent stdio` | 原生模型/effort、三档权限、会话、MCP、queued steering |
+| Grok Build | `--adapter grok` | 复用 `grok agent stdio` | 原生模型/逐模型 effort metadata、三档权限、会话、MCP、queued steering |
 | Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、三档权限、AskUserQuestion 与 MCP |
 
 Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 复用 Go ACP SDK 连接原生 ACP；Pi 在 Go 内部适配官方 RPC；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
@@ -258,6 +258,8 @@ go run ./tools/protocolgen --check
 ```
 
 OpenCode/Gemini/Grok 的逐项证据见 [原生 ACP 测试矩阵](docs/NATIVE_ACP_TEST_MATRIX.md)。账号隔离必须遵循各包 README：OpenCode 隔离四个 XDG 根（包括真正 auth.json 数据根），Gemini 使用 GEMINI_CLI_HOME 根下 .gemini，Grok 使用 GROK_HOME。
+
+Grok 将源提供的逐模型 effort metadata 投影到模型目录，当前配置和 setter/异步回执保持权威；metadata 缺失时需切换模型读取原生回执，不能从其他模型复制菜单。固定上游明确支持且无菜单时才使用其五档 fallback。
 
 真实 CLI 测试可能联网或计费，必须显式开启；执行方式与证据边界见各 Adapter README 与 `UPSTREAM.md`。
 

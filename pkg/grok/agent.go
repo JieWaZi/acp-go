@@ -54,6 +54,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		WorkingDirectory: config.WorkingDirectory, Logger: config.Logger,
 		RuntimeName: "grok", VersionArgs: append(append([]string{}, config.PrefixArgs...), "--version"),
 		PromptFIFO: true, StrictCloseSession: true,
+		EnrichConfigOptions: enrichModelCatalog,
 	})
 	if err != nil {
 		return nil, err
