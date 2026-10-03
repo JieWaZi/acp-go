@@ -4,7 +4,7 @@
 
 ## 架构
 
-以官方 CLI 的原生 ACP 为执行核心，Go SDK 承担双向代理、进程生命周期、客户端回调与公共 API。OpenCode 启动 `opencode acp`，Gemini CLI 启动 `gemini --acp`，Grok Build 启动 `grok agent stdio`。公共包分别为 `pkg/opencode`、`pkg/gemini`、`pkg/grok`；共享实现放在 `internal/nativeacp`。三个公共包提供与现有包一致的 Config、NewAgent、Agent、Close、SetAgentConnection。
+以官方 CLI 的原生 ACP 为执行核心，Go SDK 承担双向代理、进程生命周期、客户端回调与公共 API。OpenCode 启动 `opencode acp`，Gemini CLI 启动 `gemini --acp`，Grok Build 启动 `grok agent stdio`。公共包分别为 `pkg/opencode`、`pkg/gemini`、`pkg/grok`；共享实现复用最新主线已有的 `pkg/nativeacp`，禁止重复建立 transport。三个公共包提供与现有包一致的 Config、NewAgent、Agent、Close、SetAgentConnection。工作基线为 48b2b12，包含已有 Kimi、Cursor、Pi 适配器；其默认行为必须保留，新生命周期语义由显式配置启用。
 
 上游基线：OpenCode v1.18.34；Gemini CLI v0.62.0；Grok Build 提交 2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8。acpx v0.19.4 仅作为互操作实现参考。各包 UPSTREAM.md 保存固定提交、入口、能力映射和差异。
 
