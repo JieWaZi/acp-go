@@ -6,7 +6,7 @@
 
 **Architecture:** 官方原生 ACP CLI + 复用 pkg/nativeacp 双向进程代理 + 三个轻量公共适配器，供应商差异由可追溯兼容层处理。基线 48b2b12 已包含五种适配器，不能重复开发桥接。
 
-**Tech Stack:** Go 1.25.8、coder/acp-go-sdk v0.13.5、官方 CLI；Ally Go 后端和 Svelte/TypeScript 桌面端。
+**Tech Stack:** Go 1.25.8、coder/acp-go-sdk v0.13.5、官方 CLI；Ally Go 后端和 React/TypeScript/Electron 桌面端。
 
 **Spec:** docs/superpowers/specs/2026-10-03-native-acp-adapters-design.md
 
@@ -41,7 +41,7 @@
 
 1. [ ] 阅读 Task 1 的公共接口，先编写三个适配器行为测试并观察失败。
 2. [ ] 三个包公开 Config（Logger、供应商 Path、PrefixArgs、Environment）、NewAgent、Agent，命令分别 opencode acp、gemini --acp、grok agent stdio；注册 adapter ID opencode、gemini、grok。
-3. [ ] 从固定上游代码查验、实现模型/configOptions/legacy models 与真实 thinking/effort 的发现和更新。必要时做源代码支持的兼容映射；thinking 内容转发必须单独测试。
+3. [ ] 从固定上游代码查验、实现模型/configOptions/legacy models 与真实 thinking/effort 的发现和更新。Gemini 可用官方 customAliases/customOverrides + 原生 set_model 补齐可追溯预设；必须用官方 resolver/SDK 验证真实 model 和 thinking 参数、保留用户默认配置、处理 budget/level 冲突、恢复时反向映射。档位来自官方精确能力快照与原生模型目录交集，未知模型不得猜测。thinking 内容转发必须单独测试。
 4. [ ] 查验并处理原生 session resume/close/history、steering、MCP、usage、额外目录和指令/技能差异。官方扩展可用于补齐，不能无依据宣称。任何无法对齐的关键能力必须在报告中具体列出并请求控制器决策，不能悄悄改验收标准。
 5. [ ] 查验各 CLI 实际账号隔离路径，给出三种独立实例/项目配置例子；验证 API key/profile env 完整传递；OpenCode 除配置目录还要隔离真正 auth.json 数据目录。
 6. [ ] 固定上游版本解析到 commit SHA，UPSTREAM.md 记录代码路径、关键能力与限制、acpx 参考来源及升级步骤；源码可临时放忽略目录，不能 vendoring 大量无关实现。
