@@ -1,6 +1,6 @@
 # acp-go
 
-`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor CLI 或 Pi CLI。
+`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor、Pi、OpenCode、Gemini CLI 或 Grok Build。
 
 项目同时提供可直接嵌入其他 Go 程序的公开包：
 
@@ -10,6 +10,9 @@
 - `github.com/JieWaZi/acp-go/pkg/claude`
 - `github.com/JieWaZi/acp-go/pkg/kimi`
 - `github.com/JieWaZi/acp-go/pkg/cursor`
+- `github.com/JieWaZi/acp-go/pkg/opencode`
+- `github.com/JieWaZi/acp-go/pkg/gemini`
+- `github.com/JieWaZi/acp-go/pkg/grok`
 - `github.com/JieWaZi/acp-go/pkg/pi`
 - `github.com/JieWaZi/acp-go/pkg/nativeacp`
 
@@ -21,6 +24,9 @@
 | Claude | `--adapter claude` | 每个 ACP Session 持有一个 `claude` stream-json 进程 | 会话恢复、FIFO Prompt、取消、steering、Edit/Write 标准文件 diff、工具、权限、AskUserQuestion、MCP、模型、effort、fast 与权限模式 |
 | Kimi | `--adapter kimi` | 复用 `kimi acp` 原生服务 | 原生模型目录（含旧 models）、会话、消息、三档权限、统一问答与 MCP |
 | Cursor | `--adapter cursor` | 复用 `cursor-agent acp`，默认命令缺失时尝试 `agent acp` | 原生会话、模型、MCP、审批、提问与计划/待办投影 |
+| OpenCode | `--adapter opencode` | 复用 `opencode acp` | 原生 provider/model、variants/thinking、会话、MCP、审批与附加目录；即时 steering 不支持 |
+| Gemini CLI | `--adapter gemini` | 复用 `gemini --acp` | 基础接入：原生 models、思考流、MCP、本轮 usage；thinking/权限与真实恢复兼容层待完成，close/steering 不支持 |
+| Grok Build | `--adapter grok` | 复用 `grok agent stdio` | 原生模型/effort、三档权限、会话、MCP、queued steering |
 | Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、三档权限、AskUserQuestion 与 MCP |
 
 Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 复用 Go ACP SDK 连接原生 ACP；Pi 在 Go 内部适配官方 RPC；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
@@ -110,6 +116,9 @@ Claude 配置示例：
 | `CODEX_PATH` | Codex | 指定 Codex CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
 | `KIMI_PATH` | Kimi | 指定已安装的 `kimi` 路径 |
 | `CURSOR_PATH` | Cursor | 指定 `cursor-agent` 或 `agent` 路径 |
+| `OPENCODE_PATH` | OpenCode | 指定已安装 `opencode` 路径 |
+| `GEMINI_PATH` | Gemini CLI | 指定支持 `--acp` 的已安装 `gemini` 路径 |
+| `GROK_PATH` | Grok Build | 指定已安装 `grok` 路径 |
 | `PI_PATH` | Pi | 指定 Pi CLI 路径，默认发现 `pi` |
 | `PI_MCP_MODULE_PATH` | Pi | 宿主提供的 bridge 单文件绝对路径，所有 Pi 会话必需 |
 | `CLAUDE_CODE_EXECUTABLE` | Claude | 指定 Claude CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
@@ -224,6 +233,9 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | Claude | [`pkg/claude/README.md`](pkg/claude/README.md) | [`pkg/claude/UPSTREAM.md`](pkg/claude/UPSTREAM.md) |
 | Kimi | [`pkg/kimi/README.md`](pkg/kimi/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) |
 | Cursor | [`pkg/cursor/README.md`](pkg/cursor/README.md) | [`pkg/nativeacp/UPSTREAM.md`](pkg/nativeacp/UPSTREAM.md) |
+| OpenCode | [`pkg/opencode/README.md`](pkg/opencode/README.md) | [`pkg/opencode/UPSTREAM.md`](pkg/opencode/UPSTREAM.md) |
+| Gemini CLI | [`pkg/gemini/README.md`](pkg/gemini/README.md) | [`pkg/gemini/UPSTREAM.md`](pkg/gemini/UPSTREAM.md) |
+| Grok Build | [`pkg/grok/README.md`](pkg/grok/README.md) | [`pkg/grok/UPSTREAM.md`](pkg/grok/UPSTREAM.md) |
 | Pi | [`pkg/pi/README.md`](pkg/pi/README.md) | [`pkg/pi/UPSTREAM.md`](pkg/pi/UPSTREAM.md) |
 
 ## 开发与验证
@@ -244,6 +256,8 @@ Codex 协议生成文件禁止手工修改：
 go generate ./pkg/codex/protocol
 go run ./tools/protocolgen --check
 ```
+
+OpenCode/Gemini/Grok 的逐项证据见 [原生 ACP 测试矩阵](docs/NATIVE_ACP_TEST_MATRIX.md)。账号隔离必须遵循各包 README：OpenCode 隔离四个 XDG 根（包括真正 auth.json 数据根），Gemini 使用 GEMINI_CLI_HOME 根下 .gemini，Grok 使用 GROK_HOME。
 
 真实 CLI 测试可能联网或计费，必须显式开启；执行方式与证据边界见各 Adapter README 与 `UPSTREAM.md`。
 

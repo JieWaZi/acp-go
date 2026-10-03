@@ -727,3 +727,18 @@ func writeFakeError(encoder *json.Encoder, id json.RawMessage, code int, message
 		},
 	})
 }
+
+// TestRegistryIncludesNativePublicAdapters 验证三种公开 Adapter 可被选择，路径错误不会回退或写 stdout。
+func TestRegistryIncludesNativePublicAdapters(t *testing.T) {
+	for _, name := range []string{"opencode", "gemini", "grok"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "missing-"+name)
+			t.Setenv(strings.ToUpper(name)+"_PATH", path)
+			var output, diagnostics bytes.Buffer
+			exit := run(context.Background(), []string{"--adapter", name}, processIO{input: bytes.NewReader(nil), output: &output, diagnostics: &diagnostics})
+			if exit == 0 || output.Len() != 0 || !strings.Contains(diagnostics.String(), path) {
+				t.Fatalf("native registry %s: exit=%d stdout=%q diagnostics=%q", name, exit, output.String(), diagnostics.String())
+			}
+		})
+	}
+}

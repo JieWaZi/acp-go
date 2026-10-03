@@ -11,6 +11,8 @@ import (
 
 // sessionOptions 将宿主统一配置标识映射到上游声明的实际标识。
 type sessionOptions struct {
+	// workingDirectory 保存原生会话实际 cwd，供 opt-in 审查使用。
+	workingDirectory string
 	// queue 保存显式开启的会话执行队列。
 	queue *promptQueue
 	// configMutex 串行化一次配置操作中的多项原生参数更新。
@@ -81,7 +83,7 @@ func (agent *Agent) normalizeSession(
 	id acp.SessionId,
 	cwd string,
 ) error {
-	state := &sessionOptions{ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
+	state := &sessionOptions{workingDirectory: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
 	if agent.config.SessionAdapter != nil {
 		snapshot := SessionSnapshot{
 			ConfigOptions:    response.ConfigOptions,
