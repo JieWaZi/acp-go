@@ -25,43 +25,47 @@
 
 **Files:** 增强现有 pkg/nativeacp/{agent,session,environment,version,forward}.go，按职责添加 *_test.go；必要的 FIFO 生命周期可新增小文件。现有 callback/session adapter 接口必须复用。
 
-1. [ ] 先写行为测试并观察失败：真实 ACP 外层连接→代理→假 CLI 进程；假进程由测试二进制 helper 启动，stdout 不污染协议。
-2. [ ] 复用 Config.Command/Args/VersionArgs/Environment/Logger 和现有版本、PATH、进程实现；复制调用者切片。默认命令与 PrefixArgs 由 Task 2 公共包构造。测试显式路径失败不回退 PATH、按完整环境查找和版本 acpmeta。允许保留现有 NewAgent 立即启动语义。
-3. [ ] 实现 acp.Agent 与 AgentLoader、SetAgentConnection、Close。透传已存在的标准会话/配置方法以及 SDK 支持的可选接口；不要把方法缺失改成假成功。
-4. [ ] 子进程到外层客户端的文件、terminal、request_permission、user_input、elicitation、session_update 双向转发；保留 payload、_meta、错误 code/data。按 SDK 可选接口转发。
-5. [ ] 初始化能力从原生响应得来；保留现有回调等待绑定语义，必须能被 ctx/Close 解除。关闭幂等、进程退出唤醒待处理请求。不要在 connection 启动后替换 Logger。
-6. [ ] 显式 opt-in 的 Config 开关使新增适配器的每个 session prompt FIFO，可并发不同 session；Cancel 不中断别的会话，能解除当前本地等待并保持原生 cancel 通知。排队请求支持 context 取消，CloseSession/Close 不挂住；新建/load/resume 建立会话记录，closed session 不复用。现有 Kimi/Cursor/Pi 默认并发语义不得改变；另一个显式开关使不支持 close 的新适配器返回真实 MethodNotFound 而不是假成功，兼容层可另行实现资源释放。
-7. [ ] 保留现有扩展转发、CallbackAdapter/SessionAdapter/CallNative，不额外设计 transport。测试 request 扩展不循环；不把未知 notification 扩展当作可保证支持的能力。
-8. [ ] 测试并验证完整环境替换、prefix 参数、CLI 版本与 build 版本、所有回调、扩展错误、FIFO、取消、关闭、进程崩溃和可选方法；运行 go test ./... 和桥接 race 测试一次。
-9. [ ] 自审、提交、写详细报告（含 RED/GREEN 与命令输出）。
+1. [x] 先写行为测试并观察失败：真实 ACP 外层连接→代理→假 CLI 进程；假进程由测试二进制 helper 启动，stdout 不污染协议。
+2. [x] 复用 Config.Command/Args/VersionArgs/Environment/Logger 和现有版本、PATH、进程实现；复制调用者切片。默认命令与 PrefixArgs 由 Task 2 公共包构造。测试显式路径失败不回退 PATH、按完整环境查找和版本 acpmeta。允许保留现有 NewAgent 立即启动语义。
+3. [x] 实现 acp.Agent 与 AgentLoader、SetAgentConnection、Close。透传已存在的标准会话/配置方法以及 SDK 支持的可选接口；不要把方法缺失改成假成功。
+4. [x] 子进程到外层客户端的文件、terminal、request_permission、user_input、elicitation、session_update 双向转发；保留 payload、_meta、错误 code/data。按 SDK 可选接口转发。
+5. [x] 初始化能力从原生响应得来；保留现有回调等待绑定语义，必须能被 ctx/Close 解除。关闭幂等、进程退出唤醒待处理请求。不要在 connection 启动后替换 Logger。
+6. [x] 显式 opt-in 的 Config 开关使新增适配器的每个 session prompt FIFO，可并发不同 session；Cancel 不中断别的会话，能解除当前本地等待并保持原生 cancel 通知。排队请求支持 context 取消，CloseSession/Close 不挂住；新建/load/resume 建立会话记录，closed session 不复用。现有 Kimi/Cursor/Pi 默认并发语义不得改变；另一个显式开关使不支持 close 的新适配器返回真实 MethodNotFound 而不是假成功，兼容层可另行实现资源释放。
+7. [x] 保留现有扩展转发、CallbackAdapter/SessionAdapter/CallNative，不额外设计 transport。测试 request 扩展不循环；不把未知 notification 扩展当作可保证支持的能力。
+8. [x] 测试并验证完整环境替换、prefix 参数、CLI 版本与 build 版本、所有回调、扩展错误、FIFO、取消、关闭、进程崩溃和可选方法；运行 go test ./... 和桥接 race 测试一次。
+9. [x] 自审、提交、写详细报告（含 RED/GREEN 与命令输出）。
 
 ### Task 2: Public adapters, source-backed normalization and documentation
 
 **Files:** pkg/opencode、pkg/gemini、pkg/grok 的 agent.go、doc.go、README.md、UPSTREAM.md、行为测试；必要的 pkg/nativeacp 供应商兼容代码；cmd/acp-agent/main.go 及其测试；根 README.md、docs/NATIVE_ACP_TEST_MATRIX.md。
 
-1. [ ] 阅读 Task 1 的公共接口，先编写三个适配器行为测试并观察失败。
-2. [ ] 三个包公开 Config（Logger、供应商 Path、PrefixArgs、Environment）、NewAgent、Agent，命令分别 opencode acp、gemini --acp、grok agent stdio；注册 adapter ID opencode、gemini、grok。
-3. [ ] 从固定上游代码查验、实现模型/configOptions/legacy models 与真实 thinking/effort 的发现和更新。Gemini 可用官方 customAliases/customOverrides + 原生 set_model 补齐可追溯预设；必须用官方 resolver/SDK 验证真实 model 和 thinking 参数、保留用户默认配置、处理 budget/level 冲突、恢复时反向映射。档位来自官方精确能力快照与原生模型目录交集，未知模型不得猜测。thinking 内容转发必须单独测试。
-4. [ ] 查验并处理原生 session resume/close/history、steering、MCP、usage、额外目录和指令/技能差异。官方扩展可用于补齐，不能无依据宣称。任何无法对齐的关键能力必须在报告中具体列出并请求控制器决策，不能悄悄改验收标准。
-5. [ ] 查验各 CLI 实际账号隔离路径，给出三种独立实例/项目配置例子；验证 API key/profile env 完整传递；OpenCode 除配置目录还要隔离真正 auth.json 数据目录。
-6. [ ] 固定上游版本解析到 commit SHA，UPSTREAM.md 记录代码路径、关键能力与限制、acpx 参考来源及升级步骤；源码可临时放忽略目录，不能 vendoring 大量无关实现。
-7. [ ] 更新 README 包导入和 CLI 列表、能力矩阵、账号配置和模型/thinking 说明；测试矩阵区分已测 fake CLI、原生无账号冒烟与真实模型未测。
-8. [ ] 运行 gofmt、go vet ./...、go test ./...，必要的 race 检查，构建 acp-agent；自审、提交并报告。
+1. [x] 阅读 Task 1 的公共接口，先编写三个适配器行为测试并观察失败。
+2. [x] 三个包公开 Config（Logger、供应商 Path、PrefixArgs、Environment）、NewAgent、Agent，命令分别 opencode acp、gemini --acp、grok agent stdio；注册 adapter ID opencode、gemini、grok。
+3. [x] 从固定上游代码查验、实现模型/configOptions/legacy models 与真实 thinking/effort 的发现和更新。Gemini 可用官方 customAliases/customOverrides + 原生 set_model 补齐可追溯预设；必须用官方 resolver/SDK 验证真实 model 和 thinking 参数、保留用户默认配置、处理 budget/level 冲突、恢复时反向映射。档位来自官方精确能力快照与原生模型目录交集，未知模型不得猜测。thinking 内容转发必须单独测试。
+4. [x] 查验并处理原生 session resume/close/history、steering、MCP、usage、额外目录和指令/技能差异。官方扩展可用于补齐，不能无依据宣称。任何无法对齐的关键能力必须在报告中具体列出并请求控制器决策，不能悄悄改验收标准。
+5. [x] 查验各 CLI 实际账号隔离路径，给出三种独立实例/项目配置例子；验证 API key/profile env 完整传递；OpenCode 除配置目录还要隔离真正 auth.json 数据目录。
+6. [x] 固定上游版本解析到 commit SHA，UPSTREAM.md 记录代码路径、关键能力与限制、acpx 参考来源及升级步骤；源码可临时放忽略目录，不能 vendoring 大量无关实现。
+7. [x] 更新 README 包导入和 CLI 列表、能力矩阵、账号配置和模型/thinking 说明；测试矩阵区分已测 fake CLI、原生无账号冒烟与真实模型未测。
+8. [x] 运行 gofmt、go vet ./...、go test ./...，必要的 race 检查，构建 acp-agent；自审、提交并报告。
 
 ### Task 3: Ally integration
 
 **Files:** /Users/ryan/Desktop/aix/ally 中运行时 catalog、ACP factory、Runtime Account、project execution config、MCP compatibility、instruction/skill delivery、生成 API 与桌面运行时选择/配置相关现有文件，以及 README/CONTEXT/运行时文档。
 
-1. [ ] 创建适当隔离工作区（若原工作区无改动也保留独立分支）；完整阅读 Ally AGENTS.md、CONTEXT.md、docs/backend-engineering-conventions-cn.md、docs/frontend-engineering-conventions-cn.md、docs/ui-design-system-cn.md 后再改动。
-2. [ ] 找出 Codex/Claude 的现有运行时发现、账号、安全路径、模型/thinking 目录、项目默认配置、执行与恢复链路。测试优先扩展三种运行时。
-3. [ ] 同步使用 Task 2 公共包，接入真实二进制发现/版本/健康状态、账号与项目配置、环境隔离、模型和 thinking 选择/事件、会话恢复、权限/问答、MCP 原生传输兼容性、指令及技能交付。所有能力来自桥接和上游，不引入假默认。
-4. [ ] 前端使用现有组件设计与数据接口，更新固定 runtime 联合类型/标签/表单/显示。若 API 变化通过现有生成器更新 OpenAPI/TS，不手工篡改生成文件。
-5. [ ] 禁止为依赖提交本机绝对 replace 路径；使用项目现有本地依赖机制，必要时通过临时 Go workspace 验证两个 worktree 并说明发布依赖要求。
-6. [ ] 更新 README、运行时支持与账号设置文档，并准确写能力边界。禁止浏览器/UI 自动化（用户未授权）。
-7. [ ] 后端 gofmt、go vet、go test，前端 pnpm --dir desktop check、pnpm api:check，跨层 pnpm check；记录任何环境阻碍及原始输出。自审、提交并报告。
+1. [x] 创建适当隔离工作区（若原工作区无改动也保留独立分支）；完整阅读 Ally AGENTS.md、CONTEXT.md、docs/backend-engineering-conventions-cn.md、docs/frontend-engineering-conventions-cn.md、docs/ui-design-system-cn.md 后再改动。
+2. [x] 找出 Codex/Claude 的现有运行时发现、账号、安全路径、模型/thinking 目录、项目默认配置、执行与恢复链路。测试优先扩展三种运行时。
+3. [x] 同步使用 Task 2 公共包，接入真实二进制发现/版本/健康状态、账号与项目配置、环境隔离、模型和 thinking 选择/事件、会话恢复、权限/问答、MCP 原生传输兼容性、指令及技能交付。所有能力来自桥接和上游，不引入假默认。
+4. [x] 前端使用现有组件设计与数据接口，更新固定 runtime 联合类型/标签/表单/显示。若 API 变化通过现有生成器更新 OpenAPI/TS，不手工篡改生成文件。
+5. [x] 禁止为依赖提交本机绝对 replace 路径；使用项目现有本地依赖机制，必要时通过临时 Go workspace 验证两个 worktree 并说明发布依赖要求。
+6. [x] 更新 README、运行时支持与账号设置文档，并准确写能力边界。禁止浏览器/UI 自动化（用户未授权）。
+7. [x] 后端 gofmt、go vet、go test，前端 pnpm --dir desktop check、pnpm api:check，跨层 pnpm check；记录任何环境阻碍及原始输出。自审、提交并报告。
 
 ### Task 4: Final integration verification and review
 
-1. [ ] 针对模型变化、thinking、项目账号环境、重启恢复和 MCP 兼容执行跨层验证，审查缺失能力，不能把尚未满足的 parity 标记完成。
-2. [ ] 整体分支审核和一个集中修复回合，执行覆盖最终变更的必需检查。
-3. [ ] 保留两个可审阅本地分支，报告测试、实际模型验证范围、能力边界与发布依赖。不得未经授权 push/publish/merge。
+1. [x] 针对模型变化、thinking、项目账号环境、重启恢复和 MCP 兼容执行跨层验证，审查缺失能力，不能把尚未满足的 parity 标记完成。
+2. [x] 整体分支审核和一个集中修复回合，执行覆盖最终变更的必需检查。
+3. [x] 保留两个可审阅本地分支，报告测试、实际模型验证范围、能力边界与发布依赖。不得未经授权 push/publish/merge。
+
+## 最终验收记录
+
+2026-10-03：开发与本地联合验收完成，最终阶段按用户要求由主代理直接自审和修复。ACP 全量 test/vet/build 与 OpenCode/Gemini race 通过；Ally 最终 pnpm check 全链路退出 0。保留两个本地分支，尚未推送/发布。Ally 独立发布需先发布可获取的 ACP 功能提交，再生成真实 go.mod/go.sum；完整证据、能力边界及全部实施取舍见 [交付记录](../reports/2026-10-03-native-acp-adapters-delivery.md)。
