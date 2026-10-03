@@ -25,7 +25,7 @@
 | Kimi | `--adapter kimi` | 复用 `kimi acp` 原生服务 | 原生模型目录（含旧 models）、会话、消息、三档权限、统一问答与 MCP |
 | Cursor | `--adapter cursor` | 复用 `cursor-agent acp`，默认命令缺失时尝试 `agent acp` | 原生会话、模型、MCP、审批、提问与计划/待办投影 |
 | OpenCode | `--adapter opencode` | 复用 `opencode acp` | 原生 provider/model、variants/thinking、会话、MCP、审批与附加目录；即时 steering 不支持 |
-| Gemini CLI | `--adapter gemini` | 复用 `gemini --acp` | 基础接入：原生 models、思考流、MCP、本轮 usage；thinking/权限与真实恢复兼容层待完成，close/steering 不支持 |
+| Gemini CLI | `--adapter gemini` | 复用 `gemini --acp` | 每会话原生进程；模型/精确 thinking、MCP、本轮 usage、auto 审查/yolo、真实恢复与关闭；配置仅空闲时重建，steering 不支持 |
 | Grok Build | `--adapter grok` | 复用 `grok agent stdio` | 原生模型/effort、三档权限、会话、MCP、queued steering |
 | Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、三档权限、AskUserQuestion 与 MCP |
 

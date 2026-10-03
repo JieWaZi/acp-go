@@ -3,7 +3,6 @@ package gemini
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -71,7 +70,7 @@ func TestThinkingOverlayPreservesDefaultsAndCleansConflict(t *testing.T) {
 
 // TestThinkingCapabilitySnapshotDoesNotGuess 验证未知、auto 与不支持关闭思考的模型不会获得虚构配置。
 func TestThinkingCapabilitySnapshotDoesNotGuess(t *testing.T) {
-	for _, model := range []string{"auto", "auto-gemini-3", "gemini-3.5-flash-custom", "private-gemini-3.5-flash"} {
+	for _, model := range []string{"auto", "auto-gemini-3", "gemini-3.5-flash", "gemini-3.5-flash-custom", "private-gemini-3.5-flash"} {
 		if len(thinkingPresets(model)) != 0 {
 			t.Fatalf("guessed capability for %s", model)
 		}
@@ -81,33 +80,7 @@ func TestThinkingCapabilitySnapshotDoesNotGuess(t *testing.T) {
 			t.Fatalf("unsupported pro preset: %+v", preset)
 		}
 	}
-	for _, model := range supportedThinkingModels() {
-		for _, preset := range thinkingPresets(model) {
-			actual, current, ok := decodeThinkingAlias(thinkingAlias(model, preset.id))
-			if !ok || actual != model || current != preset.id {
-				t.Fatalf("alias restore: %s %s", actual, current)
-			}
-		}
-	}
-}
 
-// TestOfficialResolverAndSDK 验证生成的每个预设经原始官方 resolver 和 SDK 序列化后的实际参数。
-func TestOfficialResolverAndSDK(t *testing.T) {
-	proof := os.Getenv("GEMINI_OFFICIAL_PROOF_DIRECTORY")
-	if proof == "" {
-		t.Skip("opt-in pinned official npm core/SDK verification; see UPSTREAM.md")
-	}
-	directory, environment, err := thinkingEnvironment([]string{"GEMINI_CLI_HOME=" + t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(directory)
-	command := exec.Command("node", "testdata/verify-thinking.mjs", proof, filepath.Join(nativeacp.EnvironmentValue(environment, "GEMINI_CLI_HOME"), ".gemini", "settings.json"))
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("official resolver/SDK: %v\n%s", err, output)
-	}
-	t.Log(string(output))
 }
 
 // TestDefaultProfileIsReadOnlyAndStatePersists 验证默认用户 profile 不被写入，受管状态跨配置副本保留。
@@ -156,5 +129,135 @@ func TestDefaultProfileIsReadOnlyAndStatePersists(t *testing.T) {
 	data, err = os.ReadFile(filepath.Join(profile, "oauth_creds.json"))
 	if err != nil || !reflect.DeepEqual(data, credentials) {
 		t.Fatal("original credentials overwritten")
+	}
+}
+
+// TestCanonicalOverrideAndDefault 验证规范模型覆盖清空互斥字段，default 恢复完整原始设置。
+func TestCanonicalOverrideAndDefault(t *testing.T) {
+	home := t.TempDir()
+	profile := filepath.Join(home, ".gemini")
+	if err := os.Mkdir(profile, 0700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"modelConfigs":{"customOverrides":[{"match":{"model":"gemini-3.8-flash"},"modelConfig":{"generateContentConfig":{"temperature":0.42,"thinkingConfig":{"thinkingBudget":4096}}}}]}}`)
+	if err := os.WriteFile(filepath.Join(profile, "settings.json"), original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := newProfileState([]string{"GEMINI_CLI_HOME=" + home}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, choice := range []string{"low", "default"} {
+		directory, _, err := state.environment([]string{}, "gemini-3.8-flash", choice)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(directory)
+		data, err := os.ReadFile(filepath.Join(directory, ".gemini", "settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := map[string]any{}
+		if err := json.Unmarshal(data, &values); err != nil {
+			t.Fatal(err)
+		}
+		overrides := values["modelConfigs"].(map[string]any)["customOverrides"].([]any)
+		if choice == "default" {
+			if len(overrides) != 1 {
+				t.Fatal("default retained adapter overrides")
+			}
+			continue
+		}
+		if len(overrides) != 3 {
+			t.Fatalf("canonical override count: %d", len(overrides))
+		}
+		for _, value := range overrides[1:] {
+			if value.(map[string]any)["match"].(map[string]any)["model"] != "gemini-3.8-flash" {
+				t.Fatal("override used an alias")
+			}
+		}
+		reset := overrides[1].(map[string]any)["modelConfig"].(map[string]any)["generateContentConfig"].(map[string]any)
+		selected := overrides[2].(map[string]any)["modelConfig"].(map[string]any)["generateContentConfig"].(map[string]any)["thinkingConfig"].(map[string]any)
+		if reset["thinkingConfig"] != nil || selected["thinkingBudget"] != nil || selected["thinkingLevel"] != "LOW" {
+			t.Fatal("mutually exclusive thinking configuration broken")
+		}
+	}
+}
+
+// TestCredentialRefreshSurvivesOverlayCleanup 验证新凭据与原生原子替换能共享持久状态且不会被旧进程回写。
+func TestCredentialRefreshSurvivesOverlayCleanup(t *testing.T) {
+	home := t.TempDir()
+	stateDirectory := t.TempDir()
+	state, err := newProfileState([]string{"HOME=" + home}, stateDirectory, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := state.environment([]string{}, "", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(first)
+	credential := filepath.Join(first, ".gemini", "oauth_creds.json")
+	if err := os.WriteFile(credential, []byte("new credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.persistOverlay(first); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := state.environment([]string{}, "", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(second)
+	replacement := filepath.Join(second, ".gemini", "credential.tmp")
+	if err := os.WriteFile(replacement, []byte("refreshed credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, filepath.Join(second, ".gemini", "oauth_creds.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.persistOverlay(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.persistOverlay(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(second); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(state.root, "oauth_creds.json"))
+	if err != nil || string(data) != "refreshed credential" {
+		t.Fatalf("lost refresh: %s %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".gemini")); !os.IsNotExist(err) {
+		t.Fatal("default profile was written")
+	}
+}
+
+// TestEmptyEnvironmentAndPrivateState 验证显式空环境不会带入父环境并使用私有配置权限。
+func TestEmptyEnvironmentAndPrivateState(t *testing.T) {
+	t.Setenv("GEMINI_PARENT_SENTINEL", "secret")
+	state, err := newProfileState([]string{"HOME=" + t.TempDir()}, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, environment, err := state.environment([]string{}, "", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	if len(environment) != 1 || nativeacp.EnvironmentValue(environment, "GEMINI_PARENT_SENTINEL") != "" {
+		t.Fatalf("inherited explicit-empty environment: %v", environment)
+	}
+	info, err := os.Stat(filepath.Join(directory, ".gemini", "settings.json"))
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("settings mode: %v %v", info, err)
+	}
+	info, err = os.Stat(state.root)
+	if err != nil || info.Mode().Perm() != 0700 {
+		t.Fatalf("state mode: %v %v", info, err)
 	}
 }

@@ -6,13 +6,14 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/coder/acp-go-sdk"
 )
 
 // legacyModels 保存官方 ACP 尚未迁移的 models 目录。
 type legacyModels struct {
-	// CurrentModelID 是配置模型或本包生成的 alias。
+	// CurrentModelID 是原生返回的当前模型。
 	CurrentModelID string `json:"currentModelId"`
 	// AvailableModels 是原生发现的实际模型。
 	AvailableModels []struct {
@@ -48,7 +49,7 @@ func newSessionAdapter() *sessionAdapter {
 	return &sessionAdapter{sessions: map[acp.SessionId]*geminiSession{}}
 }
 
-// NormalizeSession 保留原生 catalog，反向解码已恢复的本包别名。
+// NormalizeSession 保存原生 catalog 与当前规范模型。
 func (a *sessionAdapter) NormalizeSession(
 	_ context.Context,
 	_ nativeacp.SessionBridge,
@@ -61,26 +62,22 @@ func (a *sessionAdapter) NormalizeSession(
 			return nil, err
 		}
 	}
-	model, reasoning, _ := decodeThinkingAlias(models.CurrentModelID)
-	models.CurrentModelID = model
-	state := &geminiSession{models: models, reasoning: reasoning, cwd: snapshot.WorkingDirectory}
+	state := &geminiSession{models: models, reasoning: "default", cwd: snapshot.WorkingDirectory}
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	a.sessions[id] = state
 	return state.options(), nil
 }
 
-// options 当前仅显示原生发现的模型；思考设置等待真实 continuation 实现。
+// options 将精确思考快照与原生模型目录取交集。
 func (s *geminiSession) options() []acp.SessionConfigOption {
 	values := acp.SessionConfigSelectOptionsUngrouped{}
 
 	for _, model := range s.models.AvailableModels {
-		canonical, _, generated := decodeThinkingAlias(model.ModelID)
-		if generated {
-			continue
-		}
+		canonical := model.ModelID
 		values = append(values, acp.SessionConfigSelectOption{
 			Value: acp.SessionConfigValueId(canonical), Name: model.Name, Description: model.Description,
+			Meta: acpmeta.WithModelConfigOptions(nil, reasoningOptions(canonical, "default")),
 		})
 
 	}
@@ -95,7 +92,11 @@ func (s *geminiSession) options() []acp.SessionConfigOption {
 		values,
 	))
 
-	// 当前固定 CLI 在工具 continuation 后丢失 alias 配置；在完整实现前不公开思考菜单。
+	for _, model := range s.models.AvailableModels {
+		if model.ModelID == s.models.CurrentModelID {
+			return append(options, reasoningOptions(s.models.CurrentModelID, s.reasoning)...)
+		}
+	}
 	return options
 }
 
@@ -116,7 +117,7 @@ func (a *sessionAdapter) NormalizeUpdate(_ acp.SessionId, options []acp.SessionC
 	return nativeacp.NormalizeOptions(options, map[acp.SessionConfigId]acp.SessionConfigId{})
 }
 
-// SetConfigOption 通过原生 set_model 切换 canonical model；当前不接受未公开的思考设置。
+// SetConfigOption 供父协调器在准备执行代时调用原生 canonical model setter。
 func (a *sessionAdapter) SetConfigOption(
 	ctx context.Context,
 	bridge nativeacp.SessionBridge,
@@ -146,8 +147,7 @@ func (a *sessionAdapter) SetConfigOption(
 	}
 	a.mutex.Unlock()
 	if value.ConfigId == "model" && string(value.Value) != "" {
-		_, _, reserved := decodeThinkingAlias(string(value.Value))
-		valid = !reserved && !strings.HasPrefix(string(value.Value), "acp-go-thinking/")
+		valid = !strings.HasPrefix(string(value.Value), "acp-go-thinking/")
 	}
 	if !valid {
 		return acp.SetSessionConfigOptionResponse{}, true, acp.NewInvalidParams(nil)
@@ -158,11 +158,7 @@ func (a *sessionAdapter) SetConfigOption(
 		model = string(value.Value)
 		next.models.CurrentModelID = model
 		next.reasoning = "default"
-	case "reasoning":
-		next.reasoning = string(value.Value)
-		if next.reasoning != "default" {
-			model = thinkingAlias(model, next.reasoning)
-		}
+
 	default:
 		return acp.SetSessionConfigOptionResponse{}, true, acp.NewInvalidParams(nil)
 	}
@@ -188,4 +184,20 @@ func (a *sessionAdapter) ForgetSession(id acp.SessionId) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	delete(a.sessions, id)
+}
+
+// reasoningOptions 只对精确有据的模型公开选择项。
+func reasoningOptions(model, current string) []acp.SessionConfigOption {
+	presets := thinkingPresets(model)
+	if len(presets) == 0 {
+		return []acp.SessionConfigOption{}
+	}
+	if current == "" {
+		current = "default"
+	}
+	values := acp.SessionConfigSelectOptionsUngrouped{{Value: "default", Name: "Default (original settings)"}}
+	for _, preset := range presets {
+		values = append(values, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(preset.id), Name: preset.id})
+	}
+	return []acp.SessionConfigOption{selectOption("reasoning", "Thinking", current, values)}
 }

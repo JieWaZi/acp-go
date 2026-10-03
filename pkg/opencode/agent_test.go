@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -156,7 +155,7 @@ func TestPublicAdaptersPreserveNativeConfiguration(t *testing.T) {
 					t.Fatalf("lost isolation %s", key)
 				}
 			}
-			session, err := peer.NewSession(ctx, acp.NewSessionRequest{Cwd: "/project", McpServers: []acp.McpServer{}})
+			session, err := peer.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -184,9 +183,8 @@ func TestPublicAdaptersPreserveNativeConfiguration(t *testing.T) {
 			}
 			if name == "gemini" {
 				_, err := peer.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
-				var rpc *acp.RequestError
-				if !errors.As(err, &rpc) || rpc.Code != -32601 {
-					t.Fatalf("unsupported close: %v", err)
+				if err != nil {
+					t.Fatalf("owned Gemini child close: %v", err)
 				}
 			}
 		})
@@ -315,7 +313,7 @@ func TestGeminiCustomModelsResumeAndQuota(t *testing.T) {
 	if _, err := peer.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
 		t.Fatal(err)
 	}
-	session, err := peer.NewSession(ctx, acp.NewSessionRequest{Cwd: "/project", McpServers: []acp.McpServer{}})
+	session, err := peer.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}})
 	if err != nil {
 		t.Fatal(err)
 	}

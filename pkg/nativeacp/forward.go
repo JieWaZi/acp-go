@@ -31,30 +31,30 @@ func (agent *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionMo
 func (agent *Agent) dispatch(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
 	case "fs/read_text_file":
-		return decodeCall(ctx, params, agent.host.ReadTextFile)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.ReadTextFile)
 	case "fs/write_text_file":
-		return decodeCall(ctx, params, agent.host.WriteTextFile)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.WriteTextFile)
 	case "session/request_permission":
 		return decodeCall(ctx, params, agent.requestPermission)
 	case "terminal/create":
-		return decodeCall(ctx, params, agent.host.CreateTerminal)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.CreateTerminal)
 	case "terminal/kill":
-		return decodeCall(ctx, params, agent.host.KillTerminal)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.KillTerminal)
 	case "terminal/output":
-		return decodeCall(ctx, params, agent.host.TerminalOutput)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.TerminalOutput)
 	case "terminal/release":
-		return decodeCall(ctx, params, agent.host.ReleaseTerminal)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.ReleaseTerminal)
 	case "terminal/wait_for_exit":
-		return decodeCall(ctx, params, agent.host.WaitForTerminalExit)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.WaitForTerminalExit)
 	case "elicitation/create":
 		return agent.elicitation(ctx, params)
 	case "mcp/connect":
-		return decodeCall(ctx, params, agent.host.UnstableConnectMcp)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.UnstableConnectMcp)
 	case "mcp/disconnect":
-		return decodeCall(ctx, params, agent.host.UnstableDisconnectMcp)
+		return decodeCall(ctx, agent.publicCallback(params), agent.host.UnstableDisconnectMcp)
 	case "elicitation/complete":
 		var request acp.UnstableCompleteElicitationNotification
-		if err := json.Unmarshal(params, &request); err != nil {
+		if err := json.Unmarshal(agent.publicCallback(params), &request); err != nil {
 			return nil, acp.NewInvalidParams(nil)
 		}
 		return nil, agent.host.UnstableCompleteElicitation(ctx, request)
@@ -70,7 +70,7 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 		if silent {
 			return nil, nil
 		}
-		return nil, agent.host.SessionUpdate(ctx, request)
+		return nil, agent.UpdateSession(ctx, request)
 	}
 	if agent.config.CallbackAdapter != nil {
 		result, handled, err := agent.config.CallbackAdapter.HandleCallback(ctx, agent, method, params)
@@ -79,7 +79,7 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 		}
 	}
 	if len(method) > 0 && method[0] == '_' {
-		return agent.host.CallExtension(ctx, method, params)
+		return agent.host.CallExtension(ctx, method, agent.publicCallback(params))
 	}
 	return nil, acp.NewMethodNotFound(method)
 }
@@ -130,5 +130,5 @@ func (agent *Agent) elicitation(ctx context.Context, params json.RawMessage) (ac
 	if err := json.Unmarshal(normalized, &request); err != nil {
 		return acp.UnstableCreateElicitationResponse{}, acp.NewInvalidParams(nil)
 	}
-	return agent.host.UnstableCreateElicitation(ctx, request)
+	return agent.CreateElicitation(ctx, request)
 }

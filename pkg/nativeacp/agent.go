@@ -21,6 +21,8 @@ const maxNativeDiagnosticBytes = 4 << 10
 
 // Config 描述外部 ACP 进程；不会下载程序或修改用户配置。
 type Config struct {
+	// PublicSessionID 可选地映射发往宿主的回调身份；内部队列与原生状态仍使用原生标识。
+	PublicSessionID func(acp.SessionId) acp.SessionId
 	// PromptFIFO 为新适配器开启每会话排队与可取消的执行生命周期。
 	PromptFIFO bool
 	// StrictCloseSession 原样调用原生 close，保留不支持时的方法错误。
@@ -441,3 +443,6 @@ func decodeCall[P any, R any](ctx context.Context, data json.RawMessage, call fu
 	}
 	return call(ctx, request)
 }
+
+// Done 在原生进程被完整回收后关闭，供拥有独立配置的适配器清理该执行代。
+func (agent *Agent) Done() <-chan struct{} { return agent.done }

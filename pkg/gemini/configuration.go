@@ -1,9 +1,6 @@
 package gemini
 
 import (
-	"crypto/sha256"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,11 +22,11 @@ type thinkingPreset struct {
 func thinkingPresets(model string) []thinkingPreset {
 	levels := []string{}
 	switch model {
-	case "gemini-3.1-pro-preview":
+	case "gemini-3.1-pro-preview", "gemini-3.8-flash":
 		levels = []string{"low", "medium", "high"}
 	case "gemini-3-pro-preview":
 		levels = []string{"low", "high"}
-	case "gemini-3-flash-preview", "gemini-3.5-flash":
+	case "gemini-3-flash-preview":
 		levels = []string{"minimal", "low", "medium", "high"}
 	case "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite":
 		budgets := []int{-1, 1024, 8192, 24576}
@@ -60,29 +57,6 @@ func thinkingPresets(model string) []thinkingPreset {
 		})
 	}
 	return result
-}
-
-// supportedThinkingModels 仅列出有精确官方证据的 ID，显示仍受原生 catalog 限制。
-func supportedThinkingModels() []string {
-	return []string{
-		"gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-3.5-flash",
-		"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
-	}
-}
-
-// thinkingAlias 使用稳定命名空间，使持久会话可在新的进程中反向恢复。
-func thinkingAlias(model, preset string) string { return "acp-go-thinking/" + model + "/" + preset }
-
-// decodeThinkingAlias 只接受本包确实生成过的精确别名。
-func decodeThinkingAlias(value string) (string, string, bool) {
-	for _, model := range supportedThinkingModels() {
-		for _, preset := range thinkingPresets(model) {
-			if value == thinkingAlias(model, preset.id) {
-				return model, preset.id, true
-			}
-		}
-	}
-	return value, "default", false
 }
 
 // geminiHome 使用官方 GEMINI_CLI_HOME 根目录，默认使用当前进程环境的用户目录。
@@ -144,148 +118,4 @@ func stripSettingsComments(data []byte) []byte {
 		}
 	}
 	return result
-}
-
-// thinkingEnvironment 保留系统设置和默认层，只在私有副本加入可追溯 thinking 别名。
-func thinkingEnvironment(environment []string) (string, []string, error) {
-	return thinkingEnvironmentForState(environment, "")
-}
-
-// thinkingEnvironmentForState 将默认 profile 状态写入适配器缓存，显式 home 则使用受管账号目录。
-func thinkingEnvironmentForState(environment []string, stateDirectory string) (string, []string, error) {
-	home, err := geminiHome(environment)
-	if err != nil {
-		return "", nil, err
-	}
-	profile := filepath.Join(home, ".gemini")
-	path := filepath.Join(profile, "settings.json")
-	values := map[string]any{}
-	data, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", nil, err
-	}
-	if err == nil {
-		if err := json.Unmarshal(stripSettingsComments(data), &values); err != nil {
-			return "", nil, fmt.Errorf("reading Gemini user settings: %w", err)
-		}
-	}
-	if values == nil {
-		return "", nil, errors.New("Gemini user settings must be a JSON object")
-	}
-	modelConfigs, ok := values["modelConfigs"].(map[string]any)
-	if !ok {
-		if values["modelConfigs"] != nil {
-			return "", nil, errors.New("Gemini modelConfigs must be an object")
-		}
-		modelConfigs = map[string]any{}
-		values["modelConfigs"] = modelConfigs
-	}
-	aliases, ok := modelConfigs["customAliases"].(map[string]any)
-	if !ok {
-		if modelConfigs["customAliases"] != nil {
-			return "", nil, errors.New("Gemini customAliases must be an object")
-		}
-		aliases = map[string]any{}
-		modelConfigs["customAliases"] = aliases
-	}
-	overrides, ok := modelConfigs["customOverrides"].([]any)
-	if !ok && modelConfigs["customOverrides"] != nil {
-		return "", nil, errors.New("Gemini customOverrides must be an array")
-	}
-	overrides = slices.Clone(overrides)
-	for _, model := range supportedThinkingModels() {
-		for _, preset := range thinkingPresets(model) {
-			alias := thinkingAlias(model, preset.id)
-			if _, exists := aliases[alias]; exists {
-				return "", nil, fmt.Errorf("Gemini settings already use reserved alias %q", alias)
-			}
-			aliases[alias] = map[string]any{"extends": model, "modelConfig": map[string]any{"model": model}}
-			// 官方 deepMerge 先用 null 清空旧 budget/level，再用对象覆盖；只对显式选中的别名生效。
-			for _, thinking := range []any{nil, preset.thinking} {
-				overrides = append(overrides, map[string]any{
-					"match":       map[string]any{"model": alias},
-					"modelConfig": map[string]any{"generateContentConfig": map[string]any{"thinkingConfig": thinking}},
-				})
-			}
-		}
-	}
-	modelConfigs["customOverrides"] = overrides
-	data, err = json.Marshal(values)
-	if err != nil {
-		return "", nil, err
-	}
-	directory, err := os.MkdirTemp("", "acp-go-gemini-")
-	if err != nil {
-		return "", nil, err
-	}
-	overlayProfile := filepath.Join(directory, ".gemini")
-	if err := os.Mkdir(overlayProfile, 0700); err != nil {
-		_ = os.RemoveAll(directory)
-		return "", nil, err
-	}
-	persistent := profile
-	if nativeacp.EnvironmentValue(environment, "GEMINI_CLI_HOME") == "" {
-		if stateDirectory == "" {
-			cache, err := os.UserCacheDir()
-			if err != nil {
-				_ = os.RemoveAll(directory)
-				return "", nil, err
-			}
-			digest := sha256.Sum256([]byte(home))
-			stateDirectory = filepath.Join(cache, "acp-go", "gemini", fmt.Sprintf("%x", digest[:12]))
-		}
-		persistent = filepath.Join(stateDirectory, ".gemini")
-		if err := os.MkdirAll(persistent, 0700); err != nil {
-			_ = os.RemoveAll(directory)
-			return "", nil, err
-		}
-		// 默认凭据只读取一次，刷新和原生会话写入适配器拥有的缓存，不回写用户 CLI profile。
-		for _, name := range []string{
-			"oauth_creds.json", "google_accounts.json", "google_credentials.json", "trustedFolders.json",
-		} {
-			target := filepath.Join(persistent, name)
-			if _, err := os.Stat(target); err == nil {
-				continue
-			}
-			content, err := os.ReadFile(filepath.Join(profile, name))
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				_ = os.RemoveAll(directory)
-				return "", nil, err
-			}
-			if err := os.WriteFile(target, content, 0600); err != nil {
-				_ = os.RemoveAll(directory)
-				return "", nil, err
-			}
-		}
-	}
-	if err := os.MkdirAll(filepath.Join(persistent, "tmp"), 0700); err != nil {
-		_ = os.RemoveAll(directory)
-		return "", nil, err
-	}
-	entries, err := os.ReadDir(persistent)
-	if err != nil {
-		_ = os.RemoveAll(directory)
-		return "", nil, err
-	}
-	for _, entry := range entries {
-		if entry.Name() == "settings.json" {
-			continue
-		}
-		source := filepath.Join(persistent, entry.Name())
-		target := filepath.Join(overlayProfile, entry.Name())
-		if err := os.Symlink(source, target); err != nil {
-			_ = os.RemoveAll(directory)
-			return "", nil, err
-		}
-	}
-	overlay := filepath.Join(overlayProfile, "settings.json")
-	if err := os.WriteFile(overlay, data, 0600); err != nil {
-		_ = os.RemoveAll(directory)
-		return "", nil, err
-	}
-	environment = nativeacp.WithEnvironment(environment, "GEMINI_CLI_HOME", directory)
-	return directory, environment, nil
 }

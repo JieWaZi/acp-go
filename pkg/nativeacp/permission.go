@@ -43,7 +43,7 @@ func (agent *Agent) requestPermission(
 	if ctx.Err() != nil {
 		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 	}
-	return agent.host.RequestPermission(ctx, request)
+	return agent.RequestPermission(ctx, request)
 }
 
 // awaitToolEvidence 允许先到线上的工具通知完成入账；超时仍转人工，不凭缺失证据放行。
