@@ -165,6 +165,13 @@ func sessionFixture() int {
 			_, _ = file.Write(append(line, '\n'))
 			_ = file.Close()
 			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": sid, "update": map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": text}}}})
+			if text == "partial-wait" {
+				pending = request.ID
+				continue
+			}
+			if text == "partial-error" {
+				failure = map[string]any{"code": -32000, "message": "failed after recording user input"}
+			}
 			result = map[string]any{"stopReason": "end_turn", "_meta": map[string]any{"quota": map[string]any{"token_count": map[string]any{"input_tokens": 10, "output_tokens": 5}}}}
 		case "session/cancel":
 			if pending != nil {

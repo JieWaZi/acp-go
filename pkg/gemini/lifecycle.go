@@ -119,7 +119,7 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 	}
 	for {
 		session.mutex.Lock()
-		if session.closed {
+		if session.closed || session.child == nil {
 			session.mutex.Unlock()
 			return acp.PromptResponse{}, errors.New("Gemini session closed")
 		}
@@ -165,17 +165,39 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 		if err := turnCtx.Err(); err != nil {
 			return acp.PromptResponse{}, err
 		}
-		session.mutex.Lock()
-		session.record.HasHistory = true
-		record := session.record
-		session.mutex.Unlock()
-		if err := agent.profile.saveRecord(id, record); err != nil {
+		if err := agent.recordHistory(id, session); err != nil {
+			return acp.PromptResponse{}, err
+		}
+		if err := turnCtx.Err(); err != nil {
 			return acp.PromptResponse{}, err
 		}
 		response, err := child.agent.Prompt(turnCtx, request)
+		historyErr := agent.recordHistory(id, session)
 		persistErr := agent.profile.persistOverlay(child.directory)
-		return projectUsage(response, errors.Join(err, persistErr))
+		return projectUsage(response, errors.Join(err, historyErr, persistErr))
 	}
+}
+
+// recordHistory 仅提交已落盘的可恢复内容；取消或失败响应也必须保留真实部分历史。
+func (agent *Agent) recordHistory(id acp.SessionId, session *ownedSession) error {
+	session.mutex.Lock()
+	record := session.record
+	session.mutex.Unlock()
+	if record.HasHistory {
+		return nil
+	}
+	found, err := agent.profile.hasTranscript(record.NativeID)
+	if err != nil || !found {
+		return err
+	}
+	record.HasHistory = true
+	if err := agent.profile.saveRecord(id, record); err != nil {
+		return err
+	}
+	session.mutex.Lock()
+	session.record.HasHistory = true
+	session.mutex.Unlock()
+	return nil
 }
 
 // Cancel 不持有配置锁等待原生通知，保留共享桥的排队代取消语义。
@@ -233,7 +255,9 @@ func (agent *Agent) SetSessionConfigOption(
 		return acp.SetSessionConfigOptionResponse{}, err
 	}
 	session.mutex.Lock()
-	if session.closed || session.pending > 0 || session.changing != nil {
+	unavailable := session.closed || session.child == nil
+	busy := session.pending > 0 || session.changing != nil
+	if unavailable || busy {
 		session.mutex.Unlock()
 		return acp.SetSessionConfigOptionResponse{}, errors.New("Gemini session is busy or closed; configuration requires idle session")
 	}
@@ -292,6 +316,13 @@ func (agent *Agent) replace(
 ) (response acp.LoadSessionResponse, err error) {
 	if record.Reasoning != "default" {
 		if err := agent.checkThinkingPrecedence(record.Cwd); err != nil {
+			return acp.LoadSessionResponse{}, err
+		}
+	}
+	// 原生日志可能先于适配器标记落盘；重启或取消后的恢复必须再次确认。
+	if !record.HasHistory {
+		record.HasHistory, err = agent.profile.hasTranscript(record.NativeID)
+		if err != nil {
 			return acp.LoadSessionResponse{}, err
 		}
 	}
@@ -452,7 +483,8 @@ func (agent *Agent) load(ctx context.Context, request acp.LoadSessionRequest, si
 		return acp.LoadSessionResponse{}, errors.New("Gemini agent closed")
 	}
 	if session == nil {
-		session = &ownedSession{request: clone}
+		// 校验映射和准备原生进程期间，占位身份始终不可执行。
+		session = &ownedSession{request: clone, closed: true}
 		agent.sessions[request.SessionId] = session
 	}
 	agent.mutex.Unlock()
@@ -494,7 +526,9 @@ func (agent *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionMo
 		return acp.SetSessionModeResponse{}, err
 	}
 	session.mutex.Lock()
-	if session.closed || session.pending > 0 || session.changing != nil {
+	unavailable := session.closed || session.child == nil
+	busy := session.pending > 0 || session.changing != nil
+	if unavailable || busy {
 		session.mutex.Unlock()
 		return acp.SetSessionModeResponse{}, errors.New("Gemini session is busy or closed")
 	}

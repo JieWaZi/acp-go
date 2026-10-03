@@ -27,7 +27,7 @@ type sessionRecord struct {
 	Cwd string `json:"cwd"`
 	// Mode 是成功应用的官方权限模式。
 	Mode acp.SessionModeId `json:"mode,omitempty"`
-	// HasHistory 记录是否已经向原生进程提交过用户轮次。
+	// HasHistory 记录是否已确认真正可恢复的原生内容，确认后不因失败而清除。
 	HasHistory bool `json:"hasHistory"`
 }
 
@@ -159,10 +159,8 @@ func inspectTranscript(path string, data []byte, id acp.SessionId) (transcript, 
 	return transcript{path: path, data: data, updated: updated}, true, nil
 }
 
-// protectTranscript 在 load 启动前将最新真实记录复制到不会发生分钟碰撞的稳定文件。
-func (state *profileState) protectTranscript(id acp.SessionId) error {
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
+// resumableTranscript 查找官方可恢复的真实日志，调用方持有状态锁。
+func (state *profileState) resumableTranscript(id acp.SessionId) (*transcript, error) {
 	var best *transcript
 	err := filepath.WalkDir(filepath.Join(state.root, "tmp"), func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -202,6 +200,25 @@ func (state *profileState) protectTranscript(id acp.SessionId) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return best, nil
+}
+
+// hasTranscript 区分尚未执行的空会话与原生已经落盘的部分历史。
+func (state *profileState) hasTranscript(id acp.SessionId) (bool, error) {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	candidate, err := state.resumableTranscript(id)
+	return candidate != nil, err
+}
+
+// protectTranscript 在 load 启动前将最新真实记录复制到不会发生分钟碰撞的稳定文件。
+func (state *profileState) protectTranscript(id acp.SessionId) error {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	best, err := state.resumableTranscript(id)
 	if err != nil {
 		return err
 	}
