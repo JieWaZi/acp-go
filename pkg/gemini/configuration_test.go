@@ -10,8 +10,8 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 )
 
-// TestThinkingOverlayPreservesDefaultsAndCleansConflict 验证真实配置覆盖顺序与用户原配置保持不变。
-func TestThinkingOverlayPreservesDefaultsAndCleansConflict(t *testing.T) {
+// TestThinkingDefaultOverlayPreservesSnapshot 验证默认配置副本保留用户设置而不引入思考覆盖。
+func TestThinkingDefaultOverlayPreservesSnapshot(t *testing.T) {
 	home := t.TempDir()
 	if err := os.Mkdir(filepath.Join(home, ".gemini"), 0700); err != nil {
 		t.Fatal(err)
@@ -54,17 +54,12 @@ func TestThinkingOverlayPreservesDefaultsAndCleansConflict(t *testing.T) {
 	if configs["customAliases"].(map[string]any)["mine"] == nil || values["security"] == nil {
 		t.Fatal("original settings lost")
 	}
-	overrides := configs["customOverrides"].([]any)
-	for index := 1; index < len(overrides); index += 2 {
-		first := overrides[index].(map[string]any)
-		second := overrides[index+1].(map[string]any)
-		if !reflect.DeepEqual(first["match"], second["match"]) {
-			t.Fatal("override order lost")
-		}
-		config := first["modelConfig"].(map[string]any)["generateContentConfig"].(map[string]any)
-		if config["thinkingConfig"] != nil {
-			t.Fatal("old budget/level not cleared")
-		}
+	var originalValues map[string]any
+	if err := json.Unmarshal(original, &originalValues); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(configs, originalValues["modelConfigs"]) {
+		t.Fatalf("default model settings changed: %#v", configs)
 	}
 }
 

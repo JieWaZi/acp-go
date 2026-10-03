@@ -1,6 +1,6 @@
 # Gemini CLI 上游基线
 
-固定来源：[官方 v0.62.0](https://github.com/google-gemini/gemini-cli/tree/b460678f3db508407554afd604cc9d6635becb2a)，SHA `b460678f3db508407554afd604cc9d6635becb2a`。适配器只启动已安装 CLI，使用现有 `coder/acp-go-sdk`；不执行 acpx，不下载或内嵌完整 CLI。[acpx v0.19.4](https://github.com/openai/acpx/tree/v0.19.4) 仅为 registry/process/config 状态惯例参考。
+固定来源：[官方 v0.62.0](https://github.com/google-gemini/gemini-cli/tree/b460678f3db508407554afd604cc9d6635becb2a)，SHA `b460678f3db508407554afd604cc9d6635becb2a`。适配器只启动已安装 CLI，使用现有 `coder/acp-go-sdk`；不执行 acpx，不下载或内嵌完整 CLI。[acpx v0.19.4](https://github.com/openclaw/acpx/tree/v0.19.4) 仅为 registry/process/config 状态惯例参考。
 
 | 项目 | 固定源码与适配行为 |
 | --- | --- |

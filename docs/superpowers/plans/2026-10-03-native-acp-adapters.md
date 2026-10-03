@@ -1,6 +1,6 @@
 # Native ACP adapters implementation plan
 
-> 执行方式：subagent-driven-development；每个任务测试优先，实现后单独审查规范与质量。
+> 执行方式：前期使用 subagent-driven-development；用户在最终收尾阶段明确要求不再启动子代理，后续由主代理直接检查、修复和验证。每个任务测试优先，审查记录区分独立审查与直接自审。
 
 **Goal:** 为 acp-go 新增 OpenCode、Gemini CLI、Grok Build 的生产可用适配器，并在 Ally 同步接入运行时、账号与模型/thinking 能力。
 

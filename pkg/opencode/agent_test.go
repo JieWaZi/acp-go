@@ -308,7 +308,8 @@ func TestNativeBridgeIsSDKConnection(t *testing.T) { var _ acp.Agent = (*nativea
 // TestGeminiCustomModelsResumeAndQuota 验证未知模型保留原生接受语义、恢复别名与本轮用量。
 func TestGeminiCustomModelsResumeAndQuota(t *testing.T) {
 	agent, peer, host := startAdapter(t, "gemini")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 多次 owned-child 交接需要等待 race 测试子进程退出，每次默认有一秒清理延迟。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := peer.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
 		t.Fatal(err)
