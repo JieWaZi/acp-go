@@ -15,8 +15,6 @@ type promptQueue struct {
 	current *promptWaiter
 	// closed 阻止旧会话句柄再次启动执行。
 	closed bool
-	// canceling 阻止取消通知发出前启动下一轮，避免原生 cancel 误伤后续请求。
-	canceling int
 }
 
 // promptWaiter 拥有一次请求的独立取消上下文和执行许可。
@@ -29,9 +27,10 @@ type promptWaiter struct {
 	ready chan struct{}
 }
 
-// advance 在原生取消通知已经发出且当前执行结束后，放行最早的有效请求。
-func (queue *promptQueue) advance() {
-	if queue.closed || queue.current != nil || queue.canceling != 0 {
+// advancePrompt 在当前执行结束且跨代原生取消已经发出后，放行最早的有效请求。
+func (agent *Agent) advancePrompt(id acp.SessionId, queue *promptQueue) {
+	busy := queue.current != nil || agent.promptCanceling[id] != 0
+	if queue.closed || busy {
 		return
 	}
 	for len(queue.waiting) > 0 {
@@ -70,7 +69,7 @@ func (agent *Agent) acquirePrompt(ctx context.Context, id acp.SessionId) (*promp
 	turnCtx, cancel := context.WithCancel(ctx)
 	waiter := &promptWaiter{context: turnCtx, cancel: cancel, ready: make(chan struct{})}
 	queue.waiting = append(queue.waiting, waiter)
-	queue.advance()
+	agent.advancePrompt(id, queue)
 	agent.mutex.Unlock()
 	select {
 	case <-waiter.ready:
@@ -115,7 +114,7 @@ func (agent *Agent) releasePrompt(id acp.SessionId, queue *promptQueue, waiter *
 			break
 		}
 	}
-	queue.advance()
+	agent.advancePrompt(id, queue)
 }
 
 // promptFIFO 使用会话独立队列转发原生执行，并保留真实响应与错误。
@@ -141,20 +140,37 @@ func (agent *Agent) promptFIFO(ctx context.Context, request acp.PromptRequest) (
 	if ctx.Err() != nil {
 		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		defer cancel()
-		_ = agent.cancelFIFO(cancelCtx, acp.CancelNotification{SessionId: request.SessionId})
+		_ = agent.cancelPromptOwner(cancelCtx, acp.CancelNotification{SessionId: request.SessionId}, waiter)
 	}
 	return response, err
 }
 
 // cancelFIFO 取消当前本地等待，并在放行下一轮前保留原生会话取消通知。
 func (agent *Agent) cancelFIFO(ctx context.Context, request acp.CancelNotification) error {
+	return agent.cancelPromptOwner(ctx, request, nil)
+}
+
+// cancelPromptOwner 在同一锁下确认自动取消所属执行代，并建立跨代原生通知屏障。
+// 显式 Cancel 没有 owner 限制；旧执行的自动取消不能中断已恢复的新执行。
+func (agent *Agent) cancelPromptOwner(
+	ctx context.Context,
+	request acp.CancelNotification,
+	owner *promptWaiter,
+) error {
 	agent.mutex.Lock()
 	var queue *promptQueue
 	if state := agent.sessions[request.SessionId]; state != nil {
 		queue = state.queue
 	}
+	if owner != nil {
+		stale := queue == nil || queue.current != owner
+		if stale || agent.turnOwners[request.SessionId] != owner {
+			agent.mutex.Unlock()
+			return nil
+		}
+	}
+	agent.promptCanceling[request.SessionId]++
 	if queue != nil {
-		queue.canceling++
 		if queue.current != nil {
 			queue.current.cancel()
 		}
@@ -162,9 +178,13 @@ func (agent *Agent) cancelFIFO(ctx context.Context, request acp.CancelNotificati
 	agent.mutex.Unlock()
 	err := agent.conn.SendNotification(ctx, "session/cancel", request)
 	agent.mutex.Lock()
-	if queue != nil {
-		queue.canceling--
-		queue.advance()
+	agent.promptCanceling[request.SessionId]--
+	if agent.promptCanceling[request.SessionId] == 0 {
+		delete(agent.promptCanceling, request.SessionId)
+	}
+	// 发送期间可能发生 close/load/resume；释放的是当前代，不是已废弃的旧队列。
+	if state := agent.sessions[request.SessionId]; state != nil && state.queue != nil {
+		agent.advancePrompt(request.SessionId, state.queue)
 	}
 	agent.mutex.Unlock()
 	return err

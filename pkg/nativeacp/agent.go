@@ -89,6 +89,8 @@ type Agent struct {
 	active map[acp.SessionId]bool
 	// turnOwners 防止已关闭队列的清理删除恢复后新一轮的状态。
 	turnOwners map[acp.SessionId]*promptWaiter
+	// promptCanceling 按持久会话标识记录在途原生取消，屏障跨恢复后的执行代共享。
+	promptCanceling map[acp.SessionId]int
 	// toolSessions 保存已收到工具更新的所属会话。
 	toolSessions map[acp.ToolCallId]acp.SessionId
 	// config 保存协议特性开关。
@@ -151,23 +153,24 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, fmt.Errorf("starting native ACP: %w", err)
 	}
 	agent := &Agent{
-		command:      command,
-		input:        input,
-		output:       output,
-		cancel:       cancel,
-		done:         make(chan struct{}),
-		stderr:       stderr,
-		closed:       make(chan struct{}),
-		bound:        make(chan struct{}),
-		sessions:     make(map[acp.SessionId]*sessionOptions),
-		active:       make(map[acp.SessionId]bool),
-		turnOwners:   make(map[acp.SessionId]*promptWaiter),
-		toolSessions: make(map[acp.ToolCallId]acp.SessionId),
-		config:       config,
-		prompts:      make(map[acp.SessionId][]acp.ContentBlock),
-		toolDetails:  make(map[acp.ToolCallId]acp.ToolCallUpdate),
-		turnContexts: make(map[acp.SessionId]context.Context),
-		turnCancels:  make(map[acp.SessionId]context.CancelFunc),
+		command:         command,
+		input:           input,
+		output:          output,
+		cancel:          cancel,
+		done:            make(chan struct{}),
+		stderr:          stderr,
+		closed:          make(chan struct{}),
+		bound:           make(chan struct{}),
+		sessions:        make(map[acp.SessionId]*sessionOptions),
+		active:          make(map[acp.SessionId]bool),
+		turnOwners:      make(map[acp.SessionId]*promptWaiter),
+		promptCanceling: make(map[acp.SessionId]int),
+		toolSessions:    make(map[acp.ToolCallId]acp.SessionId),
+		config:          config,
+		prompts:         make(map[acp.SessionId][]acp.ContentBlock),
+		toolDetails:     make(map[acp.ToolCallId]acp.ToolCallUpdate),
+		turnContexts:    make(map[acp.SessionId]context.Context),
+		turnCancels:     make(map[acp.SessionId]context.CancelFunc),
 	}
 	agent.conn = acp.NewConnection(agent.handle, input, output)
 	go func() {
