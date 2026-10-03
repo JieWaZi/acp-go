@@ -4,7 +4,7 @@
 
 **Goal:** 为 acp-go 新增 OpenCode、Gemini CLI、Grok Build 的生产可用适配器，并在 Ally 同步接入运行时、账号与模型/thinking 能力。
 
-**Architecture:** 官方原生 ACP CLI + internal/nativeacp 双向进程代理 + 三个轻量公共适配器，供应商差异由可追溯兼容层处理。
+**Architecture:** 官方原生 ACP CLI + 复用 pkg/nativeacp 双向进程代理 + 三个轻量公共适配器，供应商差异由可追溯兼容层处理。基线 48b2b12 已包含五种适配器，不能重复开发桥接。
 
 **Tech Stack:** Go 1.25.8、coder/acp-go-sdk v0.13.5、官方 CLI；Ally Go 后端和 Svelte/TypeScript 桌面端。
 
@@ -23,21 +23,21 @@
 
 ### Task 1: Native ACP process bridge
 
-**Files:** 新增 internal/nativeacp/{agent,process,client,session,extensions}.go，按职责添加 *_test.go；允许必要的同目录小文件。
+**Files:** 增强现有 pkg/nativeacp/{agent,session,environment,version,forward}.go，按职责添加 *_test.go；必要的 FIFO 生命周期可新增小文件。现有 callback/session adapter 接口必须复用。
 
 1. [ ] 先写行为测试并观察失败：真实 ACP 外层连接→代理→假 CLI 进程；假进程由测试二进制 helper 启动，stdout 不污染协议。
-2. [ ] Config 描述可执行文件、默认文件名、PrefixArgs、Environment、原生命令参数、Logger、适配器身份；NewAgent 只解析选中的 CLI。明确路径失败不回退 PATH；复制切片；独立探测 --version 并按 acpmeta 注入。
+2. [ ] 复用 Config.Command/Args/VersionArgs/Environment/Logger 和现有版本、PATH、进程实现；复制调用者切片。默认命令与 PrefixArgs 由 Task 2 公共包构造。测试显式路径失败不回退 PATH、按完整环境查找和版本 acpmeta。允许保留现有 NewAgent 立即启动语义。
 3. [ ] 实现 acp.Agent 与 AgentLoader、SetAgentConnection、Close。透传已存在的标准会话/配置方法以及 SDK 支持的可选接口；不要把方法缺失改成假成功。
 4. [ ] 子进程到外层客户端的文件、terminal、request_permission、user_input、elicitation、session_update 双向转发；保留 payload、_meta、错误 code/data。按 SDK 可选接口转发。
-5. [ ] 原生子进程按需启动、可重复 Initialize，初始化能力从原生响应得来；外层绑定未完成时回调显式失败。关闭幂等、进程退出唤醒待处理请求；日志无敏感数据。
-6. [ ] 每个 session prompt FIFO，可并发不同 session；Cancel 不中断别的会话。排队请求支持 context 取消，CloseSession/Close 不挂住；新建/load/resume 建立会话记录，closed session 不复用。
-7. [ ] 可转发未知 ACP 扩展，给三个适配器供应商兼容留清晰、窄接口。避免因扩展处理器无法区分 request/notification 引入循环。
+5. [ ] 初始化能力从原生响应得来；保留现有回调等待绑定语义，必须能被 ctx/Close 解除。关闭幂等、进程退出唤醒待处理请求。不要在 connection 启动后替换 Logger。
+6. [ ] 显式 opt-in 的 Config 开关使新增适配器的每个 session prompt FIFO，可并发不同 session；Cancel 不中断别的会话，能解除当前本地等待并保持原生 cancel 通知。排队请求支持 context 取消，CloseSession/Close 不挂住；新建/load/resume 建立会话记录，closed session 不复用。现有 Kimi/Cursor/Pi 默认并发语义不得改变；另一个显式开关使不支持 close 的新适配器返回真实 MethodNotFound 而不是假成功，兼容层可另行实现资源释放。
+7. [ ] 保留现有扩展转发、CallbackAdapter/SessionAdapter/CallNative，不额外设计 transport。测试 request 扩展不循环；不把未知 notification 扩展当作可保证支持的能力。
 8. [ ] 测试并验证完整环境替换、prefix 参数、CLI 版本与 build 版本、所有回调、扩展错误、FIFO、取消、关闭、进程崩溃和可选方法；运行 go test ./... 和桥接 race 测试一次。
 9. [ ] 自审、提交、写详细报告（含 RED/GREEN 与命令输出）。
 
 ### Task 2: Public adapters, source-backed normalization and documentation
 
-**Files:** pkg/opencode、pkg/gemini、pkg/grok 的 agent.go、doc.go、README.md、UPSTREAM.md、行为测试；必要的 internal/nativeacp 供应商兼容代码；cmd/acp-agent/main.go 及其测试；根 README.md、docs/NATIVE_ACP_TEST_MATRIX.md。
+**Files:** pkg/opencode、pkg/gemini、pkg/grok 的 agent.go、doc.go、README.md、UPSTREAM.md、行为测试；必要的 pkg/nativeacp 供应商兼容代码；cmd/acp-agent/main.go 及其测试；根 README.md、docs/NATIVE_ACP_TEST_MATRIX.md。
 
 1. [ ] 阅读 Task 1 的公共接口，先编写三个适配器行为测试并观察失败。
 2. [ ] 三个包公开 Config（Logger、供应商 Path、PrefixArgs、Environment）、NewAgent、Agent，命令分别 opencode acp、gemini --acp、grok agent stdio；注册 adapter ID opencode、gemini、grok。
