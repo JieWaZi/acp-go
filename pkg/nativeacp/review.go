@@ -43,6 +43,11 @@ func NewReviewPermissionAdapter(config ReviewPermissionConfig) PermissionAdapter
 func (agent *Agent) CurrentSession(id acp.SessionId) (SessionContext, bool) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
+	return agent.currentSessionLocked(id)
+}
+
+// currentSessionLocked 在调用方持有原生状态锁时读取同一会话事实。
+func (agent *Agent) currentSessionLocked(id acp.SessionId) (SessionContext, bool) {
 	state := agent.sessions[id]
 	if state == nil {
 		return SessionContext{}, false
@@ -84,7 +89,7 @@ func (adapter *reviewPermissionAdapter) Review(
 		session, exists = adapter.config.CurrentSession(evidence.Request.SessionId)
 	}
 	complete := exists && evidence.Active && evidence.ToolOwner == evidence.Request.SessionId &&
-		tool.RawInput != nil && len(evidence.Prompt) > 0
+		tool.RawInput != nil && len(evidence.Prompt) > 0 && evidence.unchanged != nil && evidence.unchanged()
 	if complete && adapter.config.Reviewer != nil {
 		decision, reviewErr = adapter.config.Reviewer(ctx, autoreview.Request{
 			WorkingDirectory: session.WorkingDirectory, Model: session.Model, Prompt: evidence.Prompt, Tool: tool,
@@ -92,6 +97,10 @@ func (adapter *reviewPermissionAdapter) Review(
 	}
 	if ctx.Err() != nil {
 		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, true, nil
+	}
+	if reviewErr == nil && decision.Outcome == "allow" &&
+		(evidence.unchanged == nil || !evidence.unchanged()) {
+		reviewErr = errors.New("permission evidence changed during review")
 	}
 	update := acp.SessionNotification{
 		SessionId: evidence.Request.SessionId,
@@ -106,7 +115,7 @@ func (adapter *reviewPermissionAdapter) Review(
 	if reviewErr == nil && decision.Outcome == "allow" && ctx.Err() == nil && evidence.Active {
 		if current, exists := adapter.config.CurrentSession(evidence.Request.SessionId); exists && current == session {
 			for _, option := range evidence.Request.Options {
-				if option.Kind == acp.PermissionOptionKindAllowOnce {
+				if option.Kind == acp.PermissionOptionKindAllowOnce && evidence.unchanged != nil && evidence.unchanged() {
 					return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected(option.OptionId)}, true, nil
 				}
 			}

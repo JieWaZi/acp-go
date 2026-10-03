@@ -203,6 +203,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	if update := request.Update.ToolCall; update != nil {
+		agent.toolRevisions[update.ToolCallId] = &toolEvidenceRevision{}
 		agent.toolSessions[update.ToolCallId] = request.SessionId
 		agent.toolDetails[update.ToolCallId] = acp.ToolCallUpdate{
 			ToolCallId: update.ToolCallId,
@@ -213,6 +214,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 		}
 	}
 	if update := request.Update.ToolCallUpdate; update != nil {
+		agent.toolRevisions[update.ToolCallId] = &toolEvidenceRevision{}
 		agent.toolSessions[update.ToolCallId] = request.SessionId
 		previous := agent.toolDetails[update.ToolCallId]
 		if update.RawInput != nil {

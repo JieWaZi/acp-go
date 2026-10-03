@@ -102,6 +102,7 @@ func (agent *Agent) releasePrompt(id acp.SessionId, queue *promptQueue, waiter *
 			if sid == id {
 				delete(agent.toolSessions, toolID)
 				delete(agent.toolDetails, toolID)
+				delete(agent.toolRevisions, toolID)
 			}
 		}
 	}

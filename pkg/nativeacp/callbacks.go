@@ -89,6 +89,8 @@ type PermissionEvidence struct {
 	ToolOwner acp.SessionId
 	// Active 表示请求所属执行轮仍然有效。
 	Active bool
+	// unchanged 在原生状态锁内复核当前回合、会话和完整工具事件身份，外部适配器不能伪造。
+	unchanged func() bool
 }
 
 // PermissionBridge 只暴露厂商审批适配器发布审查结果所需的宿主能力。

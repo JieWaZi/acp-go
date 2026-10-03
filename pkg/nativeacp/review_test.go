@@ -29,7 +29,7 @@ func TestReviewRejectsReplacedSession(t *testing.T) {
 			}
 			return autoreview.Decision{Outcome: "allow"}, nil
 		}})
-		evidence := PermissionEvidence{Request: acp.RequestPermissionRequest{SessionId: "s", ToolCall: acp.ToolCallUpdate{ToolCallId: "tool"}, Options: []acp.PermissionOption{{OptionId: "once", Kind: acp.PermissionOptionKindAllowOnce}}}, Detail: acp.ToolCallUpdate{RawInput: map[string]any{"command": "ls"}}, Prompt: []acp.ContentBlock{acp.TextBlock("list")}, ToolOwner: "s", Active: true}
+		evidence := PermissionEvidence{Request: acp.RequestPermissionRequest{SessionId: "s", ToolCall: acp.ToolCallUpdate{ToolCallId: "tool"}, Options: []acp.PermissionOption{{OptionId: "once", Kind: acp.PermissionOptionKindAllowOnce}}}, Detail: acp.ToolCallUpdate{RawInput: map[string]any{"command": "ls"}}, Prompt: []acp.ContentBlock{acp.TextBlock("list")}, ToolOwner: "s", Active: true, unchanged: func() bool { return true }}
 		_, handled, err := adapter.Review(context.Background(), &reviewHost{}, evidence)
 		if err != nil || handled {
 			t.Fatalf("replaced session approved: generation=%v handled=%v err=%v", replaceGeneration, handled, err)
@@ -63,7 +63,7 @@ func TestReviewPermissionFallsBackAndOnlyAllowsOnce(t *testing.T) {
 				}
 				return autoreview.Decision{Outcome: outcome}, nil
 			}})
-			evidence := PermissionEvidence{Request: acp.RequestPermissionRequest{SessionId: "s", ToolCall: acp.ToolCallUpdate{ToolCallId: "tool"}, Options: []acp.PermissionOption{{OptionId: "always", Kind: acp.PermissionOptionKindAllowAlways, Name: "Always"}, {OptionId: "once", Kind: acp.PermissionOptionKindAllowOnce, Name: "Once"}}}, Detail: acp.ToolCallUpdate{RawInput: map[string]any{"command": "ls"}}, Prompt: []acp.ContentBlock{acp.TextBlock("list files")}, ToolOwner: "s", Active: true}
+			evidence := PermissionEvidence{Request: acp.RequestPermissionRequest{SessionId: "s", ToolCall: acp.ToolCallUpdate{ToolCallId: "tool"}, Options: []acp.PermissionOption{{OptionId: "always", Kind: acp.PermissionOptionKindAllowAlways, Name: "Always"}, {OptionId: "once", Kind: acp.PermissionOptionKindAllowOnce, Name: "Once"}}}, Detail: acp.ToolCallUpdate{RawInput: map[string]any{"command": "ls"}}, Prompt: []acp.ContentBlock{acp.TextBlock("list files")}, ToolOwner: "s", Active: true, unchanged: func() bool { return true }}
 			if outcome == "missing" {
 				evidence.Detail.RawInput = nil
 			}

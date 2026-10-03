@@ -103,6 +103,8 @@ type Agent struct {
 	prompts map[acp.SessionId][]acp.ContentBlock
 	// toolDetails 保存上游增量工具参数，供执行前风险审查使用。
 	toolDetails map[acp.ToolCallId]acp.ToolCallUpdate
+	// toolRevisions 为每次原生工具事件保存不可复用的证据身份。
+	toolRevisions map[acp.ToolCallId]*toolEvidenceRevision
 	// toolChanged 在先行工具通知入账时唤醒并发到达的审批请求。
 	toolChanged chan struct{}
 	// silentLoads 屏蔽只用于恢复配置的历史回放，宿主 Resume 不重复展示旧消息。
@@ -173,6 +175,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		config:          config,
 		prompts:         make(map[acp.SessionId][]acp.ContentBlock),
 		toolDetails:     make(map[acp.ToolCallId]acp.ToolCallUpdate),
+		toolRevisions:   make(map[acp.ToolCallId]*toolEvidenceRevision),
 		turnContexts:    make(map[acp.SessionId]context.Context),
 		turnCancels:     make(map[acp.SessionId]context.CancelFunc),
 	}
@@ -359,6 +362,7 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 			if sid == request.SessionId {
 				delete(agent.toolSessions, id)
 				delete(agent.toolDetails, id)
+				delete(agent.toolRevisions, id)
 			}
 		}
 		agent.mutex.Unlock()

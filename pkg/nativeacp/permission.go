@@ -7,6 +7,12 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 )
 
+// toolEvidenceRevision 以非零大小分配保证事件身份不被零大小指针规则合并。
+type toolEvidenceRevision struct {
+	// marker 只保证不同事件拥有独立地址，不保存工具或账号内容。
+	marker byte
+}
+
 // requestPermission 收集标准执行证据，并让当前 CLI 自己决定是否需要补充审批策略。
 func (agent *Agent) requestPermission(
 	ctx context.Context,
@@ -19,6 +25,9 @@ func (agent *Agent) requestPermission(
 	owner := agent.toolSessions[request.ToolCall.ToolCallId]
 	turnCtx := agent.turnContexts[request.SessionId]
 	active := agent.active[request.SessionId]
+	turnOwner := agent.turnOwners[request.SessionId]
+	revision := agent.toolRevisions[request.ToolCall.ToolCallId]
+	session, sessionExists := agent.currentSessionLocked(request.SessionId)
 	agent.mutex.Unlock()
 	if turnCtx != nil {
 		scoped, cancel := context.WithCancel(ctx)
@@ -34,6 +43,16 @@ func (agent *Agent) requestPermission(
 			Prompt:    prompt,
 			ToolOwner: owner,
 			Active:    active,
+			unchanged: func() bool {
+				agent.mutex.Lock()
+				defer agent.mutex.Unlock()
+				current, exists := agent.currentSessionLocked(request.SessionId)
+				return sessionExists && exists && current == session && turnCtx != nil && turnCtx.Err() == nil &&
+					agent.active[request.SessionId] && agent.turnContexts[request.SessionId] == turnCtx &&
+					agent.turnOwners[request.SessionId] == turnOwner &&
+					agent.toolSessions[request.ToolCall.ToolCallId] == request.SessionId && revision != nil &&
+					agent.toolRevisions[request.ToolCall.ToolCallId] == revision
+			},
 		}
 		response, handled, err := adapter.Review(ctx, agent, evidence)
 		if err != nil || handled {
