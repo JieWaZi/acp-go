@@ -63,10 +63,24 @@ func TestHandwrittenGoDeclarationsHaveChineseComments(t *testing.T) {
 // shouldSkipCommentAuditDirectory 判断不属于本仓库手写 Go 源码的目录。
 func shouldSkipCommentAuditDirectory(name string) bool {
 	switch name {
-	case ".git", ".upstream", "node_modules", "vendor":
+	case ".git", ".upstream", ".worktrees", "node_modules", "vendor":
 		return true
 	default:
 		return false
+	}
+}
+
+// TestCommentAuditDirectoryScope 保证旧工作树和外部依赖不会混入当前分支的注释审计。
+func TestCommentAuditDirectoryScope(t *testing.T) {
+	for _, name := range []string{".git", ".upstream", ".worktrees", "node_modules", "vendor"} {
+		if !shouldSkipCommentAuditDirectory(name) {
+			t.Errorf("外部目录 %q 必须跳过注释审计", name)
+		}
+	}
+	for _, name := range []string{"pkg", "internal", "cmd", ".agents"} {
+		if shouldSkipCommentAuditDirectory(name) {
+			t.Errorf("当前分支目录 %q 不能跳过注释审计", name)
+		}
 	}
 }
 

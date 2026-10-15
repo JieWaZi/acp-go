@@ -89,6 +89,8 @@ type PermissionEvidence struct {
 	ToolOwner acp.SessionId
 	// Active 表示请求所属执行轮仍然有效。
 	Active bool
+	// unchanged 在原生状态锁内复核当前回合、会话和完整工具事件身份，外部适配器不能伪造。
+	unchanged func() bool
 }
 
 // PermissionBridge 只暴露厂商审批适配器发布审查结果所需的宿主能力。
@@ -114,6 +116,7 @@ func (agent *Agent) ResolveInteractionSession(toolCallID, sessionID string) acp.
 
 // UpdateSession 实现 CallbackBridge，统一使用已绑定的 ACP 宿主连接。
 func (agent *Agent) UpdateSession(ctx context.Context, request acp.SessionNotification) error {
+	request.SessionId = agent.publicSessionID(request.SessionId)
 	return agent.host.SessionUpdate(ctx, request)
 }
 
@@ -122,6 +125,7 @@ func (agent *Agent) RequestPermission(
 	ctx context.Context,
 	request acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
+	request.SessionId = agent.publicSessionID(request.SessionId)
 	return agent.host.RequestPermission(ctx, request)
 }
 
@@ -130,12 +134,22 @@ func (agent *Agent) CreateElicitation(
 	ctx context.Context,
 	request acp.UnstableCreateElicitationRequest,
 ) (acp.UnstableCreateElicitationResponse, error) {
+	if agent.config.PublicSessionID == nil {
+		return agent.host.UnstableCreateElicitation(ctx, request)
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return acp.UnstableCreateElicitationResponse{}, err
+	}
+	if err := json.Unmarshal(agent.publicCallback(data), &request); err != nil {
+		return acp.UnstableCreateElicitationResponse{}, err
+	}
 	return agent.host.UnstableCreateElicitation(ctx, request)
 }
 
 // SendRequest 实现 SessionBridge，协议编解码仍由 nativeacp 统一拥有。
 func (agent *Agent) SendRequest(ctx context.Context, method string, request any, response any) error {
-	raw, err := sendNativeRequest[json.RawMessage](agent, ctx, method, request)
+	raw, err := agent.CallNative(ctx, method, request)
 	if err != nil {
 		return err
 	}
@@ -143,4 +157,42 @@ func (agent *Agent) SendRequest(ctx context.Context, method string, request any,
 		return nil
 	}
 	return json.Unmarshal(raw, response)
+}
+
+// CallNative 为兼容层提供窄原生请求入口，保留 SDK 的原始结果和协议错误。
+func (agent *Agent) CallNative(ctx context.Context, method string, request any) (json.RawMessage, error) {
+	return sendNativeRequest[json.RawMessage](agent, ctx, method, request)
+}
+
+// publicSessionID 仅在适配器显式启用时转换宿主可见标识。
+func (agent *Agent) publicSessionID(id acp.SessionId) acp.SessionId {
+	if agent.config.PublicSessionID == nil {
+		return id
+	}
+	return agent.config.PublicSessionID(id)
+}
+
+// publicCallback 映射标准顶层与 elicitation 元数据，不更改工具输入中的同名字段。
+func (agent *Agent) publicCallback(data json.RawMessage) json.RawMessage {
+	if agent.config.PublicSessionID == nil {
+		return data
+	}
+	fields := map[string]json.RawMessage{}
+	if json.Unmarshal(data, &fields) != nil {
+		return data
+	}
+	if raw, ok := fields["sessionId"]; ok {
+		var id acp.SessionId
+		if json.Unmarshal(raw, &id) == nil {
+			fields["sessionId"], _ = json.Marshal(agent.publicSessionID(id))
+		}
+	}
+	if raw, ok := fields["_meta"]; ok {
+		fields["_meta"] = agent.publicCallback(raw)
+	}
+	result, err := json.Marshal(fields)
+	if err != nil {
+		return data
+	}
+	return result
 }

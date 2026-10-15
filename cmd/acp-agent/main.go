@@ -16,7 +16,10 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/claude"
 	"github.com/JieWaZi/acp-go/pkg/codex"
 	"github.com/JieWaZi/acp-go/pkg/cursor"
+	"github.com/JieWaZi/acp-go/pkg/gemini"
+	"github.com/JieWaZi/acp-go/pkg/grok"
 	"github.com/JieWaZi/acp-go/pkg/kimi"
+	"github.com/JieWaZi/acp-go/pkg/opencode"
 	"github.com/JieWaZi/acp-go/pkg/pi"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -170,6 +173,28 @@ func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
 	if err := registry.Register(acpserver.Registration{Name: "pi", Factory: func(ctx context.Context) (acp.Agent, error) {
 		return pi.NewAgent(ctx, pi.Config{Logger: logger, PiPath: os.Getenv("PI_PATH"), MCPModulePath: os.Getenv("PI_MCP_MODULE_PATH")})
 	}}); err != nil {
+		return nil, err
+	}
+
+	if err := registry.Register(acpserver.Registration{
+		Name: "opencode", Factory: func(ctx context.Context) (acp.Agent, error) {
+			return opencode.NewAgent(ctx, opencode.Config{Logger: logger, OpenCodePath: os.Getenv("OPENCODE_PATH")})
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(acpserver.Registration{
+		Name: "gemini", Factory: func(ctx context.Context) (acp.Agent, error) {
+			return gemini.NewAgent(ctx, gemini.Config{Logger: logger, GeminiPath: os.Getenv("GEMINI_PATH")})
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(acpserver.Registration{
+		Name: "grok", Factory: func(ctx context.Context) (acp.Agent, error) {
+			return grok.NewAgent(ctx, grok.Config{Logger: logger, GrokPath: os.Getenv("GROK_PATH")})
+		},
+	}); err != nil {
 		return nil, err
 	}
 

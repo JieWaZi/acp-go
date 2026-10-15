@@ -11,12 +11,18 @@ import (
 
 // sessionOptions 将宿主统一配置标识映射到上游声明的实际标识。
 type sessionOptions struct {
+	// workingDirectory 保存原生会话实际 cwd，供 opt-in 审查使用。
+	workingDirectory string
+	// queue 保存显式开启的会话执行队列。
+	queue *promptQueue
 	// configMutex 串行化一次配置操作中的多项原生参数更新。
 	configMutex sync.Mutex
 	// ids 按 model/reasoning 等规范化标识保存原生配置标识。
 	ids map[acp.SessionConfigId]acp.SessionConfigId
 	// options 是最后一次会话返回的配置目录。
 	options []acp.SessionConfigOption
+	// models 保存当前会话代的旧版模型目录，恢复时以新响应克隆替换。
+	models json.RawMessage
 }
 
 // nativeSessionResponse 兼容当前仍提供 models 的外部 ACP 实现。
@@ -79,7 +85,8 @@ func (agent *Agent) normalizeSession(
 	id acp.SessionId,
 	cwd string,
 ) error {
-	state := &sessionOptions{ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
+	state := &sessionOptions{workingDirectory: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
+	state.models = append(json.RawMessage{}, response.Models...)
 	if agent.config.SessionAdapter != nil {
 		snapshot := SessionSnapshot{
 			ConfigOptions:    response.ConfigOptions,
@@ -95,9 +102,16 @@ func (agent *Agent) normalizeSession(
 	} else {
 		response.ConfigOptions = NormalizeOptions(response.ConfigOptions, state.ids)
 	}
+	response.ConfigOptions = agent.enrichConfigOptions(state, response.ConfigOptions)
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state.options = response.ConfigOptions
+	if agent.config.PromptFIFO {
+		if old := agent.sessions[id]; old != nil && old.queue != nil {
+			old.queue.close()
+		}
+		state.queue = &promptQueue{waiting: []*promptWaiter{}}
+	}
 	agent.sessions[id] = state
 	return nil
 }
@@ -179,6 +193,7 @@ func (agent *Agent) SetSessionConfigOption(
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	response.ConfigOptions = NormalizeOptions(response.ConfigOptions, state.ids)
+	response.ConfigOptions = agent.enrichConfigOptions(state, response.ConfigOptions)
 	state.options = response.ConfigOptions
 	return response, nil
 }
@@ -188,6 +203,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	if update := request.Update.ToolCall; update != nil {
+		agent.toolRevisions[update.ToolCallId] = &toolEvidenceRevision{}
 		agent.toolSessions[update.ToolCallId] = request.SessionId
 		agent.toolDetails[update.ToolCallId] = acp.ToolCallUpdate{
 			ToolCallId: update.ToolCallId,
@@ -198,6 +214,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 		}
 	}
 	if update := request.Update.ToolCallUpdate; update != nil {
+		agent.toolRevisions[update.ToolCallId] = &toolEvidenceRevision{}
 		agent.toolSessions[update.ToolCallId] = request.SessionId
 		previous := agent.toolDetails[update.ToolCallId]
 		if update.RawInput != nil {
@@ -222,6 +239,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 			} else {
 				update.ConfigOptions = NormalizeOptions(update.ConfigOptions, state.ids)
 			}
+			update.ConfigOptions = agent.enrichConfigOptions(state, update.ConfigOptions)
 			state.options = update.ConfigOptions
 		}
 	}
@@ -231,6 +249,21 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 		}
 		agent.toolChanged = make(chan struct{})
 	}
+}
+
+// enrichConfigOptions 仅向显式启用的纯投影提供当前会话代事实；模型原文克隆避免外部修改保存的目录。
+func (agent *Agent) enrichConfigOptions(
+	state *sessionOptions,
+	options []acp.SessionConfigOption,
+) []acp.SessionConfigOption {
+	if agent.config.EnrichConfigOptions == nil {
+		return options
+	}
+	return agent.config.EnrichConfigOptions(SessionSnapshot{
+		ConfigOptions:    options,
+		Models:           append(json.RawMessage{}, state.models...),
+		WorkingDirectory: state.workingDirectory,
+	})
 }
 
 // interactionSession 只在会话归属唯一时路由缺少会话标识的请求。
