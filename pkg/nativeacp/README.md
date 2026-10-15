@@ -1,6 +1,6 @@
 # 原生 ACP 进程接入
 
-`pkg/kimi`、`pkg/cursor`、`pkg/pi` 提供现有 Adapter 风格的 Config、NewAgent 和 Agent，可直接交给 acpserver.New。公共层使用 coder/acp-go-sdk 的 Connection、请求关联、通知排序、取消与类型校验，不包含第二套 JSON-RPC 实现。
+`pkg/kimi`、`pkg/cursor`、`pkg/pi`、`pkg/opencode`、`pkg/gemini`、`pkg/grok`、`pkg/workbuddy` 提供现有 Adapter 风格的 Config、NewAgent 和 Agent，可直接交给 acpserver.New。公共层使用 coder/acp-go-sdk 的 Connection、请求关联、通知排序、取消与类型校验，不包含第二套 JSON-RPC 实现。
 
 ```go
 agent, err := kimi.NewAgent(ctx, kimi.Config{
@@ -26,3 +26,5 @@ WorkingDirectory 是进程启动目录，session/new.cwd 是会话目录；需�
 未声明 close 的上游收到取消，本地映射删除，资源随进程退出回收。Close 先结束 stdin，再有界终止进程；acpserver.Serve 负责调用。Unix 终止独立进程组，包含 Pi / MCP 子进程。其他平台目前只保证直接子进程清理，未做 Windows 进程树实测。
 
 [来源基线](UPSTREAM.md) · [验证记录](../../docs/NATIVE_ACP_TEST_MATRIX.md)
+
+WorkBuddy 复用 CodeBuddy Code 的零身份元数据标准 ACP，公开问答在厂商包内转为统一表单，并通过 `InteractionContext` 绑定当前执行代的取消信号。具体边界见 [WorkBuddy](../workbuddy/README.md)。

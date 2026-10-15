@@ -1,6 +1,6 @@
 # acp-go
 
-`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor、Pi、OpenCode、Gemini CLI 或 Grok Build。
+`acp-go` 是一个使用 Go 实现的 [Agent Client Protocol（ACP）](https://agentclientprotocol.com/) Agent 服务。它通过标准输入输出连接 ACP 客户端，并把会话请求交给用户本机安装的 Codex、Claude、Kimi、Cursor、Pi、OpenCode、Gemini CLI、Grok Build 或 WorkBuddy（CodeBuddy Code）。
 
 项目同时提供可直接嵌入其他 Go 程序的公开包：
 
@@ -13,6 +13,7 @@
 - `github.com/JieWaZi/acp-go/pkg/opencode`
 - `github.com/JieWaZi/acp-go/pkg/gemini`
 - `github.com/JieWaZi/acp-go/pkg/grok`
+- `github.com/JieWaZi/acp-go/pkg/workbuddy`
 - `github.com/JieWaZi/acp-go/pkg/pi`
 - `github.com/JieWaZi/acp-go/pkg/nativeacp`
 
@@ -27,6 +28,7 @@
 | OpenCode | `--adapter opencode` | 复用 `opencode acp` | 原生 provider/model、variants/thinking、会话、MCP、审批与附加目录；即时 steering 不支持 |
 | Gemini CLI | `--adapter gemini` | 复用 `gemini --acp` | 每会话原生进程；模型/精确 thinking、MCP、本轮 usage、auto 审查/yolo、真实恢复与关闭；配置仅空闲时重建，steering 不支持 |
 | Grok Build | `--adapter grok` | 复用 `grok agent stdio` | 原生模型/逐模型 effort metadata、三档权限、会话、MCP、queued steering |
+| WorkBuddy | `--adapter workbuddy` | 复用 `codebuddy --acp`，默认命令缺失时尝试 `cbc --acp` | 原生模型/思考、FIFO、load、三档权限、原生问答表单、MCP、图片与公开扩展；即时 steering 不支持 |
 | Pi | `--adapter pi` | Go 移植 pi-acp，直连 `pi --mode rpc` | Pi 模型、思考、会话、三档权限、AskUserQuestion 与 MCP |
 
 Codex 是默认适配器。其他适配器只有被显式选择时才启动。Kimi、Cursor 复用 Go ACP SDK 连接原生 ACP；Pi 在 Go 内部适配官方 RPC；来源与能力边界见 [原生 ACP 说明](pkg/nativeacp/README.md)。
@@ -120,6 +122,9 @@ Claude 配置示例：
 | `GEMINI_PATH` | Gemini CLI | 指定支持 `--acp` 的已安装 `gemini` 路径 |
 | `GROK_PATH` | Grok Build | 指定已安装 `grok` 路径 |
 | `PI_PATH` | Pi | 指定 Pi CLI 路径，默认发现 `pi` |
+| `WORKBUDDY_PATH` | WorkBuddy | 指定 CodeBuddy Code 程序路径，默认依次发现 `codebuddy`、`cbc` |
+| `CODEBUDDY_CONFIG_DIR` | WorkBuddy | 原生登录和会话配置目录 |
+| `CODEBUDDY_API_KEY` | WorkBuddy | 使用 CLI 官方 Key；区域变量见适配器说明 |
 | `PI_MCP_MODULE_PATH` | Pi | 宿主提供的 bridge 单文件绝对路径，所有 Pi 会话必需 |
 | `CLAUDE_CODE_EXECUTABLE` | Claude | 指定 Claude CLI 的绝对路径；非空但无效时不会回退到 `PATH` |
 | `CLAUDE_CONFIG_DIR` | Claude | 指定读取本地 Session 历史的 Claude 配置目录 |
@@ -222,6 +227,7 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | [`pkg/codex`](pkg/codex) | Codex 公开包、运行时与协议类型 |
 | [`pkg/claude`](pkg/claude) | Claude 公开包、运行时与协议类型 |
 | [`pkg/nativeacp`](pkg/nativeacp) | 原生 stdio 连接、生命周期与厂商扩展窄接口 |
+| [`pkg/workbuddy`](pkg/workbuddy) | WorkBuddy 标准 ACP 入口、原生问答与权限恢复 |
 | [`pkg/kimi`](pkg/kimi)、[`pkg/cursor`](pkg/cursor)、[`pkg/pi`](pkg/pi) | 各 CLI 的模型、审批、交互与执行适配 |
 | [`tools/protocolgen`](tools/protocolgen) | Codex 协议生成与新鲜度检查 |
 
@@ -236,6 +242,7 @@ Codex 与 Claude 的 `Config` 都支持 `PrefixArgs` 和 `Environment`。前置�
 | OpenCode | [`pkg/opencode/README.md`](pkg/opencode/README.md) | [`pkg/opencode/UPSTREAM.md`](pkg/opencode/UPSTREAM.md) |
 | Gemini CLI | [`pkg/gemini/README.md`](pkg/gemini/README.md) | [`pkg/gemini/UPSTREAM.md`](pkg/gemini/UPSTREAM.md) |
 | Grok Build | [`pkg/grok/README.md`](pkg/grok/README.md) | [`pkg/grok/UPSTREAM.md`](pkg/grok/UPSTREAM.md) |
+| WorkBuddy | [`pkg/workbuddy/README.md`](pkg/workbuddy/README.md) | [`pkg/workbuddy/UPSTREAM.md`](pkg/workbuddy/UPSTREAM.md) |
 | Pi | [`pkg/pi/README.md`](pkg/pi/README.md) | [`pkg/pi/UPSTREAM.md`](pkg/pi/UPSTREAM.md) |
 
 ## 开发与验证
