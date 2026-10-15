@@ -67,19 +67,15 @@ func (questionAdapter) HandleCallback(ctx context.Context, bridge nativeacp.Call
 		}
 	}
 	cancelled := map[string]any{"outcome": "cancelled"}
-	sid := bridge.ResolveInteractionSession(request.ToolCallID, request.SessionID)
-	if sid == "" || ctx.Err() != nil {
-		return cancelled, true, nil
-	}
 	provider, ok := bridge.(interface {
-		// InteractionContext 返回原生会话当前执行代的取消上下文。
-		InteractionContext(acp.SessionId) context.Context
+		// ResolveInteractionContext 一次取得会话和所属执行，不能按会话重新查询下一轮。
+		ResolveInteractionContext(string, string) (acp.SessionId, context.Context)
 	})
 	if !ok {
 		return cancelled, true, nil
 	}
-	turn := provider.InteractionContext(sid)
-	if turn == nil || turn.Err() != nil {
+	sid, turn := provider.ResolveInteractionContext(request.ToolCallID, request.SessionID)
+	if sid == "" || ctx.Err() != nil || turn == nil || turn.Err() != nil {
 		return cancelled, true, nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -87,7 +83,7 @@ func (questionAdapter) HandleCallback(ctx context.Context, bridge nativeacp.Call
 	defer stop()
 	defer cancel()
 	result, err := userinput.Ask(ctx, questionRequester{bridge: bridge}, sid, request.Schema)
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || turn.Err() != nil {
 		return cancelled, true, nil
 	}
 	if err != nil {

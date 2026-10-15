@@ -30,7 +30,7 @@ return server.Serve(ctx)
 | --- | --- |
 | 初始化、认证 | 原样转发标准 ACP 和公开 `codebuddy.ai/userinfo`；CLI 版本放入 `agentInfo._meta.runtime.version` |
 | 会话 | 标准 new/load；resume、list、close、fork 只以当前 CLI 握手为准，不伪造能力；无 close 时取消并释放本地映射，进程退出回收资源 |
-| 连续输入与取消 | 每会话 FIFO；只发送本轮内容，不重复拼接历史、指令或 MCP；取消会使待回答表单和迟到答案失效 |
+| 连续输入与取消 | 每会话 FIFO；只发送本轮内容，不重复拼接历史、指令或 MCP；问答原子绑定所属执行代，取消会使待回答表单和迟到答案失效，不转移到同会话的下一轮 |
 | 模型与思考 | 原样保留模型 ID；标准 `thought_level` 规范为 `reasoning`，写入时还原原生 ID；保留布尔配置和其他公开选项，不推测其他模型的思考档位 |
 | 权限 | `default` → `default`、`auto` → 原生 AI 分类模式、`full-access` → `bypassPermissions`；构造时冻结并在 new/load/resume 后重设，未声明的模式明确失败；空值保留 CLI 默认 |
 | 提问 | `_codebuddy.ai/question` → 标准 Form Elicitation；复用 `pkg/userinput` 的单选、多选、自由回答、自定义选项、拒答和取消；完全访问仍须用户回答，不重复注入问答 MCP |

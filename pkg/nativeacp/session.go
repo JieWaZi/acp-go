@@ -270,6 +270,11 @@ func (agent *Agent) enrichConfigOptions(
 func (agent *Agent) interactionSession(toolID string, explicit string) acp.SessionId {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
+	return agent.interactionSessionLocked(toolID, explicit)
+}
+
+// interactionSessionLocked 在调用方持有状态锁时解析归属，允许同时冻结所属执行代。
+func (agent *Agent) interactionSessionLocked(toolID string, explicit string) acp.SessionId {
 	if explicit != "" {
 		if agent.active[acp.SessionId(explicit)] {
 			if owner := agent.toolSessions[acp.ToolCallId(toolID)]; owner != "" && owner != acp.SessionId(explicit) {

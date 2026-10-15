@@ -66,6 +66,41 @@ type evidenceReviewResult struct {
 	err error
 }
 
+// cancelledPermissionReview 模拟审查完成的同时所属执行被取消，且适配器仍返回旧决定。
+type cancelledPermissionReview struct {
+	// cancel 直接撤销权威执行上下文，不依赖异步派生取消何时调度。
+	cancel context.CancelFunc
+	// handled 区分适配器直接批准和要求继续人工审批的回执。
+	handled bool
+}
+
+// Review 返回取消前形成的决定，原生桥必须在交付回执或转人工前重新检查执行。
+func (review cancelledPermissionReview) Review(context.Context, PermissionBridge, PermissionEvidence) (acp.RequestPermissionResponse, bool, error) {
+	review.cancel()
+	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected("once")}, review.handled, nil
+}
+
+// TestPermissionDiscardsDecisionAfterTurnCancellation 覆盖审查回执与人工回退都不能越过权威执行取消。
+func TestPermissionDiscardsDecisionAfterTurnCancellation(t *testing.T) {
+	for _, handled := range []bool{true, false} {
+		agent, host, cancel := evidenceReviewAgent(t, nil)
+		agent.toolSessions["tool"] = "s"
+		agent.config.PermissionAdapter = cancelledPermissionReview{cancel: cancel, handled: handled}
+		response, err := agent.requestPermission(context.Background(), acp.RequestPermissionRequest{
+			SessionId: "s", ToolCall: acp.ToolCallUpdate{ToolCallId: "tool"},
+			Options: []acp.PermissionOption{{OptionId: "once", Kind: acp.PermissionOptionKindAllowOnce}},
+		})
+		if err != nil || response.Outcome.Cancelled == nil {
+			t.Errorf("cancelled turn retained approval: handled=%v response=%+v error=%v", handled, response, err)
+		}
+		select {
+		case <-host.permissions:
+			t.Error("cancelled turn requested manual approval")
+		default:
+		}
+	}
+}
+
 // awaitEvidenceReview 为所有阻塞边界提供有界同步，不使用时间猜测。
 func awaitEvidenceReview[T any](t *testing.T, channel <-chan T) T {
 	t.Helper()

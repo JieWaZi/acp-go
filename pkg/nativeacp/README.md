@@ -27,4 +27,6 @@ WorkingDirectory 是进程启动目录，session/new.cwd 是会话目录；需�
 
 [来源基线](UPSTREAM.md) · [验证记录](../../docs/NATIVE_ACP_TEST_MATRIX.md)
 
-WorkBuddy 复用 CodeBuddy Code 的零身份元数据标准 ACP，公开问答在厂商包内转为统一表单，并通过 `InteractionContext` 绑定当前执行代的取消信号。具体边界见 [WorkBuddy](../workbuddy/README.md)。
+WorkBuddy 复用 CodeBuddy Code 的零身份元数据标准 ACP，公开问答在厂商包内转为统一表单，并通过 `ResolveInteractionContext` 原子取得会话与所属执行代的取消信号；取消后即使同一会话已开始下一轮，旧问题与迟到答案仍然失效。具体边界见 [WorkBuddy](../workbuddy/README.md)。
+
+共享审批路径在自动审查回执、转人工前及人工回执后直接复核所属执行的取消状态，不依赖派生上下文的异步取消投递；已取消执行不再交付旧审批决定。

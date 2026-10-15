@@ -114,11 +114,15 @@ func (agent *Agent) ResolveInteractionSession(toolCallID, sessionID string) acp.
 	return agent.interactionSession(toolCallID, sessionID)
 }
 
-// InteractionContext 返回当前执行代的取消上下文；缺失表示该交互已无有效执行归属。
-func (agent *Agent) InteractionContext(sessionID acp.SessionId) context.Context {
+// ResolveInteractionContext 原子解析会话和所属执行代，防止取消后旧交互重新绑定下一轮。
+func (agent *Agent) ResolveInteractionContext(toolCallID, sessionID string) (acp.SessionId, context.Context) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
-	return agent.turnContexts[sessionID]
+	sid := agent.interactionSessionLocked(toolCallID, sessionID)
+	if sid == "" {
+		return "", nil
+	}
+	return sid, agent.turnContexts[sid]
 }
 
 // UpdateSession 实现 CallbackBridge，统一使用已绑定的 ACP 宿主连接。
