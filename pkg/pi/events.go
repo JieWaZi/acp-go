@@ -1,3 +1,4 @@
+// NeuxBot 本地修改：事件消费者在接纳原生事件时向 RPC 所有者归还等待预算，见根 PATCHES.md。
 package pi
 
 import (
@@ -48,7 +49,7 @@ func (a *Agent) events(s *session) {
 			event, startupEvents = startupEvents[0], startupEvents[1:]
 		} else {
 			var ok bool
-			event, ok = <-s.process.events
+			event, ok = s.process.nextEvent()
 			if !ok {
 				break
 			}

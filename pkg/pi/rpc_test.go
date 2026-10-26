@@ -313,34 +313,138 @@ func TestPiBadFramePreservesRawError(t *testing.T) {
 	}
 }
 
-// TestPiEventQueueOverloadTerminatesBoundedly 验证宿主停止消费事件时不会永久卡住 RPC reader。
-func TestPiEventQueueOverloadTerminatesBoundedly(t *testing.T) {
+// TestPiEventQueueBackpressureResumesAfterSlowConsumer 验证正常 stdio 突发可跨过一秒暂停并完整保序交付。
+func TestPiEventQueueBackpressureResumesAfterSlowConsumer(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := startRPC(Config{PiPath: binary, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=event-overflow")}, t.TempDir(), "", "")
+	p, err := startRPC(Config{PiPath: binary, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=event-overflow", "ACP_GO_PI_WAIT_BURST=1")}, t.TempDir(), "", "")
 	if err != nil {
+		t.Fatal(err)
+	}
+	p.startEventConsumer()
+	if err = p.write(map[string]any{"type": "burst"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = p.close(ctx)
+	})
+	select {
+	case <-p.done:
+		t.Fatalf("normal consumer pause killed Pi: %v", p.exitError())
+	case <-time.After(1200 * time.Millisecond):
+	}
+	for i := 0; i < 257; i++ {
+		event, ok := p.nextEvent()
+		if !ok || event["sequence"] != float64(i) {
+			t.Fatalf("event %d was lost or reordered: %+v ok=%v", i, event, ok)
+		}
+	}
+	p.mutex.Lock()
+	failure := p.failure
+	p.mutex.Unlock()
+	if failure != nil {
+		t.Fatalf("normal stdio burst failed: %v", failure)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPiEventQueueCloseUnblocksBackpressure 验证停止消费时，所有者关闭仍能独立终止 reader。
+func TestPiEventQueueCloseUnblocksBackpressure(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := startRPC(Config{PiPath: binary, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE=event-overflow", "ACP_GO_PI_WAIT_BURST=1")}, t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.startEventConsumer()
+	if err = p.write(map[string]any{"type": "burst"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(time.Second)
+	for len(p.events) != cap(p.events) {
+		select {
+		case <-deadline:
+			t.Fatal("event queue did not fill")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err = p.close(ctx); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-p.done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Pi reader blocked on a full event queue")
-	}
-	if detail := p.exitError().Error(); !strings.Contains(detail, "queue stalled") {
-		t.Fatalf("Pi overload reason = %q", detail)
+	default:
+		t.Fatal("owner close did not release blocked reader")
 	}
 }
 
 // TestPiRPCProcess 为直接 RPC 测试提供权威响应、错误和 settled 时序。
 func TestPiRPCProcess(t *testing.T) {
 	if os.Getenv("ACP_GO_PI_FIXTURE") == "event-overflow" {
-		for range 257 {
-			_, _ = os.Stdout.WriteString("{\"type\":\"agent_start\"}\n")
+		if os.Getenv("ACP_GO_PI_WAIT_BURST") == "1" {
+			if !bufio.NewScanner(os.Stdin).Scan() {
+				os.Exit(0)
+			}
+		}
+		for i := 0; i < 257; i++ {
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "agent_start", "sequence": i})
+		}
+		if os.Getenv("ACP_GO_PI_WAIT_BURST") == "1" {
+			bufio.NewScanner(os.Stdin).Scan()
 		}
 		os.Exit(0)
 	}
+	if os.Getenv("ACP_GO_PI_FIXTURE") == "event-bytes" {
+		if !bufio.NewScanner(os.Stdin).Scan() {
+			os.Exit(0)
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		for i := 0; i < 2; i++ {
+			if encoder.Encode(map[string]any{"type": "message_update", "sequence": i, "payload": strings.Repeat("x", 9<<20)}) != nil {
+				os.Exit(0)
+			}
+		}
+		os.Exit(0)
+	}
+	if os.Getenv("ACP_GO_PI_FIXTURE") == "event-write-stall" {
+		if !bufio.NewScanner(os.Stdin).Scan() {
+			os.Exit(0)
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		for i := 0; i < 2048; i++ {
+			if encoder.Encode(map[string]any{"type": "agent_start", "sequence": i}) != nil {
+				os.Exit(0)
+			}
+		}
+		// 即使管道吸收了全部突发，也保持进程等待所有者取消；空 select 会被 Go 判定为死锁并提前退出。
+		<-time.After(30 * time.Second)
+		os.Exit(0)
+	}
+	if os.Getenv("ACP_GO_PI_FIXTURE") == "startup-overflow" {
+		encoder := json.NewEncoder(os.Stdout)
+		for i := 0; i < 257; i++ {
+			if encoder.Encode(map[string]any{"type": "extension_ui_request", "method": "setStatus", "sequence": i}) != nil {
+				os.Exit(0)
+			}
+		}
+		if bufio.NewScanner(os.Stdin).Scan() {
+			os.Exit(0)
+		}
+		os.Exit(0)
+	}
+
 	if os.Getenv("ACP_GO_PI_FIXTURE") == "bad-frame" {
 		_, _ = os.Stdout.WriteString("{\"type\":\"response\",\"id\":\"1\",\"success\":true,\"data\":{}}\n{invalid\n")
 		_, _ = os.Stderr.WriteString("api_key=literal-secret\n")
@@ -463,8 +567,8 @@ func TestPiRPCProcess(t *testing.T) {
 
 // TestPiExtensionLoadFailure 验证 Pi 接受 RPC 命令时仍拒绝未加载成功的扩展。
 func TestPiExtensionLoadFailure(t *testing.T) {
-	p := &rpcProcess{events: make(chan map[string]any, 1)}
-	p.events <- map[string]any{"type": "extension_error", "error": "bridge import failed"}
+	p := &rpcProcess{events: make(chan rpcEvent, 1), eventChanged: make(chan struct{})}
+	p.events <- rpcEvent{data: map[string]any{"type": "extension_error", "error": "bridge import failed"}}
 	if _, err := p.awaitExtensionReady(context.Background()); err == nil || !strings.Contains(err.Error(), "bridge import failed") {
 		t.Fatalf("extension failure was accepted: %v", err)
 	}
@@ -472,9 +576,9 @@ func TestPiExtensionLoadFailure(t *testing.T) {
 
 // TestPiExtensionReadyKeepsStartupEvents 验证握手不丢失先于就绪信号的上下文事件。
 func TestPiExtensionReadyKeepsStartupEvents(t *testing.T) {
-	p := &rpcProcess{events: make(chan map[string]any, 2)}
-	p.events <- map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.context-usage", "statusText": "{}"}
-	p.events <- map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.extension-ready", "statusText": "ready"}
+	p := &rpcProcess{events: make(chan rpcEvent, 2), eventChanged: make(chan struct{})}
+	p.events <- rpcEvent{data: map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.context-usage", "statusText": "{}"}}
+	p.events <- rpcEvent{data: map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.extension-ready", "statusText": "ready"}}
 	events, err := p.awaitExtensionReady(context.Background())
 	if err != nil || len(events) != 1 || events[0]["statusKey"] != "acp-go.context-usage" {
 		t.Fatalf("startup events lost: %+v %v", events, err)
@@ -540,5 +644,154 @@ func TestPiPromptErrorContract(t *testing.T) {
 		} else if err != nil || response.StopReason != acp.StopReasonEndTurn {
 			t.Fatalf("%s 误判失败：%+v %v", message, response, err)
 		}
+	}
+}
+
+// startPiQueueFixture 启动可控的 Pi 事件突发子进程，用于验证队列预算与取消。
+func startPiQueueFixture(t *testing.T, mode string, consumer bool) *rpcProcess {
+	t.Helper()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := startRPC(Config{PiPath: binary, PrefixArgs: []string{"-test.run=^TestPiRPCProcess$", "--"}, Environment: append(os.Environ(), "ACP_GO_PI_FIXTURE="+mode)}, t.TempDir(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := p.close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if consumer {
+		p.startEventConsumer()
+		if err = p.write(map[string]any{"type": "burst"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p
+}
+
+// TestPiEventByteBudgetBackpressuresBeforeCountBudget 验证两个各9MiB事件不会同时驻留16MiB等待队列。
+func TestPiEventByteBudgetBackpressuresBeforeCountBudget(t *testing.T) {
+	p := startPiQueueFixture(t, "event-bytes", true)
+	deadline := time.After(3 * time.Second)
+	for len(p.events) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("large event did not arrive")
+		case <-p.done:
+			t.Fatal(p.exitError())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case <-p.done:
+		t.Fatalf("reader exited before queued bytes were consumed: %v", p.exitError())
+	case <-time.After(250 * time.Millisecond):
+	}
+	if len(p.events) != 1 {
+		t.Fatalf("byte budget admitted %d large events", len(p.events))
+	}
+	for i := 0; i < 2; i++ {
+		event, ok := p.nextEvent()
+		if !ok || event["sequence"] != float64(i) || len(text(event["payload"])) != 9<<20 {
+			t.Fatalf("large event %d lost: ok=%v", i, ok)
+		}
+	}
+	select {
+	case <-p.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader did not finish after byte budget returned")
+	}
+}
+
+// TestPiFatalWriteCancellationUnblocksEventReader 验证begin的致命取消通过已有进程Context解除满队列等待。
+func TestPiFatalWriteCancellationUnblocksEventReader(t *testing.T) {
+	p := startPiQueueFixture(t, "event-write-stall", true)
+	deadline := time.After(3 * time.Second)
+	for len(p.events) != cap(p.events) {
+		select {
+		case <-deadline:
+			t.Fatal("event queue did not fill")
+		case <-p.done:
+			t.Fatal(p.exitError())
+		case <-time.After(time.Millisecond):
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := p.begin(ctx, "prompt", map[string]any{"message": strings.Repeat("x", 1<<20)}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("write cancellation=%v context=%v stderr=%q", err, ctx.Err(), p.stderr.String())
+	}
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		t.Fatal("fatal owner cancellation left event reader waiting for credit")
+	}
+}
+
+// TestPiStartupFloodCannotHideInitialResponse 验证就绪计时尚未启动时，满启动预算明确失败而非遮挡get_state响应。
+func TestPiStartupFloodCannotHideInitialResponse(t *testing.T) {
+	p := startPiQueueFixture(t, "startup-overflow", false)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var state map[string]any
+	err := p.call(ctx, "get_state", nil, &state)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "Pi RPC startup event queue resource budget exceeded") {
+		t.Fatalf("startup flood did not report resource limit: %v", err)
+	}
+}
+
+// TestPiStartupRetentionHasCountAndByteBudget 验证已经出队的启动片段不能形成第二份无界驻留。
+func TestPiStartupRetentionHasCountAndByteBudget(t *testing.T) {
+	for _, kind := range []string{"count", "bytes"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			p := &rpcProcess{events: make(chan rpcEvent, piEventQueueCapacity), eventChanged: make(chan struct{}), stop: make(chan struct{}), ownerDone: ctx.Done()}
+			event := map[string]any{"type": "agent_start"}
+			count := 257
+			if kind == "bytes" {
+				event["payload"] = strings.Repeat("x", 9<<20)
+				count = 2
+			}
+			raw, err := json.Marshal(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			produced := make(chan error, 1)
+			go func() {
+				for i := 0; i < count; i++ {
+					p.mutex.Lock()
+					changed := p.eventChanged
+					p.mutex.Unlock()
+					if err := p.enqueueEvent(rpcEvent{data: event, bytes: len(raw)}); err != nil {
+						produced <- err
+						return
+					}
+					select {
+					case <-changed:
+					case <-ctx.Done():
+						produced <- ctx.Err()
+						return
+					}
+				}
+				produced <- nil
+			}()
+			if _, err := p.awaitExtensionReady(ctx); err == nil || !strings.Contains(err.Error(), "startup events exceed") {
+				t.Fatalf("startup %s budget error=%v", kind, err)
+			}
+			select {
+			case err := <-produced:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("startup producer did not stop")
+			}
+		})
 	}
 }

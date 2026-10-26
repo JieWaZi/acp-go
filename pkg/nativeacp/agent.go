@@ -1,4 +1,5 @@
 // Package nativeacp 使用现有 ACP SDK 连接原生 CLI 或开源 stdio Adapter。
+// NeuxBot 本地修改：原生 stdio 连接显式启用背压，并由已有 Agent 生命周期解除阻塞读写；见根 PATCHES.md。
 package nativeacp
 
 import (
@@ -18,6 +19,11 @@ import (
 )
 
 const maxNativeDiagnosticBytes = 4 << 10
+
+const (
+	nativeNotificationQueueCapacity = 256
+	nativeNotificationQueueBytes    = 16 << 20
+)
 
 // Config 描述外部 ACP 进程；不会下载程序或修改用户配置。
 type Config struct {
@@ -179,10 +185,27 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		turnContexts:    make(map[acp.SessionId]context.Context),
 		turnCancels:     make(map[acp.SessionId]context.CancelFunc),
 	}
-	agent.conn = acp.NewConnection(agent.handle, input, output)
+	agent.conn, err = acp.NewConnectionWithOptions(agent.handle, input, output, acp.ConnectionOptions{
+		Context:                   lifetime,
+		NotificationQueueCapacity: nativeNotificationQueueCapacity,
+		NotificationQueueBytes:    nativeNotificationQueueBytes,
+		CloseTransport:            func() error { return errors.Join(input.Close(), output.Close()) },
+	})
+	if err != nil {
+		cancel()
+		_ = input.Close()
+		_ = output.Close()
+		_ = command.Wait()
+		return nil, err
+	}
 	go func() {
 		<-agent.conn.Done()
-		cancel()
+		// 主动关闭已解除 stdio 等待，继续沿原有有界退出窗口收集 stderr；异常断连立即终止进程。
+		select {
+		case <-agent.closed:
+		default:
+			cancel()
+		}
 		waitErr := command.Wait()
 		agent.waitMu.Lock()
 		agent.waitErr = waitErr
@@ -242,7 +265,7 @@ func (agent *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 	}
 }
 
-// Close 先关闭 stdin，再在有界窗口内终止并回收程序；重复关闭安全。
+// Close 先结束拥有的 SDK 连接以解除 stdio 等待，再在有界窗口内终止并回收程序；重复关闭安全。
 func (agent *Agent) Close(ctx context.Context) error {
 	select {
 	case <-agent.closed:
@@ -261,8 +284,9 @@ func (agent *Agent) Close(ctx context.Context) error {
 	}
 	agent.closeOnce.Do(func() {
 		close(agent.closed)
+		// 不依赖已被输出背压占用的协议流发送关闭命令，先由连接所有者解除 stdio 等待。
+		agent.conn.Close()
 		agent.closePromptQueues()
-		_ = agent.input.Close()
 	})
 	timer := time.NewTimer(500 * time.Millisecond)
 	defer timer.Stop()

@@ -1,3 +1,4 @@
+// NeuxBot 本地修改：在调度事件消费者前同步移交 RPC 队列所有权，见根 PATCHES.md。
 package pi
 
 import (
@@ -119,6 +120,7 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 	previous := a.sessions[s.id]
 	a.sessions[s.id] = s
 	a.mutex.Unlock()
+	p.startEventConsumer()
 	go a.events(s)
 	if previous != nil && previous != s {
 		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)

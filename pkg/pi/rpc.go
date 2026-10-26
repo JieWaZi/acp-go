@@ -2,6 +2,7 @@ package pi
 
 // Pi RPC 进程层对照 svkozak/pi-acp src/pi-rpc/process.ts 移植。
 // MIT Copyright (c) 2025 Sergii Kozak；完整许可见 UPSTREAM-LICENSE。
+// NeuxBot 本地修改：事件队列按条数与字节施加可取消背压，启动片段复用同一资源预算。
 import (
 	"bufio"
 	"context"
@@ -16,6 +17,20 @@ import (
 	"time"
 )
 
+const (
+	piEventQueueCapacity = 256
+	piEventQueueBytes    = 16 << 20
+	piRPCFrameBytes      = 16 << 20
+)
+
+// rpcEvent 保存一条原始 Pi 事件及其等待交付期间占用的帧字节。
+type rpcEvent struct {
+	// data 是尚未归一为 ACP 的完整原生事件。
+	data map[string]any
+	// bytes 是原始 JSON 帧的大小，不计解码对象和当前处理项的额外开销。
+	bytes int
+}
+
 // rpcProcess 拥有一个直接启动的 Pi CLI，不启动 ACP 桥进程。
 type rpcProcess struct {
 	// command 是 Pi 的唯一子进程。
@@ -26,7 +41,7 @@ type rpcProcess struct {
 	output io.ReadCloser
 	// cancel 回收进程及其后代。
 	cancel context.CancelFunc
-	// mutex 保护请求关联与关闭状态。
+	// mutex 保护请求关联、事件预算与关闭状态。
 	mutex sync.Mutex
 	// writeMutex 保证每个 JSON 命令整体写入。
 	writeMutex sync.Mutex
@@ -39,7 +54,15 @@ type rpcProcess struct {
 	// sequence 为请求分配唯一标识。
 	sequence atomic.Uint64
 	// events 按 Pi 发出顺序交付事件，不静默丢弃。
-	events chan map[string]any
+	events chan rpcEvent
+	// eventBytes 是仍在事件队列内等待交付的原始帧字节，受 mutex 保护。
+	eventBytes int
+	// eventChanged 在实际出队归还预算后唤醒生产者，受 mutex 保护。
+	eventChanged chan struct{}
+	// consumerStarted 标记常驻事件消费者已取得所有权；此前不能阻塞启动 RPC 的响应读取。
+	consumerStarted bool
+	// ownerDone 复用创建进程的 Context，任何致命取消都能解除队列等待。
+	ownerDone <-chan struct{}
 	// done 在进程完全回收后关闭。
 	done chan struct{}
 	// stop 通知读取循环终止。
@@ -92,7 +115,7 @@ func startRPC(config Config, cwd, extension, sessionPath string) (*rpcProcess, e
 		_ = output.Close()
 		return nil, err
 	}
-	p := &rpcProcess{command: cmd, input: input, output: output, cancel: cancel, pending: map[string]chan rpcResponse{}, events: make(chan map[string]any, 256), done: make(chan struct{}), stop: make(chan struct{}), stderr: stderr}
+	p := &rpcProcess{command: cmd, input: input, output: output, cancel: cancel, pending: map[string]chan rpcResponse{}, events: make(chan rpcEvent, piEventQueueCapacity), eventChanged: make(chan struct{}), ownerDone: ctx.Done(), done: make(chan struct{}), stop: make(chan struct{}), stderr: stderr}
 	go p.read()
 	return p, nil
 }
@@ -111,7 +134,7 @@ func (p *rpcProcess) read() {
 		close(p.done)
 	}()
 	scanner := bufio.NewScanner(p.output)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), piRPCFrameBytes)
 	started := false
 	for scanner.Scan() {
 		var response rpcResponse
@@ -138,28 +161,81 @@ func (p *rpcProcess) read() {
 			p.setFailure(fmt.Errorf("Pi RPC invalid event: %w", err))
 			return
 		}
-		select {
-		case p.events <- event:
-		case <-p.stop:
-			return
-		default:
-			// 短暂突发允许背压；持续不消费时有界失败，避免永久阻塞响应读取器。
-			timer := time.NewTimer(time.Second)
-			select {
-			case p.events <- event:
-				timer.Stop()
-			case <-p.stop:
-				timer.Stop()
-				return
-			case <-timer.C:
-				p.setFailure(errors.New("Pi RPC event queue stalled for 1s"))
-				return
+		if err := p.enqueueEvent(rpcEvent{data: event, bytes: len(scanner.Bytes())}); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				p.setFailure(err)
 			}
+			return
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		p.setFailure(fmt.Errorf("Pi RPC stdout: %w", err))
 	}
+}
+
+// enqueueEvent 在独立进程所有者仍有效时等待预算，不把正常宿主背压伪装为 Pi 失败。
+func (p *rpcProcess) enqueueEvent(event rpcEvent) error {
+	if event.bytes > piEventQueueBytes {
+		return errors.New("Pi RPC event exceeds 16 MiB queue budget")
+	}
+	for {
+		select {
+		case <-p.stop:
+			return context.Canceled
+		case <-p.ownerDone:
+			return context.Canceled
+		default:
+		}
+		p.mutex.Lock()
+		if p.eventBytes+event.bytes <= piEventQueueBytes {
+			select {
+			case p.events <- event:
+				p.eventBytes += event.bytes
+				p.mutex.Unlock()
+				return nil
+			default:
+			}
+		}
+		changed := p.eventChanged
+		if !p.consumerStarted {
+			p.mutex.Unlock()
+			return errors.New("Pi RPC startup event queue resource budget exceeded (256 items or 16 MiB)")
+		}
+		p.mutex.Unlock()
+		select {
+		case <-changed:
+		case <-p.stop:
+			return context.Canceled
+		case <-p.ownerDone:
+			return context.Canceled
+		}
+	}
+}
+
+// startEventConsumer 在真实消费循环接纳队列前切换到可取消背压阶段。
+func (p *rpcProcess) startEventConsumer() {
+	p.mutex.Lock()
+	p.consumerStarted = true
+	p.mutex.Unlock()
+}
+
+// releaseEvent 在实际取走事件后归还等待预算，所有队列所有者都在创建时初始化信用通知。
+func (p *rpcProcess) releaseEvent(event rpcEvent) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.eventBytes -= event.bytes
+	close(p.eventChanged)
+	p.eventChanged = make(chan struct{})
+}
+
+// nextEvent 由事件消费者与管理进程复用，接纳原始事件时立即归还队列预算。
+func (p *rpcProcess) nextEvent() (map[string]any, bool) {
+	event, ok := <-p.events
+	if !ok {
+		return nil, false
+	}
+	p.releaseEvent(event)
+	return event.data, true
 }
 
 // setFailure 保存第一个读取错误，供等待中的请求共享。
@@ -306,18 +382,25 @@ func (p *rpcProcess) awaitExtensionReady(ctx context.Context) ([]map[string]any,
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
 	var startupEvents []map[string]any
+	startupBytes := 0
 	for {
 		select {
-		case event, ok := <-p.events:
+		case queued, ok := <-p.events:
 			if !ok {
 				return nil, fmt.Errorf("Pi extension failed to load: %w", p.exitError())
 			}
+			p.releaseEvent(queued)
+			event := queued.data
 			if event["type"] == "extension_ui_request" && event["method"] == "setStatus" && event["statusKey"] == "acp-go.extension-ready" && event["statusText"] == "ready" {
 				return startupEvents, nil
 			}
 			if event["type"] == "extension_error" {
 				return nil, fmt.Errorf("Pi extension failed to load: %v", event["error"])
 			}
+			if len(startupEvents) >= piEventQueueCapacity || startupBytes+queued.bytes > piEventQueueBytes {
+				return nil, errors.New("Pi extension startup events exceed 256 items or 16 MiB budget")
+			}
+			startupBytes += queued.bytes
 			startupEvents = append(startupEvents, event)
 		case <-ctx.Done():
 			return nil, ctx.Err()

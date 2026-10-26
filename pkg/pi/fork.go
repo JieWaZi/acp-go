@@ -1,3 +1,4 @@
+// NeuxBot 本地修改：分叉管理进程排空事件时复用 RPC 所有者的预算归还入口，见根 PATCHES.md。
 package pi
 
 import (
@@ -67,8 +68,12 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 		return acp.UnstableForkSessionResponse{}, err
 	}
 	// 无提示的管理进程仍可能产生扩展通知，持续排空以免阻塞命令响应。
+	p.startEventConsumer()
 	go func() {
-		for range p.events {
+		for {
+			if _, ok := p.nextEvent(); !ok {
+				return
+			}
 		}
 	}()
 	if err = acpmeta.BeginForkReceipt(request); err != nil {

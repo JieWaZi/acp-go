@@ -43,3 +43,5 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
+
+replace github.com/coder/acp-go-sdk => github.com/JieWaZi/acp-go/sdk v0.0.0-20261026082128-5f43bcd9dae8
