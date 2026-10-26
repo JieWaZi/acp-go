@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Prompt 对照 pi-acp 串行执行提示，等待整轮 settled 而非中间 agent_end。

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // emit 通过 SDK 发布标准通知，保留顺序并将错误传给回合终态。

@@ -3,7 +3,7 @@ package codex
 import (
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestResolveTerminalOutputMode 验证 terminal output 能力判定表。

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // turnProjection 保存一轮已发出的工具与 Hook 身份，不跨轮累计计费。

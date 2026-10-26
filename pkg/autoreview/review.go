@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // SystemPrompt 改编自 pi-auto-approval 33de98cb 的 buildSystemPrompt，许可见 UPSTREAM-LICENSE。

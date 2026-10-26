@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // testAgent 启动只理解 Pi RPC 的本地测试进程，拒绝任何 ACP 桥命令。
@@ -68,6 +68,18 @@ func TestPiConfigurationUsesModelThinkingLevels(t *testing.T) {
 	if len(response.ConfigOptions) != 2 || response.ConfigOptions[1].Select == nil || response.ConfigOptions[1].Select.Options.Ungrouped == nil {
 		t.Fatalf("缺少 Pi 思考配置：%+v", response.ConfigOptions)
 	}
+	if response.ConfigOptions[0].Select == nil || response.ConfigOptions[0].Select.CurrentValue != "model" {
+		t.Fatalf("Pi 模型应使用原始 ID：%+v", response.ConfigOptions[0])
+	}
+	modelOptions := response.ConfigOptions[0].Select.Options.Ungrouped
+	if modelOptions == nil || len(*modelOptions) != 1 || (*modelOptions)[0].Name != "model" || (*modelOptions)[0].Value != "model" {
+		t.Fatalf("Pi 模型选项不应拼接 provider：%+v", response.ConfigOptions[0])
+	}
+	if _, err := agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{
+		ValueId: &acp.SetSessionConfigOptionValueId{SessionId: id, ConfigId: "model", Value: "model"},
+	}); err != nil {
+		t.Fatalf("原始模型 ID 无法选择：%v", err)
+	}
 	got := *response.ConfigOptions[1].Select.Options.Ungrouped
 	want := []acp.SessionConfigValueId{"off", "high", "max"}
 	if len(got) != len(want) {
@@ -77,6 +89,34 @@ func TestPiConfigurationUsesModelThinkingLevels(t *testing.T) {
 		if got[index].Value != value {
 			t.Fatalf("思考等级错误：got=%+v want=%+v", got, want)
 		}
+	}
+}
+
+// TestPiRawModelIDTakesPrecedenceOverQualifiedAlias 防止包含斜杠的真实模型 ID 被另一个厂商的兼容别名截获。
+func TestPiRawModelIDTakesPrecedenceOverQualifiedAlias(t *testing.T) {
+	for _, preferred := range []string{"", "ally"} {
+		t.Run("preferred="+preferred, func(t *testing.T) {
+			t.Setenv("ACP_GO_PI_PREFERRED_PROVIDER", preferred)
+			t.Setenv("ACP_GO_PI_FIXTURE_MODEL_CATALOG", `[{"provider":"anthropic","id":"claude"},{"provider":"ally","id":"anthropic/claude"}]`)
+			agent, id := testAgent(t)
+			if _, err := agent.SetSessionConfigOption(context.Background(), acp.SetSessionConfigOptionRequest{
+				ValueId: &acp.SetSessionConfigOptionValueId{SessionId: id, ConfigId: "model", Value: "anthropic/claude"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			s, err := agent.get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var state map[string]any
+			if err := s.process.call(context.Background(), "get_state", nil, &state); err != nil {
+				t.Fatal(err)
+			}
+			model := object(state["model"])
+			if model["provider"] != "ally" || model["id"] != "anthropic/claude" {
+				t.Fatalf("advertised raw model selected another provider: %+v", model)
+			}
+		})
 	}
 }
 
@@ -484,6 +524,7 @@ func TestPiRPCProcess(t *testing.T) {
 		}
 	}
 	write(map[string]any{"type": "extension_ui_request", "method": "setStatus", "statusKey": "acp-go.extension-ready", "statusText": "ready"})
+	selectedModel := map[string]any{"provider": "fixture", "id": "model"}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var request map[string]any
@@ -507,11 +548,22 @@ func TestPiRPCProcess(t *testing.T) {
 			file = filepath.Join(filepath.Dir(file), "child.jsonl")
 			_ = os.WriteFile(file, []byte(string(encoded)+"\n"+parts[1]), 0600)
 		case "get_state":
-			result = map[string]any{"sessionId": id, "sessionFile": file, "model": map[string]any{"provider": "fixture", "id": "model"}, "thinkingLevel": "high"}
+			result = map[string]any{"sessionId": id, "sessionFile": file, "model": selectedModel, "thinkingLevel": "high"}
 		case "get_available_models":
-			result = map[string]any{"models": []any{map[string]any{"provider": "fixture", "id": "model"}}}
+			models := []any{map[string]any{"provider": "fixture", "id": "model"}}
+			if catalog := os.Getenv("ACP_GO_PI_FIXTURE_MODEL_CATALOG"); catalog != "" {
+				if json.Unmarshal([]byte(catalog), &models) != nil {
+					os.Exit(6)
+				}
+			}
+			result = map[string]any{"models": models}
 		case "get_available_thinking_levels":
 			result = map[string]any{"levels": []any{"off", "high", "max"}}
+		case "set_model":
+			if os.Getenv("ACP_GO_PI_FIXTURE_MODEL_CATALOG") == "" && (request["provider"] != "fixture" || request["modelId"] != "model") {
+				os.Exit(6)
+			}
+			selectedModel = map[string]any{"provider": request["provider"], "id": request["modelId"]}
 		case "get_commands":
 			result = map[string]any{"commands": []any{}}
 		case "compact":

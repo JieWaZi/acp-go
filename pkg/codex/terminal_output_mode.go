@@ -1,6 +1,6 @@
 package codex
 
-import acp "github.com/coder/acp-go-sdk"
+import acp "github.com/JieWaZi/acp-go/sdk"
 
 // terminalOutputMode 表示客户端协商的 ACP 终端输出扩展键。
 type terminalOutputMode string

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestHookTransport 验证实际 Node 传输只保留官方计量字段，且读过的事件不会再次返回。

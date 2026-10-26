@@ -23,7 +23,7 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/pi"
 	"github.com/JieWaZi/acp-go/pkg/workbuddy"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const (

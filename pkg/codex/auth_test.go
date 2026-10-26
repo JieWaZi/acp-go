@@ -10,7 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // recordingAuthServer 记录 account/read 和 account/login/start 的参数与调用顺序。

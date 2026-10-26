@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // callbackObservation 保存宿主实际收到的完整请求，便于校验字段和元数据。

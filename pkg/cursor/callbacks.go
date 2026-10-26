@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // cursorCallbacks 拥有 Cursor 私有反向请求及其计划合并状态。

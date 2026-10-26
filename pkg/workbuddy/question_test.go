@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // questionTurnGate 在问题取得执行归属后暂停，让真实 SDK 完成取消和下一轮启动。

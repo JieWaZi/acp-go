@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Question 是各 CLI 共用的单个用户问题。

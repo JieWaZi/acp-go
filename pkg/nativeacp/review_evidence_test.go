@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // evidenceReviewHost 阻塞审计交付并记录真正到达宿主的人工审批。

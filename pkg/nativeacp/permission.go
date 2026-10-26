@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // toolEvidenceRevision 以非零大小分配保证事件身份不被零大小指针规则合并。

@@ -13,7 +13,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // catalogHost 保存宿主实际收到的配置通知。

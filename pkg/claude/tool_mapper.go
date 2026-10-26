@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // toolInfo 保存 Claude 工具映射后的标准 ACP 展示信息。

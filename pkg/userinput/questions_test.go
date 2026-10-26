@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // questionHost 模拟真实表单边界并保留实际路由与输入。

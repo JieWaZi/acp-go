@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestInstalledWorkBuddyProtocol 仅在显式开启时探测已安装 CLI；不发送 Prompt、不调用模型或登录。

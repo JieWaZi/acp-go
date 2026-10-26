@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // toolState 保存已发布工具调用的最小生命周期状态。

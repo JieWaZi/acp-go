@@ -10,7 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/internal/buildinfo"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Config 保存标准 ACP 进程的启动事实，不包含 WorkBuddy 内部准入材料。

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const acpResourceNotFoundCode = -32002

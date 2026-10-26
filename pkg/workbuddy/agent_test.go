@@ -16,7 +16,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // fixtureHost 记录经过两层标准 ACP 连接交付的事件与问答。

@@ -10,7 +10,7 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/cursor"
 	"github.com/JieWaZi/acp-go/pkg/kimi"
 	"github.com/JieWaZi/acp-go/pkg/pi"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // main 从测试专属环境读取路径和权限，模型凭据由隔离 fixture 提供。

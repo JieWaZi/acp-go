@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // sessionOptions 将宿主统一配置标识映射到上游声明的实际标识。

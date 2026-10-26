@@ -6,7 +6,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	"github.com/JieWaZi/acp-go/pkg/userinput"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // questionAdapter 将公开的 CodeBuddy 问答请求转换为统一 ACP 表单。

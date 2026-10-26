@@ -5,7 +5,8 @@ import (
 	"errors"
 	"strings"
 
-	acp "github.com/coder/acp-go-sdk"
+	"github.com/JieWaZi/acp-go/pkg/nativeacp"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // configuration 对照 pi-acp 从 Pi 实际状态与已认证模型构建选项。
@@ -22,6 +23,13 @@ func (s *session) configuration(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	models := []any{}
+	preferredProvider := nativeacp.EnvironmentValue(s.process.command.Env, "ACP_GO_PI_PREFERRED_PROVIDER")
+	modelCounts := map[string]int{}
+	for _, entry := range list(available["models"]) {
+		if id := text(object(entry)["id"]); id != "" {
+			modelCounts[id]++
+		}
+	}
 	for _, entry := range list(available["models"]) {
 		m := object(entry)
 		provider, id := text(m["provider"]), text(m["id"])
@@ -32,14 +40,23 @@ func (s *session) configuration(ctx context.Context) (map[string]any, error) {
 		if name == "" {
 			name = id
 		}
-		models = append(models, map[string]any{"value": provider + "/" + id, "name": provider + "/" + name})
+		value := id
+		displayName := name
+		if modelCounts[id] > 1 && provider != preferredProvider {
+			value = provider + "/" + id
+			displayName = provider + "/" + name
+		}
+		models = append(models, map[string]any{"value": value, "name": displayName})
 	}
 	if len(models) == 0 {
 		return nil, acp.NewAuthRequired(nil)
 	}
 	model := object(state["model"])
-	current := text(model["provider"]) + "/" + text(model["id"])
-	if current == "/" {
+	current := text(model["id"])
+	if current != "" && modelCounts[current] > 1 && text(model["provider"]) != preferredProvider {
+		current = text(model["provider"]) + "/" + current
+	}
+	if current == "" {
 		current = text(object(models[0])["value"])
 	}
 	level := text(state["thinkingLevel"])
@@ -106,23 +123,51 @@ func contains(values []string, target string) bool {
 	return false
 }
 
-// setModel 校验模型来自 Pi 实际目录，再按原生 provider/modelId 切换。
+// setModel 校验模型来自 Pi 实际目录，再向原生 RPC 分别传递 provider 与 modelId。
 func (s *session) setModel(ctx context.Context, value string) error {
 	var available map[string]any
 	if err := s.process.call(ctx, "get_available_models", nil, &available); err != nil {
 		return err
 	}
+	preferredProvider := nativeacp.EnvironmentValue(s.process.command.Env, "ACP_GO_PI_PREFERRED_PROVIDER")
+	var matched map[string]any
+	ambiguous := false
+	// 原始 ID 可能包含斜杠；优先按目录中的完整 ID 解析，不能先被另一个 provider/id 别名截获。
 	for _, entry := range list(available["models"]) {
 		m := object(entry)
-		if text(m["provider"])+"/"+text(m["id"]) == value {
-			params := map[string]any{
-				"provider": m["provider"],
-				"modelId":  m["id"],
+		if text(m["id"]) != value {
+			continue
+		}
+		if text(m["provider"]) == preferredProvider {
+			matched, ambiguous = m, false
+			break
+		}
+		if matched != nil {
+			ambiguous = true
+			continue
+		}
+		matched = m
+	}
+	// 只有没有原始 ID 匹配时才解释旧的 provider/modelId 选择格式。
+	if matched == nil {
+		for _, entry := range list(available["models"]) {
+			m := object(entry)
+			if text(m["provider"])+"/"+text(m["id"]) == value {
+				matched = m
+				break
 			}
-			return s.process.call(ctx, "set_model", params, nil)
 		}
 	}
-	return acp.NewInvalidParams(map[string]any{"message": "unknown Pi model"})
+	if ambiguous {
+		return acp.NewInvalidParams(map[string]any{"message": "ambiguous Pi model"})
+	}
+	if matched == nil {
+		return acp.NewInvalidParams(map[string]any{"message": "unknown Pi model"})
+	}
+	return s.process.call(ctx, "set_model", map[string]any{
+		"provider": matched["provider"],
+		"modelId":  matched["id"],
+	}, nil)
 }
 
 // setThinking 只接受当前模型实时公布的等级，不允许把权限名发给思考配置。

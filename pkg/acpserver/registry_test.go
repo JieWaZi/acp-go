@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // registryTestAgent 是注册表测试使用的非 nil SDK Agent 令牌。

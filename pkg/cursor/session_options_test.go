@@ -3,7 +3,7 @@ package cursor
 import (
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestCursorExecutionSelection 保证官方模型参数原样传递，工作模式不会混入模型参数。

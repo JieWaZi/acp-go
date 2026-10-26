@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPermissionModesGateBypassPermissions 验证危险模式只在进程安全门槛允许时公开。

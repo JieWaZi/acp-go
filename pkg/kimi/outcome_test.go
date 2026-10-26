@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestReadWireFailure 使用真实 Kimi 2.0.2 的终态结构，防止重试耗尽后误报成功。

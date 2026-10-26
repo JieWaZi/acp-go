@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestCanceledAdmissionRemainsEmpty 验证尚未发往原生的取消不会阻塞空会话配置和重启恢复。

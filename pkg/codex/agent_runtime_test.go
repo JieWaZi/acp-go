@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // runtimeWireRequest 保存真实 transport 写向 fake app-server 的请求 envelope。

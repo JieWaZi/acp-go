@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // promptQueue 保存一个会话的待执行请求，所有字段由 Agent.mutex 保护。

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestReviewRejectsInvalidAuthority 验证非法输出、不完整证据和取消都不能产生自动授权。

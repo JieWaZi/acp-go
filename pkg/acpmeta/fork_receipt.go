@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // ErrForkUnconfirmed 表示目前没有可证明的原生结果，调用者不得重新创建分支。

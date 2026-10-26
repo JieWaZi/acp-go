@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // cloneNewRequest 固定 MCP 和元数据，防止调用方更改重建输入。

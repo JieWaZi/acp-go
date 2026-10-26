@@ -5,7 +5,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // legacyModelCatalog 只读取原生响应实际提供的模型元数据，不新增模型。

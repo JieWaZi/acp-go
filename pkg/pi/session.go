@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/userinput"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // extensionTemplate 在会话目录生成 Pi 官方加载器使用的临时 TypeScript 扩展。

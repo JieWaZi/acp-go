@@ -10,7 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	"github.com/JieWaZi/acp-go/pkg/userinput"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const disableMCPConfigFilteringEnv = "DISABLE_MCP_CONFIG_FILTERING"

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPiErrorsSurviveSuccessfulModelRetry 验证自动重试只能清除模型错误，不能覆盖扩展和交付失败。

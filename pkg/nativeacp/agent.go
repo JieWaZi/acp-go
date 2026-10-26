@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const maxNativeDiagnosticBytes = 4 << 10

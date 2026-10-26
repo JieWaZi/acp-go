@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // reviewHost 收集审查审计通知。

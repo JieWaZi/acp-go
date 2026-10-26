@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestEventRouterMapsCommandLifecycle 验证命令 start/delta/completed 使用同一 ACP toolCallId。

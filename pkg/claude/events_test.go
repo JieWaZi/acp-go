@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestTrailingIdleDebtDoesNotSettleNextTurn 锁定 upstream 的无身份尾随 idle 隔离语义。

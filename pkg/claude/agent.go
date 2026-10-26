@@ -15,7 +15,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/internal/buildinfo"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const (

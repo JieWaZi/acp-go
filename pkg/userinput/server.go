@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

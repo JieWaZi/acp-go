@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/term"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // terminalHost 通过真实 ACP 回调返回测试审批，记录完整的工具与文本输出。

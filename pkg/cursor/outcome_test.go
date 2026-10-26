@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestCursorMissingStopHookFailure 回放真实额度错误，验证没有 stop Hook 时仍及时结束当前轮且保留套餐升级分类。

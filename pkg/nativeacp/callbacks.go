@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // CallbackBridge 只暴露厂商回调接入 ACP 宿主所需的稳定能力。

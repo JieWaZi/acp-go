@@ -6,7 +6,7 @@ import (
 	"net/url"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // mcpStatusSnapshot 把状态与全局单调水位绑定，防止新会话消费旧同名 server 终态。

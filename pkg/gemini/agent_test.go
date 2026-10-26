@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestMain 提供只访问临时目录的原生 ACP 子进程夹具。

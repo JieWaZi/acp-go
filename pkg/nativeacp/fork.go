@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // UnstableForkSession 转发原生分叉并复用配置规范化，不把分叉命令交给 Prompt。

@@ -12,7 +12,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/internal/sessionfiles"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // UnstableForkSession 使用隔离 RPC 进程执行 clone，不切换来源连接的当前会话。

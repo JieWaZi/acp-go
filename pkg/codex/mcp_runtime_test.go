@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // recordingElicitationRequester 记录 ACP Elicitation 并返回预置响应。

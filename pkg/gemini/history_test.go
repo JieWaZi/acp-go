@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestTranscriptIgnoresResetContext 验证官方 session_context 检查点不覆盖真实可恢复内容。

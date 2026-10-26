@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // lifecycleHost 记录真实外层连接收到的原生会话事件。

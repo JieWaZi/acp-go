@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // processLogHandler 捕获进程层写入结构化日志的记录，并仅启用告警及以上级别。

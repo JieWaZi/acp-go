@@ -17,7 +17,7 @@ import (
 	"time"
 
 	codexprotocol "github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // fakeCodexProcessEnv 标记测试二进制子进程应进入 fake Codex 模式。

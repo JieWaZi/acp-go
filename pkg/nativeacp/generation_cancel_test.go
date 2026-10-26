@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // completionGateContext 在旧 SDK 请求完成后暂停调用者取消检查，精确控制恢复时序。

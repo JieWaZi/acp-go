@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // recordingSessionUpdater 记录事件组件通过 ACP SDK 发出的原生 session/update DTO。

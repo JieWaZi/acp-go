@@ -193,7 +193,7 @@ Claude Adapter 在非 root 进程，或显式 `IS_SANDBOX` 环境中，提供 `b
 
 ## 作为 Go 包使用
 
-所有 Adapter 都以 `Config`、`NewAgent` 和 `Agent` 作为公开入口，并实现 `github.com/coder/acp-go-sdk` 的 Agent 接口。`pkg/acpserver` 提供公共 Registry 和 stdio Server。调用方负责提供非空日志器、选择 CLI 路径和可选启动配置，并在不再使用时关闭 Agent。
+所有 Adapter 都以 `Config`、`NewAgent` 和 `Agent` 作为公开入口，并实现 `github.com/JieWaZi/acp-go/sdk` 的 Agent 接口。`pkg/acpserver` 提供公共 Registry 和 stdio Server。调用方负责提供非空日志器、选择 CLI 路径和可选启动配置，并在不再使用时关闭 Agent。
 
 ```go
 logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
