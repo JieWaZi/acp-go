@@ -11,10 +11,10 @@ Learn more about the protocol itself at <https://agentclientprotocol.com>.
 
 ## Installation
 
-<!-- `$ printf 'go get github.com/coder/acp-go-sdk@v%s\n' "$(cat schema/version)"` as bash -->
+本仓库维护的 SDK 使用独立模块路径，改动与验证说明见 [PATCHES.md](PATCHES.md)。
 
 ```bash
-go get github.com/coder/acp-go-sdk@v0.13.5
+go get github.com/JieWaZi/acp-go/sdk@latest
 ```
 
 ## Get Started
