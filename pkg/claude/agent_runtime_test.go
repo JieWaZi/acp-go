@@ -542,6 +542,9 @@ func assertRuntimeUpdates(t *testing.T, updates []acp.SessionNotification) {
 	for _, notification := range updates {
 		switch {
 		case notification.Update.AgentMessageChunk != nil:
+			if notification.Update.AgentMessageChunk.Content.Text != nil && notification.Update.AgentMessageChunk.Content.Text.Text == "" {
+				continue
+			}
 			textCount++
 			if notification.Update.AgentMessageChunk.Content.Text == nil || notification.Update.AgentMessageChunk.Content.Text.Text != "answer" {
 				t.Fatalf("message update = %#v", notification.Update.AgentMessageChunk)

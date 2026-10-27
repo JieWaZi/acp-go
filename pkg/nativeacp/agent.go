@@ -119,6 +119,8 @@ type Agent struct {
 	turnContexts map[acp.SessionId]context.Context
 	// turnCancels 使 session/cancel 在原生回复前撤销待审查授权。
 	turnCancels map[acp.SessionId]context.CancelFunc
+	// messageSequence 为本进程内无原生身份的消息段分配不复用的标识。
+	messageSequence uint64
 }
 
 var _ acp.Agent = (*Agent)(nil)
@@ -374,6 +376,10 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 	agent.turnContexts[request.SessionId] = turnCtx
 	agent.turnCancels[request.SessionId] = turnCancel
 	agent.active[request.SessionId] = true
+	if state := agent.sessions[request.SessionId]; state != nil {
+		state.messageID = ""
+		state.messageKnownID = ""
+	}
 	agent.prompts[request.SessionId] = append([]acp.ContentBlock{}, request.Prompt...)
 	agent.mutex.Unlock()
 	defer func() {

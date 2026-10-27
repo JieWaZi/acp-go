@@ -176,6 +176,17 @@ func assertCodexMessageChunk(t *testing.T, notification acp.SessionNotification,
 	if got := meta["messageCompleted"]; got != want.messageCompleted {
 		t.Errorf("messageCompleted = %#v，期望 %v", got, want.messageCompleted)
 	}
+	common, ok := message.Meta["acp-go/message"].(map[string]any)
+	phase := "unknown"
+	if want.phase == "commentary" || want.phase == "partial_answer" {
+		phase = "commentary"
+	}
+	if want.phase == "final_answer" && want.phaseVerified {
+		phase = "final"
+	}
+	if !ok || common["phase"] != phase || common["complete"] != want.messageCompleted {
+		t.Errorf("generic message facts = %#v", common)
+	}
 }
 
 // failOnceMessageUpdater 模拟 ACP 完成边界首次发送失败，成功通知仍按真实 DTO 保存。

@@ -10,6 +10,45 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
+// TestClaudeMessageIDGroupsNativeStream 验证 wire UUID 改变时仍按原生消息 ID 交付，并保留完成边界。
+func TestClaudeMessageIDGroupsNativeStream(t *testing.T) {
+	client := &recordingClaudeClient{}
+	turn := &claudeTurn{id: "turn", streamedBlocks: map[string][]streamedContentBlock{}}
+	session := &claudeSession{id: "s", active: turn, agent: &Agent{updater: client}}
+	for _, raw := range []string{
+		`{"type":"stream_event","uuid":"wire-1","session_id":"s","event":{"type":"message_start","message":{"id":"msg-native","role":"assistant"}}}`,
+		`{"type":"stream_event","uuid":"wire-2","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Answer"}}}`,
+		`{"type":"stream_event","uuid":"wire-3","session_id":"s","event":{"type":"message_stop"}}`,
+	} {
+		var event protocol.StreamEventMessage
+		if err := json.Unmarshal([]byte(raw), &event); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.handleStreamEvent(context.Background(), &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updates, _ := client.snapshot()
+	var chunks []*acp.SessionUpdateAgentMessageChunk
+	for _, update := range updates {
+		if update.Update.AgentMessageChunk != nil {
+			chunks = append(chunks, update.Update.AgentMessageChunk)
+		}
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("native boundary missing: %#v", chunks)
+	}
+	for _, chunk := range chunks {
+		if chunk.MessageId == nil || *chunk.MessageId != "msg-native" {
+			t.Fatalf("wire UUID used for message: %#v", chunk)
+		}
+	}
+	facts, ok := chunks[1].Meta["acp-go/message"].(map[string]any)
+	if !ok || facts["complete"] != true || facts["phase"] != "unknown" {
+		t.Fatalf("wrong completion: %#v", facts)
+	}
+}
+
 // TestTrailingIdleDebtDoesNotSettleNextTurn 锁定 upstream 的无身份尾随 idle 隔离语义。
 func TestTrailingIdleDebtDoesNotSettleNextTurn(t *testing.T) {
 	t.Parallel()
@@ -136,7 +175,7 @@ func TestClaudeExplicitErrorsNeverBecomeAssistantText(t *testing.T) {
 					t.Fatalf("错误详情丢失：%v", result.err)
 				}
 			}
-			if kind == "" && len(updates) != 1 {
+			if kind == "" && (len(updates) != 2 || updates[0].Update.AgentMessageChunk == nil || updates[0].Update.AgentMessageChunk.Content.Text.Text != message.Message.Content[0].Text || updates[1].Update.AgentMessageChunk.Content.Text.Text != "") {
 				t.Fatalf("普通文本被误判：%+v", updates)
 			}
 		})
@@ -287,7 +326,7 @@ func TestClaudeSubagentErrorKeepsParentTurnSuccessful(t *testing.T) {
 		t.Fatalf("子代理错误覆盖主代理成功终态：%+v", result)
 	}
 	updates, _ = client.snapshot()
-	if len(updates) != 3 || updates[1].Update.ToolCallUpdate == nil ||
+	if len(updates) != 4 || updates[1].Update.ToolCallUpdate == nil ||
 		updates[1].Update.ToolCallUpdate.Status == nil || *updates[1].Update.ToolCallUpdate.Status != acp.ToolCallStatusFailed ||
 		updates[2].Update.AgentMessageChunk == nil || updates[2].Update.AgentMessageChunk.Content.Text.Text != "I handled the subagent failure." {
 		t.Fatalf("工具失败和主代理正文未独立交付：%+v", updates)

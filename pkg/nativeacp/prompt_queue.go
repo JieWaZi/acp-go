@@ -133,6 +133,10 @@ func (agent *Agent) promptFIFO(ctx context.Context, request acp.PromptRequest) (
 	}
 	agent.turnOwners[request.SessionId] = waiter
 	agent.active[request.SessionId] = true
+	if state := agent.sessions[request.SessionId]; state != nil {
+		state.messageID = ""
+		state.messageKnownID = ""
+	}
 	agent.prompts[request.SessionId] = append([]acp.ContentBlock{}, request.Prompt...)
 	agent.turnContexts[request.SessionId] = waiter.context
 	agent.turnCancels[request.SessionId] = waiter.cancel

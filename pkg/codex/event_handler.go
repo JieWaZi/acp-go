@@ -9,6 +9,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
@@ -499,8 +500,18 @@ func (h *eventHandler) emitAgentMessage(
 	if phase != "" {
 		codexMeta["phase"] = string(phase)
 	}
+	info := acpmeta.MessageInfo{Phase: acpmeta.MessagePhaseUnknown, Complete: messageCompleted, Source: acpmeta.MessageSourceNativeMessage}
+	if phase == "commentary" || phase == "partial_answer" {
+		info.Phase = acpmeta.MessagePhaseCommentary
+	}
+	if phaseVerified {
+		info.Source = acpmeta.MessageSourceNativePhase
+		if phase == "final_answer" {
+			info.Phase = acpmeta.MessagePhaseFinal
+		}
+	}
 	update := acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-		Meta: map[string]any{"codex": codexMeta}, MessageId: &itemID, Content: acp.TextBlock(text),
+		Meta: acpmeta.WithMessageInfo(map[string]any{"codex": codexMeta}, info), MessageId: &itemID, Content: acp.TextBlock(text),
 	}}
 	return h.emit(ctx, update)
 }

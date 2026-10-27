@@ -95,6 +95,7 @@ func (a *Agent) events(s *session) {
 			continue
 		}
 		if kind == "agent_settled" {
+			s.resetMessage()
 			s.mutex.Lock()
 			turn := s.turn
 			reason := acp.StopReasonEndTurn
@@ -110,6 +111,11 @@ func (a *Agent) events(s *session) {
 		}
 		var update map[string]any
 		switch kind {
+		case "message_start":
+			message := object(event["message"])
+			if message["role"] == "assistant" {
+				s.beginMessage(text(message["id"]))
+			}
 		case "message_update":
 			message := object(event["assistantMessageEvent"])
 			typ := text(message["type"])
@@ -119,6 +125,9 @@ func (a *Agent) events(s *session) {
 					name = "agent_thought_chunk"
 				}
 				update = map[string]any{"sessionUpdate": name, "content": map[string]any{"type": "text", "text": text(message["delta"])}}
+				if typ == "text_delta" {
+					update = s.messageUpdate(map[string]any{"type": "text", "text": text(message["delta"])}, false)
+				}
 			} else if strings.HasPrefix(typ, "toolcall_") {
 				tool := object(message["toolCall"])
 				if tool == nil {
@@ -135,6 +144,7 @@ func (a *Agent) events(s *session) {
 		case "message_end":
 			message := object(event["message"])
 			if message["role"] == "assistant" {
+				update = s.messageUpdate(map[string]any{"type": "text", "text": ""}, true)
 				s.accumulateUsage(object(message["usage"]))
 				if reason := text(message["stopReason"]); reason == "error" {
 					s.mutex.Lock()
@@ -143,11 +153,14 @@ func (a *Agent) events(s *session) {
 				}
 			}
 		case "tool_execution_start":
+			s.resetMessage()
 			s.snapshotFile(event)
 			update = s.toolUpdate(text(event["toolCallId"]), text(event["toolName"]), "in_progress", event["args"], nil, false)
 		case "tool_execution_update":
+			s.resetMessage()
 			update = s.toolUpdate(text(event["toolCallId"]), text(event["toolName"]), "in_progress", nil, event["partialResult"], false)
 		case "tool_execution_end":
+			s.resetMessage()
 			failed, _ := event["isError"].(bool)
 			status := "completed"
 			if failed {

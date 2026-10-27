@@ -85,6 +85,10 @@ type claudeTurn struct {
 	gotResult bool
 	// streamedBlocks 按父工具调用隔离并按文档顺序保存已发送内容块。
 	streamedBlocks map[string][]streamedContentBlock
+	// streamMessages 按父工具槽保留当前原生消息身份与完成边界。
+	streamMessages map[string]*streamedMessage
+	// messageSequence 为当前回合缺失原生身份的消息分配独立标识。
+	messageSequence uint64
 	// steeringIDs 保存注入当前 turn 的 priority 消息标识。
 	steeringIDs map[string]struct{}
 	// steered 表示本轮曾注入 priority 消息，最终在 idle 边界完成。

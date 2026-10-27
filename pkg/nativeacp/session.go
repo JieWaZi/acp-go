@@ -3,6 +3,7 @@ package nativeacp
 import (
 	"context"
 	"encoding/json"
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"strings"
 	"sync"
 
@@ -23,6 +24,14 @@ type sessionOptions struct {
 	options []acp.SessionConfigOption
 	// models 保存当前会话代的旧版模型目录，恢复时以新响应克隆替换。
 	models json.RawMessage
+	// messageID 是当前连续助手消息段的身份，工具或新一轮开始时清空。
+	messageID string
+	// messageInfo 保留当前消息已经明确声明的阶段，后续无元数据增量不覆盖它。
+	messageInfo acpmeta.MessageInfo
+	// messageKnownID 保留最近一个明确阶段的原生身份，工具活动不撤销它已经声明的阶段。
+	messageKnownID string
+	// messageKnownInfo 只用于恢复同一原生身份的明确阶段，不保存历史正文或其他消息。
+	messageKnownInfo acpmeta.MessageInfo
 }
 
 // nativeSessionResponse 兼容当前仍提供 models 的外部 ACP 实现。
@@ -202,6 +211,7 @@ func (agent *Agent) SetSessionConfigOption(
 func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
+	agent.normalizeMessageLocked(request)
 	if update := request.Update.ToolCall; update != nil {
 		agent.toolRevisions[update.ToolCallId] = &toolEvidenceRevision{}
 		agent.toolSessions[update.ToolCallId] = request.SessionId

@@ -110,6 +110,10 @@ type session struct {
 	eventsDone chan struct{}
 	// callbacks 跟踪本会话发起的扩展 UI 回调。
 	callbacks sync.WaitGroup
+	// messageSequence 由事件消费者为没有原生 ID 的助手消息分配本会话内不复用的标识。
+	messageSequence uint64
+	// messageID 由事件消费者维护当前原生助手消息身份，不保存正文。
+	messageID string
 }
 
 // NewAgent 解析 Pi 和宿主 bridge，不启动额外 ACP 程序。
