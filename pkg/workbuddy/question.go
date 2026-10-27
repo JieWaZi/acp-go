@@ -3,6 +3,7 @@ package workbuddy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	"github.com/JieWaZi/acp-go/pkg/userinput"
@@ -93,4 +94,73 @@ func (questionAdapter) HandleCallback(ctx context.Context, bridge nativeacp.Call
 		return cancelled, true, nil
 	}
 	return map[string]any{"outcome": "submitted", "answers": result.Answers}, true, nil
+}
+
+// Review 将新版 CLI 审批中携带的原生问题转成表单；普通工具仍交由标准审批处理。
+func (questionAdapter) Review(ctx context.Context, bridge nativeacp.PermissionBridge, evidence nativeacp.PermissionEvidence) (acp.RequestPermissionResponse, bool, error) {
+	request := evidence.Request
+	if request.ToolCall.Meta["codebuddy.ai/toolName"] != "AskUserQuestion" {
+		return acp.RequestPermissionResponse{}, false, nil
+	}
+	cancelled := acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}
+	host, ok := bridge.(interface {
+		nativeacp.CallbackBridge
+		nativeacp.SessionBridge
+		// ResolveInteractionContext 取得问题所属执行的取消信号。
+		ResolveInteractionContext(string, string) (acp.SessionId, context.Context)
+	})
+	if !ok || !evidence.Active || evidence.ToolOwner != request.SessionId || ctx.Err() != nil {
+		return cancelled, true, nil
+	}
+	sid, turn := host.ResolveInteractionContext(string(request.ToolCall.ToolCallId), string(request.SessionId))
+	if sid != request.SessionId || turn == nil || turn.Err() != nil {
+		return cancelled, true, nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(turn, cancel)
+	defer stop()
+	defer cancel()
+	input := request.ToolCall.RawInput
+	if input == nil {
+		input = evidence.Detail.RawInput
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return cancelled, true, err
+	}
+	var questions userinput.Questions
+	if len(encoded) > 65536 || json.Unmarshal(encoded, &questions) != nil {
+		return cancelled, true, acp.NewInvalidParams(nil)
+	}
+	// 原生 AskService 按问题正文收答案，与旧 question 回调使用的 q_N 身份分开。
+	for i := range questions.Questions {
+		questions.Questions[i].ID = ""
+	}
+	result, err := userinput.Ask(ctx, questionRequester{bridge: host}, sid, questions)
+	if err != nil {
+		return cancelled, true, err
+	}
+	if ctx.Err() != nil || turn.Err() != nil {
+		return cancelled, true, nil
+	}
+	decision := "deny"
+	var answers map[string]any
+	if result.Action == "accept" {
+		decision, answers = "allow", result.Answers
+	}
+	var resolved struct {
+		// Resolved 表示原生问题确已接收答案或拒答，不能把排队视为完成。
+		Resolved bool `json:"resolved"`
+	}
+	err = host.SendRequest(ctx, "_codebuddy.ai/resolveInterruption", map[string]any{
+		"sessionId": sid, "toolCallId": request.ToolCall.ToolCallId, "decision": decision, "answers": answers,
+	}, &resolved)
+	if err != nil {
+		return cancelled, true, err
+	}
+	if !resolved.Resolved {
+		return cancelled, true, errors.New("WorkBuddy question resolution was not accepted")
+	}
+	// resolveInterruption 已完成交互；取消原审批回执，避免再次放行或记住问答权限。
+	return cancelled, true, nil
 }

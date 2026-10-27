@@ -20,3 +20,5 @@
 `TestInstalledWorkBuddyProtocol` 以 `WORKBUDDY_REAL_ACP=1` 显式开启，在临时 `CODEBUDDY_CONFIG_DIR` 与工作目录中验证实际 CLI 握手、新建、原生 auto 权限及跨进程 load，不登录、不发送 Prompt。真实服务商的模型回复、工具执行、问答、Teams/MCP-UI 和 Windows 进程树不由 fixture 或无模型探针证明。
 
 升级时重新检查零身份元数据路径、问答能力位和请求/回执、模型/思考菜单、布尔配置、权限重设、MCP 刷新、load 重放、取消和进程退出。公开 Teams 的 `memberEvent` 必须由消费它的宿主按成员归属解释，不把它视为主智能体的身份声明。
+
+CodeBuddy Code 2.151.0 的实际 CLI 入口 `dist/codebuddy.js` 使用 `handleToolApproval`：`AskUserQuestion` 通过 `session/request_permission` 携带 `toolCall._meta["codebuddy.ai/toolName"]` 和 `toolCall.rawInput.questions`。普通 `allow` 只放行工具，随后 `AskService.acquireAnswers` 等待答案，不能作为问答完成。适配器在此边界转为标准 Form Elicitation，并调用 `_codebuddy.ai/resolveInterruption`，参数为 `{sessionId,toolCallId,decision:"allow"|"deny",answers:{[questionText]:string|string[]}}`；必须收到 `{resolved:true}`，旧审批回执随之取消。只有用户实际提交的答案才形成 `allow`，拒答走 `deny`，执行取消不提交迟到答案。`WORKBUDDY_REAL_QUESTION=1 go test ./pkg/workbuddy -run '^TestInstalledWorkBuddyQuestion$' -count=1 -v` 在临时目录执行真实模型连续两轮问答，检查回答表单、无普通授权及模型收到真实答案；此检查会使用当前登录账号。

@@ -71,7 +71,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		Command: command, Args: args, Environment: config.Environment,
 		WorkingDirectory: config.WorkingDirectory, Logger: config.Logger,
 		RuntimeName: "workbuddy", VersionArgs: append(append([]string{}, config.PrefixArgs...), "--version"),
-		PromptFIFO: true, CallbackAdapter: questionAdapter{},
+		PromptFIFO: true, CallbackAdapter: questionAdapter{}, PermissionAdapter: questionAdapter{},
 	})
 	if err != nil {
 		return nil, err

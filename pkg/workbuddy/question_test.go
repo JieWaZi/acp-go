@@ -153,3 +153,33 @@ func TestQuestionDiscardsAcceptedAnswerAfterCancellation(t *testing.T) {
 		t.Fatalf("cancelled turn retained answer: handled=%v result=%v error=%v", handled, answer, err)
 	}
 }
+
+// cancelledPermissionBridge 记录取消后是否仍向原生 CLI 提交答案。
+type cancelledPermissionBridge struct {
+	// cancelledAnswerBridge 在宿主提交答案时取消原始执行。
+	cancelledAnswerBridge
+	// PermissionBridge 保留该测试不调用的会话通知端口。
+	nativeacp.PermissionBridge
+	// submitted 标记是否向已经取消的执行交付答案。
+	submitted bool
+}
+
+// SendRequest 记录不应发生的迟到原生答复。
+func (bridge *cancelledPermissionBridge) SendRequest(context.Context, string, any, any) error {
+	bridge.submitted = true
+	return nil
+}
+
+// TestPermissionQuestionDiscardsAcceptedAnswerAfterCancellation 防止审批型问题把迟到答案送给已取消或后续执行。
+func TestPermissionQuestionDiscardsAcceptedAnswerAfterCancellation(t *testing.T) {
+	turn, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bridge := &cancelledPermissionBridge{cancelledAnswerBridge: cancelledAnswerBridge{turn: turn, cancel: cancel}}
+	evidence := nativeacp.PermissionEvidence{Active: true, ToolOwner: "s", Request: acp.RequestPermissionRequest{
+		SessionId: "s", ToolCall: acp.ToolCallUpdate{ToolCallId: "old-question", Meta: map[string]any{"codebuddy.ai/toolName": "AskUserQuestion"}, RawInput: map[string]any{"questions": []map[string]any{{"question": "choose", "options": []map[string]string{{"label": "A"}}}}}},
+	}}
+	answer, handled, err := (questionAdapter{}).Review(context.Background(), bridge, evidence)
+	if err != nil || !handled || answer.Outcome.Cancelled == nil || bridge.submitted {
+		t.Fatalf("cancelled question retained answer: handled=%v submitted=%v result=%+v error=%v", handled, bridge.submitted, answer, err)
+	}
+}

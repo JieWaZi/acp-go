@@ -190,6 +190,55 @@ func TestWorkBuddyStandardContract(t *testing.T) {
 	}
 }
 
+// TestWorkBuddyPermissionQuestionAnswers 覆盖新版 CLI 通过审批携带问题，必须回答后才能继续工具执行。
+func TestWorkBuddyPermissionQuestionAnswers(t *testing.T) {
+	for _, action := range []string{"accept", "decline", "wait"} {
+		t.Run(action, func(t *testing.T) {
+			_, peer, host := startFixture(t, "full-access", action)
+			initializeFixture(t, peer)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			session, err := peer.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), McpServers: []acp.McpServer{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := "permission-question"
+			if action == "decline" {
+				text = "permission-question-decline"
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+				done <- err
+			}()
+			select {
+			case <-host.questions:
+			case <-ctx.Done():
+				t.Fatal("AskUserQuestion became a permission approval instead of an answer form")
+			}
+			if action == "wait" {
+				if err := peer.Cancel(ctx, acp.CancelNotification{SessionId: session.SessionId}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case err := <-done:
+				if action != "wait" && err != nil {
+					t.Fatalf("question did not resume with real answers: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("question stayed blocked after answering or cancelling")
+			}
+			if action == "accept" {
+				// 同一会话再次提问仍须提交答案，不能因首轮允许而静默放行。
+				if _, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("permission-question")}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // TestWorkBuddyRestoreAndCancel 覆盖冷恢复、恢复权限、拒答、待回答取消与未声明方法。
 func TestWorkBuddyRestoreAndCancel(t *testing.T) {
 	for _, action := range []string{"decline", "wait"} {
@@ -277,6 +326,7 @@ func TestWorkBuddyProcess(t *testing.T) {
 	var connection *acp.Connection
 	var mutex sync.Mutex
 	reasoning := "enabled"
+	questionResults := make(chan map[string]any, 1)
 	options := func() []map[string]any {
 		return []map[string]any{
 			{"type": "select", "id": "model", "name": "Model", "category": "model", "currentValue": "native/model", "options": []map[string]string{{"value": "native/model", "name": "Native"}}},
@@ -320,6 +370,12 @@ func TestWorkBuddyProcess(t *testing.T) {
 			}
 			reasoning, _ = request["value"].(string)
 			return map[string]any{"configOptions": options()}, nil
+		case "_codebuddy.ai/resolveInterruption":
+			if request["sessionId"] != "workbuddy-session" || request["toolCallId"] != "permission-question-tool" {
+				return nil, acp.NewInvalidParams(nil)
+			}
+			questionResults <- request
+			return map[string]any{"resolved": true, "queued": false}, nil
 		case "session/prompt":
 			var prompt acp.PromptRequest
 			if json.Unmarshal(data, &prompt) != nil || len(prompt.Prompt) != 1 || prompt.Prompt[0].Text == nil {
@@ -337,6 +393,44 @@ func TestWorkBuddyProcess(t *testing.T) {
 				}
 				if answer["outcome"] == "submitted" && !reflect.DeepEqual(answer["answers"], map[string]any{"q_0": "A", "q_1": []any{"B", "C"}, "q_2": "free text"}) {
 					return nil, acp.NewInvalidParams(nil)
+				}
+			}
+			if strings.HasPrefix(text, "permission-question") {
+				input := map[string]any{"questions": []map[string]any{
+					{"question": "Choose one", "options": []map[string]string{{"label": "A"}}},
+					{"question": "Choose several", "multiSelect": true, "options": []map[string]string{{"label": "B"}, {"label": "C"}}},
+					{"question": "Explain"},
+				}}
+				meta := map[string]any{"codebuddy.ai/toolName": "AskUserQuestion"}
+				tool := acp.ToolCallUpdate{ToolCallId: "permission-question-tool", RawInput: input, Meta: meta}
+				_ = connection.SendNotification(ctx, "session/update", acp.SessionNotification{SessionId: prompt.SessionId, Update: acp.SessionUpdate{ToolCall: &acp.SessionUpdateToolCall{ToolCallId: tool.ToolCallId, Title: "AskUserQuestion", Status: acp.ToolCallStatusPending, RawInput: input, Meta: meta}}})
+				// 与已安装 CLI 一致：审批不接收答案；答案由 resolveInterruption 另行提交。
+				answer, err := acp.SendRequest[acp.RequestPermissionResponse](connection, ctx, "session/request_permission", acp.RequestPermissionRequest{SessionId: prompt.SessionId, ToolCall: tool, Options: []acp.PermissionOption{{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce}, {OptionId: "reject", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce}}})
+				if err != nil {
+					return nil, acp.NewInternalError(nil)
+				}
+				if answer.Outcome.Cancelled == nil {
+					return nil, acp.NewInvalidParams(map[string]any{"message": "question approval was not retired"})
+				}
+				select {
+				case result := <-questionResults:
+					expectedDecision := "allow"
+					if text == "permission-question-decline" {
+						expectedDecision = "deny"
+					}
+					if result["decision"] != expectedDecision || (expectedDecision == "deny" && result["answers"] != nil) {
+						return nil, acp.NewInvalidParams(map[string]any{"message": "question answer action changed"})
+					}
+					if result["decision"] == "allow" && !reflect.DeepEqual(result["answers"], map[string]any{"Choose one": "A", "Choose several": []any{"B", "C"}, "Explain": "free text"}) {
+						return nil, acp.NewInvalidParams(map[string]any{"message": "missing real answers"})
+					}
+				case <-ctx.Done():
+					return nil, acp.NewInternalError(nil)
+				default:
+					if answer.Outcome.Selected != nil {
+						return nil, acp.NewInvalidParams(map[string]any{"message": "approval is not an answer"})
+					}
+					return nil, acp.NewInternalError(nil)
 				}
 			}
 			if text == "permission" {

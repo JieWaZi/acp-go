@@ -33,7 +33,7 @@ return server.Serve(ctx)
 | 连续输入与取消 | 每会话 FIFO；只发送本轮内容，不重复拼接历史、指令或 MCP；问答原子绑定所属执行代，取消会使待回答表单和迟到答案失效，不转移到同会话的下一轮 |
 | 模型与思考 | 原样保留模型 ID；标准 `thought_level` 规范为 `reasoning`，写入时还原原生 ID；保留布尔配置和其他公开选项，不推测其他模型的思考档位 |
 | 权限 | `default` → `default`、`auto` → 原生 AI 分类模式、`full-access` → `bypassPermissions`；构造时冻结并在 new/load/resume 后重设，未声明的模式明确失败；空值保留 CLI 默认 |
-| 提问 | `_codebuddy.ai/question` → 标准 Form Elicitation；复用 `pkg/userinput` 的单选、多选、自由回答、自定义选项、拒答和取消；完全访问仍须用户回答，不重复注入问答 MCP |
+| 提问 | `session/request_permission` 中的原生 `AskUserQuestion` → 标准 Form Elicitation → `_codebuddy.ai/resolveInterruption` 提交实际答案；保留 `_codebuddy.ai/question` 回调支持；复用 `pkg/userinput` 的单选、多选、自由回答、自定义选项、拒答和取消；完全访问仍须用户回答，不重复注入问答 MCP |
 | 文件、终端、工具、diff、计划 | 复用标准 ACP 客户端回调及会话更新；只在宿主声明能力后由 CLI 使用 |
 | MCP、图片、用量 | STDIO 和声明的 HTTP/SSE 配置原样交付；图片、Prompt Usage、`usage_update` 按原生回执转发，不制造缺失统计 |
 | 公共扩展 | 保留标准事件上的公开 `_meta`，其他 `_codebuddy.ai/*` 方法继续转发给显式调用方/宿主 |
