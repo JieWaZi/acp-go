@@ -56,6 +56,18 @@ flowchart LR
 
 一个 Adapter 实例只启动一个 app-server。各 Session 共享 transport，但 Session generation、活动 Prompt、审批和 steering 队列相互隔离。
 
+## 消息阶段与完成边界
+
+Agent Message 的 `agent_message_chunk._meta.codex` 保留三个独立字段：
+
+- `phase` 透传原生 `item/started` 或 `item/completed` 提供的阶段，包括 `commentary`、`partial_answer` 和 `final_answer`；缺少阶段时省略该字段，保持未知。
+- `phaseVerified` 仅在阶段由原生 started/completed 明确提供时为 `true`。Delta 继承该消息的 started 阶段；completed 优先使用自身阶段，否则继承 started 阶段。
+- `messageCompleted` 仅在原生 `item/completed` 的正文边界为 `true`，不表示整轮成功或消息已被选定为最终答案。
+
+已发送 delta 的消息在完成时追加同一 `messageId` 的空文本 chunk，携带完成边界与已知阶段，不重复正文。未发送 delta 的消息只发送一次完整正文与完成边界；空消息同样保留完成证据。重复 completed 不重复通知，发送失败允许重试。
+
+历史 plan 文本映射为 `commentary`，其 `phaseVerified=false`、`messageCompleted=true`；该阶段来自适配器的保守映射。消费者不能仅凭消息完成或 Prompt 的 `end_turn` 推断最终答案。
+
 ## 配置
 
 公开入口：

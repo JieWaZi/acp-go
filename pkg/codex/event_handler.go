@@ -70,7 +70,7 @@ type eventHandler struct {
 	terminalOutputMode terminalOutputMode
 	// messagePhases 保存 item/started 宣告的消息阶段。
 	messagePhases map[string]protocol.PhaseEnum
-	// streamedMessages 标记已通过 delta 发出的 agent message，完成项不再重复。
+	// streamedMessages 标记已通过 delta 发出的 agent message，完成项仅发送空正文边界。
 	streamedMessages map[string]struct{}
 	// streamedReasoning 标记已通过任一 reasoning delta 发出的 reasoning item。
 	streamedReasoning map[string]struct{}
@@ -188,7 +188,7 @@ func (h *eventHandler) handleAgentMessageDelta(
 ) error {
 	h.streamedMessages[params.ItemID] = struct{}{}
 	phase := h.messagePhases[params.ItemID]
-	return h.emitAgentMessage(ctx, params.ItemID, params.Delta, phase)
+	return h.emitAgentMessage(ctx, params.ItemID, params.Delta, phase, phase != "", false)
 }
 
 // handleReasoningDelta 将 reasoning 文本映射为稳定 ACP agent_thought_chunk。
@@ -332,23 +332,24 @@ func (h *eventHandler) commandOutputMode(itemID string) terminalOutputMode {
 	return terminalOutputModeDelta
 }
 
-// handleCompletedAgentMessage 在未流式发送 delta 时补发完整消息，否则仅完成去重状态。
+// handleCompletedAgentMessage 发送原生完成边界；已流式发送的消息不重复正文。
+// 消息完成与明确阶段分别保留，缺少原生阶段时不能推断为最终答案。
 func (h *eventHandler) handleCompletedAgentMessage(ctx context.Context, item protocol.ThreadItem) error {
-	defer delete(h.messagePhases, item.ID)
-	if _, streamed := h.streamedMessages[item.ID]; streamed {
-		delete(h.streamedMessages, item.ID)
-		return nil
-	}
-	if item.Text == nil || *item.Text == "" {
-		return nil
-	}
-	phase := protocol.FinalAnswer
+	phase := h.messagePhases[item.ID]
 	if item.Phase != nil {
 		phase = *item.Phase
-	} else if startedPhase, ok := h.messagePhases[item.ID]; ok {
-		phase = startedPhase
 	}
-	return h.emitAgentMessage(ctx, item.ID, *item.Text, phase)
+	text := stringValue(item.Text)
+	if _, streamed := h.streamedMessages[item.ID]; streamed {
+		text = ""
+	}
+	if err := h.emitAgentMessage(ctx, item.ID, text, phase, phase != "", true); err != nil {
+		return err
+	}
+	// 发送成功后才释放状态，失败重试仍可保留阶段且不重复已经流出的正文。
+	delete(h.messagePhases, item.ID)
+	delete(h.streamedMessages, item.ID)
+	return nil
 }
 
 // handleCompletedReasoning 在没有 delta 时按 summary 优先、content 兜底输出完整 reasoning。
@@ -374,12 +375,13 @@ func (h *eventHandler) handleCompletedReasoning(ctx context.Context, item protoc
 	return h.handleReasoningDelta(ctx, item.ID, strings.Join(parts, "\n\n"))
 }
 
-// handleCompletedPlan 将没有稳定 checklist 事件的历史计划文本降级为最终 agent 消息。
+// handleCompletedPlan 将没有稳定 checklist 事件的历史计划文本保守映射为 commentary。
+// 完成标记只说明原生 item 的正文边界，不能把适配器提供的阶段当作最终答案证据。
 func (h *eventHandler) handleCompletedPlan(ctx context.Context, item protocol.ThreadItem) error {
 	if item.Text == nil || *item.Text == "" {
 		return nil
 	}
-	return h.emitAgentMessage(ctx, item.ID, *item.Text, protocol.FinalAnswer)
+	return h.emitAgentMessage(ctx, item.ID, *item.Text, protocol.Commentary, false, true)
 }
 
 // handlePlanUpdated 使用 ACP SDK PlanEntry/UpdatePlan 映射稳定 turn/plan/updated。
@@ -481,19 +483,24 @@ func int64Value(value *int64) int64 {
 	return *value
 }
 
-// emitAgentMessage 直接构造 SDK agent_message_chunk，以保留 messageId 与 Codex phase 元数据。
+// emitAgentMessage 保留稳定 messageId、原生阶段来源与 item 完成边界，不推断最终答案。
 func (h *eventHandler) emitAgentMessage(
 	ctx context.Context,
 	itemID string,
 	text string,
 	phase protocol.PhaseEnum,
+	phaseVerified bool,
+	messageCompleted bool,
 ) error {
-	meta := map[string]any(nil)
+	codexMeta := map[string]any{
+		"phaseVerified":    phaseVerified,
+		"messageCompleted": messageCompleted,
+	}
 	if phase != "" {
-		meta = map[string]any{"codex": map[string]any{"phase": string(phase)}}
+		codexMeta["phase"] = string(phase)
 	}
 	update := acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-		Meta: meta, MessageId: &itemID, Content: acp.TextBlock(text),
+		Meta: map[string]any{"codex": codexMeta}, MessageId: &itemID, Content: acp.TextBlock(text),
 	}}
 	return h.emit(ctx, update)
 }
