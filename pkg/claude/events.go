@@ -232,12 +232,19 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 			}
 		}
 	}
-	if err := s.completeMessage(ctx, turn, message.ParentToolUseID); err != nil {
-		return err
-	}
 	turn.mu.Lock()
-	delete(turn.streamMessages, owner)
+	state := turn.streamMessages[owner]
+	streaming := state != nil && state.streaming
 	turn.mu.Unlock()
+	// 流式 assistant 可能只聚合一个内容块；后续正文仍属于同一 message_start 身份。
+	if !streaming {
+		if err := s.completeMessage(ctx, turn, message.ParentToolUseID); err != nil {
+			return err
+		}
+		turn.mu.Lock()
+		delete(turn.streamMessages, owner)
+		turn.mu.Unlock()
+	}
 	return nil
 }
 

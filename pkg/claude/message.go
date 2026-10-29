@@ -14,6 +14,8 @@ type streamedMessage struct {
 	id string
 	// complete 阻止 stream 与聚合 assistant 帧重复交付完成边界。
 	complete bool
+	// streaming 表示已接收 message_start，只能由 message_stop 确认完整消息结束。
+	streaming bool
 }
 
 // messageIdentity 为同一父工具槽中的消息提供稳定身份，wire envelope UUID 不参与分组。
@@ -31,7 +33,7 @@ func (s *claudeSession) messageIdentity(turn *claudeTurn, parent *string, native
 			turn.messageSequence++
 			id = "acp-go/claude/" + turn.id + "/" + strconv.FormatUint(turn.messageSequence, 10)
 		}
-		state = &streamedMessage{id: id}
+		state = &streamedMessage{id: id, streaming: start}
 		turn.streamMessages[owner] = state
 	}
 	return state.id

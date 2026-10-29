@@ -49,6 +49,72 @@ func TestClaudeMessageIDGroupsNativeStream(t *testing.T) {
 	}
 }
 
+// TestClaudeBlockSnapshotsKeepStreamingIdentity 捕获块级 assistant 快照提前结束整条流式消息的错误。
+func TestClaudeBlockSnapshotsKeepStreamingIdentity(t *testing.T) {
+	for _, snapshotAfterStop := range []bool{false, true} {
+		t.Run(map[bool]string{false: "snapshot before stop", true: "snapshot after stop"}[snapshotAfterStop], func(t *testing.T) {
+			client := &recordingClaudeClient{}
+			turn := &claudeTurn{id: "turn", streamedBlocks: map[string][]streamedContentBlock{}}
+			session := &claudeSession{id: "s", active: turn, agent: &Agent{updater: client}}
+			ctx := context.Background()
+			stream := func(event protocol.StreamEvent) {
+				t.Helper()
+				if err := session.handleStreamEvent(ctx, &protocol.StreamEventMessage{SessionID: "s", Event: event}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot := func(kind, text string) {
+				t.Helper()
+				block := protocol.ContentBlock{Type: kind}
+				if kind == "thinking" {
+					block.Thinking = text
+				} else {
+					block.Text = text
+				}
+				if err := session.handleAssistant(ctx, &protocol.AssistantMessage{SessionID: "s", Message: protocol.AnthropicMessage{ID: "msg-native", Content: []protocol.ContentBlock{block}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream(protocol.StreamEvent{Type: "message_start", Message: &protocol.AnthropicMessage{ID: "msg-native"}})
+			stream(protocol.StreamEvent{Type: "content_block_delta", Index: 0, Delta: &protocol.ContentBlock{Thinking: "thinking"}})
+			snapshot("thinking", "thinking")
+			stream(protocol.StreamEvent{Type: "content_block_delta", Index: 1, Delta: &protocol.ContentBlock{Text: "READY"}})
+			if !snapshotAfterStop {
+				snapshot("text", "READY")
+			}
+			stream(protocol.StreamEvent{Type: "message_stop"})
+			if snapshotAfterStop {
+				snapshot("text", "READY")
+			}
+			updates, _ := client.snapshot()
+			var texts, thoughts []string
+			completions := 0
+			for _, update := range updates {
+				if thought := update.Update.AgentThoughtChunk; thought != nil {
+					thoughts = append(thoughts, thought.Content.Text.Text)
+				}
+				if chunk := update.Update.AgentMessageChunk; chunk != nil {
+					if chunk.MessageId == nil || *chunk.MessageId != "msg-native" {
+						t.Fatalf("block snapshot changed stream identity: %+v", chunk)
+					}
+					facts, _ := chunk.Meta["acp-go/message"].(map[string]any)
+					if facts["complete"] == true {
+						if len(texts) != 1 {
+							t.Fatalf("message completed before text: %+v", updates)
+						}
+						completions++
+					} else {
+						texts = append(texts, chunk.Content.Text.Text)
+					}
+				}
+			}
+			if completions != 1 || len(texts) != 1 || texts[0] != "READY" || len(thoughts) != 1 || thoughts[0] != "thinking" {
+				t.Fatalf("stream duplicated content or completion: texts=%q thoughts=%q completions=%d", texts, thoughts, completions)
+			}
+		})
+	}
+}
+
 // TestTrailingIdleDebtDoesNotSettleNextTurn 锁定 upstream 的无身份尾随 idle 隔离语义。
 func TestTrailingIdleDebtDoesNotSettleNextTurn(t *testing.T) {
 	t.Parallel()
