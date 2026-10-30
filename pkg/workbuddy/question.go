@@ -104,7 +104,9 @@ func (questionAdapter) Review(ctx context.Context, bridge nativeacp.PermissionBr
 	}
 	cancelled := acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}
 	host, ok := bridge.(interface {
+		// CallbackBridge 把结构化问题交给当前宿主。
 		nativeacp.CallbackBridge
+		// SessionBridge 把收集到的答案提交回原生会话。
 		nativeacp.SessionBridge
 		// ResolveInteractionContext 取得问题所属执行的取消信号。
 		ResolveInteractionContext(string, string) (acp.SessionId, context.Context)
