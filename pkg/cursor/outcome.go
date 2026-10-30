@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // outcomeCursor 只读取本进程启动后的官方结束标记，补足套餐错误不触发 stop Hook 的路径。

@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // wireTurnOutcome 只读取官方主 Agent 终态，不按助手正文或中间重试推测失败。

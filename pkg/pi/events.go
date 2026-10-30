@@ -1,3 +1,4 @@
+// NeuxBot 本地修改：事件消费者在接纳原生事件时向 RPC 所有者归还等待预算，见根 PATCHES.md。
 package pi
 
 import (
@@ -10,7 +11,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // emit 通过 SDK 发布标准通知，保留顺序并将错误传给回合终态。
@@ -48,7 +49,7 @@ func (a *Agent) events(s *session) {
 			event, startupEvents = startupEvents[0], startupEvents[1:]
 		} else {
 			var ok bool
-			event, ok = <-s.process.events
+			event, ok = s.process.nextEvent()
 			if !ok {
 				break
 			}
@@ -94,6 +95,7 @@ func (a *Agent) events(s *session) {
 			continue
 		}
 		if kind == "agent_settled" {
+			s.resetMessage()
 			s.mutex.Lock()
 			turn := s.turn
 			reason := acp.StopReasonEndTurn
@@ -109,6 +111,11 @@ func (a *Agent) events(s *session) {
 		}
 		var update map[string]any
 		switch kind {
+		case "message_start":
+			message := object(event["message"])
+			if message["role"] == "assistant" {
+				s.beginMessage(text(message["id"]))
+			}
 		case "message_update":
 			message := object(event["assistantMessageEvent"])
 			typ := text(message["type"])
@@ -118,6 +125,9 @@ func (a *Agent) events(s *session) {
 					name = "agent_thought_chunk"
 				}
 				update = map[string]any{"sessionUpdate": name, "content": map[string]any{"type": "text", "text": text(message["delta"])}}
+				if typ == "text_delta" {
+					update = s.messageUpdate(map[string]any{"type": "text", "text": text(message["delta"])}, false)
+				}
 			} else if strings.HasPrefix(typ, "toolcall_") {
 				tool := object(message["toolCall"])
 				if tool == nil {
@@ -134,6 +144,7 @@ func (a *Agent) events(s *session) {
 		case "message_end":
 			message := object(event["message"])
 			if message["role"] == "assistant" {
+				update = s.messageUpdate(map[string]any{"type": "text", "text": ""}, true)
 				s.accumulateUsage(object(message["usage"]))
 				if reason := text(message["stopReason"]); reason == "error" {
 					s.mutex.Lock()
@@ -142,11 +153,14 @@ func (a *Agent) events(s *session) {
 				}
 			}
 		case "tool_execution_start":
+			s.resetMessage()
 			s.snapshotFile(event)
 			update = s.toolUpdate(text(event["toolCallId"]), text(event["toolName"]), "in_progress", event["args"], nil, false)
 		case "tool_execution_update":
+			s.resetMessage()
 			update = s.toolUpdate(text(event["toolCallId"]), text(event["toolName"]), "in_progress", nil, event["partialResult"], false)
 		case "tool_execution_end":
+			s.resetMessage()
 			failed, _ := event["isError"].(bool)
 			status := "completed"
 			if failed {

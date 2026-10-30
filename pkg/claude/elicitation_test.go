@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestAskUserQuestionElicitationRoundTrip 验证选项、自定义答案与多选结果转换。

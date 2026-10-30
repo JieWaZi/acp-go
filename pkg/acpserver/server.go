@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/userinput"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const adapterCloseTimeout = 5 * time.Second

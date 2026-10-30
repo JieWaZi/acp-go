@@ -13,7 +13,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/internal/sessionfiles"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // UnstableForkSession 在受管终端执行原生 /fork，绝不调用模型 Prompt 接口。

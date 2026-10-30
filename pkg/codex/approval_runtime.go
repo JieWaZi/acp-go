@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // failClosedServerRequest 按生成协议变体返回审批拒绝安全值。

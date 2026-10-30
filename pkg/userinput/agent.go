@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Agent 在原生适配器外补充统一问答，模型、审批与执行仍由原适配器拥有。

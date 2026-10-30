@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPrepareLaunchOptionsAndArgs 验证目录、MCP 与创建参数稳定映射。

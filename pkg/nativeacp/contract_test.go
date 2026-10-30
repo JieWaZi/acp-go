@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestNativeCallPreservesExtensionPayloadAndErrors 验证原生调用入口不改写扩展参数和 JSON-RPC 错误。

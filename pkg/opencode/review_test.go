@@ -14,7 +14,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 	sqlite3 "github.com/ncruces/go-sqlite3"
 )
 

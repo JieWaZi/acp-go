@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // CallbackBridge 只暴露厂商回调接入 ACP 宿主所需的稳定能力。
@@ -112,6 +112,17 @@ type PermissionAdapter interface {
 // ResolveInteractionSession 实现 CallbackBridge，不向适配器暴露 Agent 内部状态。
 func (agent *Agent) ResolveInteractionSession(toolCallID, sessionID string) acp.SessionId {
 	return agent.interactionSession(toolCallID, sessionID)
+}
+
+// ResolveInteractionContext 原子解析会话和所属执行代，防止取消后旧交互重新绑定下一轮。
+func (agent *Agent) ResolveInteractionContext(toolCallID, sessionID string) (acp.SessionId, context.Context) {
+	agent.mutex.Lock()
+	defer agent.mutex.Unlock()
+	sid := agent.interactionSessionLocked(toolCallID, sessionID)
+	if sid == "" {
+		return "", nil
+	}
+	return sid, agent.turnContexts[sid]
 }
 
 // UpdateSession 实现 CallbackBridge，统一使用已绑定的 ACP 宿主连接。

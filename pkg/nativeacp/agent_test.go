@@ -20,7 +20,7 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/cursor"
 	"github.com/JieWaZi/acp-go/pkg/kimi"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // hostClient 只实现本测试实际宣告或使用的宿主能力。

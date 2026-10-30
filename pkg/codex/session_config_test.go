@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestAgentDefaultModeUserInputOption 验证公开构造选项传入真实 Agent，零值不改变其他调用方。

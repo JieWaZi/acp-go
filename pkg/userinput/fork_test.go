@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // forkAgentProbe 记录包装层提交给原生适配器的参数。

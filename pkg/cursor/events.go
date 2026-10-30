@@ -11,7 +11,8 @@ import (
 	"strings"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // turnProjection 保存一轮已发出的工具与 Hook 身份，不跨轮累计计费。
@@ -78,6 +79,9 @@ func (a *Agent) project(ctx context.Context, s *interactiveSession, p *turnProje
 					continue
 				}
 				update = acp.UpdateAgentMessageText(part.text)
+				id := message.id
+				update.AgentMessageChunk.MessageId = &id
+				update.AgentMessageChunk.Meta = acpmeta.WithMessageInfo(nil, acpmeta.MessageInfo{Phase: acpmeta.MessagePhaseUnknown, Source: acpmeta.MessageSourceNativeMessage})
 			case "reasoning":
 				if message.role != "assistant" || part.text == "" {
 					continue
@@ -107,6 +111,15 @@ func (a *Agent) project(ctx context.Context, s *interactiveSession, p *turnProje
 			default:
 				continue
 			}
+			if err := a.notify(ctx, s, update); err != nil {
+				return err
+			}
+		}
+		if message.role == "assistant" {
+			id := message.id
+			update := acp.UpdateAgentMessageText("")
+			update.AgentMessageChunk.MessageId = &id
+			update.AgentMessageChunk.Meta = acpmeta.WithMessageInfo(nil, acpmeta.MessageInfo{Phase: acpmeta.MessagePhaseUnknown, Complete: true, Source: acpmeta.MessageSourceNativeMessage})
 			if err := a.notify(ctx, s, update); err != nil {
 				return err
 			}

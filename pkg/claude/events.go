@@ -9,8 +9,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // toolState 保存已发布工具调用的最小生命周期状态。
@@ -106,6 +107,11 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 	event := message.Event
 	switch event.Type {
 	case "message_start":
+		nativeID := ""
+		if event.Message != nil {
+			nativeID = event.Message.ID
+		}
+		s.messageIdentity(turn, message.ParentToolUseID, nativeID, true)
 		turn.mu.Lock()
 		delete(turn.streamedBlocks, streamedBlockOwner(message.ParentToolUseID))
 		turn.mu.Unlock()
@@ -135,7 +141,8 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 				event.Delta.Text,
 			)
 			turn.mu.Unlock()
-			return s.sendAgentText(ctx, message.UUID, event.Delta.Text, false)
+			id := s.messageIdentity(turn, message.ParentToolUseID, "", false)
+			return s.sendMessagePart(ctx, id, event.Delta.Text, false, messageInfo(message.ParentToolUseID, false))
 		}
 		if event.Delta.Thinking != "" {
 			turn.mu.Lock()
@@ -147,13 +154,16 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 				event.Delta.Thinking,
 			)
 			turn.mu.Unlock()
-			return s.sendAgentText(ctx, message.UUID, event.Delta.Thinking, true)
+			id := s.messageIdentity(turn, message.ParentToolUseID, "", false)
+			return s.sendMessagePart(ctx, id, event.Delta.Thinking, true, messageInfo(message.ParentToolUseID, false))
 		}
 	case "message_delta":
 		if message.ParentToolUseID == nil && event.Usage != nil {
 			recordContextUsageDelta(turn, *event.Usage)
 			return s.sendUsageUpdate(ctx, turn, false)
 		}
+	case "message_stop":
+		return s.completeMessage(ctx, turn, message.ParentToolUseID)
 	}
 	return nil
 }
@@ -188,6 +198,7 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 		}
 	}
 	owner := streamedBlockOwner(message.ParentToolUseID)
+	id := s.messageIdentity(turn, message.ParentToolUseID, message.Message.ID, false)
 	turn.mu.Lock()
 	streamed := append([]streamedContentBlock(nil), turn.streamedBlocks[owner]...)
 	delete(turn.streamedBlocks, owner)
@@ -201,7 +212,7 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 				streamPosition++
 			}
 			if remainder != "" {
-				if err := s.sendAgentText(ctx, message.UUID, remainder, false); err != nil {
+				if err := s.sendMessagePart(ctx, id, remainder, false, messageInfo(message.ParentToolUseID, false)); err != nil {
 					return err
 				}
 			}
@@ -211,7 +222,7 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 				streamPosition++
 			}
 			if remainder != "" {
-				if err := s.sendAgentText(ctx, message.UUID, remainder, true); err != nil {
+				if err := s.sendMessagePart(ctx, id, remainder, true, messageInfo(message.ParentToolUseID, false)); err != nil {
 					return err
 				}
 			}
@@ -220,6 +231,19 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 				return err
 			}
 		}
+	}
+	turn.mu.Lock()
+	state := turn.streamMessages[owner]
+	streaming := state != nil && state.streaming
+	turn.mu.Unlock()
+	// 流式 assistant 可能只聚合一个内容块；后续正文仍属于同一 message_start 身份。
+	if !streaming {
+		if err := s.completeMessage(ctx, turn, message.ParentToolUseID); err != nil {
+			return err
+		}
+		turn.mu.Lock()
+		delete(turn.streamMessages, owner)
+		turn.mu.Unlock()
 	}
 	return nil
 }
@@ -465,6 +489,11 @@ func (s *claudeSession) activeTurn() *claudeTurn {
 
 // sendAgentText 发送一段普通文本或思考文本。
 func (s *claudeSession) sendAgentText(ctx context.Context, messageID, text string, thinking bool) error {
+	return s.sendMessagePart(ctx, messageID, text, thinking, messageInfo(nil, false))
+}
+
+// sendMessagePart 保留统一消息事实与原生消息身份，正文空值由完成边界单独发布。
+func (s *claudeSession) sendMessagePart(ctx context.Context, messageID, text string, thinking bool, info acpmeta.MessageInfo) error {
 	if text == "" {
 		return nil
 	}
@@ -475,6 +504,7 @@ func (s *claudeSession) sendAgentText(ctx context.Context, messageID, text strin
 	if messageID != "" {
 		if update.AgentMessageChunk != nil {
 			update.AgentMessageChunk.MessageId = &messageID
+			update.AgentMessageChunk.Meta = acpmeta.WithMessageInfo(update.AgentMessageChunk.Meta, info)
 		}
 		if update.AgentThoughtChunk != nil {
 			update.AgentThoughtChunk.MessageId = &messageID

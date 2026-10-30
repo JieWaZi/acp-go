@@ -10,7 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // recordingPermissionRequester 记录 ACP permission 请求并返回测试指定结果。

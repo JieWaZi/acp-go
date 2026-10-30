@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 var ErrUnsupportedPromptContent = errors.New("unsupported Claude prompt content")

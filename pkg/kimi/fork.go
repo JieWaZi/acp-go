@@ -10,7 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/internal/sessionfiles"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // UnstableForkSession 先调用原生 fork，再把完整分支移植到原生创建的目标工作区会话。

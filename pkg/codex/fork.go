@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // UnstableForkSession 通过 thread/fork 保留原生上下文，并绑定独立工作区。

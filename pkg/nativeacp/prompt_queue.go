@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // promptQueue 保存一个会话的待执行请求，所有字段由 Agent.mutex 保护。
@@ -133,6 +133,10 @@ func (agent *Agent) promptFIFO(ctx context.Context, request acp.PromptRequest) (
 	}
 	agent.turnOwners[request.SessionId] = waiter
 	agent.active[request.SessionId] = true
+	if state := agent.sessions[request.SessionId]; state != nil {
+		state.messageID = ""
+		state.messageKnownID = ""
+	}
 	agent.prompts[request.SessionId] = append([]acp.ContentBlock{}, request.Prompt...)
 	agent.turnContexts[request.SessionId] = waiter.context
 	agent.turnCancels[request.SessionId] = waiter.cancel

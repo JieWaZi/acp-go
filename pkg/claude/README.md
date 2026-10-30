@@ -1,3 +1,4 @@
+<!-- NeuxBot 本地文档修订：上游缺失的测试矩阵链接改指固定提交的原始说明，见根 PATCHES.md。 -->
 # Claude Adapter
 
 `pkg/claude` 是可公开导入的 Claude ACP Adapter。它为每个 ACP Session 启动一个 Claude Code CLI stream-json 进程，并把消息、工具事件、权限请求和配置变化发送回 ACP 客户端。
@@ -104,7 +105,7 @@ go test ./pkg/claude -count=1
 go test ./pkg/claude/protocol -count=1
 ```
 
-全仓验证和竞态检查见[根 README](../../README.md#开发与验证)，真实 CLI 边界见 [`docs/CLAUDE_V1_TEST_MATRIX.md`](../../docs/CLAUDE_V1_TEST_MATRIX.md)。默认测试使用 fake CLI 和冻结 fixture，不读取真实账号或访问网络。
+全仓验证和竞态检查见[根 README](../../README.md#开发与验证)，真实 CLI 边界见 [上游测试矩阵说明](https://github.com/JieWaZi/acp-go/blob/ff51cfbfe5fb/pkg/claude/README.md#测试)。默认测试使用 fake CLI 和冻结 fixture，不读取真实账号或访问网络。
 
 ## 已知边界
 
@@ -122,4 +123,4 @@ go test ./pkg/claude/protocol -count=1
 - 公开入口保持在 `pkg/claude`，协议类型保持在 `pkg/claude/protocol`。
 - 手写类型、字段、函数和关键逻辑使用中文注释，且只描述当前实现。
 - 版本、来源、行为映射与差异统一维护在 [`UPSTREAM.md`](UPSTREAM.md)。
-- 能力变化必须同步更新本 README、测试和 [`docs/CLAUDE_V1_TEST_MATRIX.md`](../../docs/CLAUDE_V1_TEST_MATRIX.md)。
+- 能力变化必须同步更新本 README、测试和 [上游测试矩阵说明](https://github.com/JieWaZi/acp-go/blob/ff51cfbfe5fb/pkg/claude/README.md#测试)。

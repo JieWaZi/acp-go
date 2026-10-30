@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestParseContextUsage 验证模型名不会干扰页头解析，并覆盖官方 Token 缩写。

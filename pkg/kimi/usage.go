@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 	"github.com/pelletier/go-toml/v2"
 )
 

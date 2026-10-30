@@ -17,7 +17,7 @@ import (
 	"time"
 
 	codexprotocol "github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // fakeCodexProcessEnv 标记测试二进制子进程应进入 fake Codex 模式。
@@ -730,7 +730,7 @@ func writeFakeError(encoder *json.Encoder, id json.RawMessage, code int, message
 
 // TestRegistryIncludesNativePublicAdapters 验证三种公开 Adapter 可被选择，路径错误不会回退或写 stdout。
 func TestRegistryIncludesNativePublicAdapters(t *testing.T) {
-	for _, name := range []string{"opencode", "gemini", "grok"} {
+	for _, name := range []string{"opencode", "gemini", "grok", "workbuddy"} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "missing-"+name)
 			t.Setenv(strings.ToUpper(name)+"_PATH", path)

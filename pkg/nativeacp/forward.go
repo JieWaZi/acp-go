@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Authenticate 原样转发标准 ACP 请求。

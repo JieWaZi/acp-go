@@ -2,8 +2,6 @@ module github.com/JieWaZi/acp-go
 
 go 1.25.8
 
-require github.com/coder/acp-go-sdk v0.13.5
-
 require (
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/charmbracelet/x/term v0.2.2
@@ -33,6 +31,7 @@ require (
 )
 
 require (
+	github.com/JieWaZi/acp-go/sdk v0.0.0-20261026093029-d283676c207f
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/segmentio/asm v1.1.3 // indirect

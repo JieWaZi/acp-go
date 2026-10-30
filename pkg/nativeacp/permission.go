@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // toolEvidenceRevision 以非零大小分配保证事件身份不被零大小指针规则合并。
@@ -36,6 +36,9 @@ func (agent *Agent) requestPermission(
 		defer cancel()
 		ctx = scoped
 	}
+	cancelled := func() bool {
+		return ctx.Err() != nil || (turnCtx != nil && turnCtx.Err() != nil)
+	}
 	if adapter := agent.config.PermissionAdapter; adapter != nil {
 		evidence := PermissionEvidence{
 			Request:   request,
@@ -55,14 +58,22 @@ func (agent *Agent) requestPermission(
 			},
 		}
 		response, handled, err := adapter.Review(ctx, agent, evidence)
+		// 派生取消由 AfterFunc 异步投递，交付决定前必须直接复核权威执行。
+		if cancelled() {
+			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+		}
 		if err != nil || handled {
 			return response, err
 		}
 	}
-	if ctx.Err() != nil {
+	if cancelled() {
 		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 	}
-	return agent.RequestPermission(ctx, request)
+	response, err := agent.RequestPermission(ctx, request)
+	if cancelled() {
+		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+	}
+	return response, err
 }
 
 // awaitToolEvidence 允许先到线上的工具通知完成入账；超时仍转人工，不凭缺失证据放行。

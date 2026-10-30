@@ -2,7 +2,7 @@ package pi
 
 import (
 	"encoding/json"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // accumulateUsage 对照 Pi AssistantMessage.usage，累计本轮每次完成的模型调用。

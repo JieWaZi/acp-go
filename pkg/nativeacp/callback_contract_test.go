@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // callbackObservation 保存宿主实际收到的完整请求，便于校验字段和元数据。
@@ -186,7 +186,7 @@ func (host *lifecycleHost) captureNotification(method string, request any) {
 	host.notifications <- callbackObservation{method: method, params: params}
 }
 
-// TestNativeNotificationsPreserveMetadata 验证流式消息与问答完成通知保持原样。
+// TestNativeNotificationsPreserveMetadata 验证已有消息事实与问答完成通知的厂商元数据保持原样。
 func TestNativeNotificationsPreserveMetadata(t *testing.T) {
 	_, peer, host := startLifecycleBridge(t, true, true)
 	fixtures := []struct {
@@ -195,7 +195,7 @@ func TestNativeNotificationsPreserveMetadata(t *testing.T) {
 		// params 是包含自定义元数据的固定通知。
 		params string
 	}{
-		{method: "session/update", params: `{"sessionId":"a","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"notice"}},"_meta":{"trace":"update"}}`},
+		{method: "session/update", params: `{"sessionId":"a","update":{"sessionUpdate":"agent_message_chunk","messageId":"native-message","content":{"type":"text","text":"notice"},"_meta":{"acp-go/message":{"phase":"commentary","complete":false,"source":"native_phase"},"vendor":"keep"}},"_meta":{"trace":"update"}}`},
 		{method: "elicitation/complete", params: `{"elicitationId":"question","_meta":{"trace":"complete"}}`},
 	}
 	for _, fixture := range fixtures {

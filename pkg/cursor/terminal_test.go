@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	acp "github.com/JieWaZi/acp-go/sdk"
 	"github.com/charmbracelet/x/term"
-	acp "github.com/coder/acp-go-sdk"
 )
 
 // terminalHost 通过真实 ACP 回调返回测试审批，记录完整的工具与文本输出。
@@ -141,7 +141,7 @@ func TestCursorTerminalRoundTrip(t *testing.T) {
 	messages := 0
 	contextUpdates := 0
 	for _, update := range h.updates {
-		if update.Update.AgentMessageChunk != nil {
+		if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil && chunk.Content.Text.Text != "" {
 			messages++
 		}
 		if update.Update.UsageUpdate != nil {

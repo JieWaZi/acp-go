@@ -8,7 +8,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // legacyModels 是 Python Kimi 仍返回的旧模型选择协议。

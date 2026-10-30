@@ -1,3 +1,4 @@
+<!-- NeuxBot 本地文档修订：上游缺失的测试矩阵链接改指固定提交的原始说明，见根 PATCHES.md。 -->
 # Codex Adapter
 
 `pkg/codex` 是可公开导入的 Codex ACP Adapter。它把 ACP Agent 生命周期转换为 Codex CLI `app-server` 请求，并把消息、工具事件、审批和配置变化发送回 ACP 客户端。
@@ -55,6 +56,18 @@ flowchart LR
 
 一个 Adapter 实例只启动一个 app-server。各 Session 共享 transport，但 Session generation、活动 Prompt、审批和 steering 队列相互隔离。
 
+## 消息阶段与完成边界
+
+Agent Message 的 `agent_message_chunk._meta.codex` 保留三个独立字段：
+
+- `phase` 透传原生 `item/started` 或 `item/completed` 提供的阶段，包括 `commentary`、`partial_answer` 和 `final_answer`；缺少阶段时省略该字段，保持未知。
+- `phaseVerified` 仅在阶段由原生 started/completed 明确提供时为 `true`。Delta 继承该消息的 started 阶段；completed 优先使用自身阶段，否则继承 started 阶段。
+- `messageCompleted` 仅在原生 `item/completed` 的正文边界为 `true`，不表示整轮成功或消息已被选定为最终答案。
+
+已发送 delta 的消息在完成时追加同一 `messageId` 的空文本 chunk，携带完成边界与已知阶段，不重复正文。未发送 delta 的消息只发送一次完整正文与完成边界；空消息同样保留完成证据。重复 completed 不重复通知，发送失败允许重试。
+
+历史 plan 文本映射为 `commentary`，其 `phaseVerified=false`、`messageCompleted=true`；该阶段来自适配器的保守映射。消费者不能仅凭消息完成或 Prompt 的 `end_turn` 推断最终答案。
+
 ## 配置
 
 公开入口：
@@ -105,7 +118,7 @@ go test ./pkg/codex/protocol -count=1
 go run ./tools/protocolgen --check
 ```
 
-全仓验证和竞态检查见[根 README](../../README.md#开发与验证)，真实 CLI 场景见 [`docs/V1_TEST_MATRIX.md`](../../docs/V1_TEST_MATRIX.md)。默认测试使用 fake app-server，不读取凭据或调用模型。
+全仓验证和竞态检查见[根 README](../../README.md#开发与验证)，真实 CLI 场景见 [上游测试矩阵说明](https://github.com/JieWaZi/acp-go/blob/ff51cfbfe5fb/pkg/codex/README.md#测试)。默认测试使用 fake app-server，不读取凭据或调用模型。
 
 ## 已知边界
 
@@ -121,4 +134,4 @@ go run ./tools/protocolgen --check
 - 禁止手工修改 `protocol/generated_protocol.go`；通过 `go generate ./pkg/codex/protocol` 生成。
 - 手写类型、字段、函数和关键逻辑使用中文注释，且只描述当前实现。
 - 版本、来源、行为映射与差异统一维护在 [`UPSTREAM.md`](UPSTREAM.md)。
-- 能力变化必须同步更新本 README、测试和 [`docs/V1_TEST_MATRIX.md`](../../docs/V1_TEST_MATRIX.md)。
+- 能力变化必须同步更新本 README、测试和 [上游测试矩阵说明](https://github.com/JieWaZi/acp-go/blob/ff51cfbfe5fb/pkg/codex/README.md#测试)。

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // RuntimeVersion 读取同一 CLI 的版本，不执行模型请求；失败保持未知，输出和等待均有界。

@@ -21,8 +21,9 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/kimi"
 	"github.com/JieWaZi/acp-go/pkg/opencode"
 	"github.com/JieWaZi/acp-go/pkg/pi"
+	"github.com/JieWaZi/acp-go/pkg/workbuddy"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const (
@@ -198,5 +199,10 @@ func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
 		return nil, err
 	}
 
+	if err := registry.Register(acpserver.Registration{Name: "workbuddy", Factory: func(ctx context.Context) (acp.Agent, error) {
+		return workbuddy.NewAgent(ctx, workbuddy.Config{Logger: logger, WorkBuddyPath: os.Getenv("WORKBUDDY_PATH")})
+	}}); err != nil {
+		return nil, err
+	}
 	return registry, nil
 }

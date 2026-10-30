@@ -7,7 +7,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // replayThreadHistory 按 Thread 中的 Turn 与 Item 顺序重放历史。

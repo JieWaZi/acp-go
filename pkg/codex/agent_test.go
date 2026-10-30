@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestAgentInitializeAdvertisesRuntimeCapabilities 验证握手成功后声明 V1 已接线的真实能力。

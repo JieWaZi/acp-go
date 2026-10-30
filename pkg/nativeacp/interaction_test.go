@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestInteractionRejectsConflictingSession 验证未知身份和跨会话工具不能落到唯一活跃聊天。

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const askUserQuestionCustomSuffix = "_custom"

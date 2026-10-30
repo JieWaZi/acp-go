@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestBuildPromptInputUsesSupportedContentRules 验证 Text、Image 与 Resource 的输入格式。

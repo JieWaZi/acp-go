@@ -12,7 +12,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestReplaySessionHistory 验证 load 保持消息顺序、过滤本地命令并映射工具生命周期。

@@ -5,7 +5,7 @@ import (
 	"errors"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // SessionContext 是不含配置树或凭据的不可变会话快照。

@@ -5,3 +5,4 @@ skills-lock.json
 node_modules/
 .codex
 .idea
+.openbitfun/

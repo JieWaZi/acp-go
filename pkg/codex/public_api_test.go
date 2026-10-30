@@ -6,7 +6,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPublicAPICompiles 验证外部模块可以通过规范 import 使用 Codex 构造入口。

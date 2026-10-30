@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // testAgent 是协议边界测试使用的最小 SDK Agent，并记录 connection 注入结果。

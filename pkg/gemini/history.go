@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // sessionRecord 保留公共身份到真实持久会话的映射，不存储会话内容或凭据。

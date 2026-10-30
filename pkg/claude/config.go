@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 const (
@@ -223,7 +223,6 @@ func (c sessionConfiguration) effortOption(model protocol.ModelInfo) acp.Session
 
 // fastOption 把快速模式表示为兼容所有客户端的 select 配置。
 func (c sessionConfiguration) fastOption() acp.SessionConfigOption {
-	category := acp.SessionConfigOptionCategoryModel
 	values := acp.SessionConfigSelectOptionsUngrouped{
 		{Value: "on", Name: "On"},
 		{Value: "off", Name: "Off"},
@@ -234,7 +233,7 @@ func (c sessionConfiguration) fastOption() acp.SessionConfigOption {
 	}
 	description := "Faster responses on supported models"
 	return acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{
-		Id: fastConfigID, Name: "Fast mode", Description: &description, Category: &category,
+		Id: fastConfigID, Name: "Fast mode", Description: &description,
 		CurrentValue: current, Options: acp.SessionConfigSelectOptions{Ungrouped: &values}, Type: "select",
 	}}
 }

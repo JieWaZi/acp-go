@@ -7,8 +7,113 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
+
+// TestClaudeMessageIDGroupsNativeStream 验证 wire UUID 改变时仍按原生消息 ID 交付，并保留完成边界。
+func TestClaudeMessageIDGroupsNativeStream(t *testing.T) {
+	client := &recordingClaudeClient{}
+	turn := &claudeTurn{id: "turn", streamedBlocks: map[string][]streamedContentBlock{}}
+	session := &claudeSession{id: "s", active: turn, agent: &Agent{updater: client}}
+	for _, raw := range []string{
+		`{"type":"stream_event","uuid":"wire-1","session_id":"s","event":{"type":"message_start","message":{"id":"msg-native","role":"assistant"}}}`,
+		`{"type":"stream_event","uuid":"wire-2","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Answer"}}}`,
+		`{"type":"stream_event","uuid":"wire-3","session_id":"s","event":{"type":"message_stop"}}`,
+	} {
+		var event protocol.StreamEventMessage
+		if err := json.Unmarshal([]byte(raw), &event); err != nil {
+			t.Fatal(err)
+		}
+		if err := session.handleStreamEvent(context.Background(), &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updates, _ := client.snapshot()
+	var chunks []*acp.SessionUpdateAgentMessageChunk
+	for _, update := range updates {
+		if update.Update.AgentMessageChunk != nil {
+			chunks = append(chunks, update.Update.AgentMessageChunk)
+		}
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("native boundary missing: %#v", chunks)
+	}
+	for _, chunk := range chunks {
+		if chunk.MessageId == nil || *chunk.MessageId != "msg-native" {
+			t.Fatalf("wire UUID used for message: %#v", chunk)
+		}
+	}
+	facts, ok := chunks[1].Meta["acp-go/message"].(map[string]any)
+	if !ok || facts["complete"] != true || facts["phase"] != "unknown" {
+		t.Fatalf("wrong completion: %#v", facts)
+	}
+}
+
+// TestClaudeBlockSnapshotsKeepStreamingIdentity 捕获块级 assistant 快照提前结束整条流式消息的错误。
+func TestClaudeBlockSnapshotsKeepStreamingIdentity(t *testing.T) {
+	for _, snapshotAfterStop := range []bool{false, true} {
+		t.Run(map[bool]string{false: "snapshot before stop", true: "snapshot after stop"}[snapshotAfterStop], func(t *testing.T) {
+			client := &recordingClaudeClient{}
+			turn := &claudeTurn{id: "turn", streamedBlocks: map[string][]streamedContentBlock{}}
+			session := &claudeSession{id: "s", active: turn, agent: &Agent{updater: client}}
+			ctx := context.Background()
+			stream := func(event protocol.StreamEvent) {
+				t.Helper()
+				if err := session.handleStreamEvent(ctx, &protocol.StreamEventMessage{SessionID: "s", Event: event}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot := func(kind, text string) {
+				t.Helper()
+				block := protocol.ContentBlock{Type: kind}
+				if kind == "thinking" {
+					block.Thinking = text
+				} else {
+					block.Text = text
+				}
+				if err := session.handleAssistant(ctx, &protocol.AssistantMessage{SessionID: "s", Message: protocol.AnthropicMessage{ID: "msg-native", Content: []protocol.ContentBlock{block}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream(protocol.StreamEvent{Type: "message_start", Message: &protocol.AnthropicMessage{ID: "msg-native"}})
+			stream(protocol.StreamEvent{Type: "content_block_delta", Index: 0, Delta: &protocol.ContentBlock{Thinking: "thinking"}})
+			snapshot("thinking", "thinking")
+			stream(protocol.StreamEvent{Type: "content_block_delta", Index: 1, Delta: &protocol.ContentBlock{Text: "READY"}})
+			if !snapshotAfterStop {
+				snapshot("text", "READY")
+			}
+			stream(protocol.StreamEvent{Type: "message_stop"})
+			if snapshotAfterStop {
+				snapshot("text", "READY")
+			}
+			updates, _ := client.snapshot()
+			var texts, thoughts []string
+			completions := 0
+			for _, update := range updates {
+				if thought := update.Update.AgentThoughtChunk; thought != nil {
+					thoughts = append(thoughts, thought.Content.Text.Text)
+				}
+				if chunk := update.Update.AgentMessageChunk; chunk != nil {
+					if chunk.MessageId == nil || *chunk.MessageId != "msg-native" {
+						t.Fatalf("block snapshot changed stream identity: %+v", chunk)
+					}
+					facts, _ := chunk.Meta["acp-go/message"].(map[string]any)
+					if facts["complete"] == true {
+						if len(texts) != 1 {
+							t.Fatalf("message completed before text: %+v", updates)
+						}
+						completions++
+					} else {
+						texts = append(texts, chunk.Content.Text.Text)
+					}
+				}
+			}
+			if completions != 1 || len(texts) != 1 || texts[0] != "READY" || len(thoughts) != 1 || thoughts[0] != "thinking" {
+				t.Fatalf("stream duplicated content or completion: texts=%q thoughts=%q completions=%d", texts, thoughts, completions)
+			}
+		})
+	}
+}
 
 // TestTrailingIdleDebtDoesNotSettleNextTurn 锁定 upstream 的无身份尾随 idle 隔离语义。
 func TestTrailingIdleDebtDoesNotSettleNextTurn(t *testing.T) {
@@ -136,7 +241,7 @@ func TestClaudeExplicitErrorsNeverBecomeAssistantText(t *testing.T) {
 					t.Fatalf("错误详情丢失：%v", result.err)
 				}
 			}
-			if kind == "" && len(updates) != 1 {
+			if kind == "" && (len(updates) != 2 || updates[0].Update.AgentMessageChunk == nil || updates[0].Update.AgentMessageChunk.Content.Text.Text != message.Message.Content[0].Text || updates[1].Update.AgentMessageChunk.Content.Text.Text != "") {
 				t.Fatalf("普通文本被误判：%+v", updates)
 			}
 		})
@@ -287,7 +392,7 @@ func TestClaudeSubagentErrorKeepsParentTurnSuccessful(t *testing.T) {
 		t.Fatalf("子代理错误覆盖主代理成功终态：%+v", result)
 	}
 	updates, _ = client.snapshot()
-	if len(updates) != 3 || updates[1].Update.ToolCallUpdate == nil ||
+	if len(updates) != 4 || updates[1].Update.ToolCallUpdate == nil ||
 		updates[1].Update.ToolCallUpdate.Status == nil || *updates[1].Update.ToolCallUpdate.Status != acp.ToolCallStatusFailed ||
 		updates[2].Update.AgentMessageChunk == nil || updates[2].Update.AgentMessageChunk.Content.Text.Text != "I handled the subagent failure." {
 		t.Fatalf("工具失败和主代理正文未独立交付：%+v", updates)

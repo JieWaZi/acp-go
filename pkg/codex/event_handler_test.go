@@ -3,12 +3,239 @@ package codex
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
+
+// expectedCodexMessageChunk 描述消费者可观察的单个消息正文与原生证据。
+type expectedCodexMessageChunk struct {
+	// text 是该通知增量提供的正文，完成边界可以为空。
+	text string
+	// phase 是原生已知阶段；空值要求通知不提供阶段。
+	phase string
+	// phaseVerified 表示阶段是否来自原生 started/completed。
+	phaseVerified bool
+	// messageCompleted 表示该通知是否对应原生 item/completed。
+	messageCompleted bool
+}
+
+// TestEventRouterPreservesMessageFinalityEvidence 验证缺阶段不升为 final，完成边界保留原生证据且不重复正文。
+func TestEventRouterPreservesMessageFinalityEvidence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		// name 描述该用例保护的证据边界。
+		name string
+		// notifications 是实际 app-server 形状的按序通知。
+		notifications []string
+		// want 是消费者应收到的正文与证据序列。
+		want []expectedCodexMessageChunk
+	}{
+		{
+			name: "missing phase remains unknown",
+			notifications: []string{
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{{text: "Answer", messageCompleted: true}},
+		},
+		{
+			name: "null phase remains unknown",
+			notifications: []string{
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer","phase":null}}}`,
+			},
+			want: []expectedCodexMessageChunk{{text: "Answer", messageCompleted: true}},
+		},
+		{
+			name: "completed final phase overrides started commentary without repeating text",
+			notifications: []string{
+				`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"agentMessage","id":"message-1","text":"","phase":"commentary"}}}`,
+				`{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"An"}}`,
+				`{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"swer"}}`,
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer","phase":"final_answer"}}}`,
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer","phase":"final_answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{
+				{text: "An", phase: "commentary", phaseVerified: true},
+				{text: "swer", phase: "commentary", phaseVerified: true},
+				{phase: "final_answer", phaseVerified: true, messageCompleted: true},
+			},
+		},
+		{
+			name: "final phase first appears at completion",
+			notifications: []string{
+				`{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"Answer"}}`,
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer","phase":"final_answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{
+				{text: "Answer"},
+				{phase: "final_answer", phaseVerified: true, messageCompleted: true},
+			},
+		},
+		{
+			name: "streamed completion inherits started phase",
+			notifications: []string{
+				`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"agentMessage","id":"message-1","text":"","phase":"final_answer"}}}`,
+				`{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"Answer"}}`,
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{
+				{text: "Answer", phase: "final_answer", phaseVerified: true},
+				{phase: "final_answer", phaseVerified: true, messageCompleted: true},
+			},
+		},
+		{
+			name: "nonstreamed completion inherits started phase",
+			notifications: []string{
+				`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"agentMessage","id":"message-1","text":"","phase":"commentary"}}}`,
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Checking"}}}`,
+			},
+			want: []expectedCodexMessageChunk{{text: "Checking", phase: "commentary", phaseVerified: true, messageCompleted: true}},
+		},
+		{
+			name: "partial answer is preserved",
+			notifications: []string{
+				`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"agentMessage","id":"message-1","text":"","phase":"partial_answer"}}}`,
+				`{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"Partial"}}`,
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Partial","phase":"partial_answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{
+				{text: "Partial", phase: "partial_answer", phaseVerified: true},
+				{phase: "partial_answer", phaseVerified: true, messageCompleted: true},
+			},
+		},
+		{
+			name: "completed plan stays unverified commentary",
+			notifications: []string{
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"plan","id":"message-1","text":"Plan","phase":"final_answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{{text: "Plan", phase: "commentary", messageCompleted: true}},
+		},
+		{
+			name: "empty final message still emits completion",
+			notifications: []string{
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"","phase":"final_answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{{phase: "final_answer", phaseVerified: true, messageCompleted: true}},
+		},
+		{
+			name: "absent final text still emits completion",
+			notifications: []string{
+				`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","phase":"final_answer"}}}`,
+			},
+			want: []expectedCodexMessageChunk{{phase: "final_answer", phaseVerified: true, messageCompleted: true}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			updater := &recordingSessionUpdater{}
+			router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.Default())
+			for _, raw := range tt.notifications {
+				if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+					t.Fatalf("HandleJSON 返回错误: %v", err)
+				}
+			}
+			if len(updater.notifications) != len(tt.want) {
+				t.Fatalf("消息通知数 = %d，期望 %d", len(updater.notifications), len(tt.want))
+			}
+			for index, want := range tt.want {
+				assertCodexMessageChunk(t, updater.notifications[index], want)
+			}
+		})
+	}
+}
+
+// assertCodexMessageChunk 检查公开 ACP 通知的消息身份、增量正文与最终性元数据。
+func assertCodexMessageChunk(t *testing.T, notification acp.SessionNotification, want expectedCodexMessageChunk) {
+	t.Helper()
+	message := notification.Update.AgentMessageChunk
+	if message == nil || message.MessageId == nil || *message.MessageId != "message-1" || message.Content.Text == nil {
+		t.Fatalf("消息身份或正文类型不正确: %#v", message)
+	}
+	if message.Content.Text.Text != want.text {
+		t.Errorf("消息正文 = %q，期望 %q", message.Content.Text.Text, want.text)
+	}
+	meta, ok := message.Meta["codex"].(map[string]any)
+	if !ok {
+		t.Fatalf("消息缺少 Codex 证据: %#v", message.Meta)
+	}
+	if want.phase == "" {
+		if phase, present := meta["phase"]; present {
+			t.Errorf("未知阶段不应提供 phase，收到 %#v", phase)
+		}
+	} else if meta["phase"] != want.phase {
+		t.Errorf("phase = %#v，期望 %q", meta["phase"], want.phase)
+	}
+	if got := meta["phaseVerified"]; got != want.phaseVerified {
+		t.Errorf("phaseVerified = %#v，期望 %v", got, want.phaseVerified)
+	}
+	if got := meta["messageCompleted"]; got != want.messageCompleted {
+		t.Errorf("messageCompleted = %#v，期望 %v", got, want.messageCompleted)
+	}
+	common, ok := message.Meta["acp-go/message"].(map[string]any)
+	phase := "unknown"
+	if want.phase == "commentary" || want.phase == "partial_answer" {
+		phase = "commentary"
+	}
+	if want.phase == "final_answer" && want.phaseVerified {
+		phase = "final"
+	}
+	if !ok || common["phase"] != phase || common["complete"] != want.messageCompleted {
+		t.Errorf("generic message facts = %#v", common)
+	}
+}
+
+// failOnceMessageUpdater 模拟 ACP 完成边界首次发送失败，成功通知仍按真实 DTO 保存。
+type failOnceMessageUpdater struct {
+	// failed 标记唯一一次预期的边界发送失败是否已发生。
+	failed bool
+	// notifications 保存成功发出的消息通知。
+	notifications []acp.SessionNotification
+}
+
+// SessionUpdate 在首次完成边界返回错误，后续重试正常记录。
+func (u *failOnceMessageUpdater) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
+	message := notification.Update.AgentMessageChunk
+	if message != nil && !u.failed {
+		if meta, ok := message.Meta["codex"].(map[string]any); ok && meta["messageCompleted"] == true {
+			u.failed = true
+			return errors.New("test completion delivery failed")
+		}
+	}
+	u.notifications = append(u.notifications, notification)
+	return nil
+}
+
+// TestEventRouterRetriesCompletionWithoutRepeatingStreamedText 验证发送失败后可重试边界且保留 started 阶段。
+func TestEventRouterRetriesCompletionWithoutRepeatingStreamedText(t *testing.T) {
+	t.Parallel()
+	updater := &failOnceMessageUpdater{}
+	router := newTestEventRouter(updater, &fixedGenerationGuard{current: true}, slog.Default())
+	for _, raw := range []string{
+		`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":0,"item":{"type":"agentMessage","id":"message-1","text":"","phase":"final_answer"}}}`,
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"Answer"}}`,
+	} {
+		if err := router.HandleJSON(context.Background(), []byte(raw)); err != nil {
+			t.Fatalf("HandleJSON 返回错误: %v", err)
+		}
+	}
+	completed := []byte(`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"message-1","text":"Answer"}}}`)
+	if err := router.HandleJSON(context.Background(), completed); err == nil {
+		t.Fatal("首次完成边界发送应返回错误")
+	}
+	if err := router.HandleJSON(context.Background(), completed); err != nil {
+		t.Fatalf("完成边界重试失败: %v", err)
+	}
+	if len(updater.notifications) != 2 {
+		t.Fatalf("重试后成功通知数 = %d，期望 2", len(updater.notifications))
+	}
+	assertCodexMessageChunk(t, updater.notifications[0], expectedCodexMessageChunk{text: "Answer", phase: "final_answer", phaseVerified: true})
+	assertCodexMessageChunk(t, updater.notifications[1], expectedCodexMessageChunk{phase: "final_answer", phaseVerified: true, messageCompleted: true})
+}
 
 // recordingSessionUpdater 记录事件组件通过 ACP SDK 发出的原生 session/update DTO。
 type recordingSessionUpdater struct {
@@ -53,7 +280,7 @@ func TestEventRouterStreamsMessagesAndReasoningWithoutCompletionDuplicates(t *te
 			t.Fatalf("HandleJSON 返回错误: %v", err)
 		}
 	}
-	if got, want := len(updater.notifications), 4; got != want {
+	if got, want := len(updater.notifications), 5; got != want {
 		t.Fatalf("update 数 = %d，期望 %d", got, want)
 	}
 	message := updater.notifications[0].Update.AgentMessageChunk
@@ -63,9 +290,12 @@ func TestEventRouterStreamsMessagesAndReasoningWithoutCompletionDuplicates(t *te
 	if got := message.Meta["codex"].(map[string]any)["phase"]; got != "commentary" {
 		t.Fatalf("message phase = %#v，期望 commentary", got)
 	}
+	assertCodexMessageChunk(t, updater.notifications[1], expectedCodexMessageChunk{
+		phase: "commentary", phaseVerified: true, messageCompleted: true,
+	})
 	wantThoughts := []string{"First thought", "\n\n", "Raw detail"}
 	for index, want := range wantThoughts {
-		thought := updater.notifications[index+1].Update.AgentThoughtChunk
+		thought := updater.notifications[index+2].Update.AgentThoughtChunk
 		if thought == nil || thought.MessageId == nil || *thought.MessageId != "reason-1" || thought.Content.Text == nil || thought.Content.Text.Text != want {
 			t.Fatalf("thought[%d] = %#v，期望 %q", index, thought, want)
 		}

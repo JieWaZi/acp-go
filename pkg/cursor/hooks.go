@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // hookTransport 只负责传输白名单事件；会话、用量与结束语义由 Go 解释。

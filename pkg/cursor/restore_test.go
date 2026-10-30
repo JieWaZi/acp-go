@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestCursorRestoreIncludesWAL 验证恢复快照包含尚未 checkpoint 的已提交消息，并不改写真实执行库。

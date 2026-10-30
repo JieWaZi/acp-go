@@ -20,7 +20,7 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/grok"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	"github.com/JieWaZi/acp-go/pkg/opencode"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestMain 在子进程内运行无账号的原生协议夹具。

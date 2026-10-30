@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // UnstableForkSession 复用 Agent SDK 的原生离线分叉语义，再通过 CLI resume 打开独立身份。

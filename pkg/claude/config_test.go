@@ -1,10 +1,11 @@
 package claude
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPermissionModesGateBypassPermissions 验证危险模式只在进程安全门槛允许时公开。
@@ -92,4 +93,23 @@ func containsSessionMode(modes []acp.SessionMode, id string) bool {
 		}
 	}
 	return false
+}
+
+// TestModelCategoryContainsOnlyModelSelections 防止标准客户端把快速开关误当作模型目录。
+func TestModelCategoryContainsOnlyModelSelections(t *testing.T) {
+	configuration := newSessionConfiguration(protocol.InitializeControlResponse{
+		Models: []protocol.ModelInfo{{Value: "opus", SupportsFastMode: true}},
+	}, "default", false)
+	var models []string
+	for _, option := range configuration.options() {
+		if option.Select == nil || option.Select.Category == nil || *option.Select.Category != acp.SessionConfigOptionCategoryModel {
+			continue
+		}
+		for _, model := range *option.Select.Options.Ungrouped {
+			models = append(models, string(model.Value))
+		}
+	}
+	if !reflect.DeepEqual(models, []string{"opus"}) {
+		t.Fatalf("model category exposed non-model choices: %v", models)
+	}
 }

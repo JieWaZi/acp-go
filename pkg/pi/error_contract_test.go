@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPiErrorsSurviveSuccessfulModelRetry 验证自动重试只能清除模型错误，不能覆盖扩展和交付失败。
@@ -17,26 +17,26 @@ func TestPiErrorsSurviveSuccessfulModelRetry(t *testing.T) {
 	for _, name := range []string{"extension", "delivery", "model recovered", "model failed", "retry exhausted"} {
 		t.Run(name, func(t *testing.T) {
 			deliveryError := errors.New("delivery failed")
-			events := make(chan map[string]any, 4)
+			events := make(chan rpcEvent, 4)
 			done := make(chan struct{})
 			turn := make(chan acp.StopReason, 1)
-			process := &rpcProcess{events: events, done: done}
+			process := &rpcProcess{events: events, done: done, eventChanged: make(chan struct{})}
 			session := &session{process: process, turn: turn, eventsDone: make(chan struct{})}
 			if name == "delivery" {
 				session.failure = deliveryError
 			}
 			if name == "extension" {
-				events <- map[string]any{"type": "extension_error", "error": "extension rejected operation"}
+				events <- rpcEvent{data: map[string]any{"type": "extension_error", "error": "extension rejected operation"}}
 			}
 			if name == "model recovered" || name == "model failed" {
-				events <- map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "provider failed"}}
+				events <- rpcEvent{data: map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "provider failed"}}}
 			}
 			if name == "retry exhausted" {
-				events <- map[string]any{"type": "auto_retry_end", "success": false, "finalError": "529 overloaded_error: Overloaded"}
+				events <- rpcEvent{data: map[string]any{"type": "auto_retry_end", "success": false, "finalError": "529 overloaded_error: Overloaded"}}
 			} else if name != "model failed" {
-				events <- map[string]any{"type": "auto_retry_end", "success": true}
+				events <- rpcEvent{data: map[string]any{"type": "auto_retry_end", "success": true}}
 			}
-			events <- map[string]any{"type": "agent_settled"}
+			events <- rpcEvent{data: map[string]any{"type": "agent_settled"}}
 			agent := &Agent{}
 			go agent.events(session)
 			t.Cleanup(func() { close(events); close(done); <-session.eventsDone })
@@ -71,16 +71,16 @@ func TestPiErrorEventsDoNotBecomeAssistantText(t *testing.T) {
 		reader, writer := io.Pipe()
 		agent := &Agent{}
 		agent.SetAgentConnection(acp.NewAgentSideConnection(agent, output, reader))
-		events := make(chan map[string]any, 2)
+		events := make(chan rpcEvent, 2)
 		done := make(chan struct{})
 		turn := make(chan acp.StopReason, 1)
-		session := &session{id: "fixture", process: &rpcProcess{events: events, done: done}, turn: turn, eventsDone: make(chan struct{})}
+		session := &session{id: "fixture", process: &rpcProcess{events: events, done: done, eventChanged: make(chan struct{})}, turn: turn, eventsDone: make(chan struct{})}
 		if failed {
-			events <- map[string]any{"type": "extension_error", "error": "extension failed"}
+			events <- rpcEvent{data: map[string]any{"type": "extension_error", "error": "extension failed"}}
 		} else {
-			events <- map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "explain error handling"}}
+			events <- rpcEvent{data: map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "explain error handling"}}}
 		}
-		events <- map[string]any{"type": "agent_settled"}
+		events <- rpcEvent{data: map[string]any{"type": "agent_settled"}}
 		go agent.events(session)
 		select {
 		case <-turn:
@@ -112,15 +112,15 @@ func TestPiStatusEventsDoNotBecomeAssistantText(t *testing.T) {
 	defer writer.Close()
 	agent := &Agent{}
 	agent.SetAgentConnection(acp.NewAgentSideConnection(agent, output, reader))
-	events := make(chan map[string]any, 8)
+	events := make(chan rpcEvent, 8)
 	done := make(chan struct{})
 	turn := make(chan acp.StopReason, 1)
-	session := &session{id: "fixture", process: &rpcProcess{events: events, done: done}, turn: turn, eventsDone: make(chan struct{})}
+	session := &session{id: "fixture", process: &rpcProcess{events: events, done: done, eventChanged: make(chan struct{})}, turn: turn, eventsDone: make(chan struct{})}
 	for _, kind := range []string{"auto_retry_start", "auto_retry_end", "auto_compaction_start", "auto_compaction_end", "compaction_start", "compaction_end"} {
-		events <- map[string]any{"type": kind, "success": true}
+		events <- rpcEvent{data: map[string]any{"type": kind, "success": true}}
 	}
-	events <- map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "real streamed text"}}
-	events <- map[string]any{"type": "agent_settled"}
+	events <- rpcEvent{data: map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "real streamed text"}}}
+	events <- rpcEvent{data: map[string]any{"type": "agent_settled"}}
 	go agent.events(session)
 	select {
 	case <-turn:
@@ -149,16 +149,16 @@ func TestPiRetryCancellationKeepsCancellation(t *testing.T) {
 				ctx, stop = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 				defer stop()
 			}
-			events := make(chan map[string]any, 2)
+			events := make(chan rpcEvent, 2)
 			done := make(chan struct{})
 			turn := make(chan acp.StopReason, 1)
 			session := &session{
-				process: &rpcProcess{events: events, done: done},
+				process: &rpcProcess{events: events, done: done, eventChanged: make(chan struct{})},
 				turn:    turn, eventsDone: make(chan struct{}), turnContext: ctx,
 				cancelled: name == "user", modelFailure: errors.New("previous transient failure"),
 			}
-			events <- map[string]any{"type": "auto_retry_end", "success": false, "finalError": "Retry cancelled"}
-			events <- map[string]any{"type": "agent_settled"}
+			events <- rpcEvent{data: map[string]any{"type": "auto_retry_end", "success": false, "finalError": "Retry cancelled"}}
+			events <- rpcEvent{data: map[string]any{"type": "agent_settled"}}
 			go (&Agent{}).events(session)
 			select {
 			case reason := <-turn:

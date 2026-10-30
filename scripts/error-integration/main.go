@@ -15,7 +15,7 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/cursor"
 	"github.com/JieWaZi/acp-go/pkg/kimi"
 	"github.com/JieWaZi/acp-go/pkg/pi"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // main 组装五种真实适配器，并在退出时清理本次测试拥有的子进程。

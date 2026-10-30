@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Prompt 对照 pi-acp 串行执行提示，等待整轮 settled 而非中间 agent_end。
@@ -284,10 +284,7 @@ func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages
 
 // emitAgentMessage 发布一个标准 Agent 消息内容块。
 func (a *Agent) emitAgentMessage(ctx context.Context, s *session, content map[string]any) error {
-	return a.emit(ctx, s, map[string]any{
-		"sessionUpdate": "agent_message_chunk",
-		"content":       content,
-	})
+	return a.emit(ctx, s, s.messageUpdate(content, true))
 }
 
 // abortTurn 等待被取消的回合清空事件，避免上一轮终态误结束下一轮。

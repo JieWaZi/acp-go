@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestOfficialSessionThinkingAndHistory 使用固定官方 CLI 验证真实工具续轮与生产替换实现。

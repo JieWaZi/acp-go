@@ -7,7 +7,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // buildPromptInput 将 ACP 内容块等价映射为 codex app-server 的 turn input。

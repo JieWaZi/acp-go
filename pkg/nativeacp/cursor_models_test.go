@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestCursorModelDependentThinking 验证握手启用参数目录，模型切换后只有该模型的有效思考选项。

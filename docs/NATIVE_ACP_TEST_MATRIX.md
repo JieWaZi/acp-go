@@ -20,3 +20,9 @@
 Grok 额外 fixture 覆盖：New/Load/Resume 不同菜单、多会话隔离、重载目录替换、custom id 与规范 value 不同、明确 none/max 菜单、无 reasoning 的 setter/异步回执优先、原生 JSON-RPC 错误保留。源 metadata 足够时可直接读取逐模型菜单；metadata 缺失或畸形时仍需实际 setter 探测，不能复制当前模型菜单。未执行官方 Grok 可执行文件或付费模型测试；api_backend/auth_scheme 文档仅为固定源码证据。
 
 Gemini 额外 fixture 覆盖：多会话隔离、空会话身份映射、全部标准文件/终端/permission/elicitation/vendor callback 映射、跨 Adapter 重启、原始 JSONL 失败回滚、Authenticate 重放、新凭据及原子刷新持久化、默认 profile 只读、显式空环境、符号链接拒绝、高优先级模型配置拒绝、restricted/false trust 人工回退。3.5 模型提升边界不公开不可保证的 thinking 选择。
+
+## WorkBuddy（2026-10-15）
+
+`go test ./pkg/workbuddy ./pkg/nativeacp ./cmd/acp-agent` 覆盖标准登录入口、版本、认证元数据、标准模型/思考/boolean 配置、权限重设、MCP 配置、new/load、两轮新增输入、原生问答、审批、取消、错误原文和公开事件元数据。nativeacp 既有 FIFO、回调和回收矩阵继续适用。
+
+真实已安装 `CodeBuddy Code 2.151.0` 的无模型路径由 `WORKBUDDY_REAL_ACP=1 go test ./pkg/workbuddy -run TestInstalledWorkBuddyProtocol -v` 单独验证：临时配置目录、initialize、新建、auto 和跨进程 load。它不发送 Prompt；真实付费模型、工具/MCP 执行、问答与桌面视觉验收保持独立。协议来源和具体能力以 [WorkBuddy 基线](../pkg/workbuddy/UPSTREAM.md) 为准。

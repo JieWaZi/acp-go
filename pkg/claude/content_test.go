@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestPromptToUserMessage 验证文本、图片和嵌入资源保留关键字段。

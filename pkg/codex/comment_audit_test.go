@@ -30,6 +30,14 @@ func TestHandwrittenGoDeclarationsHaveChineseComments(t *testing.T) {
 			if path != repositoryRoot && shouldSkipCommentAuditDirectory(entry.Name()) {
 				return filepath.SkipDir
 			}
+			// 嵌套 Go 模块独立维护与验证，不属于当前模块的手写代码审计范围。
+			if path != repositoryRoot {
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				} else if !os.IsNotExist(err) {
+					return err
+				}
+			}
 			return nil
 		}
 		if filepath.Ext(path) != ".go" {

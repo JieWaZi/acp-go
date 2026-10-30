@@ -11,7 +11,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // fakeAppServerRPC 为 typed client 测试提供可编排的请求/通知边界。

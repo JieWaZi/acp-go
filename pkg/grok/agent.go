@@ -10,7 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/internal/buildinfo"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Config 保存受控进程配置。

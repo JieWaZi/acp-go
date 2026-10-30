@@ -1,3 +1,4 @@
+// NeuxBot 本地修改：在调度事件消费者前同步移交 RPC 队列所有权，见根 PATCHES.md。
 package pi
 
 import (
@@ -15,7 +16,7 @@ import (
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // NewSession 创建独立 Pi 原生会话及其 MCP 快照。
@@ -119,6 +120,7 @@ func (a *Agent) open(ctx context.Context, cwd, file string, servers []acp.McpSer
 	previous := a.sessions[s.id]
 	a.sessions[s.id] = s
 	a.mutex.Unlock()
+	p.startEventConsumer()
 	go a.events(s)
 	if previous != nil && previous != s {
 		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)

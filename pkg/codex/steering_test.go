@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // steeringRawParams 编码 SDK extension 输入，确保 ContentBlock 仍由 SDK union 解码。

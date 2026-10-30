@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // TestWireUsageExcludesHistory 验证官方事件只累计新增本轮，缺失统计不能返回假零值。
