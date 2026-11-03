@@ -342,32 +342,80 @@ func recordClaudeMessageUsage(turn *claudeTurn, usage protocol.Usage, id string)
 	if id == "" {
 		id = turn.usageMessageID
 	}
+	if id != "" {
+		if _, covered := turn.usageCoveredMessages[id]; covered {
+			return
+		}
+	}
 	if turn.usageMessages == nil {
 		turn.usageMessages = make(map[string]acpmeta.TurnUsage)
 	}
 	turn.usageMessages[id] = reported
 }
 
-// claudeTurnUsageLocked 以最终回执为准；此前按消息身份累计可证实的部分消费。
+// recordClaudeResultUsageLocked 以当前 result 替换边界内消息快照，再与已结算边界累计。
+// 调用方持有 turn.mu；没有身份也没有新消息时不猜测另一笔消费。
+func recordClaudeResultUsageLocked(turn *claudeTurn, reported acpmeta.TurnUsage, id string) {
+	if id != "" {
+		if _, seen := turn.usageResultIDs[id]; seen {
+			return
+		}
+	} else if turn.reportedUsage != nil && len(turn.usageMessages) == 0 {
+		return
+	}
+	result := reported
+	if turn.reportedUsage != nil {
+		result = sumClaudeUsageSnapshots([]acpmeta.TurnUsage{*turn.reportedUsage, reported}, "claude.result.usage", turn.assistantModel)
+	}
+	turn.reportedUsage = &result
+	if turn.usageCoveredMessages == nil {
+		turn.usageCoveredMessages = make(map[string]struct{})
+	}
+	for messageID := range turn.usageMessages {
+		if messageID != "" {
+			turn.usageCoveredMessages[messageID] = struct{}{}
+		}
+	}
+	turn.usageMessages = nil
+	turn.usageMessageID = ""
+	if id != "" {
+		if turn.usageResultIDs == nil {
+			turn.usageResultIDs = make(map[string]struct{})
+		}
+		turn.usageResultIDs[id] = struct{}{}
+	}
+}
+
+// claudeTurnUsageLocked 将已结算的 result 边界与之后尚未结算的请求快照合并。
 // 调用方持有 turn.mu。
 func claudeTurnUsageLocked(turn *claudeTurn) (acpmeta.TurnUsage, bool) {
+	snapshots := make([]acpmeta.TurnUsage, 0, len(turn.usageMessages)+1)
+	source := "claude.assistant.usage"
 	if turn.reportedUsage != nil {
-		return *turn.reportedUsage, true
+		snapshots = append(snapshots, *turn.reportedUsage)
+		source = turn.reportedUsage.Source
 	}
-	result := acpmeta.TurnUsage{Source: "claude.assistant.usage", Coverage: "main_loop", Model: turn.assistantModel}
-	if len(turn.usageMessages) == 0 {
-		return result, false
-	}
-	first := true
 	for _, usage := range turn.usageMessages {
-		targets := []struct {
+		snapshots = append(snapshots, usage)
+	}
+	if turn.reportedUsage != nil && len(turn.usageMessages) > 0 {
+		source = "claude.main_loop.usage"
+	}
+	return sumClaudeUsageSnapshots(snapshots, source, turn.assistantModel), len(snapshots) > 0
+}
+
+// sumClaudeUsageSnapshots 累计互不重叠的主循环边界，缺失分类不伪造零。
+func sumClaudeUsageSnapshots(snapshots []acpmeta.TurnUsage, source, model string) acpmeta.TurnUsage {
+	result := acpmeta.TurnUsage{Source: source, Coverage: "main_loop", Model: model}
+	for index, usage := range snapshots {
+		fields := []struct {
 			// target 指向累计字段。
 			target **int64
-			// value 是该消息的可选计数。
+			// value 是当前边界的可选计数。
 			value *int64
 		}{{&result.InputTokens, usage.InputTokens}, {&result.OutputTokens, usage.OutputTokens}, {&result.CacheReadTokens, usage.CacheReadTokens}, {&result.CacheWriteTokens, usage.CacheWriteTokens}}
-		for _, field := range targets {
-			if first {
+		for _, field := range fields {
+			if index == 0 {
 				if field.value != nil {
 					value := *field.value
 					*field.target = &value
@@ -381,9 +429,8 @@ func claudeTurnUsageLocked(turn *claudeTurn) (acpmeta.TurnUsage, bool) {
 				}
 			}
 		}
-		first = false
 	}
-	return result, true
+	return result
 }
 
 // claudePromptUsage 兼容标准 ACP 数值字段，同时用元数据保留未知字段。

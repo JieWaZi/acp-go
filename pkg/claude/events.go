@@ -373,7 +373,7 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 		reported.Model = turn.assistantModel
 		// result.usage 只覆盖主循环，不能据此声明含子调用的整轮完整。
 		reported.Complete = false
-		turn.reportedUsage = &reported
+		recordClaudeResultUsageLocked(turn, reported, message.UUID)
 	}
 	final, hasUsage := claudeTurnUsageLocked(turn)
 	turn.mu.Unlock()

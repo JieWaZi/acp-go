@@ -234,6 +234,10 @@ func TestKimiCurrentUsageACPProcess(t *testing.T) {
 			wire := filepath.Join(home, "sessions", "wd_workspace", sessionID, "agents", "main", "wire.jsonl")
 			events := `{"type":"usage.record","model":"deepseek/deepseek-flash","usage":{"inputOther":7,"output":5,"inputCacheRead":3,"inputCacheCreation":2},"usageScope":"turn"}` + "\n" +
 				`{"type":"token_counting.turn_recorded","tokens":120,"length":3}` + "\n"
+			mode := os.Getenv("ACP_GO_KIMI_USAGE_FIX_MODE")
+			if mode == "failure" {
+				events += `{"type":"usage.record","usage":`
+			}
 			file, err := os.OpenFile(wire, os.O_APPEND|os.O_WRONLY, 0o600)
 			if err != nil {
 				return nil, acp.NewInternalError(nil)
@@ -244,6 +248,18 @@ func TestKimiCurrentUsageACPProcess(t *testing.T) {
 			}
 			if err = file.Close(); err != nil {
 				return nil, acp.NewInternalError(nil)
+			}
+			switch mode {
+			case "equal", "conflict":
+				input := 7
+				if mode == "conflict" {
+					input = 99
+				}
+				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn, Usage: &acp.Usage{InputTokens: input, OutputTokens: 5, CachedReadTokens: acp.Ptr(3), CachedWriteTokens: acp.Ptr(2), TotalTokens: input + 10}}, nil
+			case "failure":
+				os.Exit(7)
+			case "cancel":
+				return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
 			}
 			return map[string]any{"stopReason": "end_turn"}, nil
 		default:

@@ -85,14 +85,17 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 		offset,
 		filepath.Join(agent.codeDirectory, "config.toml"),
 	)
-	if result.Usage == nil {
+	// Wire offset 明确归属当前 Prompt，且保留字段缺失性；存在时它是本轮唯一权威。
+	// 原生 ACP Usage 可能采用不同累计范围，不能与 wire 相加或将不同来源混写到终态。
+	if usage != nil {
 		result.Usage = usage
-		if update != nil {
-			if reported, ok := acpmeta.ReadTurnUsage(update.Meta); ok {
-				result.Meta = acpmeta.WithTurnUsage(result.Meta, reported)
-			}
+	}
+	if update != nil {
+		if reported, ok := acpmeta.ReadTurnUsage(update.Meta); ok {
+			result.Meta = acpmeta.WithTurnUsage(result.Meta, reported)
 		}
 	}
+
 	if host := agent.host.Load(); host != nil && update != nil {
 		// 提示取消后仍交付已经产生的统计；有界超时避免关闭时等待宿主。
 		notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
@@ -125,7 +128,8 @@ func readWireUsage(path string, offset int64, configPath string) (*acp.Usage, *a
 	for scanner.Scan() {
 		var record wireUsageRecord
 		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
-			return nil, nil
+			// 失败进程可能留下半条尾记录；保留此前已经解析的消费并停止猜读。
+			break
 		}
 		switch record.Type {
 		case "usage.record":
@@ -155,9 +159,7 @@ func readWireUsage(path string, offset int64, configPath string) (*acp.Usage, *a
 			}
 		}
 	}
-	if scanner.Err() != nil {
-		return nil, nil
-	}
+	// scanner 错误同样只截断可观测范围，不抹掉此前记录；快照本来就声明部分覆盖。
 	if update == nil && contextTokens != nil {
 		if size := readModelContextSize(configPath, model); size > 0 {
 			update = &acp.SessionUsageUpdate{

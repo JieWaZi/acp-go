@@ -173,8 +173,16 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (response ac
 					p.usage.InputTokens += usage.InputTokens
 					p.usage.OutputTokens += usage.OutputTokens
 					p.usage.TotalTokens += usage.TotalTokens
-					*p.usage.CachedReadTokens += *usage.CachedReadTokens
-					*p.usage.CachedWriteTokens += *usage.CachedWriteTokens
+					if p.usage.CachedReadTokens != nil && usage.CachedReadTokens != nil {
+						*p.usage.CachedReadTokens += *usage.CachedReadTokens
+					} else {
+						p.usage.CachedReadTokens = nil
+					}
+					if p.usage.CachedWriteTokens != nil && usage.CachedWriteTokens != nil {
+						*p.usage.CachedWriteTokens += *usage.CachedWriteTokens
+					} else {
+						p.usage.CachedWriteTokens = nil
+					}
 				}
 			}
 			if update := p.usageUpdate(); update != nil {
@@ -365,7 +373,10 @@ func (p *turnProjection) usageUpdate() *acp.SessionUsageUpdate {
 		return nil
 	}
 	input, output := int64(p.usage.InputTokens), int64(p.usage.OutputTokens)
-	reported := acpmeta.TurnUsage{InputTokens: &input, OutputTokens: &output, Source: "cursor.stop_hook.usage", Coverage: "observed_requests"}
+	reported := acpmeta.TurnUsage{OutputTokens: &output, Source: "cursor.stop_hook.usage", Coverage: "observed_requests"}
+	if p.usage.CachedReadTokens != nil && p.usage.CachedWriteTokens != nil {
+		reported.InputTokens = &input
+	}
 	if p.usage.CachedReadTokens != nil {
 		value := int64(*p.usage.CachedReadTokens)
 		reported.CacheReadTokens = &value

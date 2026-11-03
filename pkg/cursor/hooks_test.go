@@ -65,7 +65,7 @@ func TestHookUsageUnknownAndZero(t *testing.T) {
 	if event.usage() == nil || event.usage().TotalTokens != 0 {
 		t.Fatal("explicit zero lost")
 	}
-	event.CacheRead = -1
+	event.CacheRead = acp.Ptr(-1)
 	if event.usage() != nil {
 		t.Fatal("negative usage accepted")
 	}

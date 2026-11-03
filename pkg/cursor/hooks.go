@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,10 +49,10 @@ type hookEvent struct {
 	Input *int `json:"input_tokens"`
 	// Output 是生成输出量；nil 表示未提供。
 	Output *int `json:"output_tokens"`
-	// CacheRead 是读取缓存的输入量。
-	CacheRead int `json:"cache_read_tokens"`
-	// CacheWrite 是写入缓存的输入量。
-	CacheWrite int `json:"cache_write_tokens"`
+	// CacheRead 是读取缓存的输入量；nil 表示原生未报告。
+	CacheRead *int `json:"cache_read_tokens"`
+	// CacheWrite 是写入缓存的输入量；nil 表示原生未报告。
+	CacheWrite *int `json:"cache_write_tokens"`
 	// ContextTokens 是压缩前官方上下文快照。
 	ContextTokens int `json:"context_tokens"`
 	// ContextWindow 是该快照对应的上下文容量。
@@ -60,10 +61,31 @@ type hookEvent struct {
 
 // usage 校验官方用量并拆分非缓存输入，缺失值不伪造为零。
 func (event hookEvent) usage() *acp.Usage {
-	if event.Input == nil || event.Output == nil || *event.Input < 0 || *event.Output < 0 || event.CacheRead < 0 || event.CacheWrite < 0 || event.CacheRead > *event.Input || event.CacheWrite > *event.Input-event.CacheRead {
+	if event.Input == nil || event.Output == nil || *event.Input < 0 || *event.Output < 0 || *event.Input > math.MaxInt-*event.Output {
 		return nil
 	}
-	return &acp.Usage{InputTokens: max(0, *event.Input-event.CacheRead-event.CacheWrite), OutputTokens: *event.Output, CachedReadTokens: acp.Ptr(event.CacheRead), CachedWriteTokens: acp.Ptr(event.CacheWrite), TotalTokens: *event.Input + *event.Output}
+	read, write := 0, 0
+	if event.CacheRead != nil {
+		read = *event.CacheRead
+	}
+	if event.CacheWrite != nil {
+		write = *event.CacheWrite
+	}
+	if read < 0 || write < 0 || read > *event.Input || write > *event.Input-read {
+		return nil
+	}
+	usage := &acp.Usage{OutputTokens: *event.Output, TotalTokens: *event.Input + *event.Output}
+	if event.CacheRead != nil {
+		usage.CachedReadTokens = acp.Ptr(read)
+	}
+	if event.CacheWrite != nil {
+		usage.CachedWriteTokens = acp.Ptr(write)
+	}
+	// 标准必填输入字段无法表示未知分类；只有缓存读写均已报告时才能计算非缓存输入。
+	if event.CacheRead != nil && event.CacheWrite != nil {
+		usage.InputTokens = *event.Input - read - write
+	}
+	return usage
 }
 
 // createPlugin 生成私有 MCP 插件和 Hook 脚本；项目 Hook 的临时登记由独立租约负责。

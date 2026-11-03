@@ -254,7 +254,7 @@ func TestCursorTerminalProcess(t *testing.T) {
 		put(id+"-committed", map[string]any{"role": "assistant", "content": []any{call}}, false)
 		put(id+"-result", map[string]any{"role": "tool", "content": []any{map[string]any{"type": "tool-result", "toolCallId": id, "toolName": "Shell", "result": result}}}, false)
 		put(id+"-text", map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "完成"}}}, false)
-		data, _ := json.Marshal(hookEvent{Name: "stop", Session: "fixture-session", Generation: id, Status: "completed", Input: acp.Ptr(100), Output: acp.Ptr(5), CacheRead: 80})
+		data, _ := json.Marshal(hookEvent{Name: "stop", Session: "fixture-session", Generation: id, Status: "completed", Input: acp.Ptr(100), Output: acp.Ptr(5), CacheRead: acp.Ptr(80), CacheWrite: acp.Ptr(0)})
 		file := filepath.Join(root, "events", id+".json")
 		if err = os.WriteFile(file+".tmp", data, 0600); err != nil {
 			panic(err)

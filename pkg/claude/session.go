@@ -100,7 +100,11 @@ type claudeTurn struct {
 	usageMessages map[string]acpmeta.TurnUsage
 	// usageMessageID 是当前顶层流式消息身份。
 	usageMessageID string
-	// reportedUsage 是原生 result 累计快照，优先于消息级部分统计。
+	// usageCoveredMessages 保存已被 result 覆盖的原生消息身份，忽略跨边界重放。
+	usageCoveredMessages map[string]struct{}
+	// usageResultIDs 保存已经结算的原生 result 身份，避免重复回执加倍。
+	usageResultIDs map[string]struct{}
+	// reportedUsage 保存已经按 result 边界结算的主循环消费累计。
 	reportedUsage *acpmeta.TurnUsage
 	// contextUsage 保存当前顶层 assistant 消息的累计上下文用量快照。
 	contextUsage protocol.Usage
