@@ -109,7 +109,7 @@ func usageInteger(value any) (int64, bool) {
 			return 0, false
 		}
 	case float64:
-		if number < 0 || number > 1<<53 || math.Trunc(number) != number {
+		if number < 0 || number > (1<<53)-1 || math.Trunc(number) != number {
 			return 0, false
 		}
 		result = int64(number)
