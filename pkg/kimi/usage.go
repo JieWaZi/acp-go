@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/nativeacp"
 	acp "github.com/JieWaZi/acp-go/sdk"
 	"github.com/pelletier/go-toml/v2"
@@ -85,6 +87,11 @@ func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.
 	)
 	if result.Usage == nil {
 		result.Usage = usage
+		if update != nil {
+			if reported, ok := acpmeta.ReadTurnUsage(update.Meta); ok {
+				result.Meta = acpmeta.WithTurnUsage(result.Meta, reported)
+			}
+		}
 	}
 	if host := agent.host.Load(); host != nil && update != nil {
 		// 提示取消后仍交付已经产生的统计；有界超时避免关闭时等待宿主。
@@ -111,6 +118,7 @@ func readWireUsage(path string, offset int64, configPath string) (*acp.Usage, *a
 	scanner := bufio.NewScanner(io.LimitReader(file, 64*1024*1024))
 	scanner.Buffer(make([]byte, 4096), 8*1024*1024)
 	var usage *acp.Usage
+	var reported *acpmeta.TurnUsage
 	var update *acp.SessionUsageUpdate
 	var contextTokens *int
 	var model string
@@ -122,11 +130,8 @@ func readWireUsage(path string, offset int64, configPath string) (*acp.Usage, *a
 		switch record.Type {
 		case "usage.record":
 			value := record.Usage
-			validUsage := record.UsageScope == "turn" && value != nil &&
-				value.Input >= 0 && value.Output >= 0 &&
-				value.CacheRead >= 0 && value.CacheWrite >= 0
-			if validUsage {
-				usage = appendWireUsage(usage, value.Input, value.Output, value.CacheRead, value.CacheWrite)
+			if record.UsageScope == "turn" && value != nil {
+				reported, usage = appendWireCounters(reported, value.Input, value.Output, value.CacheRead, value.CacheWrite)
 				model = record.Model
 			}
 		case "token_counting.measured", "token_counting.turn_recorded":
@@ -137,10 +142,8 @@ func readWireUsage(path string, offset int64, configPath string) (*acp.Usage, *a
 		if record.Message.Type == "StatusUpdate" {
 			status := record.Message.Payload
 			value := status.TokenUsage
-			validUsage := value != nil && value.Input >= 0 && value.Output >= 0 &&
-				value.CacheRead >= 0 && value.CacheWrite >= 0
-			if validUsage {
-				usage = appendWireUsage(usage, value.Input, value.Output, value.CacheRead, value.CacheWrite)
+			if value != nil {
+				reported, usage = appendWireCounters(reported, value.Input, value.Output, value.CacheRead, value.CacheWrite)
 			}
 			if status.ContextTokens != nil && status.MaxContextTokens != nil &&
 				*status.ContextTokens >= 0 && *status.MaxContextTokens > 0 {
@@ -163,6 +166,14 @@ func readWireUsage(path string, offset int64, configPath string) (*acp.Usage, *a
 				Size:          size,
 			}
 		}
+	}
+	if usage != nil && reported != nil {
+		reported.ContextKnown = update != nil
+		reported.Model = model
+		if update == nil {
+			update = &acp.SessionUsageUpdate{}
+		}
+		update.Meta = acpmeta.WithTurnUsage(update.Meta, *reported)
 	}
 	return usage, update
 }
@@ -242,16 +253,77 @@ func pathWithin(root, candidate string) bool {
 	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
-// appendWireUsage 将一次模型调用的互斥 Token 分类累加到当前轮统计。
-func appendWireUsage(usage *acp.Usage, input, output, cacheRead, cacheWrite int) *acp.Usage {
-	if usage == nil {
-		usage = &acp.Usage{CachedReadTokens: new(int), CachedWriteTokens: new(int)}
+// appendWireCounters 累计字段级已知消费，保留缺失与零；非法记录不清除先前快照。
+func appendWireCounters(previous *acpmeta.TurnUsage, input, output, read, write *int) (*acpmeta.TurnUsage, *acp.Usage) {
+	incoming := []*int{input, output, read, write}
+	known := false
+	for _, counter := range incoming {
+		if counter != nil {
+			if *counter < 0 {
+				return previous, wirePromptUsage(previous)
+			}
+			known = true
+		}
 	}
-	usage.InputTokens += input
-	usage.OutputTokens += output
-	*usage.CachedReadTokens += cacheRead
-	*usage.CachedWriteTokens += cacheWrite
-	usage.TotalTokens += input + output + cacheRead + cacheWrite
+	if !known {
+		return previous, wirePromptUsage(previous)
+	}
+	result := acpmeta.TurnUsage{Source: "kimi.wire.usage", Coverage: "observed_requests"}
+	if previous != nil {
+		result = *previous
+	}
+	targets := []**int64{&result.InputTokens, &result.OutputTokens, &result.CacheReadTokens, &result.CacheWriteTokens}
+	for index, target := range targets {
+		value := incoming[index]
+		if previous == nil {
+			if value != nil {
+				counter := int64(*value)
+				*target = &counter
+			}
+		} else if *target != nil {
+			if value == nil || int64(*value) > int64(math.MaxInt)-**target {
+				*target = nil
+			} else {
+				counter := **target + int64(*value)
+				*target = &counter
+			}
+		}
+	}
+	usage := wirePromptUsage(&result)
+	if usage == nil {
+		return previous, wirePromptUsage(previous)
+	}
+	return &result, usage
+}
+
+// wirePromptUsage 兼容标准必填数值字段，元数据负责保留对应分类是否已知。
+func wirePromptUsage(reported *acpmeta.TurnUsage) *acp.Usage {
+	if reported == nil {
+		return nil
+	}
+	usage := &acp.Usage{}
+	if reported.InputTokens != nil {
+		usage.InputTokens = int(*reported.InputTokens)
+	}
+	if reported.OutputTokens != nil {
+		usage.OutputTokens = int(*reported.OutputTokens)
+	}
+	if reported.CacheReadTokens != nil {
+		value := int(*reported.CacheReadTokens)
+		usage.CachedReadTokens = &value
+	}
+	if reported.CacheWriteTokens != nil {
+		value := int(*reported.CacheWriteTokens)
+		usage.CachedWriteTokens = &value
+	}
+	for _, counter := range []*int64{reported.InputTokens, reported.OutputTokens, reported.CacheReadTokens, reported.CacheWriteTokens} {
+		if counter != nil {
+			if *counter > int64(math.MaxInt-usage.TotalTokens) {
+				return nil
+			}
+			usage.TotalTokens += int(*counter)
+		}
+	}
 	return usage
 }
 
@@ -290,13 +362,13 @@ type wireUsageRecord struct {
 // wireCurrentTokenUsage 对应新版 usage.record 的驼峰字段。
 type wireCurrentTokenUsage struct {
 	// Input 是扣除缓存读写后的输入 Token。
-	Input int `json:"inputOther"`
+	Input *int `json:"inputOther"`
 	// Output 是提供方报告的输出 Token。
-	Output int `json:"output"`
+	Output *int `json:"output"`
 	// CacheRead 是缓存命中的输入 Token。
-	CacheRead int `json:"inputCacheRead"`
+	CacheRead *int `json:"inputCacheRead"`
 	// CacheWrite 是新创建缓存的输入 Token。
-	CacheWrite int `json:"inputCacheCreation"`
+	CacheWrite *int `json:"inputCacheCreation"`
 }
 
 // wireSessionIndexRecord 是新版 session_index.jsonl 的会话定位信息。
@@ -342,11 +414,11 @@ type wireUsageStatus struct {
 // wireTokenUsage 对应 Kosong TokenUsage 的互斥输入与输出分类。
 type wireTokenUsage struct {
 	// Input 是扣除缓存读写后的输入 Token。
-	Input int `json:"input_other"`
+	Input *int `json:"input_other"`
 	// Output 是提供方报告的输出 Token。
-	Output int `json:"output"`
+	Output *int `json:"output"`
 	// CacheRead 是缓存命中的输入 Token。
-	CacheRead int `json:"input_cache_read"`
+	CacheRead *int `json:"input_cache_read"`
 	// CacheWrite 是新创建缓存的输入 Token。
-	CacheWrite int `json:"input_cache_creation"`
+	CacheWrite *int `json:"input_cache_creation"`
 }

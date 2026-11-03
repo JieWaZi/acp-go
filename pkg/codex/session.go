@@ -29,6 +29,8 @@ type sessionState struct {
 	generation uint64
 	// mu 保护 activePrompt。
 	mu sync.Mutex
+	// usageTotal 是同一会话最后确认的累计值；恢复或回退后未知。
+	usageTotal *turnUsage
 	// activePrompt 是该 session 唯一 pending/active turn。
 	activePrompt *activePrompt
 	// configuration 是 config 子组件维护的 model、effort 与安全模式状态。

@@ -372,8 +372,8 @@ func TestEventRouterMapsPlanAndLatestUsage(t *testing.T) {
 		t.Fatalf("latest usage = %#v, %v", usage, ok)
 	}
 	promptUsage := usage.PromptUsage()
-	if promptUsage == nil || promptUsage.TotalTokens != 1500 || promptUsage.InputTokens != 1200 ||
-		promptUsage.OutputTokens != 200 || promptUsage.ThoughtTokens == nil || *promptUsage.ThoughtTokens != 100 {
+	if promptUsage == nil || promptUsage.TotalTokens != 4500 || promptUsage.InputTokens != 3100 ||
+		promptUsage.OutputTokens != 750 || promptUsage.ThoughtTokens == nil || *promptUsage.ThoughtTokens != 150 {
 		t.Fatalf("Prompt Usage = %#v", promptUsage)
 	}
 }

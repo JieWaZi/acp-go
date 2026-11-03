@@ -4,8 +4,10 @@ import (
 	"context"
 	"math"
 	"strings"
+	"time"
 	"unicode"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
@@ -20,8 +22,12 @@ const (
 // recordContextUsage 用 assistant 的完整累计快照替换当前上下文用量。
 func recordContextUsage(turn *claudeTurn, usage protocol.Usage, model string) {
 	turn.mu.Lock()
-	turn.contextUsage = sanitizeClaudeUsage(usage)
-	turn.contextUsageSet = true
+	if !validClaudeContextUsage(usage) {
+		turn.mu.Unlock()
+		return
+	}
+	turn.contextUsage = usage
+	turn.contextUsageSet = usage.KnownFields == nil || len(usage.KnownFields) == 4
 	if model != "" {
 		turn.assistantModel = model
 	}
@@ -30,20 +36,42 @@ func recordContextUsage(turn *claudeTurn, usage protocol.Usage, model string) {
 
 // recordContextUsageDelta 合并 Anthropic message_delta 的可空累计字段。
 func recordContextUsageDelta(turn *claudeTurn, delta protocol.UsageDelta) {
+	for _, counter := range []*int64{&delta.OutputTokens, delta.InputTokens, delta.CacheCreationInputTokens, delta.CacheReadInputTokens} {
+		if counter != nil && *counter < 0 {
+			return
+		}
+	}
+
 	turn.mu.Lock()
 	usage := turn.contextUsage
+	if usage.KnownFields != nil {
+		fields := make(map[string]bool, len(usage.KnownFields)+4)
+		for key, value := range usage.KnownFields {
+			fields[key] = value
+		}
+		usage.KnownFields = fields
+	}
+	mark := func(key string) {
+		if usage.KnownFields != nil {
+			usage.KnownFields[key] = true
+		}
+	}
+	mark("output_tokens")
 	if delta.InputTokens != nil {
 		usage.InputTokens = nonNegativeToken(*delta.InputTokens)
+		mark("input_tokens")
 	}
 	usage.OutputTokens = nonNegativeToken(delta.OutputTokens)
 	if delta.CacheCreationInputTokens != nil {
 		usage.CacheCreationInputTokens = nonNegativeToken(*delta.CacheCreationInputTokens)
+		mark("cache_creation_input_tokens")
 	}
 	if delta.CacheReadInputTokens != nil {
 		usage.CacheReadInputTokens = nonNegativeToken(*delta.CacheReadInputTokens)
+		mark("cache_read_input_tokens")
 	}
 	turn.contextUsage = usage
-	turn.contextUsageSet = true
+	turn.contextUsageSet = validClaudeContextUsage(usage) && (usage.KnownFields == nil || len(usage.KnownFields) == 4)
 	turn.mu.Unlock()
 }
 
@@ -54,25 +82,37 @@ func (s *claudeSession) sendUsageUpdate(
 	force bool,
 ) error {
 	turn.mu.Lock()
-	if !turn.contextUsageSet {
-		turn.mu.Unlock()
-		return nil
+	reported, hasUsage := claudeTurnUsageLocked(turn)
+	used := int64(0)
+	contextKnown := turn.contextUsageSet
+	if contextKnown {
+		used = totalClaudeUsage(turn.contextUsage)
 	}
-	used := totalClaudeUsage(turn.contextUsage)
-	alreadyPublished := turn.contextUsagePublishedSet && turn.contextUsagePublished == used
 	turn.mu.Unlock()
-	if alreadyPublished && !force {
+	if !hasUsage && !contextKnown {
 		return nil
 	}
-
 	s.mu.Lock()
 	window := s.contextWindowSize
 	s.mu.Unlock()
-	if window <= 0 {
-		return nil
+	contextKnown = contextKnown && window > 0
+	reported.ContextKnown = contextKnown
+	if !contextKnown {
+		used = 0
+		window = 0
 	}
-	if err := s.agent.sendUpdate(ctx, s.id, acp.SessionUpdate{
+	// 同样的上下文大小可能对应消费累计的变化，不能只按 Used 去重。
+	_ = force
+	meta := map[string]any(nil)
+	if hasUsage {
+		meta = acpmeta.WithTurnUsage(nil, reported)
+	}
+
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := s.agent.sendUpdate(notifyCtx, s.id, acp.SessionUpdate{
 		UsageUpdate: &acp.SessionUsageUpdate{
+			Meta: meta,
 			Used: boundedInt(used),
 			Size: boundedInt(window),
 		},
@@ -263,4 +303,127 @@ func totalClaudeUsage(usage protocol.Usage) int64 {
 		total += value
 	}
 	return total
+}
+
+// reportedClaudeUsage 保留上游字段 presence，非法分量不投影成可信零。
+func reportedClaudeUsage(usage protocol.Usage) (acpmeta.TurnUsage, bool) {
+	result := acpmeta.TurnUsage{Source: "claude.usage", Coverage: "main_loop"}
+	fields := []struct {
+		// key 是原生字段名。
+		key string
+		// value 是原生 token 值。
+		value int64
+		// target 是归一化字段地址。
+		target **int64
+	}{{"input_tokens", usage.InputTokens, &result.InputTokens}, {"output_tokens", usage.OutputTokens, &result.OutputTokens}, {"cache_creation_input_tokens", usage.CacheCreationInputTokens, &result.CacheWriteTokens}, {"cache_read_input_tokens", usage.CacheReadInputTokens, &result.CacheReadTokens}}
+	known := false
+	for _, field := range fields {
+		present := usage.KnownFields[field.key]
+		if usage.KnownFields == nil {
+			present = field.value != 0
+		}
+		if present && field.value >= 0 {
+			value := field.value
+			*field.target = &value
+			known = true
+		}
+	}
+	return result, known
+}
+
+// recordClaudeMessageUsage 替换同一原生消息的累计请求用量；无身份时只保留一个部分槽位。
+func recordClaudeMessageUsage(turn *claudeTurn, usage protocol.Usage, id string) {
+	reported, known := reportedClaudeUsage(usage)
+	if !known {
+		return
+	}
+	turn.mu.Lock()
+	defer turn.mu.Unlock()
+	if id == "" {
+		id = turn.usageMessageID
+	}
+	if turn.usageMessages == nil {
+		turn.usageMessages = make(map[string]acpmeta.TurnUsage)
+	}
+	turn.usageMessages[id] = reported
+}
+
+// claudeTurnUsageLocked 以最终回执为准；此前按消息身份累计可证实的部分消费。
+// 调用方持有 turn.mu。
+func claudeTurnUsageLocked(turn *claudeTurn) (acpmeta.TurnUsage, bool) {
+	if turn.reportedUsage != nil {
+		return *turn.reportedUsage, true
+	}
+	result := acpmeta.TurnUsage{Source: "claude.assistant.usage", Coverage: "main_loop", Model: turn.assistantModel}
+	if len(turn.usageMessages) == 0 {
+		return result, false
+	}
+	first := true
+	for _, usage := range turn.usageMessages {
+		targets := []struct {
+			// target 指向累计字段。
+			target **int64
+			// value 是该消息的可选计数。
+			value *int64
+		}{{&result.InputTokens, usage.InputTokens}, {&result.OutputTokens, usage.OutputTokens}, {&result.CacheReadTokens, usage.CacheReadTokens}, {&result.CacheWriteTokens, usage.CacheWriteTokens}}
+		for _, field := range targets {
+			if first {
+				if field.value != nil {
+					value := *field.value
+					*field.target = &value
+				}
+			} else if *field.target != nil {
+				if field.value == nil || *field.value > math.MaxInt64-**field.target {
+					*field.target = nil
+				} else {
+					value := **field.target + *field.value
+					*field.target = &value
+				}
+			}
+		}
+		first = false
+	}
+	return result, true
+}
+
+// claudePromptUsage 兼容标准 ACP 数值字段，同时用元数据保留未知字段。
+func claudePromptUsage(reported acpmeta.TurnUsage) *acp.Usage {
+	value := &acp.Usage{}
+	if reported.InputTokens != nil {
+		value.InputTokens = boundedInt(*reported.InputTokens)
+	}
+	if reported.OutputTokens != nil {
+		value.OutputTokens = boundedInt(*reported.OutputTokens)
+	}
+	if reported.CacheReadTokens != nil {
+		converted := boundedInt(*reported.CacheReadTokens)
+		value.CachedReadTokens = &converted
+	}
+	if reported.CacheWriteTokens != nil {
+		converted := boundedInt(*reported.CacheWriteTokens)
+		value.CachedWriteTokens = &converted
+	}
+	total := int64(0)
+	for _, counter := range []*int64{reported.InputTokens, reported.OutputTokens, reported.CacheReadTokens, reported.CacheWriteTokens} {
+		if counter != nil {
+			if *counter > int64(math.MaxInt)-total {
+				return nil
+			}
+			total += *counter
+		}
+	}
+	value.TotalTokens = int(total)
+	return value
+}
+
+// validClaudeContextUsage 拒绝不可靠的上下文总量，避免负数与溢出变为可信零。
+func validClaudeContextUsage(usage protocol.Usage) bool {
+	total := int64(0)
+	for _, value := range []int64{usage.InputTokens, usage.OutputTokens, usage.CacheReadInputTokens, usage.CacheCreationInputTokens} {
+		if value < 0 || value > int64(math.MaxInt)-total {
+			return false
+		}
+		total += value
+	}
+	return true
 }

@@ -12,11 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // Prompt 对照 pi-acp 串行执行提示，等待整轮 settled 而非中间 agent_end。
-func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
+func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response acp.PromptResponse, promptErr error) {
 	s, err := a.get(request.SessionId)
 	if err != nil {
 		return acp.PromptResponse{}, err
@@ -57,10 +58,15 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	s.failure = nil
 	s.modelFailure = nil
 	s.usage = nil
+	s.reportedUsage = nil
 	s.mutex.Unlock()
 	defer func() {
 		s.mutex.Lock()
 		if s.turn == turn {
+			if s.reportedUsage != nil {
+				response.Usage = s.usage
+				response.Meta = acpmeta.WithTurnUsage(response.Meta, *s.reportedUsage)
+			}
 			s.turn = nil
 		}
 		s.mutex.Unlock()
@@ -86,8 +92,12 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 		}
 		s.mutex.Lock()
 		failure, usage := errors.Join(s.failure, s.modelFailure), s.usage
+		meta := map[string]any(nil)
+		if s.reportedUsage != nil {
+			meta = acpmeta.WithTurnUsage(nil, *s.reportedUsage)
+		}
 		s.mutex.Unlock()
-		return acp.PromptResponse{StopReason: reason, Usage: usage}, failure
+		return acp.PromptResponse{StopReason: reason, Usage: usage, Meta: meta}, failure
 	case <-ctx.Done():
 		a.abortTurn(s, turn)
 		return acp.PromptResponse{}, ctx.Err()

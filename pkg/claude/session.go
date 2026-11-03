@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
@@ -95,6 +96,12 @@ type claudeTurn struct {
 	steered bool
 	// steeredResult 保存 steering 周期内最后一个可用结果。
 	steeredResult *acp.PromptResponse
+	// usageMessages 按顶层原生消息身份保存可替换的请求快照，避免流式与聚合帧重复计数。
+	usageMessages map[string]acpmeta.TurnUsage
+	// usageMessageID 是当前顶层流式消息身份。
+	usageMessageID string
+	// reportedUsage 是原生 result 累计快照，优先于消息级部分统计。
+	reportedUsage *acpmeta.TurnUsage
 	// contextUsage 保存当前顶层 assistant 消息的累计上下文用量快照。
 	contextUsage protocol.Usage
 	// contextUsageSet 表示已经观察到当前 assistant 的用量字段。

@@ -447,6 +447,10 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if !installed {
 		return acp.NewSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
 	}
+	// thread/start 创建的新线程具有独立的零基线，不能套用到恢复或 fork。
+	state.mu.Lock()
+	state.usageTotal = &turnUsage{CacheWriteTokens: new(int64)}
+	state.mu.Unlock()
 	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
 	modes, options := sessionConfigurationResponse(state)
 	return acp.NewSessionResponse{
@@ -752,7 +756,7 @@ func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionReques
 }
 
 // Prompt 提交 turn/start，并按精确 completion 产生 ACP stop reason。
-func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
+func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response acp.PromptResponse, promptErr error) {
 	if err := a.requireInitialized(); err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -778,6 +782,12 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.Prom
 	// 前台返回后立即释放 Session 槽位；普通提前取消时，RunTurn 观察者继续
 	// 等待迟到的 turn/start 并执行 stale interrupt。
 	defer func() {
+		if promptErr != nil || response.StopReason == acp.StopReasonCancelled {
+			// 失败或提前取消后可能仍有未观测尾部，下一轮不能借旧样本收取这些消费。
+			state.mu.Lock()
+			state.usageTotal = nil
+			state.mu.Unlock()
+		}
 		prompt.markForegroundFinished()
 		a.releaseActivePrompt(state, prompt)
 		a.finishPromptForeground(prompt)
@@ -877,6 +887,7 @@ func codexPromptResponse(
 	usage, ok := router.Usage()
 	if ok {
 		response.Usage = usage.PromptUsage()
+		response.Meta = acpmeta.WithTurnUsage(response.Meta, usage.Metadata(stopReason == acp.StopReasonEndTurn))
 	}
 	return response
 }
@@ -969,12 +980,27 @@ func (a *Agent) onTurnStarted(state *sessionState, prompt *activePrompt, turnID 
 		return
 	}
 	if updater := a.currentSessionUpdater(); updater != nil {
-		prompt.setEventRouter(newEventRouter(updater, turnGeneration{
+		router := newEventRouter(updater, turnGeneration{
 			SessionID:  acp.SessionId(state.id),
 			ThreadID:   state.id,
 			TurnID:     turnID,
 			Generation: prompt.generation,
-		}, a, a.logger, state.terminalOutputMode))
+		}, a, a.logger, state.terminalOutputMode)
+		state.mu.Lock()
+		if state.usageTotal != nil {
+			baseline := *state.usageTotal
+			router.handler.previous = &baseline
+			router.handler.baselineKnown = true
+		}
+		state.mu.Unlock()
+		router.handler.checkpoint = func(total *turnUsage) {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if state.activePrompt == prompt {
+				state.usageTotal = total
+			}
+		}
+		prompt.setEventRouter(router)
 	}
 }
 

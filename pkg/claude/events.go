@@ -111,7 +111,12 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 		if event.Message != nil {
 			nativeID = event.Message.ID
 		}
-		s.messageIdentity(turn, message.ParentToolUseID, nativeID, true)
+		identity := s.messageIdentity(turn, message.ParentToolUseID, nativeID, true)
+		if message.ParentToolUseID == nil {
+			turn.mu.Lock()
+			turn.usageMessageID = identity
+			turn.mu.Unlock()
+		}
 		turn.mu.Lock()
 		delete(turn.streamedBlocks, streamedBlockOwner(message.ParentToolUseID))
 		turn.mu.Unlock()
@@ -121,6 +126,7 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 		s.useAssistantModel(event.Message.Model)
 		if event.Message.Usage != nil {
 			recordContextUsage(turn, *event.Message.Usage, event.Message.Model)
+			recordClaudeMessageUsage(turn, *event.Message.Usage, nativeID)
 			return s.sendUsageUpdate(ctx, turn, false)
 		}
 	case "content_block_start":
@@ -160,6 +166,10 @@ func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol
 	case "message_delta":
 		if message.ParentToolUseID == nil && event.Usage != nil {
 			recordContextUsageDelta(turn, *event.Usage)
+			turn.mu.Lock()
+			usage := turn.contextUsage
+			turn.mu.Unlock()
+			recordClaudeMessageUsage(turn, usage, "")
 			return s.sendUsageUpdate(ctx, turn, false)
 		}
 	case "message_stop":
@@ -173,6 +183,16 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 	turn := s.activeTurn()
 	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
 		return nil
+	}
+	if message.ParentToolUseID == nil {
+		s.useAssistantModel(message.Message.Model)
+		if message.Message.Usage != nil {
+			recordContextUsage(turn, *message.Message.Usage, message.Message.Model)
+			recordClaudeMessageUsage(turn, *message.Message.Usage, message.Message.ID)
+			if err := s.sendUsageUpdate(ctx, turn, false); err != nil {
+				return err
+			}
+		}
 	}
 	if message.Error != "" {
 		var details []string
@@ -191,12 +211,7 @@ func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.A
 		// 错误正文不交付；顶层错误由 result 结算，子代理错误由后续 user.tool_result 结算对应工具。
 		return nil
 	}
-	if message.ParentToolUseID == nil {
-		s.useAssistantModel(message.Message.Model)
-		if message.Message.Usage != nil {
-			recordContextUsage(turn, *message.Message.Usage, message.Message.Model)
-		}
-	}
+
 	owner := streamedBlockOwner(message.ParentToolUseID)
 	id := s.messageIdentity(turn, message.ParentToolUseID, message.Message.ID, false)
 	turn.mu.Lock()
@@ -350,6 +365,31 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 		message = &copy
 	}
 	response, err := promptResponseFromResult(message, assistantError)
+	reported, known := reportedClaudeUsage(message.Usage)
+	turn.mu.Lock()
+	_, hasObserved := claudeTurnUsageLocked(turn)
+	if known && ((err == nil && !turn.cancelled) || !hasObserved) {
+		reported.Source = "claude.result.usage"
+		reported.Model = turn.assistantModel
+		// result.usage 只覆盖主循环，不能据此声明含子调用的整轮完整。
+		reported.Complete = false
+		turn.reportedUsage = &reported
+	}
+	final, hasUsage := claudeTurnUsageLocked(turn)
+	turn.mu.Unlock()
+	s.updateContextWindowFromResult(turn, message.ModelUsage)
+	updateErr := s.sendUsageUpdate(ctx, turn, true)
+	if hasUsage {
+		response.Usage = claudePromptUsage(final)
+		turn.mu.Lock()
+		contextSet := turn.contextUsageSet
+		turn.mu.Unlock()
+		s.mu.Lock()
+		window := s.contextWindowSize
+		s.mu.Unlock()
+		final.ContextKnown = contextSet && window > 0
+		response.Meta = acpmeta.WithTurnUsage(response.Meta, final)
+	}
 	turn.mu.Lock()
 	turn.gotResult = true
 	cancelled := turn.cancelled
@@ -367,15 +407,14 @@ func (s *claudeSession) handleResult(ctx context.Context, message *protocol.Resu
 	}
 	if cancelled {
 		turn.drain()
-		return nil
+		return updateErr
 	}
 	if err != nil {
 		turn.settle(acp.PromptResponse{}, err)
 		turn.drain()
-		return nil
+		return updateErr
 	}
-	s.updateContextWindowFromResult(turn, message.ModelUsage)
-	updateErr := s.sendUsageUpdate(ctx, turn, true)
+
 	if steered {
 		return updateErr
 	}
@@ -631,14 +670,15 @@ func promptResponseFromResult(
 			stopReason = acp.StopReasonMaxTurnRequests
 		}
 	}
-	usage := acp.Usage{
-		InputTokens:       boundedInt(message.Usage.InputTokens),
-		OutputTokens:      boundedInt(message.Usage.OutputTokens),
-		CachedReadTokens:  intPointer(message.Usage.CacheReadInputTokens),
-		CachedWriteTokens: intPointer(message.Usage.CacheCreationInputTokens),
+	reported, known := reportedClaudeUsage(message.Usage)
+	response := acp.PromptResponse{StopReason: stopReason}
+	if known {
+		reported.Source = "claude.result.usage"
+		reported.Complete = false
+		response.Usage = claudePromptUsage(reported)
+		response.Meta = acpmeta.WithTurnUsage(nil, reported)
 	}
-	usage.TotalTokens = boundedInt(totalClaudeUsage(message.Usage))
-	return acp.PromptResponse{StopReason: stopReason, Usage: &usage}, nil
+	return response, nil
 }
 
 // claudeResultRequestError 把 is_error 结果转换为 ACP InternalError。

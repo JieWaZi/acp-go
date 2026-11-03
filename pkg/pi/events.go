@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/autoreview"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
@@ -146,6 +147,22 @@ func (a *Agent) events(s *session) {
 			if message["role"] == "assistant" {
 				update = s.messageUpdate(map[string]any{"type": "text", "text": ""}, true)
 				s.accumulateUsage(object(message["usage"]))
+				s.mutex.Lock()
+				meta := map[string]any(nil)
+				if s.reportedUsage != nil {
+					meta = acpmeta.WithTurnUsage(nil, *s.reportedUsage)
+				}
+				s.mutex.Unlock()
+				if meta != nil {
+					notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+					usageErr := a.emit(notifyCtx, s, map[string]any{"sessionUpdate": "usage_update", "used": 0, "size": 0, "_meta": meta})
+					cancel()
+					if usageErr != nil {
+						s.mutex.Lock()
+						s.failure = errors.Join(s.failure, usageErr)
+						s.mutex.Unlock()
+					}
+				}
 				if reason := text(message["stopReason"]); reason == "error" {
 					s.mutex.Lock()
 					s.modelFailure = errors.New("Pi model request failed: " + text(message["errorMessage"]))

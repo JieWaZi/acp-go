@@ -173,7 +173,7 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 						TotalTokens: 1500, InputTokens: 1200, CachedInputTokens: 500,
 						OutputTokens: 200, ReasoningOutputTokens: 100,
 					},
-					Total:              protocol.Last{TotalTokens: 7000},
+					Total:              protocol.Last{TotalTokens: 1500, InputTokens: 1200, CachedInputTokens: 500, OutputTokens: 200, ReasoningOutputTokens: 100},
 					ModelContextWindow: &contextWindow,
 				},
 			},

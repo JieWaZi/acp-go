@@ -280,6 +280,8 @@ type ResultMessage struct {
 
 // Usage 是 result.usage 中 V1 使用的 token 统计子集。
 type Usage struct {
+	// KnownFields 保存原始 JSON 中明确出现的 token 字段；nil 表示程序内构造。
+	KnownFields map[string]bool `json:"-"`
 	// InputTokens 是普通输入 token 数。
 	InputTokens int64 `json:"input_tokens"`
 	// OutputTokens 是输出 token 数。
@@ -288,6 +290,27 @@ type Usage struct {
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	// CacheReadInputTokens 是从缓存读取的输入 token 数。
 	CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+}
+
+// UnmarshalJSON 保留字段是否实际出现，显式零与缺失不能混为一谈。
+func (u *Usage) UnmarshalJSON(data []byte) error {
+	type plain Usage
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	value.KnownFields = make(map[string]bool)
+	for _, key := range []string{"input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		if raw, ok := fields[key]; ok && string(raw) != "null" {
+			value.KnownFields[key] = true
+		}
+	}
+	*u = Usage(value)
+	return nil
 }
 
 // UsageDelta 是 message_delta 中允许省略累计字段的上下文用量增量。

@@ -559,7 +559,7 @@ func assertRuntimeUpdates(t *testing.T, updates []acp.SessionNotification) {
 			usageCount++
 		}
 	}
-	if textCount != 1 || toolStartCount != 1 || toolCompleteCount != 1 || planCount != 1 || usageCount != 1 {
+	if textCount != 1 || toolStartCount != 1 || toolCompleteCount != 1 || planCount != 1 || usageCount != 3 {
 		t.Fatalf("updates 统计 text=%d start=%d complete=%d plan=%d usage=%d：%#v", textCount, toolStartCount, toolCompleteCount, planCount, usageCount, updates)
 	}
 }

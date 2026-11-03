@@ -68,7 +68,7 @@ func (h *terminalHost) contextUpdateCount() int {
 	defer h.mutex.Unlock()
 	count := 0
 	for _, update := range h.updates {
-		if update.Update.UsageUpdate != nil {
+		if update.Update.UsageUpdate != nil && update.Update.UsageUpdate.Size > 0 {
 			count++
 		}
 	}
@@ -144,7 +144,7 @@ func TestCursorTerminalRoundTrip(t *testing.T) {
 		if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil && chunk.Content.Text.Text != "" {
 			messages++
 		}
-		if update.Update.UsageUpdate != nil {
+		if update.Update.UsageUpdate != nil && update.Update.UsageUpdate.Size > 0 {
 			contextUpdates++
 			if update.Update.UsageUpdate.Used != 25_000 || update.Update.UsageUpdate.Size != 200_000 {
 				t.Fatalf("context usage=%+v", update.Update.UsageUpdate)

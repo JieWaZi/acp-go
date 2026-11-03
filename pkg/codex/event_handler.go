@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
@@ -19,7 +20,7 @@ type sessionUpdater interface {
 	SessionUpdate(context.Context, acp.SessionNotification) error
 }
 
-// turnUsage 保存当前 generation 最近一次 token usage，不跨 Turn 复用。
+// turnUsage 保存当前 generation 的消费累计及最近一次上下文。
 type turnUsage struct {
 	// LastTokens 是最近一次请求自身消耗的 token 数。
 	LastTokens int64
@@ -27,7 +28,7 @@ type turnUsage struct {
 	TotalTokens int64
 	// ContextWindow 是模型上下文窗口大小；未知时为零。
 	ContextWindow int64
-	// InputTokens 是扣除缓存读取后的本轮输入 token 数。
+	// InputTokens 是扣除缓存读写后的本轮输入 token 数。
 	InputTokens int64
 	// CacheReadTokens 是本轮命中的缓存输入 token 数。
 	CacheReadTokens int64
@@ -37,6 +38,10 @@ type turnUsage struct {
 	OutputTokens int64
 	// ThoughtTokens 是本轮 reasoning 输出 token 数。
 	ThoughtTokens int64
+	// TurnTokens 是本轮累计 token 消费，不是最近请求的上下文。
+	TurnTokens int64
+	// Complete 表示具有可靠轮前基线且尚未出现计数回退。
+	Complete bool
 }
 
 // PromptUsage 把已校验的 Codex 本轮统计转换为 ACP PromptResponse Usage。
@@ -48,7 +53,7 @@ func (u turnUsage) PromptUsage() *acp.Usage {
 		InputTokens:      int(u.InputTokens),
 		OutputTokens:     int(u.OutputTokens),
 		ThoughtTokens:    &thought,
-		TotalTokens:      int(u.LastTokens),
+		TotalTokens:      int(u.TurnTokens),
 	}
 	if u.CacheWriteTokens != nil {
 		cacheWrite := int(*u.CacheWriteTokens)
@@ -83,6 +88,16 @@ type eventHandler struct {
 	terminalCommands map[string]struct{}
 	// terminalCommandOutputs 标记 terminal 命令已经发送过非空输出增量。
 	terminalCommandOutputs map[string]struct{}
+	// usageMu 保护通知线程与 Prompt 终态之间的用量快照。
+	usageMu sync.Mutex
+	// previous 是同会话上一条可信累计快照。
+	previous *turnUsage
+	// counterInvalid 表示出现无 epoch 证据的累计回退，禁止向后续回合复用检查点。
+	counterInvalid bool
+	// baselineKnown 表示轮前基线有独立会话证据。
+	baselineKnown bool
+	// checkpoint 将最新累计值保存给同会话下一轮；nil 表示基线失效。
+	checkpoint func(*turnUsage)
 	// usage 保存当前 turn 最新 usage 快照。
 	usage *turnUsage
 }
@@ -114,6 +129,8 @@ func newEventHandler(
 
 // Usage 返回当前 turn 最近一次 token usage 的副本。
 func (h *eventHandler) Usage() (turnUsage, bool) {
+	h.usageMu.Lock()
+	defer h.usageMu.Unlock()
 	if h.usage == nil {
 		return turnUsage{}, false
 	}
@@ -414,24 +431,113 @@ func mapPlanStatus(status protocol.PlanStatus) (acp.PlanEntryStatus, error) {
 	}
 }
 
-// handleTokenUsage 保存最新快照，并在上下文窗口可用时发送 ACP usage_update。
-func (h *eventHandler) handleTokenUsage(
-	ctx context.Context,
-	params protocol.ThreadTokenUsageUpdatedNotification,
-) error {
-	usage, err := turnUsageFromTokenUsage(params.TokenUsage)
+// handleTokenUsage 按线程累计字段差分并发布可替换的消费快照，上下文仍使用最近请求。
+func (h *eventHandler) handleTokenUsage(ctx context.Context, params protocol.ThreadTokenUsageUpdatedNotification) error {
+	last, err := turnUsageFromTokenUsage(params.TokenUsage)
 	if err != nil {
+		h.invalidateUsageCheckpoint()
 		return err
 	}
-	h.usage = &usage
-	if usage.ContextWindow <= 0 {
-		return nil
+	total, err := turnUsageFromTokenUsage(protocol.TokenUsage{Last: params.TokenUsage.Total})
+	if err != nil {
+		h.invalidateUsageCheckpoint()
+		return err
 	}
-	update := acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
-		Used: int(usage.LastTokens),
-		Size: int(usage.ContextWindow),
-	}}
-	return h.emit(ctx, update)
+	h.usageMu.Lock()
+	if h.previous == nil {
+		h.usage = &last
+		h.usage.Complete = false
+	} else {
+		if h.usage == nil {
+			h.usage = &turnUsage{Complete: h.baselineKnown}
+			if total.CacheWriteTokens != nil && h.previous.CacheWriteTokens != nil {
+				h.usage.CacheWriteTokens = new(int64)
+			}
+		}
+		current := *h.usage
+		if !addCodexUsageDelta(&current, &total, *h.previous) {
+			current.Complete = false
+			h.baselineKnown = false
+			h.counterInvalid = true
+			if h.checkpoint != nil {
+				h.checkpoint(nil)
+			}
+		}
+		current.LastTokens = last.LastTokens
+		current.ContextWindow = last.ContextWindow
+		current.TotalTokens = params.TokenUsage.Total.TotalTokens
+		h.usage = &current
+	}
+	h.previous = &total
+	if h.checkpoint != nil && !h.counterInvalid {
+		h.checkpoint(&total)
+	}
+	snapshot := *h.usage
+	h.usageMu.Unlock()
+	return h.emitUsage(ctx, snapshot)
+}
+
+// invalidateUsageCheckpoint 保留已观测消费，但异常后不能声明覆盖整轮或复用旧基线。
+func (h *eventHandler) invalidateUsageCheckpoint() {
+	h.usageMu.Lock()
+	defer h.usageMu.Unlock()
+	h.counterInvalid = true
+	h.baselineKnown = false
+	if h.usage != nil {
+		h.usage.Complete = false
+	}
+	if h.checkpoint != nil {
+		h.checkpoint(nil)
+	}
+}
+
+// addCodexUsageDelta 只接受单调累计字段；回退不能作为新 epoch 或负消费。
+func addCodexUsageDelta(current *turnUsage, total *turnUsage, previous turnUsage) bool {
+	valid := true
+	deltas := []struct {
+		// target 指向本轮累计字段。
+		target *int64
+		// next 指向最新会话累计字段，无效时保留旧高水位。
+		next *int64
+		// before 是前次会话累计字段。
+		before int64
+	}{{&current.InputTokens, &total.InputTokens, previous.InputTokens}, {&current.CacheReadTokens, &total.CacheReadTokens, previous.CacheReadTokens}, {&current.OutputTokens, &total.OutputTokens, previous.OutputTokens}, {&current.ThoughtTokens, &total.ThoughtTokens, previous.ThoughtTokens}, {&current.TurnTokens, &total.TurnTokens, previous.TurnTokens}}
+	for _, field := range deltas {
+		if *field.next < field.before || *field.next-field.before > int64(math.MaxInt)-*field.target {
+			valid = false
+			*field.next = field.before
+			continue
+		}
+		*field.target += *field.next - field.before
+	}
+	if current.CacheWriteTokens != nil && total.CacheWriteTokens != nil && previous.CacheWriteTokens != nil {
+		if *total.CacheWriteTokens < *previous.CacheWriteTokens || *total.CacheWriteTokens-*previous.CacheWriteTokens > int64(math.MaxInt)-*current.CacheWriteTokens {
+			valid = false
+			value := *previous.CacheWriteTokens
+			total.CacheWriteTokens = &value
+		} else {
+			value := *current.CacheWriteTokens + (*total.CacheWriteTokens - *previous.CacheWriteTokens)
+			current.CacheWriteTokens = &value
+		}
+	} else {
+		current.CacheWriteTokens = nil
+	}
+	return valid
+}
+
+// Metadata 将可证明的本轮字段与来源、上下文证据写入统一命名空间。
+func (u turnUsage) Metadata(complete bool) acpmeta.TurnUsage {
+	return acpmeta.TurnUsage{InputTokens: &u.InputTokens, CacheReadTokens: &u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens, OutputTokens: &u.OutputTokens, ReasoningTokens: &u.ThoughtTokens, Source: "codex.thread/tokenUsage/updated", Coverage: "native_turn", Complete: complete && u.Complete, ContextKnown: u.ContextWindow > 0}
+}
+
+// emitUsage 即使没有上下文窗口也立即交付已经观测的消费。
+func (h *eventHandler) emitUsage(ctx context.Context, usage turnUsage) error {
+	update := &acp.SessionUsageUpdate{Meta: acpmeta.WithTurnUsage(nil, usage.Metadata(false))}
+	if usage.ContextWindow > 0 {
+		update.Used = int(usage.LastTokens)
+		update.Size = int(usage.ContextWindow)
+	}
+	return h.emit(ctx, acp.SessionUpdate{UsageUpdate: update})
 }
 
 // turnUsageFromTokenUsage 校验 app-server 数值并保留 PromptResponse 所需的完整本轮明细。
@@ -456,7 +562,10 @@ func turnUsageFromTokenUsage(tokenUsage protocol.TokenUsage) (turnUsage, error) 
 			return turnUsage{}, fmt.Errorf("token usage exceeds ACP integer range")
 		}
 	}
-	if last.InputTokens < last.CachedInputTokens {
+	if last.InputTokens > int64(math.MaxInt)-last.OutputTokens {
+		return turnUsage{}, fmt.Errorf("input and output token sum exceeds ACP integer range")
+	}
+	if last.InputTokens < last.CachedInputTokens || int64Value(last.CacheWriteInputTokens) > last.InputTokens-last.CachedInputTokens {
 		return turnUsage{}, fmt.Errorf("cached input tokens exceed total input tokens")
 	}
 	var cacheWrite *int64
@@ -466,9 +575,10 @@ func turnUsageFromTokenUsage(tokenUsage protocol.TokenUsage) (turnUsage, error) 
 	}
 	return turnUsage{
 		LastTokens:       last.TotalTokens,
+		TurnTokens:       last.TotalTokens,
 		TotalTokens:      tokenUsage.Total.TotalTokens,
 		ContextWindow:    int64Value(tokenUsage.ModelContextWindow),
-		InputTokens:      last.InputTokens - last.CachedInputTokens,
+		InputTokens:      last.InputTokens - last.CachedInputTokens - int64Value(cacheWrite),
 		CacheReadTokens:  last.CachedInputTokens,
 		CacheWriteTokens: cacheWrite,
 		OutputTokens:     last.OutputTokens,

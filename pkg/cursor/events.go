@@ -129,8 +129,13 @@ func (a *Agent) project(ctx context.Context, s *interactiveSession, p *turnProje
 }
 
 // runTurn 合并检查点与官方 Hook，驱动审批并返回本轮真实结束与用量。
-func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptResponse, error) {
+func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (response acp.PromptResponse, resultErr error) {
 	p := &turnProjection{tools: map[string]bool{}, handled: map[string]bool{}, generations: map[string]bool{}}
+	defer func() {
+		if update := p.usageUpdate(); update != nil {
+			response.Meta = update.Meta
+		}
+	}()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var idleSince time.Time
@@ -172,6 +177,15 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 					*p.usage.CachedWriteTokens += *usage.CachedWriteTokens
 				}
 			}
+			if update := p.usageUpdate(); update != nil {
+				notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+				notifyErr := a.notify(notifyCtx, s, acp.SessionUpdate{UsageUpdate: update})
+				cancel()
+				if notifyErr != nil {
+					return acp.PromptResponse{Usage: p.usage}, notifyErr
+				}
+			}
+
 		}
 		if s.terminal.outcome != nil {
 			if err := s.terminal.outcome.failure(); err != nil {
@@ -188,6 +202,9 @@ func (a *Agent) runTurn(ctx context.Context, s *interactiveSession) (acp.PromptR
 			}
 			a.refreshContextUsage(ctx, s)
 			response := acp.PromptResponse{StopReason: acp.StopReasonEndTurn, Usage: p.usage}
+			if update := p.usageUpdate(); update != nil {
+				response.Meta = update.Meta
+			}
 			switch p.ended {
 			case "completed":
 				return response, nil
@@ -340,4 +357,22 @@ func cursorTurnError(screen, fallback string) error {
 		return acp.NewInternalError(map[string]any{"errorKind": "plan_upgrade_required", "message": "Cursor requires a plan upgrade for the selected model"})
 	}
 	return errors.New(fallback)
+}
+
+// usageUpdate 将已接收的 stop hook 消费独立交付，不把虚构零上下文展示为真实占用。
+func (p *turnProjection) usageUpdate() *acp.SessionUsageUpdate {
+	if p.usage == nil {
+		return nil
+	}
+	input, output := int64(p.usage.InputTokens), int64(p.usage.OutputTokens)
+	reported := acpmeta.TurnUsage{InputTokens: &input, OutputTokens: &output, Source: "cursor.stop_hook.usage", Coverage: "observed_requests"}
+	if p.usage.CachedReadTokens != nil {
+		value := int64(*p.usage.CachedReadTokens)
+		reported.CacheReadTokens = &value
+	}
+	if p.usage.CachedWriteTokens != nil {
+		value := int64(*p.usage.CachedWriteTokens)
+		reported.CacheWriteTokens = &value
+	}
+	return &acp.SessionUsageUpdate{Meta: acpmeta.WithTurnUsage(nil, reported)}
 }

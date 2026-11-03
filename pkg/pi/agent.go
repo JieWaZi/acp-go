@@ -94,6 +94,8 @@ type session struct {
 	generation uint64
 	// cancelled 表示宿主明确取消本轮。
 	cancelled bool
+	// reportedUsage 保存累计分类的字段缺失性和原生覆盖范围。
+	reportedUsage *acpmeta.TurnUsage
 	// usage 保存本次提示内各模型调用累计的真实用量。
 	usage *acp.Usage
 	// failure 保存协议、扩展和交付错误，不能由模型自动重试清除。
