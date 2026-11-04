@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,6 +24,7 @@ import (
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
+	"github.com/pelletier/go-toml/v2"
 )
 
 const (
@@ -51,6 +53,8 @@ type Options struct {
 	WorkingDirectory string
 	// Logger receives sanitized diagnostics.
 	Logger *slog.Logger
+	// StartupConfig fixes account-owned native configuration before authentication.
+	StartupConfig map[string]json.RawMessage
 	// ConfigOverrides contains native thread configuration overrides.
 	ConfigOverrides map[string]json.RawMessage
 	// DefaultModeRequestUserInput enables ordinary-mode questions when no setting overrides it.
@@ -214,7 +218,23 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		config[key] = bytes.Clone(value)
 	}
 	options.ConfigOverrides = config
-	args := append(slices.Clone(options.PrefixArgs), "app-server", "--listen", "stdio://")
+	args := slices.Clone(options.PrefixArgs)
+	for _, key := range slices.Sorted(maps.Keys(options.StartupConfig)) {
+		var value any
+		if key == "" || json.Unmarshal(options.StartupConfig[key], &value) != nil {
+			return nil, fmt.Errorf("invalid Codex startup configuration")
+		}
+		var encoded bytes.Buffer
+		if err := toml.NewEncoder(&encoded).SetTablesInline(true).Encode(map[string]any{"value": value}); err != nil {
+			return nil, fmt.Errorf("invalid Codex startup configuration")
+		}
+		_, literal, ok := strings.Cut(encoded.String(), "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid Codex startup configuration")
+		}
+		args = append(args, "-c", key+"="+strings.TrimSpace(literal))
+	}
+	args = append(args, "app-server", "--listen", "stdio://")
 	process, err := agentclient.NewProcess(agentclient.ProcessSpec{
 		Executable: options.Executable, Args: args, Dir: dir, Env: options.Environment,
 		Redact: func(record string) string {

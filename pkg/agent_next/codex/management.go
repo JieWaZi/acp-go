@@ -279,10 +279,10 @@ func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
 	return result, nil
 }
 
-// ChatGPTCredentialProof returns the native configuration root and a proof of
+// CredentialProof returns the native configuration root and a proof of
 // the selected credential without exposing its bearer to the host. Codex
 // 0.148.0 account/read has no principal identifier, so this uses getAuthStatus.
-func (c *Client) ChatGPTCredentialProof(ctx context.Context) (string, [sha256.Size]byte, error) {
+func (c *Client) CredentialProof(ctx context.Context, kind string) (string, [sha256.Size]byte, error) {
 	var empty [sha256.Size]byte
 	c.mu.Lock()
 	home, err := c.configHome, c.checkReadyLocked()
@@ -299,7 +299,14 @@ func (c *Client) ChatGPTCredentialProof(ctx context.Context) (string, [sha256.Si
 	if err := c.request(ctx, "getAuthStatus", map[string]bool{"includeToken": true, "refreshToken": false}, &reply); err != nil {
 		return "", empty, err
 	}
-	if reply.AuthMethod != "chatgpt" || reply.AuthToken == "" {
+	method := ""
+	switch kind {
+	case "account":
+		method = "chatgpt"
+	case "api_key":
+		method = "apikey"
+	}
+	if method == "" || reply.AuthMethod != method || reply.AuthToken == "" {
 		return "", empty, acp.NewAuthRequired(nil)
 	}
 	return home, sha256.Sum256([]byte(reply.AuthToken)), nil
