@@ -30,6 +30,8 @@ const (
 
 // OpenSettings carries native thread overrides.
 type OpenSettings struct {
+	// Mode sets the native permission policy from the moment the thread opens.
+	Mode string `json:"mode,omitempty"`
 	// Model is the exact requested model ID, or nil to inherit.
 	Model *string `json:"model,omitempty"`
 	// ReasoningEffort is the requested native reasoning effort, or nil to inherit.
@@ -258,7 +260,12 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
-	params := map[string]any{"cwd": input.cwd, "config": config, "approvalPolicy": "on-request", "sandbox": "workspace-write"}
+	mode := acp.SessionModeId(intent.Mode)
+	if mode == "" {
+		mode = "agent"
+	}
+	approval, sandbox, _ := codexModePolicy(mode, roots[1:])
+	params := map[string]any{"cwd": input.cwd, "config": config, "approvalPolicy": approval, "sandbox": sandbox}
 	if instructions != nil {
 		params["developerInstructions"] = *instructions
 	}
@@ -289,7 +296,7 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 			return acp.NewSessionResponse{}, err
 		}
 	}
-	s := &session{cwd: input.cwd, roots: roots[1:], mode: "agent", models: models, busy: true,
+	s := &session{cwd: input.cwd, roots: roots[1:], mode: mode, models: models, busy: true,
 		settings: SessionSettings{Requested: intent}, inputs: make(map[string]struct{}), mcpServers: make(map[string]bool)}
 	for key := range config {
 		if name, ok := strings.CutPrefix(key, "mcp_servers."); ok && name != "" {
@@ -472,19 +479,25 @@ func (s *session) turnParams() protocol.TurnStartParams {
 		ThreadID: string(s.id), Cwd: pointer(s.cwd), Model: s.settings.Requested.Model, Effort: s.settings.Requested.ReasoningEffort,
 		ServiceTier: s.settings.Requested.ServiceTier,
 	}
-	approval := protocol.OnRequest
-	sandbox := protocol.SandboxPolicy{Type: protocol.SandboxPolicyTypeWorkspaceWrite, WritableRoots: slices.Clone(s.roots), NetworkAccess: &protocol.NetworkAccessUnion{Bool: pointer(false)}}
-	switch s.mode {
-	case "read-only":
-		sandbox.Type = protocol.SandboxPolicyTypeReadOnly
-		sandbox.WritableRoots = nil
-	case "agent-full-access":
-		approval = protocol.Never
-		sandbox = protocol.SandboxPolicy{Type: protocol.SandboxPolicyTypeDangerFullAccess}
-	}
+	approval, _, sandbox := codexModePolicy(s.mode, s.roots)
 	p.ApprovalPolicy = &protocol.ApprovalPolicy{Enum: &approval}
 	p.SandboxPolicy = &sandbox
 	return p
+}
+
+func codexModePolicy(mode acp.SessionModeId, roots []string) (protocol.ApprovalPolicyEnum, string, protocol.SandboxPolicy) {
+	networkDisabled := &protocol.NetworkAccessUnion{Bool: pointer(false)}
+	switch mode {
+	case "read-only":
+		return protocol.OnRequest, "read-only", protocol.SandboxPolicy{Type: protocol.SandboxPolicyTypeReadOnly, NetworkAccess: networkDisabled}
+	case "agent-full-access":
+		return protocol.Never, "danger-full-access", protocol.SandboxPolicy{Type: protocol.SandboxPolicyTypeDangerFullAccess}
+	default:
+		return protocol.OnRequest, "workspace-write", protocol.SandboxPolicy{
+			Type: protocol.SandboxPolicyTypeWorkspaceWrite, WritableRoots: slices.Clone(roots),
+			NetworkAccess: networkDisabled, ExcludeTmpdirEnvVar: pointer(false), ExcludeSlashTmp: pointer(false),
+		}
+	}
 }
 
 func parseSettings(meta map[string]any) (OpenSettings, error) {
@@ -496,6 +509,9 @@ func parseSettings(meta map[string]any) (OpenSettings, error) {
 	data, err := json.Marshal(raw)
 	if err != nil || string(data) == "null" || json.Unmarshal(data, &settings) != nil {
 		return settings, acp.NewInvalidParams("invalid Codex open settings")
+	}
+	if settings.Mode != "" && settings.Mode != "read-only" && settings.Mode != "agent" && settings.Mode != "agent-full-access" {
+		return settings, acp.NewInvalidParams("invalid Codex permission mode")
 	}
 	if settings.Model != nil && *settings.Model == "" || settings.ReasoningEffort != nil && *settings.ReasoningEffort == "" {
 		return settings, acp.NewInvalidParams("model and reasoning effort cannot be empty")
@@ -880,6 +896,47 @@ func (c *Client) SetSessionConfigOption(_ context.Context, r acp.SetSessionConfi
 		return acp.SetSessionConfigOptionResponse{}, err
 	}
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: s.configOptions()}, nil
+}
+
+// ConfigureTurn replaces all requested selectors as one validated intent for the next turn.
+func (c *Client) ConfigureTurn(_ context.Context, id acp.SessionId, model, effort string, fast *bool) ([]acp.SessionConfigOption, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, err := c.idleSessionLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	target := model
+	if target == "" {
+		target = value(s.settings.Observed.Model)
+	}
+	catalog := lookupModel(s.models, target)
+	if model != "" && catalog == nil && model != value(s.settings.Observed.Model) {
+		return nil, acp.NewInvalidParams("Codex model is unavailable")
+	}
+	var settings OpenSettings
+	if model != "" {
+		settings.Model = pointer(model)
+	}
+	if effort != "" {
+		if !supportsEffort(catalog, effort) {
+			return nil, acp.NewInvalidParams("Codex reasoning effort is unavailable for the model")
+		}
+		settings.ReasoningEffort = pointer(effort)
+	}
+	if fast != nil {
+		tier := fastTier(catalog)
+		if tier == "" {
+			return nil, acp.NewInvalidParams("Codex Fast is unavailable for the model")
+		}
+		if *fast {
+			settings.ServiceTier = protocol.NewOptionalValue(tier)
+		} else {
+			settings.ServiceTier = protocol.NewOptionalNull[string]()
+		}
+	}
+	s.settings.Requested = settings
+	return s.configOptions(), nil
 }
 
 func (s *session) currentModel() string {

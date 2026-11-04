@@ -1413,3 +1413,95 @@ func TestUsageDipOptionalCounterCanAdvanceFromDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigureTurnReplacesCodexIntentAtomically(t *testing.T) {
+	c, ctx, session, _ := newFixture(t, "management", agentclient.HostCallbacks{})
+	on, off := true, false
+	if _, err := c.ConfigureTurn(ctx, session, "actual-model", "high", &on); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ConfigureTurn(ctx, session, "legacy-model", "high", &off); err == nil {
+		t.Fatal("accepted an effort absent from the target model")
+	}
+	settings, err := c.ReadSessionSettings(ctx, session)
+	tier, present := settings.Requested.ServiceTier.Value()
+	if err != nil || !present || tier != "priority-a" || settings.Observed.ServiceTier.IsPresent() {
+		t.Fatalf("invalid edit changed settings: %+v %v", settings, err)
+	}
+	if _, err := c.ConfigureTurn(ctx, session, "legacy-model", "", &off); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = c.ReadSessionSettings(ctx, session)
+	if err != nil || settings.Requested.ReasoningEffort != nil || !settings.Requested.ServiceTier.IsNull() {
+		t.Fatalf("incompatible old effort or tier survived: %+v %v", settings, err)
+	}
+	if _, err := c.ConfigureTurn(ctx, session, "legacy-model", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = c.ReadSessionSettings(ctx, session)
+	if err != nil || settings.Requested.ServiceTier.IsPresent() {
+		t.Fatalf("inherit retained an explicit tier: %+v %v", settings, err)
+	}
+}
+
+func TestCodexPermissionModeKeepsThreadAndTurnPoliciesAligned(t *testing.T) {
+	for _, tc := range []struct {
+		// mode is the host's exact permission choice.
+		mode string
+		// openSandbox is the thread/start sandbox enum.
+		openSandbox string
+		// turnSandbox is the turn/start sandbox object discriminator.
+		turnSandbox string
+		// approval is the native policy at both boundaries.
+		approval string
+	}{
+		{"read-only", "read-only", "readOnly", "on-request"},
+		{"agent", "workspace-write", "workspaceWrite", "on-request"},
+		{"agent-full-access", "danger-full-access", "dangerFullAccess", "never"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			c, ctx, id, trace := newFixture(t, "normal", agentclient.HostCallbacks{})
+			if _, err := c.CloseSession(ctx, acp.CloseSessionRequest{SessionId: id}); err != nil {
+				t.Fatal(err)
+			}
+			session, err := c.NewSession(ctx, acp.NewSessionRequest{Cwd: filepath.Dir(trace),
+				Meta: codex.OpenSettingsMetadata(codex.OpenSettings{Mode: tc.mode})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := reserve(t, c, ctx, session.SessionId, agentclient.PromptOptions{})()
+			if result.Outcome == nil || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+				t.Fatalf("turn did not complete: %+v", result)
+			}
+			file, err := os.Open(trace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			var opened, prompted map[string]any
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				var frame struct {
+					// Method identifies the actual App Server call.
+					Method string
+					// Params carries the serialized policy.
+					Params map[string]any
+				}
+				if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+					t.Fatal(err)
+				}
+				switch frame.Method {
+				case "thread/start":
+					opened = frame.Params
+				case "turn/start":
+					prompted = frame.Params
+				}
+			}
+			sandbox, _ := prompted["sandboxPolicy"].(map[string]any)
+			if opened["sandbox"] != tc.openSandbox || opened["approvalPolicy"] != tc.approval ||
+				sandbox["type"] != tc.turnSandbox || prompted["approvalPolicy"] != tc.approval {
+				t.Fatalf("thread and turn policies diverged: open=%v turn=%v", opened, prompted)
+			}
+		})
+	}
+}

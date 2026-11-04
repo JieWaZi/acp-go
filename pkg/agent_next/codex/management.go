@@ -29,7 +29,7 @@ func (c *Client) readModelPages(ctx context.Context) ([]protocol.ModelListRespon
 	models := make([]protocol.ModelListResponseDatum, 0)
 	seenIDs := make(map[string]bool)
 	seenCursors := make(map[string]bool)
-	params := protocol.ModelListParams{Limit: pointer(int64(100))}
+	params := protocol.ModelListParams{Limit: pointer(int64(100)), IncludeHidden: pointer(true)}
 	for page := 0; page < 100; page++ {
 		var reply protocol.ModelListResponse
 		if err := c.request(ctx, "model/list", params, &reply); err != nil {
@@ -37,7 +37,7 @@ func (c *Client) readModelPages(ctx context.Context) ([]protocol.ModelListRespon
 		}
 		for _, model := range reply.Data {
 			id := modelID(model)
-			if id != "" && !model.Hidden && !seenIDs[id] {
+			if id != "" && !seenIDs[id] {
 				models = append(models, model)
 				seenIDs[id] = true
 			}
@@ -96,11 +96,14 @@ func modelChoice(model protocol.ModelListResponseDatum) acp.SessionConfigSelectO
 		name = id
 	}
 	meta := map[string]any{}
-	for _, tier := range modelTiers(&model) {
-		if strings.EqualFold(strings.TrimSpace(tier.Name), "fast") {
-			meta[fastServiceTierKey] = tier.ID
-			break
-		}
+	if tier := fastTier(&model); tier != "" {
+		meta[fastServiceTierKey] = tier
+	}
+	if len(model.InputModalities) != 0 {
+		meta[modelInputsKey] = slices.Clone(model.InputModalities)
+	}
+	if model.DefaultServiceTier != nil {
+		meta[defaultServiceTierKey] = *model.DefaultServiceTier
 	}
 	settings := make([]acp.SessionConfigOption, 0, 2)
 	if efforts := effortChoices(&model); len(efforts) > 0 {
@@ -110,6 +113,34 @@ func modelChoice(model protocol.ModelListResponseDatum) acp.SessionConfigSelectO
 		settings = append(settings, selectOption("service_tier", "Service tier", "", "inherit", tiers))
 	}
 	return acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(id), Name: name, Description: optionalText(model.Description), Meta: acpmeta.WithModelConfigOptions(meta, settings)}
+}
+
+const (
+	modelInputsKey        = "codex/model-inputs"
+	defaultServiceTierKey = "codex/default-service-tier"
+)
+
+// ModelNativeMetadata returns facts that are reported only in the Codex catalog.
+func ModelNativeMetadata(meta map[string]any) ([]string, *string) {
+	var inputs []string
+	if raw, ok := meta[modelInputsKey].([]protocol.InputModalityElement); ok {
+		for _, input := range raw {
+			inputs = append(inputs, string(input))
+		}
+	}
+	if tier, ok := meta[defaultServiceTierKey].(string); ok {
+		return inputs, &tier
+	}
+	return inputs, nil
+}
+
+func fastTier(model *protocol.ModelListResponseDatum) string {
+	for _, tier := range modelTiers(model) {
+		if tier.ID != "" && strings.EqualFold(strings.TrimSpace(tier.Name), "fast") {
+			return tier.ID
+		}
+	}
+	return ""
 }
 
 func modelTiers(model *protocol.ModelListResponseDatum) []protocol.ServiceTierElement {
