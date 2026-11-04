@@ -283,7 +283,7 @@ func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
 		if isUUID(status.OrganizationID) {
 			result.OrganizationID = strings.ToLower(status.OrganizationID)
 			if !c.accountUsesEnvironment() && status.Email != nil && *status.Email != "" {
-				result.AccountID = c.subscriptionAccountID(result.OrganizationID, *status.Email)
+				result.AccountID = c.subscriptionAccountID(result.OrganizationID, *status.Email, runtime.GOOS)
 			}
 		}
 	case status.Method == "apiKey" || status.Method == "api_key" || status.Method == "anthropicConsole":
@@ -305,16 +305,21 @@ func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
 // subscriptionAccountID complements the native status's orgId with its
 // persisted OAuth account UUID. CLI 2.1.159 and 2.1.309 use .claude.json;
 // the older build first checks the account directory's legacy .config.json.
-func (c *Client) subscriptionAccountID(orgID, email string) string {
+func (c *Client) subscriptionAccountID(orgID, email, platform string) string {
 	config := c.environment("CLAUDE_CONFIG_DIR")
-	home := firstString(c.environment("HOME"), c.environment("USERPROFILE"))
+	home := config
 	if config == "" {
+		// Claude uses os.homedir() to find its system metadata. A shell's
+		// HOME on Windows does not replace the native USERPROFILE root.
+		key := "HOME"
+		if platform == "windows" {
+			key = "USERPROFILE"
+		}
+		home = c.environment(key)
 		if home == "" {
 			return ""
 		}
 		config = filepath.Join(home, ".claude")
-	} else {
-		home = config
 	}
 	if !filepath.IsAbs(config) {
 		config = filepath.Join(c.options.WorkingDirectory, config)

@@ -464,7 +464,9 @@ func (s *session) configure(ctx context.Context, id, value string) error {
 		if value := decodeOptional[protocol.SettingsControlResponse](raw); value != nil {
 			s.mu.Lock()
 			s.settings.observe(*value)
-			if selectedAlias != "" {
+			// An unchanged concrete model cannot prove a different alias
+			// took effect on an older CLI without resolvedModel.
+			if selectedAlias != "" && (selectedAlias == before.modelAlias || s.settings.model.observed != before.model.observed) {
 				s.settings.bindLegacyModel(selectedAlias, *value)
 			}
 			s.mu.Unlock()

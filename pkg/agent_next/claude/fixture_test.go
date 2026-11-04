@@ -79,7 +79,7 @@ func TestClaudeFixture(t *testing.T) {
 	}
 	f.input = bufio.NewReader(os.Stdin)
 	f.model = "sonnet"
-	if f.mode == "legacy-model-aliases" {
+	if strings.HasPrefix(f.mode, "legacy-model-") {
 		f.model = "claude-opus-4-8[1m]"
 		if os.Getenv("ANTHROPIC_MODEL") == "sonnet" {
 			f.model = "claude-sonnet-4-6"
@@ -246,7 +246,7 @@ func (f *fixture) control(frame fixtureFrame) {
 			{"value": "sonnet", "displayName": "Sonnet", "supportsEffort": true, "supportedEffortLevels": []string{"low", "high"}, "supportsFastMode": true},
 			{"value": "opus", "displayName": "Opus", "supportsEffort": false, "supportsFastMode": false},
 		}}
-		if f.mode == "legacy-model-aliases" {
+		if strings.HasPrefix(f.mode, "legacy-model-") {
 			response.(map[string]any)["fast_mode_disabled_reason"] = "extra_usage_disabled"
 			response.(map[string]any)["models"] = []map[string]any{
 				{"value": "default", "displayName": "Default (recommended)", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "xhigh", "max"}, "supportsFastMode": true},
@@ -275,8 +275,11 @@ func (f *fixture) control(frame fixtureFrame) {
 		}
 		response = map[string]any{"applied": map[string]any{"model": f.model, "effort": f.settings["effortLevel"]}, "effective": effective}
 	case "set_model":
+		if f.mode == "legacy-model-stale-ack" {
+			break
+		}
 		f.model = frame.Request.Model
-		if f.mode == "legacy-model-aliases" {
+		if strings.HasPrefix(f.mode, "legacy-model-") {
 			switch f.model {
 			case "default":
 				f.model = "claude-opus-4-8[1m]"

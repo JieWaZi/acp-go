@@ -312,3 +312,30 @@ func TestModelCatalogExposesNativeAutomaticPermissionSupport(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyClaudeModelACKDoesNotRelabelUnchangedModel(t *testing.T) {
+	client, dir, ctx := startClientMode(t, agentclient.HostCallbacks{}, "legacy-model-stale-ack", func(o *claude.Options) {
+		o.Environment = append(o.Environment, "ANTHROPIC_MODEL=")
+	})
+	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		SessionId: session.SessionId, ConfigId: "model", Value: "sonnet",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range reply.ConfigOptions {
+		if model := option.Select; model != nil && model.Id == "model" {
+			evidence, _ := model.Meta["claude.configuration"].(map[string]any)
+			if model.CurrentValue != "claude-opus-4-8[1m]" || evidence["requested"] != "sonnet" ||
+				evidence["acknowledged"] != "sonnet" || evidence["observed"] != "claude-opus-4-8[1m]" {
+				t.Fatalf("unchanged effective model was relabeled: selected=%s evidence=%+v", model.CurrentValue, evidence)
+			}
+			return
+		}
+	}
+	t.Fatal("missing effective model receipt")
+}
