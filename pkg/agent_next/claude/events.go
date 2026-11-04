@@ -45,7 +45,9 @@ func (s *session) receive(frame protocol.Message) {
 		}
 	case *protocol.ConversationResetMessage:
 		if m.SessionID == string(s.id) && isUUID(m.UUID) && isUUID(m.NewConversationID) {
-			s.counters.reset(m.NewConversationID)
+			if !s.counters.reset(m.UUID, m.NewConversationID) {
+				s.faultAndStopLocked(errors.New("Claude native conversation reset capacity exhausted"))
+			}
 		}
 	case *protocol.ResultMessage:
 		if s.matches(m.SessionID) {

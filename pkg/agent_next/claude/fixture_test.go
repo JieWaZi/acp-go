@@ -344,6 +344,53 @@ func (f *fixture) user(frame fixtureFrame) {
 			"resume_reason": "interrupted_turn", "user_message_uuid": frame.UUID, "user_message_uuids": []string{frame.UUID},
 			"result": "new provider answer", "usage": map[string]any{"input_tokens": 17, "output_tokens": 4}})
 		f.mark("emitted-rerun", "true")
+	case "closure-reset-capacity":
+		if f.index == 1 {
+			// One more unique reset than the native stream history can hold.
+			for n := range 16385 {
+				id := fmt.Sprintf("00000000-0000-4000-8000-%012x", n)
+				f.emit(map[string]any{"type": "conversation_reset", "new_conversation_id": id, "uuid": id})
+			}
+		}
+		f.result(frame.UUID, "ordinary result", "")
+	case "closure-missing-report", "closure-missing-components", "closure-missing-model", "closure-number-gap", "closure-late-reset-replay":
+		mode := f.mode
+		index := f.index
+		input, output, cost := 100, 50, "1.0"
+		if mode == "closure-late-reset-replay" {
+			input, output, cost = []int{100, 80, 70, 90}[f.index], []int{50, 40, 35, 45}[f.index], []string{"1.0", "0.8", "0.7", "0.9"}[f.index]
+			epochs := []string{"", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+			if epoch := epochs[f.index]; epoch != "" {
+				f.emit(map[string]any{"type": "conversation_reset", "new_conversation_id": epoch, "uuid": epoch, "trigger": "clear"})
+			}
+		} else if mode == "closure-number-gap" {
+			input, output, cost = []int{100, 80, 110, 120}[f.index], []int{50, 40, 55, 60}[f.index], []string{"1.0", "0.8", "1.1", "1.2"}[f.index]
+			if index > 0 {
+				index++
+			}
+		} else {
+			input, output, cost = []int{100, 90, 80, 110, 120}[f.index], []int{50, 45, 40, 55, 60}[f.index], []string{"1.0", "0.9", "0.8", "1.1", "1.2"}[f.index]
+		}
+		row := map[string]any{"inputTokens": input, "outputTokens": output, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "costUSD": json.Number(cost)}
+		result := map[string]any{"type": "result", "subtype": "success", "uuid": fmt.Sprintf("closure-%d", index),
+			"result_index": index, "user_message_uuid": frame.UUID, "usage": map[string]any{"input_tokens": 7, "output_tokens": 4},
+			"modelUsage": map[string]any{"sonnet": row}, "total_cost_usd": json.Number(cost)}
+		if f.index == 1 && mode == "closure-missing-report" {
+			delete(result, "modelUsage")
+			delete(result, "total_cost_usd")
+		}
+		if f.index == 1 && mode == "closure-missing-components" {
+			delete(row, "inputTokens")
+			delete(row, "outputTokens")
+			delete(row, "costUSD")
+		}
+		if f.index == 1 && mode == "closure-missing-model" {
+			result["modelUsage"] = map[string]any{
+				"opus": map[string]any{"inputTokens": 9, "outputTokens": 3, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
+			}
+		}
+		f.emit(result)
+		f.index++
 	case "pipeline-dip", "pipeline-token-dip", "pipeline-reset", "pipeline-system-reset":
 		if f.mode == "pipeline-reset" && f.index > 0 {
 			f.emit(map[string]any{"type": "conversation_reset", "new_conversation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",

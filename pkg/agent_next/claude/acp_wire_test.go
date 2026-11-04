@@ -639,3 +639,99 @@ func TestACPWirePipelineUsageKeepsHighWaterUntilNativeReset(t *testing.T) {
 		})
 	}
 }
+
+func TestCounterBoundaryRetainsFloorWithoutAttributingGap(t *testing.T) {
+	for _, tc := range []struct {
+		mode      string
+		resumeAt  int
+		queryCost bool
+	}{
+		{"closure-missing-report", 4, false},
+		{"closure-missing-components", 4, true},
+		{"closure-missing-model", 4, true},
+		{"closure-number-gap", 3, false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			peer, id, _, ctx := startACP(t, tc.mode, nil, nil)
+			for i := 0; i <= tc.resumeAt; i++ {
+				u := readPromptUsage(t, peer, id, ctx)
+				switch i {
+				case tc.resumeAt - 1:
+					if u.Coverage != "main_loop" || u.InputTokens == nil || *u.InputTokens != 7 ||
+						u.OutputTokens == nil || *u.OutputTokens != 4 {
+						t.Fatalf("uncertain interval replaced known main-loop usage: %+v", u)
+					}
+					for _, observation := range u.Observations {
+						if row := observation.Models["sonnet"]; observation.Complete || row.InputTokens != nil || row.OutputTokens != nil || row.Cost != nil {
+							t.Fatalf("uncertain interval appeared in pipeline evidence: %+v", observation)
+						}
+					}
+					if tc.queryCost {
+						if u.Cost == nil || string(u.Cost.Amount) != "0.100000000000000000" {
+							t.Fatalf("independently adjacent query cost lost: %+v", u.Cost)
+						}
+					} else if u.Cost != nil {
+						t.Fatalf("uncertain query cost was attributed: %+v", u.Cost)
+					}
+				case tc.resumeAt:
+					row := u.Models["sonnet"]
+					for _, observation := range u.Observations {
+						if observation.Coverage == "query_pipeline" {
+							row = observation.Models["sonnet"]
+						}
+					}
+					if row.InputTokens == nil || *row.InputTokens != 10 || row.OutputTokens == nil || *row.OutputTokens != 5 ||
+						row.Cost == nil || string(row.Cost.Amount) != "0.100000000000000000" ||
+						u.Cost == nil || string(u.Cost.Amount) != "0.100000000000000000" {
+						t.Fatalf("adjacent usage did not resume: usage=%+v model=%+v", u, row)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCounterBoundaryCannotReplayAnOlderReset(t *testing.T) {
+	peer, id, _, ctx := startACP(t, "closure-late-reset-replay", nil, nil)
+	for i, expected := range []struct {
+		input, output int64
+		cost          string
+	}{
+		{100, 50, "1.000000000000000000"},
+		{80, 40, "0.800000000000000000"},
+		{70, 35, "0.700000000000000000"},
+		{20, 10, "0.200000000000000000"},
+	} {
+		u := readPromptUsage(t, peer, id, ctx)
+		if u.Coverage != "query_pipeline" || !u.Complete || u.InputTokens == nil || *u.InputTokens != expected.input ||
+			u.OutputTokens == nil || *u.OutputTokens != expected.output || u.Cost == nil || string(u.Cost.Amount) != expected.cost {
+			t.Fatalf("turn %d usage = %+v", i, u)
+		}
+	}
+}
+
+func TestCounterBoundaryFailsClosedWhenResetHistoryIsFull(t *testing.T) {
+	c, _, ctx := startMode(t, agentclient.HostCallbacks{}, "closure-reset-capacity", nil)
+	initial := receive(t, ctx, launchPrompt(t, c, ctx, "baseline"))
+	if initial.Outcome == nil || initial.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+		t.Fatalf("baseline outcome = %+v", initial)
+	}
+	over := receive(t, ctx, launchPrompt(t, c, ctx, "overflow"))
+	if over.Outcome != nil || over.Receipt.OperationError == nil ||
+		!strings.Contains(over.Receipt.OperationError.Error(), "conversation reset capacity exhausted") {
+		t.Fatalf("reset capacity result = %+v", over)
+	}
+}
+
+func readPromptUsage(t *testing.T, peer *acp.ClientSideConnection, id acp.SessionId, ctx context.Context) *acpmeta.TurnUsage {
+	t.Helper()
+	reply, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("query")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, ok := acpmeta.ReadNativeTurn(reply.Meta)
+	if !ok || turn.Usage == nil {
+		t.Fatalf("missing usage: %+v", turn)
+	}
+	return turn.Usage
+}

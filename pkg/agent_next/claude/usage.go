@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"cmp"
 	"encoding/json"
 	"math"
 	"math/big"
@@ -22,32 +23,104 @@ type requestUsage struct {
 	counters acpmeta.ModelUsage
 }
 
+// cumulativeCounter keeps the epoch floor independently of the evidence that
+// the next report can be differenced against it for an individual invocation.
+type cumulativeCounter[T any] struct {
+	high     T
+	known    bool
+	adjacent bool
+}
+
+// advance never lowers the floor. After a gap only a sample at or above the
+// floor establishes an adjacent boundary, and that sample has no turn delta.
+func (c *cumulativeCounter[T]) advance(sample T, compare func(T, T) int) (T, bool) {
+	before := c.high
+	if c.known && compare(sample, before) < 0 {
+		return before, false
+	}
+	attributable := c.known && c.adjacent
+	c.high, c.known, c.adjacent = sample, true, true
+	return before, attributable
+}
+
+type modelCounters struct {
+	input, output, read, write, thinking cumulativeCounter[int64]
+	cost                                 cumulativeCounter[*big.Rat]
+	costBasis                            *string
+}
+
+func newModelCounters(fromZero bool) *modelCounters {
+	zero := cumulativeCounter[int64]{known: fromZero, adjacent: fromZero}
+	m := &modelCounters{input: zero, output: zero, read: zero, write: zero, thinking: zero}
+	if fromZero {
+		m.cost = cumulativeCounter[*big.Rat]{high: new(big.Rat), known: true, adjacent: true}
+	}
+	return m
+}
+
+func (m *modelCounters) breakContinuity() {
+	m.input.adjacent, m.output.adjacent = false, false
+	m.read.adjacent, m.write.adjacent = false, false
+	m.thinking.adjacent, m.cost.adjacent = false, false
+}
+
 type queryCounters struct {
-	// models holds adjacent per-model high-water marks, or nil across a reporting gap.
-	models map[string]protocol.ModelUsage
-	// cost holds the independent query estimate high-water mark.
-	cost *json.Number
-	// conversationID identifies the latest confirmed native reset in this stream.
-	conversationID string
+	// Model floors remain present even when a report omits them. A new model
+	// may start at zero only when the preceding model report was observed.
+	models         map[string]*modelCounters
+	modelsAdjacent bool
+	cost           cumulativeCounter[*big.Rat]
+	// Reset identities span all epochs of this native stream.
+	resetEvents        map[string]struct{}
+	resetConversations map[string]struct{}
 }
 
 func newQueryCounters(resume bool) queryCounters {
-	if resume {
-		return queryCounters{}
+	var q queryCounters
+	if !resume {
+		q.startEpoch()
 	}
-	return queryCounters{models: make(map[string]protocol.ModelUsage), cost: acp.Ptr(json.Number("0"))}
+	return q
+}
+
+func (q *queryCounters) startEpoch() {
+	q.models = nil
+	q.modelsAdjacent = true
+	q.cost = cumulativeCounter[*big.Rat]{high: new(big.Rat), known: true, adjacent: true}
+}
+
+func (q *queryCounters) breakModelContinuity() {
+	q.modelsAdjacent = false
+	for _, model := range q.models {
+		model.breakContinuity()
+	}
 }
 
 func (q *queryCounters) breakContinuity() {
-	q.models, q.cost = nil, nil
+	q.breakModelContinuity()
+	q.cost.adjacent = false
 }
 
-func (q *queryCounters) reset(conversationID string) {
-	if conversationID == q.conversationID {
-		return
+// reset applies each validated native boundary once for this stream.
+// It reports exhaustion so the session can fail closed without forgetting IDs.
+func (q *queryCounters) reset(eventID, conversationID string) bool {
+	eventID, conversationID = strings.ToLower(eventID), strings.ToLower(conversationID)
+	_, seenEvent := q.resetEvents[eventID]
+	_, seenConversation := q.resetConversations[conversationID]
+	if seenEvent || seenConversation {
+		return true
 	}
-	*q = newQueryCounters(false)
-	q.conversationID = conversationID
+	if len(q.resetEvents) >= maxRememberedIDs {
+		return false
+	}
+	if q.resetEvents == nil {
+		q.resetEvents = make(map[string]struct{})
+		q.resetConversations = make(map[string]struct{})
+	}
+	q.resetEvents[eventID] = struct{}{}
+	q.resetConversations[conversationID] = struct{}{}
+	q.startEpoch()
+	return true
 }
 
 func nonnegative(value int64) *int64 {
@@ -184,9 +257,8 @@ func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, r
 	}
 	// A missing or zeroized report breaks adjacency for that counter alone.
 	// The next usable report seeds a new boundary without claiming the gap.
-	models, nextModelBoundary := modelDeltas(q.models, modelReport)
-	cost, nextCostBoundary := advanceCost(q.cost, costReport)
-	q.models, q.cost = nextModelBoundary, nextCostBoundary
+	models := q.modelDeltas(modelReport)
+	cost := observeCost(&q.cost, costReport)
 
 	var observations []acpmeta.UsageObservation
 	if models != nil {
@@ -253,105 +325,112 @@ func zeroPipeline(rows map[string]protocol.ModelUsage) bool {
 	return true
 }
 
-func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]acpmeta.ModelUsage, map[string]protocol.ModelUsage) {
-	if previous == nil || current == nil {
-		return nil, current
+func (q *queryCounters) modelDeltas(report map[string]protocol.ModelUsage) map[string]acpmeta.ModelUsage {
+	if report == nil {
+		q.breakModelContinuity()
+		return nil
 	}
-	rows := make(map[string]acpmeta.ModelUsage, len(current))
-	next := make(map[string]protocol.ModelUsage, len(current))
-	for model := range previous {
-		if _, exists := current[model]; !exists {
-			if len(current)+len(next) >= maxUsageRows {
-				// Dropping a missing model's history would turn its next
-				// appearance into a false delta from zero.
-				return nil, nil
-			}
-			next[model] = protocol.ModelUsage{}
-			rows[model] = acpmeta.ModelUsage{}
+	count := len(q.models)
+	for id := range report {
+		if q.models[id] == nil {
+			count++
+		}
+		if id == "" || count > maxUsageRows {
+			// Preserve the epoch floors even if this frame cannot be
+			// reconciled within the bounded model registry.
+			q.breakModelContinuity()
+			return nil
 		}
 	}
-	for model, to := range current {
-		from, had := previous[model]
-		if model == "" {
-			return nil, nil
+	rows := make(map[string]acpmeta.ModelUsage, count)
+	for id, model := range q.models {
+		if _, exists := report[id]; !exists {
+			model.breakContinuity()
+			rows[id] = acpmeta.ModelUsage{}
 		}
-		advance := func(key string, before int64, after *int64) *int64 {
-			if !to.KnownCounters[key] || had && !from.KnownCounters[key] {
-				return nil
-			}
-			delta, high := advanceCounter(before, *after)
-			*after = high
-			return delta
-		}
-		row := acpmeta.ModelUsage{
-			InputTokens:      advance("input", from.InputTokens, &to.InputTokens),
-			OutputTokens:     advance("output", from.OutputTokens, &to.OutputTokens),
-			CacheReadTokens:  advance("read", from.CacheReadInputTokens, &to.CacheReadInputTokens),
-			CacheWriteTokens: advance("write", from.CacheCreationInputTokens, &to.CacheCreationInputTokens),
-		}
-		if to.ThinkingTokens != nil && (!had || from.ThinkingTokens != nil) {
-			var baseline int64
-			if had {
-				baseline = *from.ThinkingTokens
-			}
-			delta, high := advanceCounter(baseline, *to.ThinkingTokens)
-			row.ReasoningTokens = delta
-			if high != *to.ThinkingTokens {
-				to.ThinkingTokens = acp.Ptr(high)
-			}
-			if row.ReasoningTokens != nil && (row.OutputTokens == nil || *row.ReasoningTokens > *row.OutputTokens) {
-				row.ReasoningTokens = nil
-			}
-		}
-		if !had {
-			from.CostUSD = acp.Ptr(json.Number("0"))
-		} else if from.CostBasis != to.CostBasis {
-			from.CostUSD = nil
-		}
-		row.Cost, to.CostUSD = advanceCost(from.CostUSD, to.CostUSD)
-		rows[model] = row
-		next[model] = to
 	}
-	return rows, next
+	if q.models == nil && len(report) > 0 {
+		q.models = make(map[string]*modelCounters, len(report))
+	}
+	for id, sample := range report {
+		model := q.models[id]
+		if model == nil {
+			model = newModelCounters(q.modelsAdjacent)
+			q.models[id] = model
+		}
+		rows[id] = model.observe(sample)
+	}
+	wasAdjacent := q.modelsAdjacent
+	q.modelsAdjacent = true
+	if len(rows) == 0 && !wasAdjacent {
+		return nil
+	}
+	return rows
 }
 
-// A lower cumulative sample has no attributable delta within the same epoch.
-func advanceCounter(from, to int64) (*int64, int64) {
-	if to < from {
-		return nil, from
+func (m *modelCounters) observe(sample protocol.ModelUsage) acpmeta.ModelUsage {
+	row := acpmeta.ModelUsage{
+		InputTokens:      observeTokens(&m.input, sample.InputTokens, sample.KnownCounters["input"]),
+		OutputTokens:     observeTokens(&m.output, sample.OutputTokens, sample.KnownCounters["output"]),
+		CacheReadTokens:  observeTokens(&m.read, sample.CacheReadInputTokens, sample.KnownCounters["read"]),
+		CacheWriteTokens: observeTokens(&m.write, sample.CacheCreationInputTokens, sample.KnownCounters["write"]),
 	}
-	if from < 0 {
-		return nil, to
+	if sample.ThinkingTokens != nil {
+		reasoning := observeTokens(&m.thinking, *sample.ThinkingTokens, true)
+		if reasoning != nil && row.OutputTokens != nil && *reasoning <= *row.OutputTokens {
+			row.ReasoningTokens = reasoning
+		}
+	} else {
+		m.thinking.adjacent = false
 	}
-	return acp.Ptr(to - from), to
+	if m.costBasis == nil {
+		m.costBasis = acp.Ptr(sample.CostBasis)
+	} else if *m.costBasis != sample.CostBasis {
+		m.cost.adjacent = false
+		*m.costBasis = sample.CostBasis
+	}
+	row.Cost = observeCost(&m.cost, sample.CostUSD)
+	return row
 }
 
-func advanceCost(previous, current *json.Number) (*acpmeta.UsageCost, *json.Number) {
+func observeTokens(counter *cumulativeCounter[int64], sample int64, present bool) *int64 {
+	if !present || sample < 0 {
+		counter.adjacent = false
+		return nil
+	}
+	before, attributable := counter.advance(sample, cmp.Compare[int64])
+	if !attributable {
+		return nil
+	}
+	return acp.Ptr(sample - before)
+}
+
+func parseCumulativeCost(n *json.Number) *big.Rat {
 	// Bound exponent magnitude before parsing decimal estimates.
-	parse := func(n *json.Number) *big.Rat {
-		if n == nil || len(*n) > 32 {
-			return nil
-		}
-		f, err := n.Float64()
-		if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f == 0 && strings.ContainsAny(string(*n), "eE") {
-			return nil
-		}
-		r, ok := new(big.Rat).SetString(string(*n))
-		if !ok {
-			return nil
-		}
-		return r
+	if n == nil || len(*n) > 32 {
+		return nil
 	}
-	from, to := parse(previous), parse(current)
-	if to == nil {
-		return nil, nil
+	f, err := n.Float64()
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f == 0 && strings.ContainsAny(string(*n), "eE") {
+		return nil
 	}
-	if from == nil {
-		return nil, current
+	r, ok := new(big.Rat).SetString(string(*n))
+	if !ok {
+		return nil
 	}
-	if to.Cmp(from) < 0 {
-		return nil, previous
+	return r
+}
+
+func observeCost(counter *cumulativeCounter[*big.Rat], raw *json.Number) *acpmeta.UsageCost {
+	sample := parseCumulativeCost(raw)
+	if sample == nil {
+		counter.adjacent = false
+		return nil
 	}
-	diff := to.Sub(to, from)
-	return &acpmeta.UsageCost{Amount: json.Number(diff.FloatString(18)), Currency: "USD", Source: "claude.result.cost", Scope: queryCoverage, Aggregation: "turn_delta", Valuation: "estimated"}, current
+	before, attributable := counter.advance(sample, (*big.Rat).Cmp)
+	if !attributable {
+		return nil
+	}
+	diff := new(big.Rat).Sub(sample, before)
+	return &acpmeta.UsageCost{Amount: json.Number(diff.FloatString(18)), Currency: "USD", Source: "claude.result.cost", Scope: queryCoverage, Aggregation: "turn_delta", Valuation: "estimated"}
 }
