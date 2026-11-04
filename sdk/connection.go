@@ -627,7 +627,7 @@ func (c *Connection) shutdownReceive(cause error, unqueued *queuedNotification) 
 	// captured operation whose continuation could not be queued.
 	c.cancel(cause)
 	if unqueued != nil && unqueued.run != nil {
-		go c.handleInbound(c.ctx, unqueued.msg, unqueued.run)
+		go c.handleInbound(c.ctx, unqueued.msg, unqueued.run, nil)
 	}
 	c.closeTransport()
 
@@ -658,7 +658,7 @@ func (c *Connection) shutdownReceive(cause error, unqueued *queuedNotification) 
 // It terminates when notificationQueue is closed (e.g. on disconnect in receive()).
 func (c *Connection) processNotifications() {
 	for queued := range c.notificationQueue {
-		c.handleInbound(c.inboundCtx, queued.msg, queued.run)
+		c.handleInbound(c.inboundCtx, queued.msg, queued.run, nil)
 
 		c.notifyMu.Lock()
 		// Requests and responses also consume sequence numbers on the reader.
@@ -809,7 +809,7 @@ func (c *Connection) admitInboundRequest(msg *anyMessage, idKey string, sequence
 
 	var run inboundContinuation
 	if !valid {
-		// Own the ID until this rejection is sent, without running business capture.
+		// Hold the ID through write admission of the rejection, without business capture.
 		run = completeInbound(NewInvalidRequest(nil))
 	} else {
 		run = c.prepareMethod(reqCtx, msg)
@@ -823,16 +823,19 @@ func (c *Connection) admitInboundRequest(msg *anyMessage, idKey string, sequence
 			}
 		}
 	}
+	retire := func() {
+		c.mu.Lock()
+		if c.inflight[idKey] == owner {
+			delete(c.inflight, idKey)
+		}
+		c.mu.Unlock()
+	}
 	go func() {
 		defer func() {
-			c.mu.Lock()
-			if c.inflight[idKey] == owner {
-				delete(c.inflight, idKey)
-			}
-			c.mu.Unlock()
+			retire()
 			cancel(nil)
 		}()
-		c.handleInbound(reqCtx, msg, run)
+		c.handleInbound(reqCtx, msg, run, retire)
 	}()
 }
 
@@ -918,7 +921,7 @@ func (c *Connection) prepareNotificationDispatch(msg *anyMessage) inboundContinu
 		return result, err
 	}
 	stop := context.AfterFunc(c.inboundCtx, func() {
-		c.handleInbound(c.inboundCtx, msg, invoke)
+		c.handleInbound(c.inboundCtx, msg, invoke, nil)
 	})
 	return func(ctx context.Context) (any, *RequestError) {
 		stop()
@@ -926,7 +929,7 @@ func (c *Connection) prepareNotificationDispatch(msg *anyMessage) inboundContinu
 	}
 }
 
-func (c *Connection) handleInbound(ctx context.Context, req *anyMessage, run inboundContinuation) {
+func (c *Connection) handleInbound(ctx context.Context, req *anyMessage, run inboundContinuation, admitReply func()) {
 	res := anyMessage{JSONRPC: "2.0"}
 
 	// copy ID if present
@@ -941,9 +944,7 @@ func (c *Connection) handleInbound(ctx context.Context, req *anyMessage, run inb
 	case c.handler != nil:
 		result, err = c.handler(ctx, req.Method, req.Params)
 	case req.ID != nil:
-		res.Error = NewMethodNotFound(req.Method)
-		_ = c.sendMessage(res)
-		return
+		err = NewMethodNotFound(req.Method)
 	default:
 		return
 	}
@@ -969,7 +970,10 @@ func (c *Connection) handleInbound(ctx context.Context, req *anyMessage, run inb
 			res.Result = b
 		}
 	}
-	_ = c.sendMessage(res)
+	// Once the encoded reply owns the write gate, a later request with the
+	// same ID cannot overtake it. The peer may see the reply before Write
+	// returns, so retire at admission and use the same gate for both replies.
+	c.writeAdmittedMessage(c.ctx, res, RequestWriteHooks{}, admitReply)
 }
 
 // RequestWriteHooks binds an operation's admission decision to the actual wire write.
@@ -992,10 +996,6 @@ type RequestWriteResult struct {
 	FrameBytes int
 	// Err reports a failed or incomplete write.
 	Err error
-}
-
-func (c *Connection) sendMessage(msg anyMessage) error {
-	return c.writeMessage(c.ctx, msg, RequestWriteHooks{}).Err
 }
 
 func (c *Connection) writeMessage(ctx context.Context, msg anyMessage, hooks RequestWriteHooks) RequestWriteResult {

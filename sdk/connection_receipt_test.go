@@ -913,3 +913,124 @@ func TestRequestReceipt_ClaimedResponseSurvivesWriteErrorWhileCaptureRuns(t *tes
 		t.Fatalf("write failure obscured the response already claimed by the reader: %+v", got)
 	}
 }
+
+type inboundResultEncoding func()
+
+func (encode inboundResultEncoding) MarshalJSON() ([]byte, error) {
+	encode()
+	return []byte(`"first response"`), nil
+}
+
+func TestConnectionInboundAdmission_ReusesIDOnceReplyOwnsWriteGate(t *testing.T) {
+	requests, connWrites := io.Pipe()
+	connReads, responses := io.Pipe()
+	firstWriterEntered := make(chan struct{})
+	firstReplyEncoded := make(chan struct{})
+	replyCanReturn := make(chan struct{})
+	releaseReply := sync.OnceFunc(func() { close(replyCanReturn) })
+	defer releaseReply()
+	witness := make(chan struct{}, 2)
+	type capture struct {
+		method string
+		ctx    context.Context
+	}
+	captured := make(chan capture, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var writes int
+	conn, err := NewConnectionWithOptions(nil, receiptWriterFunction(func(frame []byte) (int, error) {
+		writes++
+		if writes == 1 {
+			close(firstWriterEntered)
+		}
+		n, err := connWrites.Write(frame)
+		if writes == 2 {
+			<-replyCanReturn
+		}
+		return n, err
+	}), connReads, ConnectionOptions{
+		Context: ctx, NotificationQueueCapacity: 4, NotificationQueueBytes: 4096,
+		CloseTransport: func() error {
+			return errors.Join(requests.Close(), connWrites.Close(), connReads.Close(), responses.Close())
+		},
+		ReceiveNotification: func(frame ReceiveNotification) {
+			if frame.Method == "_witness" {
+				witness <- struct{}{}
+			}
+		},
+		PrepareRequest: func(ctx context.Context, frame ReceiveRequest) (func(context.Context) (any, *RequestError), bool) {
+			captured <- capture{method: frame.Method, ctx: ctx}
+			if frame.Method == "_first" {
+				return func(context.Context) (any, *RequestError) {
+					return inboundResultEncoding(func() { close(firstReplyEncoded) }), nil
+				}, true
+			}
+			return func(ctx context.Context) (any, *RequestError) {
+				<-ctx.Done()
+				return "second response", nil
+			}, true
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	go conn.SendNotification(ctx, "_hold_gate", nil)
+	receiveLifecycle(t, firstWriterEntered)
+
+	send := func(frames string) {
+		t.Helper()
+		if _, err := io.WriteString(responses, frames); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decoder := json.NewDecoder(requests)
+	read := func() anyMessage {
+		t.Helper()
+		var message anyMessage
+		if err := decoder.Decode(&message); err != nil {
+			t.Fatal(err)
+		}
+		return message
+	}
+
+	send(`{"jsonrpc":"2.0","id":1,"method":"_first"}` + "\n")
+	first := receiveLifecycle(t, captured)
+	receiveLifecycle(t, firstReplyEncoded)
+	send(`{"jsonrpc":"2.0","id":1.0,"method":"_too_early"}` + "\n" +
+		`{"jsonrpc":"2.0","method":"_witness"}` + "\n")
+	receiveLifecycle(t, witness)
+	select {
+	case duplicate := <-captured:
+		t.Fatalf("request captured while the first reply waited for the write gate: %s", duplicate.method)
+	default:
+	}
+
+	if message := read(); message.Method != "_hold_gate" {
+		t.Fatalf("unexpected frame ahead of the first reply: %+v", message)
+	}
+	if message := read(); message.ID == nil || string(*message.ID) != "1" || string(message.Result) != `"first response"` {
+		t.Fatalf("unexpected first reply: %+v", message)
+	}
+
+	send(`{"jsonrpc":"2.0","id":1.0,"method":"_second"}` + "\n" +
+		`{"jsonrpc":"2.0","method":"_witness"}` + "\n")
+	receiveLifecycle(t, witness)
+	var second capture
+	select {
+	case second = <-captured:
+		if second.method != "_second" {
+			t.Fatalf("unexpected next owner: %s", second.method)
+		}
+	default:
+		t.Fatal("reused ID was dropped even though the peer had read the first reply")
+	}
+
+	releaseReply()
+	receiveLifecycle(t, first.ctx.Done())
+	send(`{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":1e0}}` + "\n")
+	receiveLifecycle(t, second.ctx.Done())
+	if message := read(); message.ID == nil || string(*message.ID) != "1.0" || string(message.Result) != `"second response"` {
+		t.Fatalf("unexpected reply from the next owner: %+v", message)
+	}
+}
