@@ -13,6 +13,8 @@ type AccountUsage struct {
 	ResetCredits *AccountUsageResetCredits `json:"reset_credits,omitempty"`
 	// Buckets holds all observed buckets; an empty slice is a known empty result.
 	Buckets []AccountUsageBucket `json:"buckets"`
+	// ModelBuckets contains distinct native model quotas. Nil is unknown, empty is confirmed empty.
+	ModelBuckets []AccountUsageBucket `json:"model_buckets"`
 }
 
 // AccountUsageBucket describes one independently metered quota.

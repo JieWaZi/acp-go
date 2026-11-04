@@ -24,7 +24,10 @@ func TestAccountUsagePreservesFractionAndPresence(t *testing.T) {
 	if window["used_percent"] != 12.75 {
 		t.Fatalf("fraction lost: %s", raw)
 	}
-	for _, input := range []string{`{"buckets":null}`, `{"buckets":[]}`} {
+	for _, input := range []string{
+		`{"buckets":null,"model_buckets":null}`,
+		`{"buckets":[],"model_buckets":[]}`,
+	} {
 		var value AccountUsage
 		if err = json.Unmarshal([]byte(input), &value); err != nil {
 			t.Fatal(err)
@@ -52,7 +55,7 @@ func TestAccountUsagePreservesFractionAndPresence(t *testing.T) {
 
 // TestAccountUsagePreservesExactExtraAllowanceNumbers protects native allowance precision.
 func TestAccountUsagePreservesExactExtraAllowanceNumbers(t *testing.T) {
-	raw := []byte(`{"available":false,"buckets":[{"name":"Model quota","windows":null,"extra":{"enabled":false,"used":0,"limit":9007199254740993}}]}`)
+	raw := []byte(`{"available":false,"buckets":[{"name":"Model quota","windows":null,"extra":{"enabled":false,"used":0,"limit":9007199254740993}}],"model_buckets":null}`)
 	var usage AccountUsage
 	if err := json.Unmarshal(raw, &usage); err != nil {
 		t.Fatal(err)
