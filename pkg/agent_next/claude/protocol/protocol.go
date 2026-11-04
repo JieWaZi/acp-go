@@ -236,6 +236,14 @@ type SystemMessage struct {
 
 // TaskMessage 合并 Task/Todo plan 所需的四类 system task 消息字段。
 type TaskMessage struct {
+	// IsBackgrounded marks a task whose execution can outlive its spawning turn.
+	IsBackgrounded bool `json:"is_backgrounded,omitempty"`
+	// RunID distinguishes resumed runs of the same task.
+	RunID string `json:"run_id,omitempty"`
+	// ParentTaskID identifies a tracked subagent that launched this task.
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Ambient marks housekeeping excluded from user-visible activity.
+	Ambient bool `json:"ambient,omitempty"`
 	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// Subtype 区分任务创建、进度、更新和通知。
@@ -262,6 +270,8 @@ type TaskMessage struct {
 
 // AssistantMessage 是完成或组装后的 assistant 消息。
 type AssistantMessage struct {
+	// AgentID identifies the native subagent task when one owns this frame.
+	AgentID string `json:"agent_id,omitempty"`
 	// TurnIdentity carries native input correlation on this frame.
 	TurnIdentity
 	// messageBase preserves the top-level discriminator and raw JSON.
@@ -389,6 +399,8 @@ type UsageDelta struct {
 type ModelUsage struct {
 	// CompleteCounters records presence of the four query-pipeline token components.
 	CompleteCounters bool `json:"-"`
+	// KnownCounters preserves which individual native token components exist.
+	KnownCounters map[string]bool `json:"-"`
 	// ThinkingTokens is an optional subset of output and may be partial across versions.
 	ThinkingTokens *int64 `json:"thinkingTokens,omitempty"`
 	// CostUSD is the native cumulative model estimate.
@@ -428,9 +440,18 @@ func (m *ModelUsage) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	m.CompleteCounters = wire.Input != nil && wire.Output != nil && wire.Read != nil && wire.Write != nil
-	if m.CompleteCounters {
-		m.InputTokens, m.OutputTokens = *wire.Input, *wire.Output
-		m.CacheReadInputTokens, m.CacheCreationInputTokens = *wire.Read, *wire.Write
+	m.KnownCounters = make(map[string]bool, 4)
+	for name, field := range map[string]struct {
+		raw   *int64
+		value *int64
+	}{
+		"input": {wire.Input, &m.InputTokens}, "output": {wire.Output, &m.OutputTokens},
+		"read": {wire.Read, &m.CacheReadInputTokens}, "write": {wire.Write, &m.CacheCreationInputTokens},
+	} {
+		if field.raw != nil {
+			*field.value = *field.raw
+			m.KnownCounters[name] = true
+		}
 	}
 	return nil
 }
@@ -447,6 +468,8 @@ type PermissionDenial struct {
 
 // StreamEventMessage 包装 Anthropic streaming event。
 type StreamEventMessage struct {
+	// AgentID identifies the native subagent task when one owns this frame.
+	AgentID string `json:"agent_id,omitempty"`
 	// TurnIdentity carries native input correlation on this frame.
 	TurnIdentity
 	// messageBase preserves the top-level discriminator and raw JSON.
@@ -479,6 +502,8 @@ type StreamEvent struct {
 
 // ToolProgressMessage 是 Claude 独立 tool progress 消息。
 type ToolProgressMessage struct {
+	// TaskID identifies the native task associated with this progress frame.
+	TaskID string `json:"task_id,omitempty"`
 	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// ToolUseID 关联已发布工具调用。
@@ -758,6 +783,8 @@ type ApplyFlagSettingsControlRequest struct {
 
 // CanUseToolControlRequest 是 CLI 发给宿主的工具权限询问。
 type CanUseToolControlRequest struct {
+	// AgentID identifies the native subagent task when one owns this frame.
+	AgentID string `json:"agent_id,omitempty"`
 	// Subtype 固定为 can_use_tool。
 	Subtype string `json:"subtype"`
 	// ToolName 是申请执行的工具名。
@@ -963,6 +990,12 @@ type MessageOrigin struct {
 
 // BackgroundTask is one physical entry in the complete native task snapshot.
 type BackgroundTask struct {
+	// RunID distinguishes resumed runs of the same task.
+	RunID string `json:"run_id,omitempty"`
+	// ParentTaskID identifies a tracked subagent that launched this task.
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Ambient marks housekeeping excluded from user-visible activity.
+	Ambient bool `json:"ambient,omitempty"`
 	// TaskID identifies the native task, including ambient watcher tasks.
 	TaskID string `json:"task_id"`
 }

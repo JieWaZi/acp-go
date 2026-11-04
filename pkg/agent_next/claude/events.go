@@ -51,20 +51,15 @@ func (s *session) receive(frame protocol.Message) {
 			if in := s.sent[m.UUID]; in != nil && m.ParentToolUseID == nil {
 				in.echoed = true
 			}
-			if s.current != nil {
-				s.toolResultsLocked(s.current, m)
-			}
+			s.toolResultsLocked(m)
 		}
 	case *protocol.ToolProgressMessage:
-		if s.matches(m.SessionID) && s.current != nil {
-			if record, ok := s.current.tools[m.ToolUseID]; ok && !record.completed {
-				s.sendTurnLocked(s.current, acp.UpdateToolCall(acp.ToolCallId(m.ToolUseID),
-					acp.WithUpdateStatus(acp.ToolCallStatusInProgress)), nil)
-			}
+		if s.matches(m.SessionID) {
+			s.toolProgressLocked(m)
 		}
 	case *protocol.TaskMessage:
-		if s.matches(m.SessionID) && s.current != nil {
-			s.taskUpdateLocked(s.current, m)
+		if s.matches(m.SessionID) {
+			s.taskUpdateLocked(m)
 		}
 	case *protocol.RateLimitMessage:
 		if s.matches(m.SessionID) {
@@ -94,7 +89,7 @@ func (s *session) systemLocked(m *protocol.SystemMessage) {
 		}
 	case "background_tasks_changed":
 		if m.BackgroundTasks != nil {
-			s.background = len(*m.BackgroundTasks)
+			s.observeBackgroundLocked(*m.BackgroundTasks)
 			s.sessionUpdateLocked(metaEvent(), acpmeta.WithNativeBackground(nil, acpmeta.NativeBackground{ActiveCount: acp.Ptr(int64(s.background))}))
 			s.signalLocked()
 		}
@@ -184,91 +179,105 @@ func consumedIDs(identity protocol.TurnIdentity) []string {
 	return out
 }
 
-// nativeInvocationLocked associates only exact UUIDs, or a legacy unstamped
-// main-thread boundary with one echoed, uncontested, foreground send.
+// nativeInvocationLocked resolves the native owner before recording consumed
+// UUIDs. A bare running notification can nominate an opening input; the
+// subsequent main-thread reply must independently prove its consumption.
 func (s *session) nativeInvocationLocked(identity protocol.TurnIdentity, legacy bool) *invocation {
 	ids := consumedIDs(identity)
 	explicit := identity.UserMessageUUID != "" || len(identity.UserMessageUUIDs) > 0
 	provider := identity.ResumeReason != "" || identity.Origin != nil && identity.Origin.Kind != "" && identity.Origin.Kind != "human"
+	human := identity.Origin != nil && identity.Origin.Kind == "human"
 	inv := s.current
-	known, belongs := false, false
+	pending, related, allRetired := false, false, len(ids) > 0
 	for _, id := range ids {
-		if _, done := s.retiredInputs[id]; done {
+		if _, retired := s.retiredInputs[id]; retired {
 			continue
 		}
-		if _, sent := s.sent[id]; sent {
-			known = true
+		allRetired = false
+		if s.sent[id] != nil {
+			pending = true
 		}
 		if inv != nil {
-			if _, same := inv.seenInputs[id]; same {
-				belongs = true
-			}
+			_, seen := inv.seenInputs[id]
+			related = related || seen
 		}
 	}
-	if !known && !belongs && explicit && len(ids) > 0 {
-		allRetired := true
-		for _, id := range ids {
-			if _, done := s.retiredInputs[id]; !done {
-				allRetired = false
-				break
-			}
-		}
-		if allRetired {
-			return nil
-		}
-	}
-	if inv != nil && explicit && !known && !belongs && !provider && inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost {
+	if allRetired || inv != nil && explicit && !pending && !related && !provider && inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost {
 		return nil
 	}
-	if !explicit && !provider && legacy && len(s.sent) == 1 && s.nativeQueued == 0 && (inv == nil || inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginUnknown && !inv.outcome.ObservedOutput) {
-		for id, in := range s.sent {
-			if in.echoed && !in.mayFollowProvider && in.message.Priority == "" {
-				ids = []string{id}
-				known = true
-			}
-		}
+	opening := s.openingHostLocked()
+	if !explicit && !provider && legacy && opening != nil && opening.echoed &&
+		(inv == nil || inv.openingHost == opening && !inv.outcome.ObservedOutput) {
+		ids = []string{opening.identity.InputID}
 	}
 	if inv == nil {
-		if len(s.retiredInputs) >= maxRememberedIDs || !s.ledger.reserve() {
-			s.faultAndStopLocked(errCapacity)
-			return nil
-		}
-		id, err := newUUID()
-		if err != nil {
-			s.ledger.complete(agentclient.NativeOutcome{}, false)
-			s.faultAndStopLocked(err)
-			return nil
-		}
-		ctx, cancel := context.WithCancel(s.ctx)
 		origin := acpmeta.NativeTurnOriginUnknown
+		if provider || len(s.sent) == 0 {
+			origin = acpmeta.NativeTurnOriginProvider
+		}
+		inv = s.beginNativeLocked(origin)
+		if inv == nil {
+			return nil
+		}
+		inv.openingHost = opening
+	}
+	if inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginUnknown {
 		switch {
 		case provider:
-			origin = acpmeta.NativeTurnOriginProvider
-		case known:
-			origin = acpmeta.NativeTurnOriginHost
-		case len(s.sent) == 0:
-			origin = acpmeta.NativeTurnOriginProvider
-		}
-		inv = &invocation{outcome: agentclient.NativeOutcome{
-			Turn: acpmeta.NativeTurn{InvocationID: id, Origin: origin}, PossibleSideEffects: true,
-		}, scope: agentclient.Scope{SessionID: s.id, NativeInvocationID: id}, seenInputs: make(map[string]struct{}),
-			ctx: ctx, cancel: cancel, retain: origin != acpmeta.NativeTurnOriginHost || s.client.foregroundReceipts,
-			closed: make(chan struct{}), partialUsage: make(map[string]requestUsage), tools: make(map[string]toolRecord),
-		}
-		s.current = inv
-		s.epoch++
-		s.signalLocked()
-	} else if inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginUnknown {
-		if provider {
 			inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginProvider
-		} else if known && !inv.outcome.ObservedOutput && identity.Origin != nil && identity.Origin.Kind == "human" {
+		case inv.openingHost != nil && !inv.outcome.ObservedOutput &&
+			slices.Contains(ids, inv.openingHost.identity.InputID):
 			inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginHost
-			inv.retain = s.client.foregroundReceipts
+		case human && (pending || related):
+			// Result frames can name an input already consumed by this
+			// invocation, after it has left the pending UUID registry.
+			inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginHost
 		}
 	}
 	for _, id := range ids {
 		s.consumeLocked(inv, id)
 	}
+	if inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost && inv.scope.HostInvocationID == "" && len(inv.inputs) > 0 {
+		inv.scope.HostInvocationID = inv.inputs[0].identity.HostInvocationID
+	}
+	for _, in := range inv.inputs {
+		s.reconcileCancellationLocked(in)
+	}
+	return inv
+}
+
+func (s *session) openingHostLocked() *input {
+	if len(s.sent) != 1 || s.nativeQueued != 0 {
+		return nil
+	}
+	for _, in := range s.sent {
+		if !in.mayFollowProvider && in.message.Priority == "" {
+			return in
+		}
+	}
+	return nil
+}
+
+func (s *session) beginNativeLocked(origin string) *invocation {
+	if len(s.retiredInputs) >= maxRememberedIDs || !s.ledger.reserve() {
+		s.faultAndStopLocked(errCapacity)
+		return nil
+	}
+	id, err := newUUID()
+	if err != nil {
+		s.ledger.complete(agentclient.NativeOutcome{}, false)
+		s.faultAndStopLocked(err)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(s.ctx)
+	inv := &invocation{outcome: agentclient.NativeOutcome{
+		Turn: acpmeta.NativeTurn{InvocationID: id, Origin: origin}, PossibleSideEffects: true,
+	}, scope: agentclient.Scope{SessionID: s.id, NativeInvocationID: id}, seenInputs: make(map[string]struct{}),
+		ctx: ctx, cancel: cancel, closed: make(chan struct{}), partialUsage: make(map[string]requestUsage),
+	}
+	s.current = inv
+	s.epoch++
+	s.signalLocked()
 	return inv
 }
 
@@ -294,13 +303,7 @@ func (s *session) consumeLocked(inv *invocation, id string) {
 	in.submission = agentclient.SubmissionSent
 	in.admission = agentclient.AdmissionConfirmed
 	inv.inputs = append(inv.inputs, in)
-	if inv.scope.HostInvocationID == "" {
-		inv.scope.HostInvocationID = in.identity.HostInvocationID
-	}
 	inv.compact = inv.compact || in.compact
-	if in.cancelRequested && inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost {
-		s.interruptLocked(inv)
-	}
 	s.signalLocked()
 }
 
@@ -340,28 +343,36 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 			return
 		}
 	}
-	if m.ResultIndex != nil && (s.lastResultSeen && *m.ResultIndex-s.lastResultIndex > 1 || !s.lastResultSeen && *m.ResultIndex > 0) {
-		// A sequence gap proves at least one lost native result. A later
-		// terminal must not complete the active invocation without exact
-		// shared input evidence.
+	gap := m.ResultIndex != nil && (s.lastResultSeen && *m.ResultIndex-s.lastResultIndex > 1 || !s.lastResultSeen && *m.ResultIndex > 0)
+	var inv, lost *invocation
+	if gap {
+		defer func() {
+			if lost != nil {
+				s.publishAfterDeliveryLocked(lost)
+			}
+		}()
 		s.counters = newQueryCounters(true)
-		if inv := s.current; inv != nil {
+		if current := s.current; current != nil {
 			related := slices.ContainsFunc(consumedIDs(m.TurnIdentity), func(id string) bool {
-				_, known := inv.seenInputs[id]
+				_, known := current.seenInputs[id]
 				return known
 			})
 			if !related {
-				inv.outcome.OperationError = errors.New("Claude native result sequence gap")
-				s.sealLocked(inv)
-				if len(consumedIDs(m.TurnIdentity)) == 0 && m.ResumeReason == "" && (m.Origin == nil || m.Origin.Kind == "human") {
-					s.lastResultIndex = *m.ResultIndex
-					s.lastResultSeen = true
-					return
-				}
+				current.outcome.OperationError = errors.New("Claude native result sequence gap")
+				s.freezeNativeLocked(current)
+				lost = current
 			}
 		}
+		// Sequence proves this terminal exists even when no UUID or origin
+		// relates it to a waiter. Do not borrow either from the lost turn.
+		if s.current == nil && len(consumedIDs(m.TurnIdentity)) == 0 && m.ResumeReason == "" &&
+			(m.Origin == nil || m.Origin.Kind == "" || m.Origin.Kind == "human") {
+			inv = s.beginNativeLocked(acpmeta.NativeTurnOriginUnknown)
+		}
 	}
-	inv := s.nativeInvocationLocked(m.TurnIdentity, true)
+	if inv == nil {
+		inv = s.nativeInvocationLocked(m.TurnIdentity, !gap)
+	}
 	if inv == nil {
 		return
 	}
@@ -412,7 +423,13 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 			s.textLocked(inv, id, text, false, true)
 		}
 	}
-	s.sealLocked(inv)
+	if lost == nil {
+		s.sealLocked(inv)
+	} else {
+		s.freezeNativeLocked(inv)
+		s.publishAfterDeliveryLocked(lost, inv)
+		lost = nil
+	}
 	s.refreshContextLocked()
 }
 
@@ -454,21 +471,26 @@ func resultReason(m *protocol.ResultMessage, inv *invocation) (*acp.StopReason, 
 }
 
 func (s *session) assistantLocked(m *protocol.AssistantMessage) {
-	inv := s.current
-	if m.ParentToolUseID == nil {
-		inv = s.nativeInvocationLocked(m.TurnIdentity, true)
+	if m.ParentToolUseID != nil || m.AgentID != "" {
+		if owner := s.sidechainOwnerLocked(m.AgentID, m.ParentToolUseID); owner.scope.NativeInvocationID != "" {
+			for _, block := range m.Message.Content {
+				if block.Type == "tool_use" || block.Type == "server_tool_use" {
+					s.startToolLocked(owner, block)
+				}
+			}
+		}
+		return
 	}
+	inv := s.nativeInvocationLocked(m.TurnIdentity, true)
 	if inv == nil {
 		return
 	}
-	if m.ParentToolUseID == nil {
-		inv.model = m.Message.Model
-		if m.Message.Usage != nil {
-			inv.recordUsage(m.Message.ID, m.Message.Model, reportedUsage(*m.Message.Usage))
-		}
-		s.applyContextLocked(inv, m)
-		s.messageIdentity(inv, m.Message.ID)
+	inv.model = m.Message.Model
+	if m.Message.Usage != nil {
+		inv.recordUsage(m.Message.ID, m.Message.Model, reportedUsage(*m.Message.Usage))
 	}
+	s.applyContextLocked(inv, m)
+	s.messageIdentity(inv, m.Message.ID)
 	var complete, thinking strings.Builder
 	for _, block := range m.Message.Content {
 		switch block.Type {
@@ -481,7 +503,7 @@ func (s *session) assistantLocked(m *protocol.AssistantMessage) {
 				thinking.WriteString(block.Thinking)
 			}
 		case "tool_use", "server_tool_use":
-			s.startToolLocked(inv, block, m.ParentToolUseID)
+			s.startToolLocked(toolOwner{scope: inv.scope}, block)
 		}
 	}
 	if m.ParentToolUseID != nil {
@@ -500,10 +522,14 @@ func (s *session) assistantLocked(m *protocol.AssistantMessage) {
 }
 
 func (s *session) streamLocked(m *protocol.StreamEventMessage) {
-	inv := s.current
-	if m.ParentToolUseID == nil {
-		inv = s.nativeInvocationLocked(m.TurnIdentity, true)
+	if m.ParentToolUseID != nil || m.AgentID != "" {
+		block := m.Event.ContentBlock
+		if m.Event.Type == "content_block_start" && block != nil && (block.Type == "tool_use" || block.Type == "server_tool_use") {
+			s.startToolLocked(s.sidechainOwnerLocked(m.AgentID, m.ParentToolUseID), *block)
+		}
+		return
 	}
+	inv := s.nativeInvocationLocked(m.TurnIdentity, true)
 	if inv == nil {
 		return
 	}
@@ -532,7 +558,7 @@ func (s *session) streamLocked(m *protocol.StreamEventMessage) {
 		}
 		block := *e.ContentBlock
 		if block.Type == "tool_use" || block.Type == "server_tool_use" {
-			s.startToolLocked(inv, block, m.ParentToolUseID)
+			s.startToolLocked(toolOwner{scope: inv.scope}, block)
 		}
 		if block.Type == "text" && block.Text != "" && m.ParentToolUseID == nil {
 			if inv.lastMessage == "" {

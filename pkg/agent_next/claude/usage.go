@@ -114,10 +114,13 @@ func partialSnapshot(inv *invocation) *acpmeta.TurnUsage {
 	if len(byModel) == 1 && len(byModel[inv.model]) == len(all) {
 		u.Model = inv.model
 	}
-	if u.Model != "" {
-		u.Models = map[string]acpmeta.ModelUsage{u.Model: sum}
+	if len(byModel) > 0 {
+		u.Models = make(map[string]acpmeta.ModelUsage, len(byModel))
+		for model, requests := range byModel {
+			u.Models[model] = sumCounters(requests)
+		}
 	}
-	if !knownUsage(u) {
+	if !knownUsage(u) && len(u.Models) == 0 {
 		return nil
 	}
 	return &u
@@ -154,55 +157,57 @@ func sumCounters(rows []acpmeta.ModelUsage) acpmeta.ModelUsage {
 
 func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, reported acpmeta.TurnUsage) *acpmeta.TurnUsage {
 	partial := partialSnapshot(inv)
-	// An errored startup or interruption may report an empty/zeroed aggregate
-	// despite earlier consumption. Such a frame cannot reset a proven baseline.
-	zeroFailure := nativeFailed(result) && !positiveUsage(reported) && zeroPipeline(result.ModelUsage)
-	if !zeroFailure {
-		report := result.ModelUsage
-		if len(report) > maxUsageRows {
-			report = nil
+	unreliableTerminal := nativeFailed(result) || result.TerminalReason == "aborted_streaming" || result.TerminalReason == "aborted_tools"
+	modelReport := result.ModelUsage
+	if len(modelReport) > maxUsageRows || unreliableTerminal && zeroPipeline(modelReport) {
+		modelReport = nil
+	}
+	costReport := result.TotalCostUSD
+	if costReport != nil && unreliableTerminal {
+		if amount, err := costReport.Float64(); err != nil || amount == 0 {
+			costReport = nil
 		}
-		models, complete := modelDeltas(q.models, report)
-		q.models = report
-		if complete {
-			rows := make([]acpmeta.ModelUsage, 0, len(models))
-			for _, row := range models {
-				rows = append(rows, row)
+	}
+	// A missing or zeroized report breaks adjacency for that counter alone.
+	// The next usable report seeds a new boundary without claiming the gap.
+	models, comparable := modelDeltas(q.models, modelReport)
+	cost := costDelta(q.cost, costReport)
+	q.models, q.cost = modelReport, costReport
+
+	if comparable {
+		rows := make([]acpmeta.ModelUsage, 0, len(models))
+		for _, row := range models {
+			rows = append(rows, row)
+		}
+		summary := turnCounters(sumCounters(rows), "claude.result.modelUsage", queryCoverage, true)
+		summary.Models = models
+		if len(models) == 1 {
+			for id := range models {
+				summary.Model = id
 			}
-			summary := turnCounters(sumCounters(rows), "claude.result.modelUsage", queryCoverage, true)
-			summary.Models = models
-			if len(models) == 1 {
-				for id := range models {
-					summary.Model = id
-				}
-			}
+		}
+		if knownUsage(summary) {
 			reported = summary
 		}
 	}
-	if !zeroFailure {
-		reported.Cost = costDelta(q.cost, result.TotalCostUSD)
-		q.cost = result.TotalCostUSD
+	if reported.Coverage == mainLoopCoverage {
+		zeroized := unreliableTerminal && !positiveUsage(reported) && modelReport == nil
+		if !knownUsage(reported) || zeroized {
+			if partial != nil {
+				reported = *partial
+			} else {
+				reported = turnCounters(acpmeta.ModelUsage{}, "claude.result.usage", mainLoopCoverage, false)
+			}
+		} else if partial != nil {
+			reported.Model = partial.Model
+			reported.Models = partial.Models
+		}
 	}
-	if partial != nil && (!knownUsage(reported) || zeroFailure && positiveUsage(*partial)) {
-		partial.Cost = reported.Cost
-		return partial
-	}
-	if !knownUsage(reported) && reported.Cost == nil {
+	reported.Cost = cost
+	reported.ContextKnown = inv.outcome.ContextUsage.UsedTokens != nil && inv.outcome.ContextUsage.WindowTokens != nil
+	if !knownUsage(reported) && len(reported.Models) == 0 && reported.Cost == nil {
 		return nil
 	}
-	if reported.Coverage == mainLoopCoverage && inv.model != "" && len(inv.partialUsage) > 0 {
-		single := true
-		for _, request := range inv.partialUsage {
-			if request.model != inv.model {
-				single = false
-				break
-			}
-		}
-		if single {
-			reported.Model = inv.model
-		}
-	}
-	reported.ContextKnown = inv.outcome.ContextUsage.UsedTokens != nil && inv.outcome.ContextUsage.WindowTokens != nil
 	return &reported
 }
 
@@ -227,16 +232,20 @@ func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]a
 	rows := make(map[string]acpmeta.ModelUsage, len(current))
 	for model, to := range current {
 		from, had := previous[model]
-		if !to.CompleteCounters || had && !from.CompleteCounters || model == "" {
+		if model == "" {
 			return nil, false
+		}
+		delta := func(key string, before, after int64) *int64 {
+			if !to.KnownCounters[key] || had && !from.KnownCounters[key] {
+				return nil
+			}
+			return deltaCounter(before, after)
 		}
 		row := acpmeta.ModelUsage{
-			InputTokens: deltaCounter(from.InputTokens, to.InputTokens), OutputTokens: deltaCounter(from.OutputTokens, to.OutputTokens),
-			CacheReadTokens:  deltaCounter(from.CacheReadInputTokens, to.CacheReadInputTokens),
-			CacheWriteTokens: deltaCounter(from.CacheCreationInputTokens, to.CacheCreationInputTokens),
-		}
-		if row.InputTokens == nil || row.OutputTokens == nil || row.CacheReadTokens == nil || row.CacheWriteTokens == nil {
-			return nil, false
+			InputTokens:      delta("input", from.InputTokens, to.InputTokens),
+			OutputTokens:     delta("output", from.OutputTokens, to.OutputTokens),
+			CacheReadTokens:  delta("read", from.CacheReadInputTokens, to.CacheReadInputTokens),
+			CacheWriteTokens: delta("write", from.CacheCreationInputTokens, to.CacheCreationInputTokens),
 		}
 		if to.ThinkingTokens != nil && (!had || from.ThinkingTokens != nil) {
 			var baseline int64
@@ -244,7 +253,7 @@ func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]a
 				baseline = *from.ThinkingTokens
 			}
 			row.ReasoningTokens = deltaCounter(baseline, *to.ThinkingTokens)
-			if row.ReasoningTokens != nil && *row.ReasoningTokens > *row.OutputTokens {
+			if row.ReasoningTokens != nil && (row.OutputTokens == nil || *row.ReasoningTokens > *row.OutputTokens) {
 				row.ReasoningTokens = nil
 			}
 		}

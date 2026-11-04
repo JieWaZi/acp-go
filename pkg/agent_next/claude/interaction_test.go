@@ -70,3 +70,22 @@ func TestWorkspaceHookDeniesProtectedWritesAfterNativePolicyVerification(t *test
 		t.Fatalf("native hook reply = %q", got)
 	}
 }
+
+func TestBackgroundToolObservationKeepsLaunchingScope(t *testing.T) {
+	observed := make(chan agentclient.Scope, 1)
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{
+		Observe: func(_ context.Context, scope agentclient.Scope, n acp.SessionNotification) error {
+			if tool := n.Update.ToolCall; tool != nil && tool.ToolCallId == "tool-first-seen-in-old-agent" {
+				observed <- scope
+			}
+			return nil
+		},
+	}, "review-stale-permission", nil)
+	first := receive(t, ctx, launchPrompt(t, client, ctx, "launch background"))
+	second := receive(t, ctx, launchPrompt(t, client, ctx, "next foreground"))
+	scope := receive(t, ctx, observed)
+	if first.Outcome == nil || second.Outcome == nil || scope.NativeInvocationID != first.Outcome.Turn.InvocationID ||
+		scope.HostInvocationID != first.Receipt.Input.HostInvocationID {
+		t.Fatalf("late tool scope = %+v, old = %+v, new = %+v", scope, first.Outcome, second.Outcome)
+	}
+}

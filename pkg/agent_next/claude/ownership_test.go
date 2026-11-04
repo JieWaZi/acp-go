@@ -444,3 +444,52 @@ func TestResultSequenceGapDoesNotAssignSuccessorToHost(t *testing.T) {
 		}
 	}
 }
+
+func TestTurnUsageKeepsKnownRowsAcrossMultipleModels(t *testing.T) {
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{}, "review-partial-models", nil)
+	result := receive(t, ctx, launchPrompt(t, client, ctx, "observe two models"))
+	if result.Outcome == nil || result.Outcome.Turn.Usage == nil {
+		t.Fatalf("result = %+v", result)
+	}
+	usage := result.Outcome.Turn.Usage
+	if usage.Coverage != "main_loop" || usage.InputTokens == nil || *usage.InputTokens != 7 || len(usage.Models) != 2 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	for model, want := range map[string]int64{"sonnet": 3, "opus": 4} {
+		row := usage.Models[model]
+		if row.InputTokens == nil || *row.InputTokens != want || row.OutputTokens != nil {
+			t.Fatalf("%s = %+v", model, row)
+		}
+	}
+}
+
+func TestCumulativeModelAndCostBoundariesAreIndependent(t *testing.T) {
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{}, "review-usage-boundaries", nil)
+	check := func(r agentclient.PromptResult, input int64, coverage, cost string) {
+		t.Helper()
+		if r.Outcome == nil || r.Outcome.Turn.Usage == nil {
+			t.Fatalf("outcome = %+v", r.Outcome)
+		}
+		usage := r.Outcome.Turn.Usage
+		amount := ""
+		if usage.Cost != nil {
+			amount = string(usage.Cost.Amount)
+		}
+		if usage.InputTokens == nil || *usage.InputTokens != input || usage.Coverage != coverage || amount != cost {
+			t.Fatalf("usage = %+v cost=%s, want %d %s %s", usage, amount, input, coverage, cost)
+		}
+	}
+	check(receive(t, ctx, launchPrompt(t, client, ctx, "baseline")), 10, "query_pipeline", "0.010000000000000000")
+	check(receive(t, ctx, launchPrompt(t, client, ctx, "auto")), 3, "main_loop", "0.010000000000000000")
+	compact, err := client.Compact(ctx, acpmeta.CompactRequest{SessionID: string(client.id)})
+	if err != nil || compact.Status != acpmeta.NativeTurnCompleted {
+		t.Fatalf("compact = %+v, %v", compact, err)
+	}
+	turn, ok := acpmeta.ReadNativeTurn(compact.Meta)
+	if !ok || turn.Usage == nil {
+		t.Fatalf("compact usage = %+v", turn)
+	}
+	check(agentclient.PromptResult{Outcome: &agentclient.NativeOutcome{Turn: turn}}, 3, "main_loop", "")
+	check(receive(t, ctx, launchPrompt(t, client, ctx, "after compact")), 10, "query_pipeline", "")
+	check(receive(t, ctx, launchPrompt(t, client, ctx, "clear")), 5, "query_pipeline", "0.005000000000000000")
+}

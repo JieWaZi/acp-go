@@ -224,18 +224,31 @@ func (f *fixture) control(frame fixtureFrame) {
 			f.assistant("", "provider successor", true)
 			return
 		}
-		f.result(f.active, "", "aborted_streaming")
+		if f.mode == "review-running-before-uuid" {
+			f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "own-cancel", "user_message_uuid": f.active, "terminal_reason": "aborted_streaming", "result_index": f.index, "origin": map[string]any{"kind": "human"}})
+			f.index++
+		} else {
+			f.result(f.active, "", "aborted_streaming")
+		}
 		f.active = ""
 	case "cancel_async_message":
+		if f.mode == "review-cancel-fold" {
+			f.assistant(frame.Request.UUID, "provider folded cancelled host", true)
+			f.mark("folded", "true")
+		}
 		f.mark("recall", frame.Request.UUID)
 		response = map[string]any{"cancelled": f.mode == "recall" && frame.Request.UUID != "" && frame.Request.UUID == f.active}
 	}
 	f.emit(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": frame.ID, "response": response}})
+	if frame.Request.Subtype == "cancel_async_message" && f.mode == "review-cancel-fold" {
+		f.waitMarker("finish-review-provider")
+		f.result(frame.Request.UUID, "provider answer", "completed")
+	}
 	if frame.Request.Subtype == "initialize" {
 		switch f.mode {
 		case "result-gap":
 			f.result("", "earlier provider", "completed")
-		case "provider", "provider-cancel-fifo":
+		case "provider", "provider-cancel-fifo", "review-cancel-fold":
 			f.assistant("", "provider started", true)
 		case "pages":
 			for i := 0; i < 20; i++ {
@@ -255,7 +268,7 @@ func (f *fixture) control(frame fixtureFrame) {
 
 func (f *fixture) controlReply(frame fixtureFrame) {
 	f.mark("interaction-"+frame.Response.RequestID, fmt.Sprint(frame.Response.Response))
-	if f.mode == "approval" || f.mode == "ask" || f.mode == "workspace" {
+	if f.mode == "approval" || f.mode == "ask" || f.mode == "workspace" || f.mode == "review-stale-permission" || f.mode == "review-foreground-agent" {
 		f.result(f.active, "interaction complete", "completed")
 		f.active = ""
 	}
@@ -275,6 +288,97 @@ func (f *fixture) user(frame fixtureFrame) {
 	}
 	f.active = frame.UUID
 	switch f.mode {
+	case "review-cancel-fold":
+		// The native producer has accepted stdin, while P owns the output stream.
+	case "review-running-before-uuid":
+		f.emit(map[string]any{"type": "system", "subtype": "session_state_changed", "state": "running"})
+		f.assistant(frame.UUID, "exact host UUID", false)
+	case "review-stale-permission":
+		if f.index == 0 {
+			f.assistant(frame.UUID, "first host", false)
+			f.emitTaskOwner(frame.UUID, true)
+			f.emit(map[string]any{"type": "system", "subtype": "background_tasks_changed", "tasks": []any{map[string]any{
+				"task_id": "old-background-agent-A", "task_type": "local_agent", "run_id": "run-1",
+			}}})
+			f.result(frame.UUID, "first host", "completed")
+			return
+		}
+		f.assistant(frame.UUID, "second host", false)
+		f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": "spawn-tool", "agent_id": "old-background-agent-A",
+			"uuid": "old-tool-message", "message": map[string]any{"content": []any{map[string]any{
+				"type": "tool_use", "id": "tool-first-seen-in-old-agent", "name": "Bash", "input": map[string]any{"command": "printf old-owner"},
+			}}},
+		})
+		f.emit(map[string]any{"type": "control_request", "request_id": "background-A-tool", "request": map[string]any{
+			"subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "tool-first-seen-in-old-agent", "agent_id": "old-background-agent-A", "input": map[string]any{"command": "printf old-owner"},
+		}})
+	case "review-foreground-agent":
+		f.assistant(frame.UUID, "foreground parent", false)
+		f.emitTaskOwner(frame.UUID, false)
+		f.emit(map[string]any{"type": "control_request", "request_id": "foreground-agent-tool", "request": map[string]any{
+			"subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "known-child-tool", "agent_id": "old-background-agent-A",
+			"input": map[string]any{"command": "printf same-owner"},
+		}})
+	case "review-gap-anonymous":
+		f.assistant(frame.UUID, "first host before lost terminal", false)
+		f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "unattributed-successor", "result_index": 1, "result": "anonymous native completion", "usage": map[string]any{"input_tokens": 17, "output_tokens": 4}})
+	case "review-repeated-assistant":
+		f.assistant(frame.UUID, "duplicate native message", false)
+		f.assistant(frame.UUID, "duplicate native message", false)
+		f.result(frame.UUID, "duplicate native message", "completed")
+	case "review-zero-failure":
+		if f.index == 0 {
+			f.emit(map[string]any{"type": "result", "subtype": "error_during_execution", "uuid": "zero-failure", "result_index": 0, "user_message_uuid": frame.UUID, "is_error": true,
+				"usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "modelUsage": map[string]any{}, "total_cost_usd": 0})
+			f.index++
+		} else {
+			f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "after-zero-failure", "result_index": 1, "user_message_uuid": frame.UUID, "result": "second",
+				"usage":          map[string]any{"input_tokens": 7, "output_tokens": 4, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+				"modelUsage":     map[string]any{f.model: map[string]any{"inputTokens": 20, "outputTokens": 4, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}},
+				"total_cost_usd": 0.02})
+			f.index++
+		}
+	case "review-partial-models":
+		for i, model := range []string{"sonnet", "opus"} {
+			f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": nil, "user_message_uuid": frame.UUID,
+				"message": map[string]any{"id": fmt.Sprintf("model-message-%d", i), "model": model,
+					"content": []any{map[string]any{"type": "text", "text": model}}, "usage": map[string]any{"input_tokens": 3 + i}},
+			})
+		}
+		f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "partial-models", "result_index": 0,
+			"user_message_uuid": frame.UUID, "result": "two models", "usage": map[string]any{"input_tokens": 7},
+		})
+	case "review-usage-boundaries":
+		text := frame.Message.Content[0].Text
+		switch text {
+		case "auto":
+			f.emit(map[string]any{"type": "system", "subtype": "compact_boundary", "compact_metadata": map[string]any{"trigger": "auto"}})
+		case "/compact":
+			f.emit(map[string]any{"type": "system", "subtype": "compact_boundary", "compact_metadata": map[string]any{"trigger": "manual"}})
+		case "clear":
+			f.emit(map[string]any{"type": "system", "subtype": "conversation_reset"})
+		}
+		frameResult := map[string]any{"type": "result", "subtype": "success", "uuid": fmt.Sprintf("counter-%d", f.index),
+			"result_index": f.index, "user_message_uuid": frame.UUID, "result": text, "usage": map[string]any{"input_tokens": 3, "output_tokens": 1},
+		}
+		if text != "auto" {
+			used := (f.index + 1) * 10
+			if text == "clear" {
+				used = 5
+			}
+			frameResult["modelUsage"] = map[string]any{f.model: map[string]any{
+				"inputTokens": used, "outputTokens": used, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+			}}
+		}
+		if text != "/compact" {
+			cost := float64(f.index+1) * 0.01
+			if text == "clear" {
+				cost = 0.005
+			}
+			frameResult["total_cost_usd"] = cost
+		}
+		f.emit(frameResult)
+		f.index++
 	case "recall":
 		f.emit(map[string]any{"type": "user", "uuid": frame.UUID, "message": map[string]any{"role": "user", "content": []map[string]any{{"type": "text", "text": "queued"}}}})
 	case "transport":
@@ -356,4 +460,13 @@ func fixtureProject(dir, cwd string) string {
 		return '-'
 	}, cwd)
 	return filepath.Join(dir, "config", "projects", name)
+}
+
+func (f *fixture) emitTaskOwner(input string, background bool) {
+	f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": nil, "uuid": "spawn-message", "user_message_uuid": input,
+		"message": map[string]any{"id": "spawn", "content": []any{map[string]any{"type": "tool_use", "id": "spawn-tool", "name": "Agent"}}},
+	})
+	f.emit(map[string]any{"type": "system", "subtype": "task_started", "task_id": "old-background-agent-A", "run_id": "run-1",
+		"tool_use_id": "spawn-tool", "is_backgrounded": background, "task_type": "local_agent",
+	})
 }

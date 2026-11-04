@@ -14,11 +14,6 @@ import (
 
 const maxInteractionRequests = 32
 
-type toolRecord struct {
-	name      string
-	completed bool
-}
-
 // ProvidesUserInput advertises the native AskUserQuestion path.
 func (c *Client) ProvidesUserInput() bool { return true }
 
@@ -50,12 +45,9 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 	case "hook_callback":
 		parseErr = m.DecodeRequest(&hook)
 	}
-	scopeOK := inv != nil && !inv.cancelRequested && !inv.terminal && s.open && !s.closing
-	if _, stale := s.retiredTools[request.ToolUseID]; stale || len(s.retiredTools) >= maxRememberedIDs {
-		scopeOK = false
-	}
-	if subtype == protocol.ControlCanUseTool && parseErr == nil && scopeOK {
-		s.startToolLocked(inv, protocol.ContentBlock{Type: "tool_use", ID: request.ToolUseID, Name: request.ToolName, Input: request.Input}, nil)
+	var tool *toolRecord
+	if subtype == protocol.ControlCanUseTool && parseErr == nil {
+		tool = s.permissionToolLocked(inv, request)
 	}
 	scope := agentScope(inv)
 	s.taskLocked(func() {
@@ -73,7 +65,7 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 			result = s.launch.workspace.hook(string(s.id), hook)
 		case protocol.ControlCanUseTool:
 			denied := denyTool(request.ToolUseID, "No verified live Claude execution owns this request.")
-			if parseErr != nil || !scopeOK || request.ToolUseID == "" || request.ToolName == "" || len(request.Input) > maxObservationFrame {
+			if tool == nil {
 				result = denied
 				break
 			}
@@ -107,7 +99,7 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 			guard = func() error {
 				s.mu.Lock()
 				defer s.mu.Unlock()
-				if ctx.Err() != nil || s.current != inv || inv.terminal || inv.cancelRequested || !s.open || s.closing {
+				if ctx.Err() != nil || !s.liveToolLocked(inv, tool) {
 					return errStale
 				}
 				return nil
@@ -294,94 +286,6 @@ func (s *session) askQuestion(ctx context.Context, scope agentclient.Scope, req 
 }
 
 func questionKey(i int) string { return fmt.Sprintf("question_%d", i+1) }
-
-func (s *session) startToolLocked(inv *invocation, block protocol.ContentBlock, parent *string) {
-	if block.ID == "" || len(block.ID) > 512 || block.Name == "" {
-		return
-	}
-	if _, known := inv.tools[block.ID]; known {
-		return
-	}
-	if len(inv.tools) >= maxUsageRows {
-		inv.deliveryErr = errObservationBudget
-		return
-	}
-	inv.tools[block.ID] = toolRecord{name: block.Name}
-	meta := map[string]any{"claude.tool": block.Name}
-	if parent != nil {
-		meta["claude.parent_tool_use_id"] = *parent
-	}
-	s.sendTurnLocked(inv, acp.StartToolCall(acp.ToolCallId(block.ID), block.Name,
-		acp.WithStartKind(toolKind(block.Name)), acp.WithStartStatus(acp.ToolCallStatusInProgress),
-		acp.WithStartRawInput(jsonValue(block.Input)), acp.WithStartLocations(toolLocations(block.Input))), meta)
-	if block.Name == "TodoWrite" {
-		value := decodeOptional[struct {
-			Todos []struct {
-				Content string
-				Status  string
-			}
-		}](block.Input)
-		if value != nil {
-			var rows []acp.PlanEntry
-			for _, todo := range value.Todos {
-				rows = append(rows, acp.PlanEntry{Content: todo.Content, Priority: acp.PlanEntryPriorityMedium, Status: planStatus(todo.Status)})
-			}
-			s.sendTurnLocked(inv, acp.UpdatePlan(rows...), nil)
-		}
-	}
-}
-
-func (s *session) toolResultsLocked(inv *invocation, m *protocol.UserMessage) {
-	for _, block := range m.Message.Content {
-		if block.Type != "tool_result" {
-			continue
-		}
-		record, ok := inv.tools[block.ToolUseID]
-		if !ok || record.completed {
-			continue
-		}
-		record.completed = true
-		inv.tools[block.ToolUseID] = record
-		status := acp.ToolCallStatusCompleted
-		if block.IsError {
-			status = acp.ToolCallStatusFailed
-		}
-		var content []acp.ToolCallContent
-		if text := decodeOptional[string](block.Content); text != nil {
-			content = append(content, acp.ToolContent(acp.TextBlock(*text)))
-		} else if parts := decodeOptional[[]protocol.ContentBlock](block.Content); parts != nil {
-			for _, part := range *parts {
-				if part.Type == "text" {
-					content = append(content, acp.ToolContent(acp.TextBlock(part.Text)))
-				}
-			}
-		}
-		s.sendTurnLocked(inv, acp.UpdateToolCall(acp.ToolCallId(block.ToolUseID), acp.WithUpdateStatus(status),
-			acp.WithUpdateContent(content), acp.WithUpdateRawOutput(jsonValue(firstRaw(m.ToolUseResult, block.Content)))), nil)
-	}
-}
-
-func (s *session) taskUpdateLocked(inv *invocation, m *protocol.TaskMessage) {
-	if m.SkipTranscript || m.TaskID == "" {
-		return
-	}
-	id := acp.ToolCallId(m.TaskID)
-	if m.ToolUseID != "" {
-		id = acp.ToolCallId(m.ToolUseID)
-	}
-	status := acp.ToolCallStatusInProgress
-	if m.Status == "completed" {
-		status = acp.ToolCallStatusCompleted
-	}
-	if m.Status == "failed" || m.Status == "stopped" {
-		status = acp.ToolCallStatusFailed
-	}
-	if _, exists := inv.tools[string(id)]; !exists {
-		s.startToolLocked(inv, protocol.ContentBlock{ID: string(id), Name: firstString(m.Description, "Agent")}, nil)
-	}
-	s.sendTurnLocked(inv, acp.UpdateToolCall(id, acp.WithUpdateStatus(status),
-		acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(m.Summary))})), map[string]any{"claude.task_id": m.TaskID})
-}
 
 func firstRaw(values ...json.RawMessage) json.RawMessage {
 	for _, value := range values {

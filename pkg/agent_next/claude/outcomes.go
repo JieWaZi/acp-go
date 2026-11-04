@@ -177,11 +177,19 @@ type delivery struct {
 	inv          *invocation
 	scope        agentclient.Scope
 	notification acp.SessionNotification
-	terminal     bool
+	terminal     []*invocation
 	bytes        int
 }
 
 func (s *session) enqueueLocked(inv *invocation, n acp.SessionNotification) {
+	scope := agentclient.Scope{SessionID: s.id}
+	if inv != nil {
+		scope = inv.scope
+	}
+	s.enqueueScopedLocked(inv, scope, n)
+}
+
+func (s *session) enqueueScopedLocked(inv *invocation, scope agentclient.Scope, n acp.SessionNotification) {
 	if s.client.host.Observe == nil {
 		return
 	}
@@ -196,10 +204,6 @@ func (s *session) enqueueLocked(inv *invocation, n acp.SessionNotification) {
 		}
 		return
 	}
-	scope := agentclient.Scope{SessionID: s.id}
-	if inv != nil {
-		scope = inv.scope
-	}
 	s.deliveries = append(s.deliveries, delivery{inv: inv, scope: scope, notification: n, bytes: size})
 	s.observationCount++
 	s.observationBytes += size
@@ -210,20 +214,21 @@ func (s *session) sealLocked(inv *invocation) {
 	if inv.terminal {
 		return
 	}
+	s.freezeNativeLocked(inv)
+	s.publishAfterDeliveryLocked(inv)
+}
+
+func (s *session) freezeNativeLocked(inv *invocation) {
 	inv.terminal = true
 	inv.sealedAt = time.Now()
 	inv.cancel()
 	close(inv.closed)
+	s.retireForegroundTasksLocked(inv)
 	if s.current == inv {
 		s.current = nil
 	}
 	for _, id := range inv.outcome.Turn.ConsumedInputIDs {
 		s.retiredInputs[id] = struct{}{}
-	}
-	for id := range inv.tools {
-		if len(s.retiredTools) < maxRememberedIDs {
-			s.retiredTools[id] = struct{}{}
-		}
 	}
 	if inv.outcome.Turn.Usage == nil {
 		inv.outcome.Turn.Usage = partialSnapshot(inv)
@@ -236,9 +241,12 @@ func (s *session) sealLocked(inv *invocation) {
 		}
 		s.sendTurnLocked(inv, usageUpdate(inv.outcome.ContextUsage), meta)
 	}
-	// The terminal marker is bounded by outstanding ledger reservations. It
-	// is always queued even when the observational budget is exhausted.
-	s.deliveries = append(s.deliveries, delivery{inv: inv, terminal: true})
+}
+
+func (s *session) publishAfterDeliveryLocked(invocations ...*invocation) {
+	// One read transition may retire a lost predecessor and observe the
+	// current native terminal. Publish both before releasing either waiter.
+	s.deliveries = append(s.deliveries, delivery{terminal: invocations})
 	s.signalLocked()
 }
 
@@ -266,22 +274,14 @@ func (s *session) deliver() {
 		d := s.deliveries[0]
 		s.deliveries[0] = delivery{}
 		s.deliveries = s.deliveries[1:]
-		if d.terminal {
-			inv := d.inv
-			if s.observerErr != nil && inv.deliveryErr == nil {
-				inv.deliveryErr = s.observerErr
+		if len(d.terminal) > 0 {
+			for _, inv := range d.terminal {
+				s.finalizeOutcomeLocked(inv)
 			}
-			inv.outcome.DeliveryError = inv.deliveryErr
-			inv.finalized = true
-			retain := inv.retain
-			for _, in := range inv.inputs {
-				if in.cancelRequested || in.detached {
-					retain = true
+			for _, inv := range d.terminal {
+				for _, in := range inv.inputs {
+					s.finishInputLocked(in, nil)
 				}
-			}
-			s.ledger.complete(inv.outcome, retain)
-			for _, in := range inv.inputs {
-				s.finishInputLocked(in, nil)
 			}
 			s.mu.Unlock()
 			continue
@@ -322,6 +322,19 @@ func (s *session) deliver() {
 			s.mu.Unlock()
 		}
 	}
+}
+
+func (s *session) finalizeOutcomeLocked(inv *invocation) {
+	if s.observerErr != nil && inv.deliveryErr == nil {
+		inv.deliveryErr = s.observerErr
+	}
+	inv.outcome.DeliveryError = inv.deliveryErr
+	inv.finalized = true
+	retain := inv.outcome.Turn.Origin != acpmeta.NativeTurnOriginHost || s.client.foregroundReceipts
+	for _, in := range inv.inputs {
+		retain = retain || in.cancelRequested || in.detached
+	}
+	s.ledger.complete(inv.outcome, retain)
 }
 
 func minTime(left, right time.Time) time.Time {

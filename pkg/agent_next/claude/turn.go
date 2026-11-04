@@ -47,6 +47,8 @@ type input struct {
 	// state below belongs exclusively to session.mu.
 	phase           inputPhase
 	cancelRequested bool
+	cancelReason    error
+	cancelDeadline  time.Time
 	controlStarted  bool
 	echoed          bool
 	// mayFollowProvider distinguishes an input sent while P was already visible.
@@ -57,6 +59,7 @@ type input struct {
 	err               error
 	done              chan struct{}
 	settled           bool
+	waitResult        agentclient.PromptResult
 }
 
 type invocation struct {
@@ -70,7 +73,7 @@ type invocation struct {
 	terminal         bool
 	sealedAt         time.Time
 	finalized        bool
-	retain           bool
+	openingHost      *input
 	compact          bool
 	compactConfirmed bool
 	cancelRequested  bool
@@ -83,7 +86,6 @@ type invocation struct {
 	streamText       string
 	streamThought    string
 	partialUsage     map[string]requestUsage
-	tools            map[string]toolRecord
 	rejectedLimit    *protocol.RateLimitInfo
 }
 
@@ -304,25 +306,29 @@ func (s *session) submit(in *input, target *invocation) error {
 }
 
 func inputResult(in *input) agentclient.PromptResult {
-	result := agentclient.PromptResult{Receipt: agentclient.PromptReceipt{
-		Input: in.identity, Submission: in.submission, Admission: in.admission, OperationError: in.err,
-	}}
-	if in.inv != nil && in.inv.finalized {
-		result.Outcome = &in.inv.outcome
-	}
-	return result.Snapshot()
+	return in.waitResult.Snapshot()
 }
 
 func (s *session) finishInputLocked(in *input, err error) {
+	in.phase = retired
+	if s.sent[in.identity.InputID] == in {
+		delete(s.sent, in.identity.InputID)
+	}
+	s.finishWaiterLocked(in, err)
+}
+
+func (s *session) finishWaiterLocked(in *input, err error) {
 	if in.settled {
 		return
 	}
 	in.err = firstError(in.err, err)
-	in.phase = retired
-	in.settled = true
-	if s.sent[in.identity.InputID] == in {
-		delete(s.sent, in.identity.InputID)
+	in.waitResult = agentclient.PromptResult{Receipt: agentclient.PromptReceipt{
+		Input: in.identity, Submission: in.submission, Admission: in.admission, OperationError: in.err,
+	}}
+	if in.inv != nil && in.inv.finalized {
+		in.waitResult.Outcome = &in.inv.outcome
 	}
+	in.settled = true
 	close(in.done)
 	s.signalLocked()
 }
@@ -365,76 +371,104 @@ func (s *session) cancelInputLocked(in *input, reason error) {
 		return
 	}
 	in.cancelRequested = true
+	in.cancelReason = reason
+	in.cancelDeadline = time.Now().Add(s.client.options.ControlTimeout)
 	switch in.phase {
 	case queued, preparing, ready:
 		in.cancel()
 		s.finishInputLocked(in, reason)
-	case writing, written:
-		s.recallLocked(in)
-	case consumed:
-		if in.inv != nil && !in.inv.terminal {
-			// Caller cancellation is scoped to its invocation, even when a
-			// provider invocation also consumed the user's native UUID.
-			if in.inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost {
-				s.interruptLocked(in.inv)
-			} else {
-				s.finishInputLocked(in, reason)
-			}
+	case writing, written, consumed:
+		s.reconcileCancellationLocked(in)
+		if !in.settled && !in.controlStarted {
+			s.startInputCancellationLocked(in, in.phase < consumed)
 		}
 	}
 }
 
-func (s *session) recallLocked(in *input) {
-	if in.controlStarted {
+// A cancelled waiter can leave a live native input or provider invocation.
+// Late native consumption still belongs to that invocation and its receipt.
+func (s *session) reconcileCancellationLocked(in *input) {
+	if !in.cancelRequested || in.settled || in.inv == nil || in.inv.terminal {
 		return
 	}
+	switch in.inv.outcome.Turn.Origin {
+	case acpmeta.NativeTurnOriginHost:
+		if time.Now().Before(in.cancelDeadline) {
+			s.interruptByLocked(in.inv, in.cancelDeadline)
+		}
+	case acpmeta.NativeTurnOriginProvider:
+		s.finishInputLocked(in, in.cancelReason)
+	}
+}
+
+func (s *session) startInputCancellationLocked(in *input, recall bool) {
 	in.controlStarted = true
-	epoch := s.epoch
+	epoch, deadline := s.epoch, in.cancelDeadline
 	s.taskLocked(func() {
-		ctx, cancel := context.WithTimeout(s.ctx, s.client.options.ControlTimeout)
+		ctx, cancel := context.WithDeadline(s.ctx, deadline)
 		defer cancel()
-		request := struct {
-			Subtype string `json:"subtype"`
-			UUID    string `json:"message_uuid"`
-		}{Subtype: "cancel_async_message", UUID: in.identity.InputID}
-		_ = s.wire.call(ctx, request, nil, func() error {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			if err := s.guardSessionLocked(); err != nil {
-				return err
-			}
-			if s.sent[in.identity.InputID] != in {
-				return errStale
-			}
-			return nil
-		}, func(raw json.RawMessage) {
-			r := decodeOptional[struct {
-				Cancelled bool `json:"cancelled"`
-			}](raw)
-			if r == nil || !r.Cancelled {
-				return
-			}
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			if s.sent[in.identity.InputID] != in {
-				return
-			}
-			s.retiredInputs[in.identity.InputID] = struct{}{}
-			in.admission = agentclient.AdmissionNotAccepted
-			s.finishInputLocked(in, context.Canceled)
-		})
+		if recall {
+			s.recallInput(ctx, in)
+		}
 		select {
 		case <-in.done:
 			return
 		case <-ctx.Done():
 		}
-		s.watchdog(func() bool {
-			return s.sent[in.identity.InputID] == in && s.current == nil && s.epoch == epoch
-		}, in)
+		s.mu.Lock()
+		pending := s.sent[in.identity.InputID] == in
+		if !in.settled && (in.inv == nil || !in.inv.terminal) {
+			// Release only the waiter. Keep a pending UUID for late native
+			// consumption and an associated invocation for its native result.
+			s.finishWaiterLocked(in, in.cancelReason)
+		}
+		s.mu.Unlock()
+		if pending {
+			s.watchdog(func() bool {
+				return s.sent[in.identity.InputID] == in && s.current == nil && s.epoch == epoch
+			})
+		}
+	})
+}
+
+func (s *session) recallInput(ctx context.Context, in *input) {
+	request := struct {
+		Subtype string `json:"subtype"`
+		UUID    string `json:"message_uuid"`
+	}{Subtype: "cancel_async_message", UUID: in.identity.InputID}
+	_ = s.wire.call(ctx, request, nil, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if err := s.guardSessionLocked(); err != nil {
+			return err
+		}
+		if s.sent[in.identity.InputID] != in {
+			return errStale
+		}
+		return nil
+	}, func(raw json.RawMessage) {
+		r := decodeOptional[struct {
+			Cancelled bool `json:"cancelled"`
+		}](raw)
+		if r == nil || !r.Cancelled {
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.sent[in.identity.InputID] != in {
+			return
+		}
+		s.retiredInputs[in.identity.InputID] = struct{}{}
+		in.admission = agentclient.AdmissionNotAccepted
+		s.finishInputLocked(in, in.cancelReason)
 	})
 }
 
 func (s *session) interruptLocked(inv *invocation) {
+	s.interruptByLocked(inv, time.Now().Add(s.client.options.ControlTimeout))
+}
+
+func (s *session) interruptByLocked(inv *invocation, deadline time.Time) {
 	if inv.cancelRequested || inv.terminal {
 		return
 	}
@@ -442,7 +476,7 @@ func (s *session) interruptLocked(inv *invocation) {
 	inv.cancel()
 	s.signalLocked()
 	s.taskLocked(func() {
-		ctx, cancel := context.WithTimeout(s.ctx, s.client.options.ControlTimeout)
+		ctx, cancel := context.WithDeadline(s.ctx, deadline)
 		defer cancel()
 		// The CLI's interrupt has no expected turn ID. This gate only
 		// excludes successors and terminals that Go has already observed.
@@ -463,11 +497,11 @@ func (s *session) interruptLocked(inv *invocation) {
 			return
 		case <-ctx.Done():
 		}
-		s.watchdog(func() bool { return s.current == inv && !inv.terminal }, nil)
+		s.watchdog(func() bool { return s.current == inv && !inv.terminal })
 	})
 }
 
-func (s *session) watchdog(stillOwner func() bool, in *input) {
+func (s *session) watchdog(stillOwner func() bool) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.client.options.ControlTimeout)
 	defer cancel()
 	if err := s.wire.lock(ctx); err != nil {
@@ -481,13 +515,6 @@ func (s *session) watchdog(stillOwner func() bool, in *input) {
 	}
 	if stillOwner() {
 		s.faultAndStopLocked(context.DeadlineExceeded)
-	} else if in != nil && !in.settled && in.inv == nil {
-		// No safe global target exists. End this waiter; retain the UUID
-		// for a later exact consumption fact on the same native process.
-		in.err = context.DeadlineExceeded
-		in.settled = true
-		close(in.done)
-		s.signalLocked()
 	}
 }
 

@@ -55,14 +55,16 @@ type session struct {
 	// current is the only observed main-thread native execution.
 	current *invocation
 	// epoch increases when the reader observes a new native execution boundary.
-	epoch           uint64
-	nativeQueued    int
-	background      int
-	lastResultIndex int64
-	lastResultSeen  bool
-	terminalIDs     map[string]struct{}
-	retiredInputs   map[string]struct{}
-	retiredTools    map[string]struct{}
+	epoch             uint64
+	nativeQueued      int
+	background        int
+	lastResultIndex   int64
+	lastResultSeen    bool
+	terminalIDs       map[string]struct{}
+	retiredInputs     map[string]struct{}
+	tools             map[string]*toolRecord
+	nativeTasks       map[string]*taskRecord
+	taskOwnershipFull bool
 	// tasks counts admitted controls, interaction callbacks and asynchronous cleanup.
 	tasks            int
 	setting          bool
@@ -125,7 +127,7 @@ func (c *Client) open(ctx context.Context, req openRequest) (*session, error) {
 	s := &session{client: c, id: req.id, launch: plan, process: process, ctx: lifetime, cancel: end,
 		changed: make(chan struct{}), closeGate: make(chan struct{}, 1),
 		deliveryDone: make(chan struct{}), sent: make(map[string]*input), used: make(map[string]struct{}),
-		terminalIDs: make(map[string]struct{}), retiredInputs: make(map[string]struct{}), retiredTools: make(map[string]struct{}),
+		terminalIDs: make(map[string]struct{}), retiredInputs: make(map[string]struct{}), tools: make(map[string]*toolRecord), nativeTasks: make(map[string]*taskRecord),
 		interactions: make(map[string]context.CancelFunc), counters: newQueryCounters(req.resume || req.forkSource != ""),
 	}
 	c.mu.Lock()
