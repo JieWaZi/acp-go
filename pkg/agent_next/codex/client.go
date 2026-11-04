@@ -117,6 +117,8 @@ type Client struct {
 	loggingOut bool
 	// version is the observed CLI version.
 	version string
+	// configHome is the actual native configuration root reported during initialize.
+	configHome string
 	// forkMode is negotiated from the pinned protocol floor and observed version.
 	forkMode string
 	// wireBound marks external ACP capability negotiation.
@@ -321,8 +323,9 @@ func (c *Client) initialize(ctx context.Context, clientInfo *acp.Implementation)
 	c.mu.Unlock()
 	go c.readFrames()
 	var reply struct {
-		UserAgent string `json:"userAgent"`
-		Version   string `json:"version"`
+		protocol.InitializeResponse
+		// Version supports native variants that send a separate version field.
+		Version string `json:"version"`
 	}
 	params := protocol.InitializeParams{
 		ClientInfo:   protocol.ClientInfo{Name: "acp-go", Title: pointer("ACP Go"), Version: "unknown"},
@@ -342,6 +345,7 @@ func (c *Client) initialize(ctx context.Context, clientInfo *acp.Implementation)
 	}
 	match := versionPattern.FindStringSubmatch(reply.Version + " " + reply.UserAgent)
 	c.mu.Lock()
+	c.configHome = reply.CodexHome
 	if len(match) > 1 {
 		c.version = match[1]
 	}

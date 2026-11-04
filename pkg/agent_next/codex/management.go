@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -242,6 +243,32 @@ func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
 		result.Account.Plan = pointer(string(*r.Account.PlanType))
 	}
 	return result, nil
+}
+
+// ChatGPTCredentialProof returns the native configuration root and a proof of
+// the selected credential without exposing its bearer to the host. Codex
+// 0.148.0 account/read has no principal identifier, so this uses getAuthStatus.
+func (c *Client) ChatGPTCredentialProof(ctx context.Context) (string, [sha256.Size]byte, error) {
+	var empty [sha256.Size]byte
+	c.mu.Lock()
+	home, err := c.configHome, c.checkReadyLocked()
+	c.mu.Unlock()
+	if err != nil {
+		return "", empty, err
+	}
+	var reply struct {
+		// AuthMethod reports the selected native authentication mode.
+		AuthMethod string `json:"authMethod"`
+		// AuthToken is the in-memory bearer used only to calculate the proof.
+		AuthToken string `json:"authToken"`
+	}
+	if err := c.request(ctx, "getAuthStatus", map[string]bool{"includeToken": true, "refreshToken": false}, &reply); err != nil {
+		return "", empty, err
+	}
+	if reply.AuthMethod != "chatgpt" || reply.AuthToken == "" {
+		return "", empty, acp.NewAuthRequired(nil)
+	}
+	return home, sha256.Sum256([]byte(reply.AuthToken)), nil
 }
 
 func (c *Client) checkAccount(ctx context.Context) error {
