@@ -137,3 +137,72 @@ func copyMetadata(meta map[string]any) map[string]any {
 	}
 	return result
 }
+
+// NativeTurnReceiptsMethod reads and acknowledges immutable adapter terminal outcomes.
+const NativeTurnReceiptsMethod = "_session/native-turns"
+
+// NativeTurnReceiptsCapability is the initialize metadata flag for foreground retention.
+const NativeTurnReceiptsCapability = "acp-go/native-turn-receipts"
+
+// NativeTurnReceiptsRequest acknowledges committed invocation IDs and reads remaining receipts.
+type NativeTurnReceiptsRequest struct {
+	// SessionID is the adapter session identity.
+	SessionID string `json:"session_id"`
+	// AckInvocationIDs contains exact invocation IDs already committed by the host.
+	AckInvocationIDs []string `json:"ack_invocation_ids,omitempty"`
+}
+
+// NativeTurnReceiptsResponse returns the oldest page of unacknowledged terminal outcomes.
+type NativeTurnReceiptsResponse struct {
+	// Receipts is empty when there are no unacknowledged terminal outcomes.
+	Receipts []NativeTurnReceipt `json:"receipts"`
+	// More means another committed outcome follows this page. Acknowledging
+	// durable receipt IDs exposes the next page; retrying without ACK preserves this prefix.
+	More bool `json:"more"`
+}
+
+const (
+	// ReceiptResultTextUnavailable means a known final result answer exceeded receipt capacity.
+	ReceiptResultTextUnavailable = "result_text"
+	// ReceiptModelUsageUnavailable means aggregate usage survives without known model attribution.
+	ReceiptModelUsageUnavailable = "turn.usage.models"
+	// ReceiptUsageModelUnavailable means an observed model ID was too large to retain.
+	ReceiptUsageModelUnavailable = "turn.usage.model"
+	// ReceiptUsageCostUnavailable means a known aggregate estimate was too large to retain.
+	ReceiptUsageCostUnavailable = "turn.usage.cost"
+	// ReceiptConsumedInputsUnavailable means native input IDs were too large to retain.
+	ReceiptConsumedInputsUnavailable = "turn.consumed_input_ids"
+	// ReceiptTerminalEventUnavailable means a native terminal event ID was too large to retain.
+	ReceiptTerminalEventUnavailable = "turn.terminal_event_id"
+)
+
+// NativeTurnReceipt is the terminal handoff shared by direct and observer delivery.
+type NativeTurnReceipt struct {
+	// Turn is the native identity and usage fact for this invocation.
+	Turn NativeTurn `json:"turn"`
+	// StopReason is the ACP result classification when there is a successful response.
+	StopReason string `json:"stop_reason,omitempty"`
+	// Failure is a safe classification when the invocation did not produce a normal response.
+	Failure *NativeTurnFailure `json:"failure,omitempty"`
+	// ResultText is the final assistant answer known from the native result, independent of observer delivery.
+	ResultText string `json:"result_text,omitempty"`
+	// Unavailable identifies known payloads omitted by the adapter's receipt capacity limit.
+	// Entries use the Receipt*Unavailable constants; remaining fields preserve their native meaning.
+	Unavailable []string `json:"unavailable,omitempty"`
+}
+
+// NativeTurnFailure contains actionable evidence without native diagnostic text.
+type NativeTurnFailure struct {
+	// Code is the ACP request error classification.
+	Code int `json:"code"`
+	// Kind is the normalized adapter failure kind, when established.
+	Kind string `json:"kind,omitempty"`
+	// Phase is the invocation phase that failed.
+	Phase string `json:"phase,omitempty"`
+	// Admission is the strength of evidence that the input reached the provider.
+	Admission string `json:"admission,omitempty"`
+	// ObservedOutput indicates a frame was seen before the failure.
+	ObservedOutput bool `json:"observed_output"`
+	// PossibleSideEffects indicates a tool or related activity may already have run.
+	PossibleSideEffects bool `json:"possible_side_effects"`
+}

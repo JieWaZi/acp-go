@@ -99,3 +99,31 @@ func TestTurnUsageDistinguishesUnknownAndEmptyModelAttribution(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeTurnReceiptWireKeepsTerminalFacts checks typed round-trip of a recoverable outcome.
+func TestNativeTurnReceiptWireKeepsTerminalFacts(t *testing.T) {
+	amount := UsageCost{Amount: "0.1234567890123456789", Currency: "USD", Source: "native", Scope: "query_pipeline", Aggregation: "turn_delta", Valuation: "estimated"}
+	receipt := NativeTurnReceipt{
+		Turn: NativeTurn{InvocationID: "one", Origin: NativeTurnOriginProvider, Status: NativeTurnCompleted,
+			Usage: &TurnUsage{Source: "native", Cost: &amount}},
+		StopReason: "end_turn", ResultText: "result-only text",
+	}
+	receipt.Unavailable = []string{ReceiptModelUsageUnavailable}
+	wire, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got NativeTurnReceipt
+	if err := json.Unmarshal(wire, &got); err != nil || !reflect.DeepEqual(got, receipt) {
+		t.Fatalf("receipt = %#v, error = %v", got, err)
+	}
+}
+
+// TestNativeTurnReceiptPageWire preserves paging independently of the receipt payload.
+func TestNativeTurnReceiptPageWire(t *testing.T) {
+	result := NativeTurnReceiptsResponse{Receipts: []NativeTurnReceipt{}, More: true}
+	encoded, err := json.Marshal(result)
+	if err != nil || string(encoded) != `{"receipts":[],"more":true}` {
+		t.Fatalf("page = %s, err = %v", encoded, err)
+	}
+}
