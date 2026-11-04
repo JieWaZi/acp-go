@@ -24,7 +24,11 @@ func TestClaudeFixture(t *testing.T) {
 	for i, arg := range os.Args {
 		switch {
 		case arg == "--version":
-			fmt.Fprintln(os.Stdout, "2.1.309 (Claude Code)")
+			version := "2.1.309"
+			if strings.HasPrefix(f.mode, "legacy-echo-") {
+				version = "2.1.159"
+			}
+			fmt.Fprintln(os.Stdout, version+" (Claude Code)")
 			os.Exit(0)
 		case arg == "status":
 			if f.mode == "subscription-identity" {
@@ -281,6 +285,12 @@ func (f *fixture) control(frame fixtureFrame) {
 			response.(map[string]any)["plugins_applied"] = p.Type == "local" && p.SkipMCPDiscovery && p.Path != ""
 		}
 	case "get_settings":
+		if f.mode == "legacy-echo-task-started" {
+			f.emit(map[string]any{"type": "system", "subtype": "task_started", "task_id": "active-task"})
+			f.emit(map[string]any{"type": "system", "subtype": "commands_changed", "commands": []any{
+				map[string]any{"name": "task-observed"},
+			}})
+		}
 		effective := map[string]any{"fastMode": f.settings["fastMode"]}
 		if f.workspace != nil {
 			effective["sandbox"] = f.workspace["sandbox"]
@@ -409,6 +419,52 @@ func (f *fixture) user(frame fixtureFrame) {
 	}
 	f.active = frame.UUID
 	switch f.mode {
+	case "legacy-echo-current", "legacy-echo-early", "legacy-echo-foreign", "legacy-echo-provider", "legacy-echo-provider-origin", "legacy-echo-background", "legacy-echo-held":
+		f.emit(map[string]any{"type": "system", "subtype": "session_state_changed", "state": "running"})
+		echoID := frame.UUID
+		if f.mode == "legacy-echo-foreign" {
+			echoID = "00000000-0000-4000-8000-000000000001"
+		}
+		echo := func() {
+			message := map[string]any{"type": "user", "uuid": echoID, "isReplay": true, "parent_tool_use_id": nil,
+				"message": map[string]any{"role": "user", "content": "legacy prompt"}}
+			if f.mode == "legacy-echo-provider-origin" {
+				message["origin"] = map[string]any{"kind": "agent"}
+			}
+			f.emit(message)
+		}
+		if f.mode == "legacy-echo-early" {
+			echo()
+		}
+		if f.mode == "legacy-echo-background" {
+			f.emit(map[string]any{"type": "system", "subtype": "background_tasks_changed", "tasks": []any{
+				map[string]any{"task_id": "competing-task"},
+			}})
+		}
+		messageID := fmt.Sprintf("legacy-message-%d", f.index)
+		opening := map[string]any{"type": "stream_event", "parent_tool_use_id": nil, "event": map[string]any{
+			"type": "message_start", "message": map[string]any{"id": messageID, "model": f.model},
+		}}
+		if f.mode == "legacy-echo-provider" {
+			opening["resume_reason"] = "interrupted_turn"
+		}
+		f.emit(opening)
+		if f.mode == "legacy-echo-background" {
+			f.emit(map[string]any{"type": "system", "subtype": "background_tasks_changed", "tasks": []any{}})
+		}
+		if f.mode != "legacy-echo-early" {
+			echo()
+		}
+		usage := map[string]any{"input_tokens": 43, "output_tokens": 7, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+		f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": nil, "message": map[string]any{
+			"id": messageID, "model": f.model, "usage": usage, "content": []map[string]any{{"type": "text", "text": "legacy reply"}},
+		}})
+		if f.mode == "legacy-echo-held" {
+			f.waitMarker("finish-legacy")
+		}
+		f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": fmt.Sprintf("legacy-result-%d", f.index),
+			"result": "legacy reply", "usage": usage})
+		f.index++
 	case "steer-admission", "steer-target-completes":
 		if frame.Priority == "" {
 			f.active = frame.UUID

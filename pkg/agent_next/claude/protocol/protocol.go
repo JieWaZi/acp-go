@@ -325,6 +325,10 @@ type UserMessage struct {
 	UUID string `json:"uuid,omitempty"`
 	// SessionID identifies the current native session.
 	SessionID string `json:"session_id,omitempty"`
+	// IsReplay identifies the native stream-json acknowledgement of stdin input.
+	IsReplay bool `json:"isReplay,omitempty"`
+	// Origin identifies the source of the replayed user input when supplied.
+	Origin *MessageOrigin `json:"origin,omitempty"`
 }
 
 // ResultMessage is the native query invocation outcome.

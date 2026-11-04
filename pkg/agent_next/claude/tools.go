@@ -183,6 +183,9 @@ func (s *session) observeBackgroundLocked(tasks []protocol.BackgroundTask) {
 			s.background++
 		}
 	}
+	if s.background > 0 {
+		s.fenceLegacyOpeningLocked()
+	}
 }
 
 func (t *taskRecord) advance(run string) bool {
@@ -352,6 +355,9 @@ func (s *session) taskUpdateLocked(m *protocol.TaskMessage) {
 		task.phase = taskEnded
 	default:
 		task.phase = taskRunning
+	}
+	if !task.ambient && task.phase == taskRunning {
+		s.fenceLegacyOpeningLocked()
 	}
 	if task.ambient || task.tool == "" {
 		return

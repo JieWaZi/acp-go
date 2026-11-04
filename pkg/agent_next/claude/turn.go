@@ -50,15 +50,17 @@ type input struct {
 	cancelReason    error
 	cancelDeadline  time.Time
 	controlStarted  bool
-	// mayFollowProvider distinguishes an input sent while P was already visible.
+	// mayFollowProvider marks an input that may run behind an observed provider operation.
 	mayFollowProvider bool
-	inv               *invocation
-	submission        agentclient.Submission
-	admission         agentclient.Admission
-	err               error
-	done              chan struct{}
-	settled           bool
-	waitResult        agentclient.PromptResult
+	// legacyEchoed records exact stdin acknowledgement from the legacy native stream.
+	legacyEchoed bool
+	inv          *invocation
+	submission   agentclient.Submission
+	admission    agentclient.Admission
+	err          error
+	done         chan struct{}
+	settled      bool
+	waitResult   agentclient.PromptResult
 }
 
 type invocation struct {
@@ -125,6 +127,9 @@ func (s *session) reserveInputLocked(ctx context.Context, id, generated string, 
 	}
 	if len(s.queued) >= maxPendingInputs || len(s.used) >= maxRememberedIDs || s.ledger.full() {
 		return nil, errCapacity
+	}
+	if s.client.usesLegacyReplay() && (len(s.queued) != 0 || s.legacyWireBusyLocked()) {
+		return nil, errBusy
 	}
 	if compact && s.busyLocked() {
 		return nil, errBusy
@@ -214,6 +219,19 @@ func (s *session) runInput(in *input) agentclient.PromptResult {
 	return inputResult(in)
 }
 
+func (s *session) legacyWireBusyLocked() bool {
+	if s.current != nil || len(s.sent) != 0 || s.nativeQueued > 0 || s.background > 0 {
+		return true
+	}
+	// 2.1.159 reports task lifecycle events without a background snapshot.
+	for _, task := range s.nativeTasks {
+		if task.phase == taskRunning && !task.ambient {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *session) interruptingLocked() bool {
 	return s.current != nil && s.current.cancelRequested
 }
@@ -257,6 +275,11 @@ func (s *session) submit(in *input, target *invocation, scope agentclient.Scope)
 			return errInterrupting
 		}
 		if in.compact && (s.current != nil || s.nativeQueued > 0 || s.background > 0) {
+			return errBusy
+		}
+		// The replay protocol confirms a single foreground input. It cannot
+		// resolve priority inputs or associate overlapping native results.
+		if s.client.usesLegacyReplay() && s.legacyWireBusyLocked() {
 			return errBusy
 		}
 		if len(s.sent) >= maxPendingInputs || s.ledger.full() {
@@ -552,6 +575,10 @@ func (c *Client) Steer(ctx context.Context, req agentclient.SteerRequest) (agent
 	if err := ctx.Err(); err != nil {
 		s.mu.Unlock()
 		return agentclient.SteerResponse{}, err
+	}
+	if target != nil && c.usesLegacyReplay() {
+		s.mu.Unlock()
+		return agentclient.SteerResponse{}, errBusy
 	}
 	if target == nil || target.cancelRequested {
 		if req.PromptRequired {

@@ -248,7 +248,7 @@ func (c *Client) capabilitiesLocked() acp.InitializeResponse {
 			},
 		},
 		Meta: map[string]any{
-			"steering":              map[string]any{"supported": true},
+			"steering":              map[string]any{"supported": !c.usesLegacyReplay()},
 			"developerInstructions": c.instructionCapability(),
 			"nativeTurn":            map[string]any{"notificationMetadata": "acp-go/native-turn", "backgroundMetadata": "acp-go/native-background"},
 			"modelCatalog":          acpmeta.ModelCatalogMethod, "accountUsage": acpmeta.AccountUsageMethod,

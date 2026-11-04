@@ -564,3 +564,96 @@ func TestMaxTurnsKeepsNativeFailureStatusAndACPStopReason(t *testing.T) {
 		t.Fatalf("native outcome = %+v", r.Outcome)
 	}
 }
+
+func TestLegacyReplayAcknowledgesOnlyExactHostInput(t *testing.T) {
+	for _, mode := range []string{"legacy-echo-current", "legacy-echo-early", "legacy-echo-foreign", "legacy-echo-provider", "legacy-echo-provider-origin", "legacy-echo-background"} {
+		t.Run(mode, func(t *testing.T) {
+			client, _, ctx := startMode(t, agentclient.HostCallbacks{}, mode, nil)
+			promptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			first := receive(t, promptCtx, launchPrompt(t, client, promptCtx, "legacy prompt"))
+			if mode == "legacy-echo-current" || mode == "legacy-echo-early" {
+				for _, result := range []agentclient.PromptResult{first, receive(t, promptCtx, launchPrompt(t, client, promptCtx, "legacy follow-up"))} {
+					if result.Receipt.Admission != agentclient.AdmissionConfirmed || result.Outcome == nil ||
+						result.Outcome.Turn.Origin != acpmeta.NativeTurnOriginHost || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted ||
+						!reflect.DeepEqual(result.Outcome.Turn.ConsumedInputIDs, []string{result.Receipt.Input.InputID}) {
+						t.Fatalf("legacy host result = %+v", result)
+					}
+				}
+				return
+			}
+			if first.Receipt.Admission != agentclient.AdmissionUnknown || first.Receipt.OperationError == nil || first.Outcome != nil {
+				t.Fatalf("foreign echo attached to the host input: %+v", first)
+			}
+			page, err := client.ReadNativeOutcomes(ctx, acpmeta.NativeTurnReceiptsRequest{SessionID: string(client.id)}, true)
+			if err != nil || len(page.Outcomes) != 1 {
+				t.Fatalf("foreign native result page = %+v %v", page, err)
+			}
+			native := page.Outcomes[0].Turn
+			if native.Status != acpmeta.NativeTurnCompleted || len(native.ConsumedInputIDs) != 0 ||
+				native.Usage == nil || native.Usage.InputTokens == nil || *native.Usage.InputTokens != 43 {
+				t.Fatalf("unassociated native result lost evidence: %+v", native)
+			}
+		})
+	}
+}
+
+func TestLegacyReplayRejectsOverlappingHostInputsBeforeAdmission(t *testing.T) {
+	opened := make(chan agentclient.Scope, 1)
+	client, input, ctx := startMode(t, agentclient.HostCallbacks{Observe: func(_ context.Context, scope agentclient.Scope, update acp.SessionNotification) error {
+		if update.Update.AgentMessageChunk != nil {
+			opened <- scope
+		}
+		return nil
+	}}, "legacy-echo-held", nil)
+	capabilities, err := client.Initialize(ctx, acp.InitializeRequest{})
+	steering, _ := capabilities.Meta["steering"].(map[string]any)
+	if err != nil || steering["supported"] != false {
+		t.Fatalf("legacy steering capability = %+v, error = %v", steering, err)
+	}
+	first := launchPrompt(t, client, ctx, "first")
+	scope := receive(t, ctx, opened)
+	if scope.HostInvocationID == "" {
+		t.Fatal("legacy foreground input was not associated")
+	}
+	// Let teardown complete if one of the overlapping operations fails this assertion.
+	release := filepath.Join(filepath.Dir(input), "finish-legacy")
+	defer os.WriteFile(release, nil, 0600)
+	if _, err := client.ReservePrompt(ctx, client.prompt("overlapping prompt"), agentclient.PromptOptions{}); err == nil {
+		t.Fatal("legacy prompt overlapped a foreground invocation")
+	}
+	_, err = client.Steer(ctx, agentclient.SteerRequest{
+		SessionID: client.id, Target: scope, Prompt: []acp.ContentBlock{acp.TextBlock("overlapping steer")},
+		Options: agentclient.PromptOptions{BeforeSubmit: func(context.Context, agentclient.PromptSubmission) error {
+			t.Error("legacy steer reached the host admission gate")
+			return nil
+		}},
+	})
+	if err == nil {
+		t.Fatal("legacy priority input overlapped a foreground invocation")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result := receive(t, ctx, first); result.Outcome == nil || result.Receipt.OperationError != nil {
+		t.Fatalf("legacy foreground result = %+v", result)
+	}
+}
+
+func TestLegacyReplayRejectsKnownTaskWithoutBackgroundSnapshot(t *testing.T) {
+	ready := make(chan struct{}, 1)
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{Observe: func(_ context.Context, _ agentclient.Scope, notification acp.SessionNotification) error {
+		if update := notification.Update.AvailableCommandsUpdate; update != nil && len(update.AvailableCommands) == 1 &&
+			update.AvailableCommands[0].Name == "task-observed" {
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}}, "legacy-echo-task-started", nil)
+	receive(t, ctx, ready)
+	if _, err := client.ReservePrompt(ctx, client.prompt("overlapping prompt"), agentclient.PromptOptions{}); err == nil {
+		t.Fatal("legacy prompt overlapped an already reported native task")
+	}
+}

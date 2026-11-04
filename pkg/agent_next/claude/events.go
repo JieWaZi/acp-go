@@ -63,6 +63,7 @@ func (s *session) receive(frame protocol.Message) {
 		}
 	case *protocol.UserMessage:
 		if s.matches(m.SessionID) {
+			s.observeLegacyEchoLocked(m)
 			s.toolResultsLocked(m)
 		}
 	case *protocol.ToolProgressMessage:
@@ -269,6 +270,12 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 	} else {
 		s.freezeNativeLocked(inv)
 		s.publishAfterDeliveryLocked(lost, inv)
+	}
+	if s.client.usesLegacyReplay() && len(s.sent) != 0 {
+		// Retain the native result and its usage. This stream did not confirm
+		// the host edge, and a later replay cannot be assigned safely.
+		s.faultAndStopLocked(errors.New("Claude did not acknowledge the legacy host input"))
+		return
 	}
 	s.refreshContextLocked()
 }

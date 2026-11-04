@@ -19,6 +19,62 @@ type nativeOpening struct {
 	recovery  string
 }
 
+// Claude 2.1.159 has no native turn input IDs. Its stream-json replay
+// acknowledges the exact host UUID instead, without identifying a queue slot.
+func (c *Client) usesLegacyReplay() bool {
+	return c.version == "2.1.159"
+}
+
+func (s *session) observeLegacyEchoLocked(message *protocol.UserMessage) {
+	if !s.client.usesLegacyReplay() || !message.IsReplay || message.SessionID != string(s.id) ||
+		message.ParentToolUseID != nil || message.Message.Role != "user" || len(s.sent) != 1 ||
+		s.nativeQueued > 0 || s.background > 0 {
+		return
+	}
+	if origin := message.Origin; origin != nil && origin.Kind != "" && origin.Kind != "human" {
+		return
+	}
+	input := s.sent[message.UUID]
+	if input == nil || input.mayFollowProvider || input.message.Priority != "" {
+		return
+	}
+	inv := s.current
+	if inv != nil && inv.opening.candidate != input {
+		return
+	}
+	input.legacyEchoed = true
+	if inv != nil && inv.opening.observed {
+		s.confirmLegacyOpeningLocked(inv)
+	}
+}
+
+// A competing native task invalidates the provisional opening even if it
+// finishes before the replay arrives. A confirmed host edge is independent.
+func (s *session) fenceLegacyOpeningLocked() {
+	if !s.client.usesLegacyReplay() || len(s.sent) == 0 {
+		return
+	}
+	for _, input := range s.sent {
+		input.mayFollowProvider = true
+	}
+	if s.current != nil {
+		s.current.opening.candidate = nil
+	}
+}
+
+func (s *session) confirmLegacyOpeningLocked(inv *invocation) {
+	input := inv.opening.candidate
+	if input == nil || !input.legacyEchoed || s.sent[input.identity.InputID] != input ||
+		s.nativeQueued > 0 || s.background > 0 {
+		return
+	}
+	inv.opening.candidate = nil
+	inv.opening.initiator = input
+	inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginHost
+	inv.scope.HostInvocationID = input.identity.HostInvocationID
+	s.recordConsumedIDsLocked(inv, []string{input.identity.InputID})
+}
+
 func consumedIDs(identity protocol.TurnIdentity) []string {
 	ids := identity.UserMessageUUIDs
 	if len(ids) == 0 && identity.UserMessageUUID != "" {
@@ -109,6 +165,10 @@ func (s *session) observeOpeningLocked(inv *invocation, identity protocol.TurnId
 		inv.opening.initiator = candidate
 		inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginHost
 		inv.scope.HostInvocationID = candidate.identity.HostInvocationID
+	case s.client.usesLegacyReplay() && !anonymousGap && candidate != nil && len(ids) == 0:
+		// The first main frame can precede the stdin acknowledgement.
+		s.confirmLegacyOpeningLocked(inv)
+		return
 	case !anonymousGap && len(s.sent) == 0 && len(ids) == 0:
 		inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginProvider
 	}
@@ -116,7 +176,11 @@ func (s *session) observeOpeningLocked(inv *invocation, identity protocol.TurnId
 }
 
 func (s *session) recordConsumptionLocked(inv *invocation, identity protocol.TurnIdentity) {
-	for _, id := range consumedIDs(identity) {
+	s.recordConsumedIDsLocked(inv, consumedIDs(identity))
+}
+
+func (s *session) recordConsumedIDsLocked(inv *invocation, ids []string) {
+	for _, id := range ids {
 		if len(inv.seenInputs) >= maxPendingInputs {
 			break
 		}
