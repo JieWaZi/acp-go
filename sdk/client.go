@@ -3,6 +3,10 @@
 package acp
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 )
@@ -44,3 +48,73 @@ func (c *ClientSideConnection) Done() <-chan struct{} { return c.conn.Done() }
 
 // SetLogger directs connection diagnostics to the provided logger.
 func (c *ClientSideConnection) SetLogger(l *slog.Logger) { c.conn.SetLogger(l) }
+
+// RequestReceipt reports the independent facts from one request.
+type RequestReceipt[T any] struct {
+	// Result is the decoded result when ResultValid is true.
+	Result T
+	// ResultValid reports successful decoding of a non-null result.
+	// The caller still validates method-specific semantics.
+	ResultValid bool
+	// PeerErr is the peer's JSON-RPC error, if it returned one.
+	PeerErr *RequestError
+	// TransportErr reports failure while waiting for a response. It retains
+	// the underlying connection or request-context cause.
+	TransportErr error
+	// Write reports the local write admission, bytes and error.
+	Write RequestWriteResult
+	// DecodeErr reports an invalid response envelope or result.
+	DecodeErr error
+	// PrepareErr reports failure to encode the request parameters.
+	PrepareErr error
+	// Sequence is the matched response's receive order, or zero if none arrived.
+	Sequence uint64
+	// NotificationWatermark is the receive sequence of the latest notification
+	// admitted to dispatch before the response, or zero when there was none.
+	NotificationWatermark uint64
+}
+
+// SendClientRequestWithReceipt sends a typed request using the connection's
+// existing pending owner. It returns response evidence before notification
+// dispatch completes. The reader still applies the configured queue limits.
+// WaitForNotifications can check dispatch separately.
+func SendClientRequestWithReceipt[T any](c *ClientSideConnection, ctx context.Context, method string, params any, hooks RequestWriteHooks) RequestReceipt[T] {
+	exchange := c.conn.exchangeRequest(ctx, method, params, hooks)
+	response := exchange.response
+	receipt := RequestReceipt[T]{
+		PrepareErr:            exchange.prepareErr,
+		TransportErr:          exchange.waitErr,
+		Write:                 exchange.write,
+		Sequence:              response.sequence,
+		NotificationWatermark: response.notificationWatermark,
+	}
+	if receipt.Sequence == 0 {
+		return receipt
+	}
+
+	msg := response.msg
+	switch {
+	case msg.JSONRPC != "2.0" || (msg.Error != nil && msg.Result != nil):
+		receipt.DecodeErr = errors.New("invalid JSON-RPC response envelope")
+	case msg.Error != nil:
+		receipt.PeerErr = msg.Error
+	case msg.Result == nil || bytes.Equal(msg.Result, []byte("null")):
+		receipt.DecodeErr = errors.New("JSON-RPC response has no non-null result")
+	default:
+		var result T
+		if err := json.Unmarshal(msg.Result, &result); err != nil {
+			receipt.DecodeErr = err
+		} else {
+			receipt.Result = result
+			receipt.ResultValid = true
+		}
+	}
+	return receipt
+}
+
+// WaitForNotifications waits for dispatch through a receipt watermark from
+// this connection. An interrupted drain does not invalidate the response.
+// Notification handler errors are logged by the SDK during dispatch.
+func (c *ClientSideConnection) WaitForNotifications(ctx context.Context, watermark uint64) error {
+	return c.conn.waitNotificationsUpTo(ctx, watermark)
+}

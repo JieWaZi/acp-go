@@ -635,20 +635,14 @@ func TestConnectionWaitForResponse_PeerDisconnectWinsOverDerivedContextCancel(t 
 		c.pending[idKey] = pr
 
 		requestCtx, requestCancel := context.WithCancel(baseCtx)
-		baseCancel(errors.New("peer closed"))
+		failure := errors.New("peer closed")
+		baseCancel(failure)
 
 		_, err := c.waitForResponse(requestCtx, pr, idKey)
 		requestCancel()
 
-		if err == nil {
-			t.Fatalf("iteration %d: expected error", i)
-		}
-		re, ok := err.(*RequestError)
-		if !ok {
-			t.Fatalf("iteration %d: expected *RequestError, got %T (%v)", i, err, err)
-		}
-		if re.Code != -32603 {
-			t.Fatalf("iteration %d: expected disconnect error code -32603, got %d (%s)", i, re.Code, re.Message)
+		if !errors.Is(err, failure) {
+			t.Fatalf("iteration %d: expected peer disconnect cause, got %v", i, err)
 		}
 
 		if _, ok := c.pending[idKey]; ok {

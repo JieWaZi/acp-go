@@ -36,6 +36,21 @@ type ConnectionOptions struct {
 	NotificationQueueBytes int64
 	// CloseTransport 中断底层阻塞读写；调用方明确把该关闭能力交给连接所有者。
 	CloseTransport func() error
+	// ReceiveNotification records technical evidence before notification dispatch.
+	// It is fixed at construction and runs synchronously on the reader. Limit it
+	// to a bounded local state update. It must not wait, perform I/O, call back
+	// into the connection, or invoke application observers.
+	ReceiveNotification func(ReceiveNotification)
+}
+
+// ReceiveNotification identifies a notification in the reader's frame order.
+type ReceiveNotification struct {
+	// Sequence shares the same per-connection order as response receipts.
+	Sequence uint64
+	// Method is the incoming notification method.
+	Method string
+	// Params is the borrowed read-only payload for the duration of the callback.
+	Params json.RawMessage
 }
 
 type anyMessage struct {
@@ -58,6 +73,7 @@ type queuedNotification struct {
 
 type responseEnvelope struct {
 	msg                   anyMessage
+	sequence              uint64
 	notificationWatermark uint64
 }
 
@@ -469,6 +485,7 @@ func (c *Connection) receive() {
 	buf := make([]byte, 0, initialBufSize)
 	scanner.Buffer(buf, maxBufSize)
 
+	var sequence uint64
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -481,6 +498,8 @@ func (c *Connection) receive() {
 			continue
 		}
 
+		sequence++
+
 		// Handle $/cancel_request notifications synchronously so cancellations take effect
 		// immediately and do not participate in notification ordering.
 		if msg.ID == nil && msg.Method == "$/cancel_request" {
@@ -490,7 +509,7 @@ func (c *Connection) receive() {
 
 		switch {
 		case msg.ID != nil && msg.Method == "":
-			c.handleResponse(&msg)
+			c.handleResponse(&msg, sequence)
 		case msg.Method != "":
 			if msg.ID != nil {
 				idKey, err := canonicalJSONRPCIDKey(*msg.ID)
@@ -519,9 +538,12 @@ func (c *Connection) receive() {
 				continue
 			}
 
+			if c.options != nil && c.options.ReceiveNotification != nil && msg.JSONRPC == "2.0" && msg.Result == nil && msg.Error == nil {
+				c.options.ReceiveNotification(ReceiveNotification{Sequence: sequence, Method: msg.Method, Params: msg.Params})
+			}
 			run := c.prepareNotificationDispatch(&msg)
 			if c.options != nil {
-				if err := c.enqueueNotification(&msg, int64(len(line)), run); err != nil {
+				if err := c.enqueueNotification(&msg, sequence, int64(len(line)), run); err != nil {
 					c.shutdownReceive(err, &queuedNotification{msg: &msg, run: run})
 					return
 				}
@@ -532,22 +554,11 @@ func (c *Connection) receive() {
 			// the response-scoped barrier boundary for requests that observe later responses.
 			m := msg
 			c.notifyMu.Lock()
-			c.lastEnqueuedNotificationSeq++
-			seq := c.lastEnqueuedNotificationSeq
 			select {
-			case c.notificationQueue <- queuedNotification{seq: seq, msg: &m, run: run}:
+			case c.notificationQueue <- queuedNotification{seq: sequence, msg: &m, run: run}:
+				c.lastEnqueuedNotificationSeq = sequence
 				c.notifyMu.Unlock()
 			default:
-				if c.lastEnqueuedNotificationSeq != seq {
-					c.notifyMu.Unlock()
-					panic("notification sequence advanced while receive goroutine was queueing")
-				}
-				c.lastEnqueuedNotificationSeq--
-				// invariant: completedNotificationSeq never exceeds the highest accepted enqueue.
-				if c.completedNotificationSeq > c.lastEnqueuedNotificationSeq {
-					c.notifyMu.Unlock()
-					panic("completed notification sequence exceeded enqueued notification sequence")
-				}
 				c.notifyMu.Unlock()
 				c.loggerOrDefault().Error("failed to queue notification; closing connection", "err", errNotificationQueueOverflow, "capacity", cap(c.notificationQueue), "queued", len(c.notificationQueue))
 				c.shutdownReceive(errNotificationQueueOverflow, &queuedNotification{msg: &msg, run: run})
@@ -566,7 +577,7 @@ func (c *Connection) receive() {
 }
 
 // enqueueNotification 在不持有消费者序号锁时等待条数和字节预算。
-func (c *Connection) enqueueNotification(msg *anyMessage, bytes int64, run inboundContinuation) error {
+func (c *Connection) enqueueNotification(msg *anyMessage, sequence uint64, bytes int64, run inboundContinuation) error {
 	if bytes > c.options.NotificationQueueBytes {
 		return ErrNotificationQueueLimit
 	}
@@ -578,9 +589,9 @@ func (c *Connection) enqueueNotification(msg *anyMessage, bytes int64, run inbou
 		if c.queuedCount < c.options.NotificationQueueCapacity && c.queuedBytes+bytes <= c.options.NotificationQueueBytes {
 			c.queuedCount++
 			c.queuedBytes += bytes
-			c.lastEnqueuedNotificationSeq++
+			c.lastEnqueuedNotificationSeq = sequence
 			// 预算包含正在处理的通知；成功预留后 channel 一定仍有空位。
-			c.notificationQueue <- queuedNotification{seq: c.lastEnqueuedNotificationSeq, msg: msg, bytes: bytes, run: run}
+			c.notificationQueue <- queuedNotification{seq: sequence, msg: msg, bytes: bytes, run: run}
 			c.notifyMu.Unlock()
 			return nil
 		}
@@ -637,8 +648,8 @@ func (c *Connection) processNotifications() {
 		c.handleInbound(c.inboundCtx, queued.msg, queued.run)
 
 		c.notifyMu.Lock()
-		expectedSeq := c.completedNotificationSeq + 1
-		if queued.seq != expectedSeq {
+		// Requests and responses also consume sequence numbers on the reader.
+		if queued.seq <= c.completedNotificationSeq {
 			c.notifyMu.Unlock()
 			panic("notification sequence completed out of order")
 		}
@@ -658,7 +669,7 @@ func (c *Connection) processNotifications() {
 	}
 }
 
-func (c *Connection) handleResponse(msg *anyMessage) {
+func (c *Connection) handleResponse(msg *anyMessage, sequence uint64) {
 	idStr, err := canonicalJSONRPCIDKey(*msg.ID)
 	if err != nil {
 		c.loggerOrDefault().Error("failed to canonicalize response id", "id_bytes", len(*msg.ID))
@@ -680,7 +691,7 @@ func (c *Connection) handleResponse(msg *anyMessage) {
 	c.notifyMu.Unlock()
 	// Publishing the immutable response and retiring pending admission are one
 	// operation, so cancellation cannot fall between them and lose the terminal.
-	pr.ch <- responseEnvelope{msg: *msg, notificationWatermark: watermark}
+	pr.ch <- responseEnvelope{msg: *msg, sequence: sequence, notificationWatermark: watermark}
 	delete(c.pending, idStr)
 }
 
@@ -865,38 +876,26 @@ func SendRequest[T any](c *Connection, ctx context.Context, method string, param
 // as SendRequest, with synchronous wire admission and delivery receipts.
 func SendRequestWithWriteHooks[T any](c *Connection, ctx context.Context, method string, params any, hooks RequestWriteHooks) (T, error) {
 	var result T
-
-	msg, idKey, err := c.prepareRequest(method, params)
-	if err != nil {
-		return result, err
+	exchange := c.exchangeRequest(ctx, method, params, hooks)
+	if exchange.prepareErr != nil {
+		return result, exchange.prepareErr
 	}
-
-	pr := &pendingResponse{ch: make(chan responseEnvelope, 1)}
-	c.mu.Lock()
-	c.pending[idKey] = pr
-	c.mu.Unlock()
-
-	write := c.writeMessage(ctx, msg, hooks)
-	var resp responseEnvelope
 	var writeErr error
-	if write.Err != nil {
-		writeErr = NewInternalError(map[string]any{"error": write.Err.Error()})
-		if write.FrameBytes == 0 || write.BytesWritten != write.FrameBytes {
-			c.cleanupPending(idKey)
+	if exchange.write.Err != nil {
+		writeErr = NewInternalError(map[string]any{"error": exchange.write.Err.Error()})
+	}
+	resp := exchange.response
+	if resp.sequence == 0 {
+		if writeErr != nil {
 			return result, writeErr
 		}
-		// The transport failed, but a complete write may already have a
-		// response on the same pending request. Never wait for one here.
-		var buffered bool
-		resp, buffered = c.takeBufferedResponse(pr, idKey)
-		if !buffered {
-			return result, writeErr
+		if exchange.waitErr != nil {
+			if _, disconnected := exchange.waitErr.(*requestDisconnectError); disconnected {
+				return result, NewInternalError(map[string]any{"error": exchange.waitErr.Error()})
+			}
+			return result, toReqErr(exchange.waitErr)
 		}
-	} else {
-		resp, err = c.waitForResponse(ctx, pr, idKey)
-		if err != nil {
-			return result, err
-		}
+		return result, nil
 	}
 	var responseErr error
 	if resp.msg.Error != nil {
@@ -914,10 +913,41 @@ func SendRequestWithWriteHooks[T any](c *Connection, ctx context.Context, method
 	if err := c.waitNotificationsUpTo(ctx, resp.notificationWatermark); err != nil {
 		return result, errors.Join(responseErr, err)
 	}
-	if responseErr != nil {
-		return result, responseErr
+	return result, responseErr
+}
+
+type requestExchange struct {
+	response   responseEnvelope
+	write      RequestWriteResult
+	prepareErr error
+	waitErr    error
+}
+
+func (c *Connection) exchangeRequest(ctx context.Context, method string, params any, hooks RequestWriteHooks) requestExchange {
+	msg, idKey, err := c.prepareRequest(method, params)
+	if err != nil {
+		return requestExchange{prepareErr: err}
 	}
-	return result, nil
+
+	pr := &pendingResponse{ch: make(chan responseEnvelope, 1)}
+	c.mu.Lock()
+	c.pending[idKey] = pr
+	c.mu.Unlock()
+
+	exchange := requestExchange{write: c.writeMessage(ctx, msg, hooks)}
+	if exchange.write.Err != nil {
+		if exchange.write.FrameBytes == 0 || exchange.write.BytesWritten != exchange.write.FrameBytes {
+			c.cleanupPending(idKey)
+			return exchange
+		}
+		// The transport failed, but a complete write may already have a
+		// response on the same pending request. Never wait for one here.
+		exchange.response, _ = c.takeBufferedResponse(pr, idKey)
+		return exchange
+	}
+
+	exchange.response, exchange.waitErr = c.waitForResponse(ctx, pr, idKey)
+	return exchange
 }
 
 func (c *Connection) prepareRequest(method string, params any) (anyMessage, string, error) {
@@ -997,6 +1027,16 @@ func (c *Connection) sendCancelRequest(idKey string) {
 	}
 }
 
+// A disconnect has precedence over derived caller cancellation. Keep its
+// underlying cause available to receipt callers without changing legacy errors.
+type requestDisconnectError struct {
+	cause error
+}
+
+func (*requestDisconnectError) Error() string { return "peer disconnected before response" }
+
+func (e *requestDisconnectError) Unwrap() error { return e.cause }
+
 func (c *Connection) waitForResponse(ctx context.Context, pr *pendingResponse, idKey string) (responseEnvelope, error) {
 	select {
 	case resp := <-pr.ch:
@@ -1007,14 +1047,14 @@ func (c *Connection) waitForResponse(ctx context.Context, pr *pendingResponse, i
 	if resp, buffered := c.takeBufferedResponse(pr, idKey); buffered {
 		return resp, nil
 	}
-	if c.ctx.Err() != nil {
-		return responseEnvelope{}, NewInternalError(map[string]any{"error": "peer disconnected before response"})
+	if cause := context.Cause(c.ctx); cause != nil {
+		return responseEnvelope{}, &requestDisconnectError{cause: cause}
 	}
 	c.sendCancelRequest(idKey)
 	if cause := context.Cause(ctx); cause != nil {
-		return responseEnvelope{}, toReqErr(cause)
+		return responseEnvelope{}, cause
 	}
-	return responseEnvelope{}, NewInternalError(map[string]any{"error": "request context ended without cause"})
+	return responseEnvelope{}, errors.New("request context ended without cause")
 }
 
 // takeBufferedResponse observes a published response or retires the pending
@@ -1043,7 +1083,7 @@ func (c *Connection) waitNotificationsUpTo(ctx context.Context, target uint64) e
 	c.notifyMu.Lock()
 	defer c.notifyMu.Unlock()
 	if target > c.lastEnqueuedNotificationSeq {
-		panic("response watermark exceeded last enqueued notification sequence")
+		return errors.New("notification watermark was not received on this connection")
 	}
 
 	go func() {
