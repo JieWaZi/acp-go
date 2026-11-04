@@ -1,4 +1,4 @@
-package cursor
+package acpclient
 
 import (
 	"context"
@@ -59,7 +59,7 @@ type turn struct {
 	observedOutput bool
 	// associated records an explicit turn-scoped native update.
 	associated bool
-	// authLost is set only by the Cursor-specific complete sign-in chunk.
+	// authLost is set only by an exact native sign-in failure chunk.
 	authLost bool
 	// elicitations binds completion to its original URL request.
 	elicitations map[acp.UnstableElicitationId]struct{}
@@ -84,14 +84,14 @@ type promptResponse struct {
 
 func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, options agentclient.PromptOptions) (func() agentclient.PromptResult, error) {
 	if request.SessionId == "" || len(request.Prompt) == 0 {
-		return nil, invalid("Cursor prompt requires an open session and input")
+		return nil, invalid("ACP agent prompt requires an open session and input")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	frozen, err := clone(request)
 	if err != nil {
-		return nil, invalid("invalid Cursor prompt content")
+		return nil, invalid("invalid ACP agent prompt content")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -100,7 +100,7 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 	}
 	s := c.sessions[frozen.SessionId]
 	if s == nil {
-		return nil, invalid("Cursor session is not open")
+		return nil, invalid("ACP agent session is not open")
 	}
 	prep, stopPrep := context.WithCancel(ctx)
 	interactions, stopInteractions := context.WithCancel(context.WithoutCancel(ctx))
@@ -120,11 +120,11 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 		options.HostInvocationID = newID()
 	}
 	t := &turn{session: s, conn: c.conn, preparation: prep, stopPreparation: stopPrep, interactions: interactions,
-		stopInteractions: stopInteractions, settings: freezeSettings(s.config), delivery: newDelivery(c.ctx), writeDone: make(chan struct{}),
+		stopInteractions: stopInteractions, settings: c.freezeSettings(s.config), delivery: newDelivery(c.ctx), writeDone: make(chan struct{}),
 		received: make(chan struct{}), settled: make(chan struct{}),
 		scope: agentclient.Scope{SessionID: s.id, HostInvocationID: options.HostInvocationID, NativeInvocationID: newID()},
 		input: agentclient.PromptSubmission{SessionID: s.id, HostInvocationID: options.HostInvocationID, InputID: inputID}}
-	// Cursor's observed ACP build does not establish messageId support.
+	// The supported native launch profiles have no proven messageId contract.
 	frozen.MessageId = nil
 	c.busy, c.turn = true, t
 	c.workers.Add(1)
@@ -134,7 +134,7 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 		if !t.claimed.CompareAndSwap(false, true) {
 			return agentclient.PromptResult{Receipt: agentclient.PromptReceipt{
 				Input: t.input, Submission: agentclient.SubmissionNotSent, Admission: agentclient.AdmissionNotAccepted,
-				OperationError: errors.New("Cursor prompt continuation already consumed"),
+				OperationError: errors.New("ACP agent prompt continuation already consumed"),
 			}}
 		}
 		defer stopCaller()
@@ -236,20 +236,20 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 			result.Receipt.Submission = agentclient.SubmissionSent
 		}
 	}
-	operationErr := promptOperationError(r, t.session.id)
+	operationErr := promptOperationError(c, r, t.session.id)
 	c.mu.Lock()
 	if !t.terminal {
 		t.terminal = true
 		t.stopInteractions()
 		t.outcome = c.nativeOutcomeLocked(t, nil, nil)
 	}
-	if t.authLost || r.Write.BytesWritten > 0 && !knownStopReason(r.Result.StopReason) && !preAcceptanceRejection(r.PeerErr, t.session.id) {
+	if t.authLost || r.Write.BytesWritten > 0 && !knownStopReason(r.Result.StopReason) && !c.preAcceptanceRejection(r.PeerErr, t.session.id) {
 		c.unusable = true
 	}
 	if t.outcome != nil && (t.associated || r.ResultValid && t.outcome.StopReason != nil || t.authLost) {
 		result.Receipt.Admission = agentclient.AdmissionConfirmed
 	}
-	if preAcceptanceRejection(r.PeerErr, t.session.id) && result.Receipt.Admission != agentclient.AdmissionConfirmed {
+	if c.preAcceptanceRejection(r.PeerErr, t.session.id) && result.Receipt.Admission != agentclient.AdmissionConfirmed {
 		result.Receipt.Admission = agentclient.AdmissionNotAccepted
 	}
 	if result.Receipt.Admission == agentclient.AdmissionConfirmed && t.session.instructionEpoch == epoch {
@@ -323,11 +323,14 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 		ContextUsage: t.contextUsage, ObservedOutput: t.observedOutput, PossibleSideEffects: true,
 	}
 	if response != nil {
-		cumulative := t.session.usage.consume(response.Usage)
+		standard := t.session.usage.consume(c.opts.Protocol.PromptUsage, response.Usage)
 		if native, ok := acpmeta.ReadTurnUsage(response.Meta); ok {
+			if standard != nil {
+				native.Observations = append(native.Observations, standard.Observations...)
+			}
 			outcome.Turn.Usage = &native
-		} else if cumulative != nil {
-			outcome.Turn.Usage = cumulative
+		} else if standard != nil {
+			outcome.Turn.Usage = standard
 		}
 		switch response.StopReason {
 		case acp.StopReasonEndTurn, acp.StopReasonMaxTokens, acp.StopReasonMaxTurnRequests, acp.StopReasonRefusal:
@@ -344,7 +347,7 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 		if outcome.StopReason != nil || peer != nil {
 			outcome.Turn.Status = acpmeta.NativeTurnFailed
 		}
-	} else if peer != nil && t.associated && !preAcceptanceRejection(peer, t.session.id) {
+	} else if peer != nil && t.associated && !c.preAcceptanceRejection(peer, t.session.id) {
 		outcome.NativeFailure = freezeProtocolError(safePeerError(peer, acp.AgentMethodSessionPrompt))
 		outcome.Turn.Status = acpmeta.NativeTurnFailed
 	}
@@ -359,8 +362,8 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 	return outcome
 }
 
-func promptOperationError(r acp.RequestReceipt[promptResponse], id acp.SessionId) error {
-	if err := sessionReceiptFailure(r, acp.AgentMethodSessionPrompt, id); err != nil {
+func promptOperationError(c *Client, r acp.RequestReceipt[promptResponse], id acp.SessionId) error {
+	if err := sessionReceiptFailure(c, r, acp.AgentMethodSessionPrompt, id); err != nil {
 		var protocol *acp.RequestError
 		if errors.As(err, &protocol) {
 			return freezeProtocolError(protocol)
@@ -370,7 +373,7 @@ func promptOperationError(r acp.RequestReceipt[promptResponse], id acp.SessionId
 	if knownStopReason(r.Result.StopReason) {
 		return nil
 	}
-	return errors.New("Cursor did not report a known prompt terminal reason")
+	return errors.New("ACP agent did not report a known prompt terminal reason")
 }
 
 func knownStopReason(reason acp.StopReason) bool {
@@ -382,21 +385,22 @@ func knownStopReason(reason acp.StopReason) bool {
 	}
 }
 
-func preAcceptanceRejection(err *acp.RequestError, id acp.SessionId) bool {
-	return err != nil && (err.Code == -32000 || err.Code == -32601 || missingSession(err, id))
+func (c *Client) preAcceptanceRejection(err *acp.RequestError, id acp.SessionId) bool {
+	return err != nil && (err.Code == -32000 || err.Code == -32601 || c.missingSession(err, id))
 }
 
-func missingSession(err *acp.RequestError, id acp.SessionId) bool {
-	if err == nil || err.Code != -32602 || id == "" {
+func (c *Client) missingSession(err *acp.RequestError, id acp.SessionId) bool {
+	if err == nil || id == "" {
 		return false
 	}
-	details, _ := err.Data.(map[string]any)
-	return details["message"] == fmt.Sprintf("Session %q not found", id)
+	return err.Code == -32002 || c.opts.Protocol.SessionMissing != nil && c.opts.Protocol.SessionMissing(err, id)
 }
 
-func sessionReceiptFailure[T any](r acp.RequestReceipt[T], method string, id acp.SessionId) error {
-	if missingSession(r.PeerErr, id) {
-		return acp.NewInvalidParams(map[string]any{"method": method, "classification": "session_missing"})
+func sessionReceiptFailure[T any](c *Client, r acp.RequestReceipt[T], method string, id acp.SessionId) error {
+	if c.missingSession(r.PeerErr, id) {
+		result := safePeerError(r.PeerErr, method)
+		result.Data = map[string]any{"method": method, "classification": "session_missing"}
+		return result
 	}
 	return receiptFailure(r, method)
 }
@@ -505,8 +509,8 @@ func (c *Client) sendCancel(t *turn, deadline time.Time) {
 }
 
 var (
-	errControlRetired  = errors.New("Cursor control owner already retired")
-	errSettingsChanged = errors.New("Cursor settings changed before prompt submission")
+	errControlRetired  = errors.New("ACP agent control owner already retired")
+	errSettingsChanged = errors.New("ACP agent settings changed before prompt submission")
 )
 
 func (c *Client) recordControlFailure(t *turn, err error) {
@@ -581,68 +585,4 @@ func newID() string {
 	value[6] = value[6]&0x0f | 0x40
 	value[8] = value[8]&0x3f | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", value[:4], value[4:6], value[6:8], value[8:10], value[10:])
-}
-
-// wireUsage retains independent presence for ACP's cumulative session counters.
-type wireUsage struct {
-	// Input includes both cache reads and cache writes.
-	Input *int64 `json:"inputTokens"`
-	// Output is the total output counter.
-	Output *int64 `json:"outputTokens"`
-	// CacheRead is the cumulative count served from cache.
-	CacheRead *int64 `json:"cachedReadTokens"`
-	// CacheWrite is the cumulative count written to cache.
-	CacheWrite *int64 `json:"cachedWriteTokens"`
-	// Thought is the separately reported reasoning subset.
-	Thought *int64 `json:"thoughtTokens"`
-}
-
-type usageCounter struct {
-	// fresh proves a zero baseline only for the first response of a new session.
-	fresh bool
-	// previous is the immediate prior response; gaps cannot be billed as one turn.
-	previous wireUsage
-}
-
-func (counter *usageCounter) consume(value *wireUsage) *acpmeta.TurnUsage {
-	fresh, previous := counter.fresh, counter.previous
-	counter.fresh = false
-	if value == nil {
-		counter.previous = wireUsage{}
-		return nil
-	}
-	counter.previous = *value
-	delta := func(current, baseline *int64) *int64 {
-		current = nonnegative(current)
-		if current == nil {
-			return nil
-		}
-		if fresh {
-			return current
-		}
-		baseline = nonnegative(baseline)
-		if baseline == nil || *current < *baseline {
-			return nil
-		}
-		return acp.Ptr(*current - *baseline)
-	}
-	input := delta(value.Input, previous.Input)
-	cacheRead := delta(value.CacheRead, previous.CacheRead)
-	cacheWrite := delta(value.CacheWrite, previous.CacheWrite)
-	output := delta(value.Output, previous.Output)
-	thought := delta(value.Thought, previous.Thought)
-	var uncached *int64
-	if input != nil && cacheRead != nil && cacheWrite != nil && *cacheRead <= *input && *cacheWrite <= *input-*cacheRead {
-		uncached = acp.Ptr(*input - *cacheRead - *cacheWrite)
-	}
-	if output != nil && thought != nil && *thought > *output {
-		thought = nil
-	}
-	return &acpmeta.TurnUsage{
-		InputTokens: uncached, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite, OutputTokens: output, ReasoningTokens: thought,
-		Source: "cursor/acp/prompt", Coverage: "invocation",
-		Complete: (value.Input == nil || uncached != nil) && (value.Output == nil || output != nil) &&
-			(value.CacheRead == nil || cacheRead != nil) && (value.CacheWrite == nil || cacheWrite != nil) &&
-			(value.Thought == nil || thought != nil),
-	}
 }

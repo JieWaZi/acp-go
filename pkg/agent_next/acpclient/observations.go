@@ -1,11 +1,9 @@
-package cursor
+package acpclient
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
@@ -17,29 +15,6 @@ const (
 	deliveryTimeout        = 500 * time.Millisecond
 	compactionContextRatio = 0.6
 )
-
-var cursorErrorClass = regexp.MustCompile(`^[a-zA-Z0-9_$]+$`)
-
-// Cursor emits these complete provider-error chunks as assistant text. Keep
-// normal assistant text that merely mentions the same error words.
-func cursorNoise(text string) bool {
-	detail, ok := strings.CutPrefix(strings.TrimSpace(text), "Error: ")
-	if !ok {
-		return false
-	}
-	if name, remainder, hasClass := strings.Cut(detail, ": "); hasClass && cursorErrorClass.MatchString(name) {
-		detail = remainder
-	}
-	return detail == "WritableIterable is closed"
-}
-
-func cursorAuthLost(text string) bool {
-	detail, ok := strings.CutPrefix(text, "\n\n")
-	if !ok || strings.Contains(detail, "\n") {
-		return false
-	}
-	return detail == "Please sign in to continue" || strings.HasPrefix(detail, "Error: [unauthenticated] Backend rejected authentication.")
-}
 
 type delivery struct {
 	// ctx and cancel bound callbacks and stop abandoned observations.
@@ -132,7 +107,7 @@ func (c *Client) receive(frame acp.ReceiveNotification) {
 		Kind string `json:"sessionUpdate"`
 		// ConfigOptions is the raw directory.
 		ConfigOptions json.RawMessage `json:"configOptions"`
-		// Status reports completion of Cursor's optional compaction notification.
+		// Status reports completion of an optional native compaction notification.
 		Status string `json:"status"`
 	}
 	if json.Unmarshal(raw.Update, &discriminator) != nil {
@@ -264,12 +239,11 @@ func (c *Client) publishOpeningLocked(p *opening) {
 
 func (c *Client) foldTurnUpdateLocked(t *turn, update receivedUpdate) {
 	u := update.note.Update
-	if u.AgentMessageChunk != nil && u.AgentMessageChunk.Content.Text != nil {
-		text := u.AgentMessageChunk.Content.Text.Text
-		if cursorNoise(text) {
+	if classify := c.opts.Protocol.ClassifyText; classify != nil && u.AgentMessageChunk != nil && u.AgentMessageChunk.Content.Text != nil {
+		switch classify(c.version, u.AgentMessageChunk.Content.Text.Text) {
+		case TextNoise:
 			return
-		}
-		if cursorAuthLost(text) {
+		case TextAuthenticationLost:
 			t.authLost = true
 			return
 		}
@@ -364,7 +338,7 @@ func (c *Client) deliver() {
 				// config value is shared with the native session directory.
 				note, cloneErr := clone(o.update)
 				if cloneErr != nil {
-					err = errors.New("invalid Cursor observation")
+					err = errors.New("invalid ACP agent observation")
 				} else {
 					err = c.host.Observe(ctx, o.scope, note)
 				}

@@ -624,6 +624,10 @@ func TestCumulativeUsageUsesFreshAndRestoredBaselines(t *testing.T) {
 	if baseline.Outcome == nil || baseline.Outcome.Turn.Usage == nil || baseline.Outcome.Turn.Usage.InputTokens != nil || baseline.Outcome.Turn.Usage.Complete {
 		t.Fatalf("restore booked earlier cumulative usage: %#v", baseline.Outcome)
 	}
+	observed := baseline.Outcome.Turn.Usage.Observations
+	if len(observed) != 1 || observed[0].Coverage != "session_cumulative" || observed[0].Tokens.InputTokens == nil || *observed[0].Tokens.InputTokens != 51 {
+		t.Fatalf("lost unbilled cumulative evidence: %#v", observed)
+	}
 	requireTerminal(t, reserve(t, client, ctx, agentclient.PromptOptions{})(), acp.StopReasonEndTurn)
 }
 
@@ -731,7 +735,7 @@ func TestDashboardReadsOnlyBoundDefaultCredential(t *testing.T) {
 		}
 		return cursor.DashboardCredential{Selection: binding, AccessToken: "selected"}, nil
 	}}
-	client, ctx, _ := candidate(t, "", agentclient.HostCallbacks{}, func(o *cursor.Options) {
+	client, ctx, trace := candidate(t, "", agentclient.HostCallbacks{}, func(o *cursor.Options) {
 		o.Dashboard, o.Credential = &dashboard, selection
 	})
 	got, err := client.ReadAccountUsage(ctx)
@@ -750,6 +754,29 @@ func TestDashboardReadsOnlyBoundDefaultCredential(t *testing.T) {
 	if _, err := api.ReadAccountUsage(apiCtx); err == nil || calls.Load() != 2 {
 		t.Fatalf("API-key selection used a default login: %v, calls %d", err, calls.Load())
 	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold, err := cursor.NewClient(ctx, cursor.Options{Executable: executable, Environment: []string{}, Dashboard: &dashboard, Credential: selection}, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cold.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := cold.ReadAccountUsage(ctx); err != nil {
+		t.Fatalf("quota without ACP startup: %v", err)
+	}
+	openOne(t, client, ctx, trace)
+	run := reserve(t, client, ctx, agentclient.PromptOptions{})
+	if _, err := client.ReadAccountUsage(ctx); err != nil {
+		t.Errorf("quota while a prompt owns ACP: %v", err)
+	}
+	requireTerminal(t, run(), acp.StopReasonEndTurn)
 }
 
 func TestNativeForkPublishesOnlyChildConfigurationAndReceipt(t *testing.T) {
@@ -811,5 +838,24 @@ func TestDeveloperInstructionsUseOnlyTheNativePromptPrefix(t *testing.T) {
 	wire, _ := os.ReadFile(trace)
 	if strings.Count(string(wire), instructions) != 2 || strings.Contains(string(wire), "developerInstructions") {
 		t.Fatalf("instructions were duplicated or sent as unnegotiated native metadata: %s", wire)
+	}
+}
+
+func TestForkReceiptFailureDoesNotPublishChildAdmission(t *testing.T) {
+	client, ctx, trace := candidate(t, "fork", agentclient.HostCallbacks{})
+	openOne(t, client, ctx, trace)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "receipt.json"), []byte("invalid existing receipt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.UnstableForkSession(ctx, acp.UnstableForkSessionRequest{SessionId: "one", Cwd: filepath.Dir(trace), Meta: map[string]any{"forkReceiptDirectory": dir}})
+	if err == nil || result.SessionId != "forked" || len(result.ConfigOptions) != 0 {
+		t.Fatalf("lost native child evidence: %#v, %v", result, err)
+	}
+	if run, err := client.ReservePrompt(ctx, acp.PromptRequest{SessionId: result.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("must not run")}}, agentclient.PromptOptions{}); err == nil || run != nil {
+		t.Fatal("uncommitted native child became promptable")
+	}
+	if _, err := client.CloseSession(ctx, acp.CloseSessionRequest{SessionId: result.SessionId}); err != nil {
+		t.Fatal(err)
 	}
 }

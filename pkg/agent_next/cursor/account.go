@@ -1,7 +1,6 @@
 package cursor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -71,23 +70,15 @@ func (c *Client) AuthenticationSource() CredentialSource {
 	return DefaultLogin
 }
 
-func (c *Client) probeVersion(ctx context.Context) (string, error) {
-	versionCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	data, err := c.runCommand(versionCtx, c.opts.Environment, "--version", 4096)
-	version := strings.TrimSpace(string(data))
-	if err == nil && versionPattern.MatchString(version) {
-		return version, nil
+func parseVersion(executable string, output []byte) string {
+	version := strings.TrimSpace(string(output))
+	if versionPattern.MatchString(version) {
+		return version
 	}
-	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" && versionCtx.Err() == nil {
-		if version := manifestVersion(c.opts.Executable); version != "" {
-			return version, nil
-		}
+	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" {
+		return manifestVersion(executable)
 	}
-	if err != nil {
-		return "", err
-	}
-	return "", errors.New("selected executable did not report a Cursor CLI version")
+	return ""
 }
 
 // manifestVersion handles the Windows installer layout when its launcher does
@@ -136,12 +127,6 @@ func cliName(path string) string {
 	}
 }
 
-func (c *Client) runCommand(ctx context.Context, env []string, command string, limit int64) ([]byte, error) {
-	var output bytes.Buffer
-	err := c.runCommandTo(ctx, env, command, limit, &output)
-	return output.Bytes(), err
-}
-
 func (c *Client) runCommandTo(ctx context.Context, env []string, command string, limit int64, output io.Writer) (result error) {
 	proc, err := agentclient.NewProcess(agentclient.ProcessSpec{
 		Executable: c.opts.Executable, Args: append(slices.Clone(c.opts.PrefixArgs), command), Env: env, Dir: c.opts.WorkingDirectory,
@@ -157,10 +142,9 @@ func (c *Client) runCommandTo(ctx context.Context, env []string, command string,
 	c.command = proc
 	c.mu.Unlock()
 	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), controlTimeout)
+		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := c.closeCommand(cleanup, proc); err != nil {
-			c.invalidate()
 			result = errors.Join(result, err)
 		}
 	}()
@@ -199,68 +183,24 @@ func (c *Client) closeCommand(ctx context.Context, proc *agentclient.Process) er
 	return nil
 }
 
-func (c *Client) Authenticate(ctx context.Context, request acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
-	conn, err := c.begin(ctx)
-	if err != nil {
-		return acp.AuthenticateResponse{}, err
-	}
-	defer c.end()
-	if request.MethodId != loginMethod || c.apiKey != "" {
-		return acp.AuthenticateResponse{}, invalid("Cursor native login is unavailable for this selection")
-	}
-	advertised := slices.ContainsFunc(c.initialized.AuthMethods, func(method acp.AuthMethod) bool {
-		return method.Agent != nil && method.Agent.Id == loginMethod
-	})
-	if !advertised {
-		return acp.AuthenticateResponse{}, acp.NewMethodNotFound(acp.AgentMethodAuthenticate)
-	}
-	op, cancel := c.operationContext(ctx, 5*time.Minute)
-	defer cancel()
-	r := send[acp.AuthenticateResponse](conn, op, acp.AgentMethodAuthenticate, request)
-	return r.Result, receiptFailure(r, acp.AgentMethodAuthenticate)
-}
-
 // LoginLink runs the Cursor CLI's headless login flow and returns its native output.
 func (c *Client) LoginLink(ctx context.Context, output io.Writer) error {
 	if output == nil || c.apiKey != "" {
 		return invalid("Cursor headless login requires a default login and an output writer")
 	}
-	if _, err := c.begin(ctx); err != nil {
+	if err := c.RetireAuthentication(ctx); err != nil {
 		return err
 	}
-	defer c.end()
-	defer c.invalidate()
-	op, cancel := c.operationContext(ctx, 5*time.Minute)
+	op, cancel := c.managementContext(ctx, 5*time.Minute)
 	defer cancel()
 	env := append(slices.Clone(c.opts.Environment), "NO_OPEN_BROWSER=1")
 	return c.runCommandTo(op, env, "login", 1<<20, output)
 }
 
-func (c *Client) Logout(ctx context.Context, request acp.LogoutRequest) (acp.LogoutResponse, error) {
-	conn, err := c.begin(ctx)
-	if err != nil {
-		return acp.LogoutResponse{}, err
-	}
-	defer c.end()
-	if c.apiKey != "" {
-		return acp.LogoutResponse{}, invalid("Cursor API key selection does not support logout")
-	}
-	// A native process can keep the former credential cached after logout.
-	defer c.invalidate()
-	op, cancel := c.operationContext(ctx, requestTimeout)
-	defer cancel()
-	if c.initialized.AgentCapabilities.Auth.Logout == nil {
-		_, err := c.runCommand(op, c.opts.Environment, "logout", 64<<10)
-		return acp.LogoutResponse{}, err
-	}
-	r := send[acp.LogoutResponse](conn, op, acp.AgentMethodLogout, request)
-	return r.Result, receiptFailure(r, acp.AgentMethodLogout)
-}
-
-func (c *Client) invalidate() {
-	c.mu.Lock()
-	c.unusable = true
-	c.mu.Unlock()
+func (c *Client) managementContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	op, cancel := context.WithTimeout(ctx, timeout)
+	stop := context.AfterFunc(c.management, cancel)
+	return op, func() { stop(); cancel() }
 }
 
 func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
@@ -280,15 +220,17 @@ func (c *Client) ReadAccountUsage(ctx context.Context) (acpmeta.AccountUsage, er
 	if c.opts.Dashboard == nil || c.apiKey != "" {
 		return acpmeta.AccountUsage{}, acp.NewMethodNotFound(acpmeta.AccountUsageMethod)
 	}
-	if _, err := c.begin(ctx); err != nil {
-		return acpmeta.AccountUsage{}, err
+	if c.management.Err() != nil {
+		return acpmeta.AccountUsage{}, ErrRestartRequired
 	}
-	defer c.end()
-	op, cancel := c.operationContext(ctx, 10*time.Second)
+	op, cancel := c.managementContext(ctx, 10*time.Second)
 	defer cancel()
 	usage, err := c.opts.Dashboard.read(op, c.opts.Credential)
 	if ctx.Err() != nil {
 		return acpmeta.AccountUsage{}, ctx.Err()
+	}
+	if c.management.Err() != nil {
+		return acpmeta.AccountUsage{}, ErrRestartRequired
 	}
 	return usage, err
 }

@@ -1,11 +1,10 @@
-package cursor
+package acpclient
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
@@ -14,7 +13,7 @@ import (
 
 const (
 	legacyModelID          = "model"
-	unknownCurrentValueKey = "acp-go/cursor/unknown-current-value"
+	unknownCurrentValueKey = "acp-go/unknown-current-value"
 )
 
 type configuration struct {
@@ -58,7 +57,7 @@ func (c *Client) applyConfigurationLocked(s *session, raw, legacyRaw json.RawMes
 	}
 	next := s.config
 	if present(raw) {
-		options, currentAt, err := parseOptions(raw, s.config, seq)
+		options, currentAt, err := parseOptions(raw, s.config, seq, c.opts.Protocol.NormalizeOption)
 		if err != nil {
 			return err
 		}
@@ -110,10 +109,10 @@ func cloneCurrent(prior map[acp.SessionConfigId]uint64) map[acp.SessionConfigId]
 
 func present(raw json.RawMessage) bool { return len(raw) > 0 && string(raw) != "null" }
 
-func parseOptions(raw json.RawMessage, prior configuration, seq uint64) ([]acp.SessionConfigOption, map[acp.SessionConfigId]uint64, error) {
+func parseOptions(raw json.RawMessage, prior configuration, seq uint64, normalize func(acp.SessionConfigOption) acp.SessionConfigOption) ([]acp.SessionConfigOption, map[acp.SessionConfigId]uint64, error) {
 	var entries []json.RawMessage
 	if json.Unmarshal(raw, &entries) != nil || len(entries) > 512 {
-		return nil, nil, errors.New("invalid Cursor configuration directory")
+		return nil, nil, errors.New("invalid ACP agent configuration directory")
 	}
 	options := make([]acp.SessionConfigOption, 0, len(entries))
 	currentAt := make(map[acp.SessionConfigId]uint64, len(entries))
@@ -123,12 +122,15 @@ func parseOptions(raw json.RawMessage, prior configuration, seq uint64) ([]acp.S
 			// An unrelated future option cannot make the known choices disappear.
 			continue
 		}
+		if normalize != nil {
+			option = normalize(option)
+		}
 		id := optionID(option)
 		if id == "" {
 			continue
 		}
 		if _, duplicate := currentAt[id]; duplicate {
-			return nil, nil, errors.New("ambiguous Cursor configuration key")
+			return nil, nil, errors.New("ambiguous ACP agent configuration key")
 		}
 		var presence struct {
 			// Current retains omission independently of a literal false or empty string.
@@ -160,6 +162,12 @@ func parseOptions(raw json.RawMessage, prior configuration, seq uint64) ([]acp.S
 	return options, currentAt, nil
 }
 
+// DecodeCatalogOptions preserves native option presence in a model catalog.
+func DecodeCatalogOptions(raw json.RawMessage) ([]acp.SessionConfigOption, error) {
+	options, _, err := parseOptions(raw, configuration{}, 1, nil)
+	return options, err
+}
+
 func parseLegacyModels(raw json.RawMessage) (*acp.SessionConfigOptionSelect, bool, error) {
 	var state struct {
 		// Current is optional even when the model catalog is available.
@@ -177,7 +185,7 @@ func parseLegacyModels(raw json.RawMessage) (*acp.SessionConfigOptionSelect, boo
 		} `json:"availableModels"`
 	}
 	if json.Unmarshal(raw, &state) != nil {
-		return nil, false, errors.New("invalid Cursor legacy model directory")
+		return nil, false, errors.New("invalid ACP agent legacy model directory")
 	}
 	if state.Models == nil {
 		return nil, false, nil
@@ -261,13 +269,13 @@ func (c *Client) SetSessionConfigOption(ctx context.Context, request acp.SetSess
 		id = request.Boolean.SessionId
 		wanted = setting{id: request.Boolean.ConfigId, toggle: acp.Ptr(request.Boolean.Value)}
 	default:
-		return acp.SetSessionConfigOptionResponse{}, invalid("invalid Cursor setting")
+		return acp.SetSessionConfigOptionResponse{}, invalid("invalid ACP agent setting")
 	}
 	c.mu.Lock()
 	s := c.sessions[id]
 	c.mu.Unlock()
 	if s == nil {
-		return acp.SetSessionConfigOptionResponse{}, invalid("Cursor session is not open")
+		return acp.SetSessionConfigOptionResponse{}, invalid("ACP agent session is not open")
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
@@ -280,13 +288,13 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	if !advertised || wanted.toggle == nil && (option.Select == nil || !hasChoice(option.Select, wanted.value)) ||
 		wanted.toggle != nil && option.Boolean == nil {
 		c.mu.Unlock()
-		return acp.SetSessionConfigOptionResponse{}, invalid("Cursor did not advertise the requested setting")
+		return acp.SetSessionConfigOptionResponse{}, invalid("ACP agent did not advertise the requested setting")
 	}
 	model := modelOption(s.config.options)
 	modelWrite := model != nil && model.Id == wanted.id
 	legacy := modelWrite && s.config.legacy
 	confirmedCurrent := settingConfirmed(s.config, wanted) || legacy && s.config.legacyRequested == wanted.value
-	if confirmedCurrent && (!modelWrite || c.processModel == wanted.value) {
+	if confirmedCurrent && (!modelWrite || c.opts.Protocol.ModelScope == ModelPerSession || c.processModel == wanted.value) {
 		options := s.config.options
 		c.mu.Unlock()
 		result, err := clone(acp.SetSessionConfigOptionResponse{ConfigOptions: options})
@@ -323,11 +331,11 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 			s.config.legacyRequested = wanted.value
 			confirmed = true
 		}
-		if modelWrite && confirmed {
+		if modelWrite && confirmed && c.opts.Protocol.ModelScope == ModelPerProcess {
 			c.processModel = wanted.value
 		}
 	})
-	if err := sessionReceiptFailure(r, method, s.id); err != nil {
+	if err := sessionReceiptFailure(c, r, method, s.id); err != nil {
 		if r.PeerErr == nil && r.Write.BytesWritten > 0 && !confirmed {
 			c.invalidate()
 		}
@@ -342,7 +350,7 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	c.mu.Unlock()
 	meta := copyMeta(r.Result.Meta)
 	if legacy {
-		meta["acp-go/cursor/model-acknowledgement"] = string(wanted.value)
+		meta["acp-go/model-acknowledgement"] = string(wanted.value)
 	}
 	return clone(acp.SetSessionConfigOptionResponse{ConfigOptions: options, Meta: meta})
 }
@@ -358,7 +366,7 @@ func settingConfirmed(config configuration, wanted setting) bool {
 	return option.Select != nil && option.Select.CurrentValue == wanted.value
 }
 
-func freezeSettings(config configuration) []setting {
+func (c *Client) freezeSettings(config configuration) []setting {
 	var plan []setting
 	model := modelOption(config.options)
 	if model != nil {
@@ -375,18 +383,19 @@ func freezeSettings(config configuration) []setting {
 		if config.currentAt[id] == 0 || model != nil && model.Id == id {
 			continue
 		}
-		if selectOption := option.Select; selectOption != nil && executionCategory(selectOption.Category) && selectOption.CurrentValue != "" {
+		if selectOption := option.Select; selectOption != nil && c.executionCategory(selectOption.Category) && selectOption.CurrentValue != "" {
 			plan = append(plan, setting{id: id, value: selectOption.CurrentValue})
 		}
-		if boolean := option.Boolean; boolean != nil && executionCategory(boolean.Category) {
+		if boolean := option.Boolean; boolean != nil && c.executionCategory(boolean.Category) {
 			plan = append(plan, setting{id: id, toggle: acp.Ptr(boolean.CurrentValue)})
 		}
 	}
 	return plan
 }
 
-func executionCategory(category *acp.SessionConfigOptionCategory) bool {
-	return category != nil && (*category == acp.SessionConfigOptionCategoryThoughtLevel || *category == "model_config")
+func (c *Client) executionCategory(category *acp.SessionConfigOptionCategory) bool {
+	return category != nil && (*category == acp.SessionConfigOptionCategoryThoughtLevel ||
+		c.opts.Protocol.ExecutionOption != nil && c.opts.Protocol.ExecutionOption(*category))
 }
 
 func (c *Client) prepareSettings(ctx context.Context, t *turn) error {
@@ -418,9 +427,10 @@ func (c *Client) settingActiveLocked(s *session, wanted setting) bool {
 	model := modelOption(config.options)
 	isModel := model != nil && model.Id == wanted.id
 	confirmed := settingConfirmed(config, wanted) || isModel && config.legacy && config.legacyRequested == wanted.value
-	return confirmed && (!isModel || c.processModel == wanted.value)
+	return confirmed && (!isModel || c.opts.Protocol.ModelScope == ModelPerSession || c.processModel == wanted.value)
 }
 
+// ReadModels reads the advertised model directory without starting a Prompt.
 func (c *Client) ReadModels(ctx context.Context) (acpmeta.ModelCatalog, error) {
 	conn, err := c.begin(ctx)
 	if err != nil {
@@ -442,55 +452,31 @@ func (c *Client) ReadModels(ctx context.Context) (acpmeta.ModelCatalog, error) {
 		}
 	}
 	c.mu.Unlock()
-	op, cancel := c.operationContext(ctx, 3*time.Second)
-	defer cancel()
-	type catalogResponse struct {
-		// Models preserves each discovered model and its optional settings.
-		Models []struct {
-			// The ACP option contains the native model identity and label.
-			acp.SessionConfigSelectOption
-			// Options is nil when settings have not been discovered.
-			Options json.RawMessage `json:"configOptions"`
-		} `json:"models"`
-		// DefaultID is independent from the first advertised model.
-		DefaultID *acp.SessionConfigValueId `json:"defaultModelId"`
-	}
-	const method = "cursor/list_available_models"
-	r := send[catalogResponse](conn, op, method, struct{}{})
-	if err := receiptFailure(r, method); err != nil {
-		if r.PeerErr != nil && r.PeerErr.Code == -32601 && fallbackSeq != 0 {
-			return clone(fallback)
-		}
-		return acpmeta.ModelCatalog{}, err
-	}
-	if r.Result.Models == nil {
-		if fallbackSeq != 0 {
-			return clone(fallback)
-		}
-		return acpmeta.ModelCatalog{}, acp.NewMethodNotFound(acpmeta.ModelCatalogMethod)
-	}
-	models := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(r.Result.Models))
-	seen := make(map[acp.SessionConfigValueId]bool)
-	for _, row := range r.Result.Models {
-		if strings.TrimSpace(string(row.Value)) == "" || seen[row.Value] {
-			return acpmeta.ModelCatalog{}, errors.New("invalid Cursor model catalog")
-		}
-		seen[row.Value] = true
-		if present(row.Options) {
-			options, _, err := parseOptions(row.Options, configuration{}, r.Sequence)
-			if err != nil {
+	probe := c.opts.Protocol.Catalog
+	if probe != nil {
+		op, cancel := c.operationContext(ctx, 3*time.Second)
+		defer cancel()
+		r := send[json.RawMessage](conn, op, probe.Method, struct{}{})
+		if err := receiptFailure(r, probe.Method); err != nil {
+			if r.PeerErr == nil || r.PeerErr.Code != -32601 {
 				return acpmeta.ModelCatalog{}, err
 			}
-			row.Meta = acpmeta.WithModelConfigOptions(row.Meta, options)
+		} else {
+			catalog, err := probe.Decode(r.Result)
+			if err == nil {
+				c.mu.Lock()
+				c.catalog = &catalog
+				c.mu.Unlock()
+				return clone(catalog)
+			}
+			var protocol *acp.RequestError
+			if !errors.As(err, &protocol) || protocol.Code != -32601 {
+				return acpmeta.ModelCatalog{}, err
+			}
 		}
-		models = append(models, row.SessionConfigSelectOption)
 	}
-	catalog := acpmeta.ModelCatalog{Options: acp.SessionConfigSelectOptions{Ungrouped: &models}}
-	if r.Result.DefaultID != nil && seen[*r.Result.DefaultID] {
-		catalog.DefaultID = r.Result.DefaultID
+	if fallbackSeq != 0 {
+		return clone(fallback)
 	}
-	c.mu.Lock()
-	c.catalog = &catalog
-	c.mu.Unlock()
-	return clone(catalog)
+	return acpmeta.ModelCatalog{}, acp.NewMethodNotFound(acpmeta.ModelCatalogMethod)
 }

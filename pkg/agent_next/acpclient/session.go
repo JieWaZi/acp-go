@@ -1,4 +1,4 @@
-package cursor
+package acpclient
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 const (
 	maxOpeningFrames  = 256
 	maxOpeningBytes   = 4 << 20
-	mcpObservationKey = "acp-go/cursor/mcp"
+	mcpObservationKey = "acp-go/mcp"
 )
 
 // session is a single confirmed native session generation.
@@ -31,8 +31,8 @@ type session struct {
 	usedInputIDs map[string]struct{}
 	// mcpIDs identifies ACP-transport MCP servers explicitly declared on open.
 	mcpIDs []acp.UnstableMcpServerAcpId
-	// todos retains Cursor plan entries across incremental updates.
-	todos []todoEntry
+	// plan retains the native plan entries across incremental updates.
+	plan []PlanItem
 	// modes is the last advertised native mode state.
 	modes *acp.SessionModeState
 	// instructions are the frozen developer instructions for this binding.
@@ -123,7 +123,7 @@ func (c *Client) NewSession(ctx context.Context, request acp.NewSessionRequest) 
 
 func (c *Client) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
 	if request.SessionId == "" {
-		return acp.ResumeSessionResponse{}, invalid("Cursor restore requires an exact session ID")
+		return acp.ResumeSessionResponse{}, invalid("ACP agent restore requires an exact session ID")
 	}
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
@@ -137,7 +137,7 @@ func (c *Client) ResumeSession(ctx context.Context, request acp.ResumeSessionReq
 
 func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	if request.SessionId == "" {
-		return acp.LoadSessionResponse{}, invalid("Cursor restore requires an exact session ID")
+		return acp.LoadSessionResponse{}, invalid("ACP agent restore requires an exact session ID")
 	}
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
@@ -151,7 +151,7 @@ func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest
 
 func (c *Client) UnstableForkSession(ctx context.Context, request acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
 	if request.SessionId == "" {
-		return acp.UnstableForkSessionResponse{}, invalid("Cursor fork requires an exact source ID")
+		return acp.UnstableForkSessionResponse{}, invalid("ACP agent fork requires an exact source ID")
 	}
 	if acpmeta.ReconcileOnly(request) {
 		id, err := acpmeta.ReadForkReceipt(request)
@@ -159,7 +159,7 @@ func (c *Client) UnstableForkSession(ctx context.Context, request acp.UnstableFo
 	}
 	servers, err := acpmeta.ForkMCPServers(request.McpServers)
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, invalid("invalid Cursor fork MCP servers")
+		return acp.UnstableForkSessionResponse{}, invalid("invalid ACP agent fork MCP servers")
 	}
 	receipt := request.Meta["forkReceiptDirectory"] != nil
 	// The filesystem receipt path is private to the host and never goes to the CLI.
@@ -199,7 +199,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	}
 	instructions, err := acpmeta.DeveloperInstructions(request.meta)
 	if err != nil || instructions != nil && len(*instructions) > 1<<20 {
-		return acp.NewSessionResponse{}, invalid("invalid Cursor developer instructions")
+		return acp.NewSessionResponse{}, invalid("invalid ACP agent developer instructions")
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
@@ -214,7 +214,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	}
 	if p.previous == nil && len(c.sessions) >= maxSessions {
 		c.mu.Unlock()
-		return acp.NewSessionResponse{}, invalid("Cursor session budget exhausted")
+		return acp.NewSessionResponse{}, invalid("ACP agent session budget exhausted")
 	}
 	if p.previous != nil {
 		p.session.config, p.session.modes = p.previous.config, p.previous.modes
@@ -260,14 +260,14 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	response := acp.NewSessionResponse{}
 	if p.matched {
 		response.SessionId = p.session.id
-		response.ConfigOptions = p.session.config.options
-		response.Modes = p.session.modes
-		response.Meta = mcpMetadata(receipt.Result.Meta, len(request.servers))
-		if p.err == nil && !p.overflow && !c.closed {
+		if p.err == nil && receiptErr == nil && !p.overflow && !c.closed {
+			response.ConfigOptions = p.session.config.options
+			response.Modes = p.session.modes
+			response.Meta = mcpMetadata(receipt.Result.Meta, len(request.servers))
 			c.sessions[p.session.id] = p.session
 			// Opening can change the process's active model. Only an
 			// acknowledged model set can establish the process-wide value.
-			if model := modelOption(p.session.config.options); model != nil && model.CurrentValue != c.processModel {
+			if model := modelOption(p.session.config.options); c.opts.Protocol.ModelScope == ModelPerProcess && model != nil && model.CurrentValue != c.processModel {
 				c.processModel = ""
 			}
 			c.opening = nil
@@ -281,7 +281,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	c.sealDeliveryLocked(p.delivery)
 	normalizeErr := p.err
 	if p.overflow {
-		normalizeErr = errors.Join(normalizeErr, errors.New("Cursor session opening observation budget exhausted"))
+		normalizeErr = errors.Join(normalizeErr, errors.New("ACP agent session opening observation budget exhausted"))
 	}
 	if c.closed {
 		normalizeErr = errors.Join(normalizeErr, ErrRestartRequired)
@@ -292,15 +292,15 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	c.mu.Unlock()
 	projected, cloneErr := clone(response)
 	if cloneErr != nil {
-		return acp.NewSessionResponse{SessionId: response.SessionId}, errors.New("invalid Cursor session setup evidence")
+		return acp.NewSessionResponse{SessionId: response.SessionId}, errors.New("invalid ACP agent session setup evidence")
 	}
 	response = projected
-	operationErr := sessionReceiptFailure(receipt, request.method, request.id)
+	operationErr := sessionReceiptFailure(c, receipt, request.method, request.id)
 	if operationErr != nil || normalizeErr != nil || receiptErr != nil {
 		return response, errors.Join(operationErr, normalizeErr, receiptErr)
 	}
 	if !p.matched {
-		return response, errors.New("Cursor returned an unconfirmed session ID")
+		return response, errors.New("ACP agent returned an unconfirmed session ID")
 	}
 	// A replay must settle before returning. Session observations remain
 	// independent and can call a setter as soon as the ready state is visible.
@@ -320,13 +320,13 @@ func (c *Client) bindOpening(p *opening, r acp.RequestReceipt[setupResult]) {
 	id := r.Result.ID
 	if p.session.id != "" {
 		if id != "" && id != p.session.id {
-			p.err = errors.New("Cursor restore returned a different native session")
+			p.err = errors.New("ACP agent restore returned a different native session")
 			return
 		}
 		id = p.session.id
 	}
 	if id == "" || id == p.source || c.sessions[id] != p.previous {
-		p.err = errors.New("Cursor did not return an independent native session")
+		p.err = errors.New("ACP agent did not return an independent native session")
 		return
 	}
 	p.matched = true
@@ -354,26 +354,26 @@ func (c *Client) validateSetup(request setupRequest) error {
 		return acp.NewMethodNotFound(request.method)
 	}
 	if request.method == acp.AgentMethodSessionFork && acpmeta.ForkPosition(request.meta) != "" && acpmeta.ForkMode(c.initialized.Meta) != acpmeta.ForkTurn {
-		return invalid("Cursor did not advertise exact fork positions")
+		return invalid("ACP agent did not advertise exact fork positions")
 	}
 	if !filepath.IsAbs(request.cwd) || len(request.roots) > 0 && sessions.AdditionalDirectories == nil {
-		return invalid("Cursor requires an absolute cwd and advertised additional directories")
+		return invalid("ACP agent requires an absolute cwd and advertised additional directories")
 	}
 	for _, root := range request.roots {
 		if !filepath.IsAbs(root) {
-			return invalid("Cursor additional directories must be absolute")
+			return invalid("ACP agent additional directories must be absolute")
 		}
 	}
 	if len(request.servers) > 0 && c.opts.RequireVerifiedMCP {
-		return invalid("Cursor does not provide a verified MCP load receipt")
+		return invalid("ACP agent does not provide a verified MCP load receipt")
 	}
 	for _, s := range request.servers {
 		mcp := caps.McpCapabilities
 		if s.Acp != nil && c.peer == nil {
-			return invalid("Cursor ACP MCP requires a negotiated wire host")
+			return invalid("ACP agent ACP MCP requires a negotiated wire host")
 		}
 		if s.Http != nil && !mcp.Http || s.Sse != nil && !mcp.Sse || s.Acp != nil && !mcp.Acp {
-			return invalid("Cursor did not advertise the requested MCP transport")
+			return invalid("ACP agent did not advertise the requested MCP transport")
 		}
 	}
 	return nil
@@ -389,7 +389,7 @@ func (c *Client) ListSessions(ctx context.Context, request acp.ListSessionsReque
 		return acp.ListSessionsResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionList)
 	}
 	if request.Cwd != nil && !filepath.IsAbs(*request.Cwd) {
-		return acp.ListSessionsResponse{}, invalid("Cursor session list requires an absolute cwd")
+		return acp.ListSessionsResponse{}, invalid("ACP agent session list requires an absolute cwd")
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
@@ -407,7 +407,7 @@ func (c *Client) CloseSession(ctx context.Context, request acp.CloseSessionReque
 		return acp.CloseSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionClose)
 	}
 	if request.SessionId == "" {
-		return acp.CloseSessionResponse{}, invalid("Cursor close requires an exact session ID")
+		return acp.CloseSessionResponse{}, invalid("ACP agent close requires an exact session ID")
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
@@ -422,7 +422,7 @@ func (c *Client) CloseSession(ctx context.Context, request acp.CloseSessionReque
 	if r.PeerErr == nil && !r.ResultValid && r.Write.BytesWritten > 0 {
 		c.invalidate()
 	}
-	return r.Result, sessionReceiptFailure(r, acp.AgentMethodSessionClose, request.SessionId)
+	return r.Result, sessionReceiptFailure(c, r, acp.AgentMethodSessionClose, request.SessionId)
 }
 
 func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
@@ -438,7 +438,7 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 	})
 	c.mu.Unlock()
 	if !valid {
-		return acp.SetSessionModeResponse{}, invalid("Cursor did not advertise the requested mode")
+		return acp.SetSessionModeResponse{}, invalid("ACP agent did not advertise the requested mode")
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
@@ -455,7 +455,7 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 	if !r.ResultValid && r.PeerErr == nil && r.Write.BytesWritten > 0 {
 		c.invalidate()
 	}
-	return r.Result, sessionReceiptFailure(r, acp.AgentMethodSessionSetMode, request.SessionId)
+	return r.Result, sessionReceiptFailure(c, r, acp.AgentMethodSessionSetMode, request.SessionId)
 }
 
 // MCPObservation reports only the MCP facts established during session setup.
