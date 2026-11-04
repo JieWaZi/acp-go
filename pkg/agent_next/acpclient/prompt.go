@@ -243,13 +243,20 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		t.stopInteractions()
 		t.outcome = c.nativeOutcomeLocked(t, nil, nil)
 	}
-	if t.authLost || r.Write.BytesWritten > 0 && !knownStopReason(r.Result.StopReason) && !c.preAcceptanceRejection(r.PeerErr, t.session.id) {
+	preAcceptanceRejection := c.preAcceptanceRejection(r.PeerErr, t.session.id)
+	if t.authLost || r.Write.BytesWritten > 0 && !knownStopReason(r.Result.StopReason) && !preAcceptanceRejection {
 		c.unusable = true
 	}
-	if t.outcome != nil && (t.associated || r.ResultValid && t.outcome.StopReason != nil || t.authLost) {
+	associated := t.outcome != nil && (t.associated || r.ResultValid && t.outcome.StopReason != nil)
+	if associated && r.Write.BytesWritten > 0 && !preAcceptanceRejection {
+		// The matched prompt or owned observation proves consumption of this
+		// adapter input. Standard ACP never supplied a native input ID.
+		t.outcome.Turn.ConsumedInputIDs = []string{t.input.InputID}
+	}
+	if t.outcome != nil && (associated || t.authLost) {
 		result.Receipt.Admission = agentclient.AdmissionConfirmed
 	}
-	if c.preAcceptanceRejection(r.PeerErr, t.session.id) && result.Receipt.Admission != agentclient.AdmissionConfirmed {
+	if preAcceptanceRejection && result.Receipt.Admission != agentclient.AdmissionConfirmed {
 		result.Receipt.Admission = agentclient.AdmissionNotAccepted
 	}
 	if result.Receipt.Admission == agentclient.AdmissionConfirmed && t.session.instructionEpoch == epoch {

@@ -144,6 +144,17 @@ func TestCursorFixture(t *testing.T) {
 		case "session/prompt":
 			prompts++
 			promptID = msg.ID
+			switch scenario {
+			case "terminal-only":
+				reply(msg.ID, map[string]any{"stopReason": "end_turn"})
+				continue
+			case "reject-prompt":
+				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": -32000, "message": "prompt rejected"}})
+				continue
+			case "unproven-prompt":
+				reply(msg.ID, map[string]any{"stopReason": "future_reason"})
+				continue
+			}
 			if scenario == "interaction" {
 				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": 9000, "method": "cursor/ask_question", "params": map[string]any{
 					"sessionId": "one", "toolCallId": "question", "title": "Choose", "questions": []any{
@@ -511,6 +522,38 @@ func TestDisconnectDoesNotInventTerminal(t *testing.T) {
 	}
 }
 
+func TestStandardACPPromptConsumptionRequiresAssociation(t *testing.T) {
+	for _, tc := range []struct {
+		scenario string
+		consumed bool
+	}{
+		{scenario: "terminal-only", consumed: true},
+		{scenario: "disconnect", consumed: true},
+		{scenario: "reject-prompt"},
+		{scenario: "unproven-prompt"},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			client, ctx, trace := candidate(t, tc.scenario, agentclient.HostCallbacks{})
+			openOne(t, client, ctx, trace)
+			var input agentclient.PromptSubmission
+			result := reserve(t, client, ctx, agentclient.PromptOptions{BeforeSubmit: func(_ context.Context, submission agentclient.PromptSubmission) error {
+				input = submission
+				return nil
+			}})()
+			if input.InputID == "" || input.NativeInputID != nil || result.Receipt.Input != input {
+				t.Fatalf("adapter input identity = %+v, receipt = %+v", input, result.Receipt)
+			}
+			if tc.consumed {
+				if result.Outcome == nil || len(result.Outcome.Turn.ConsumedInputIDs) != 1 || result.Outcome.Turn.ConsumedInputIDs[0] != input.InputID {
+					t.Fatalf("exact adapter consumption missing: %+v", result.Outcome)
+				}
+			} else if result.Outcome != nil && len(result.Outcome.Turn.ConsumedInputIDs) != 0 {
+				t.Fatalf("unproven consumption: %+v", result.Outcome)
+			}
+		})
+	}
+}
+
 func TestOpeningObservationCanUseNativeSetter(t *testing.T) {
 	var client *cursor.Client
 	result := make(chan error, 1)
@@ -685,6 +728,7 @@ func TestPublicACPAdjacentPromptCancelCapturesBeforePreparation(t *testing.T) {
 	if err := json.Unmarshal(f["result"], &completed); err != nil || completed.StopReason != acp.StopReasonEndTurn {
 		t.Fatalf("successor: %s / %s (%v)", f["result"], f["error"], err)
 	}
+	assertWireInputConsumption(t, completed.Meta)
 	usage, ok := acpmeta.ReadTurnUsage(completed.Meta)
 	if !ok || usage.InputTokens == nil || *usage.InputTokens != 17 || usage.OutputTokens != nil {
 		t.Fatalf("wire usage = %#v", usage)
@@ -697,11 +741,22 @@ func TestPublicACPAdjacentPromptCancelCapturesBeforePreparation(t *testing.T) {
 		t.Fatalf("wire failure = %s / %s", f["error"], f["result"])
 	}
 	data, _ := rejection.Data.(map[string]any)
+	assertWireInputConsumption(t, data)
 	usage, ok = acpmeta.ReadTurnUsage(data)
 	turn, nativeTurn := acpmeta.ReadNativeTurn(data)
 	if !ok || usage.InputTokens == nil || *usage.InputTokens != 17 || !nativeTurn || turn.Status != acpmeta.NativeTurnCompleted ||
 		data["acp-go/delivery-error"] != true || data["nativeStopReason"] != string(acp.StopReasonEndTurn) {
 		t.Fatalf("wire failure lost terminal evidence: %#v", data)
+	}
+}
+
+func assertWireInputConsumption(t *testing.T, meta map[string]any) {
+	t.Helper()
+	receipt, _ := meta["acp-go/prompt-receipt"].(map[string]any)
+	id, _ := receipt["input_id"].(string)
+	turn, ok := acpmeta.ReadNativeTurn(meta)
+	if id == "" || !ok || len(turn.ConsumedInputIDs) != 1 || turn.ConsumedInputIDs[0] != id {
+		t.Fatalf("wire input consumption = %+v, receipt = %+v", turn, receipt)
 	}
 }
 
