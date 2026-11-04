@@ -253,6 +253,10 @@ func (f *fixture) control(frame fixtureFrame) {
 				{"value": "sonnet", "displayName": "Sonnet", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "max"}, "supportsAutoMode": true},
 			}
 		}
+		if f.mode == "legacy-model-configured-role-ack" {
+			rows := response.(map[string]any)["models"].([]map[string]any)
+			response.(map[string]any)["models"] = append(rows, map[string]any{"value": f.model, "displayName": "Concrete model"})
+		}
 		if f.mode == "catalog-optional-capabilities" {
 			response.(map[string]any)["models"] = []map[string]any{
 				{"value": "deepseek-v4-flash", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "xhigh", "max"}, "supportsAutoMode": true},
@@ -284,7 +288,7 @@ func (f *fixture) control(frame fixtureFrame) {
 		}
 		response = map[string]any{"applied": map[string]any{"model": f.model, "effort": f.settings["effortLevel"]}, "effective": effective}
 	case "set_model":
-		if f.mode == "legacy-model-stale-ack" {
+		if f.mode == "legacy-model-stale-ack" || f.mode == "legacy-model-configured-role-ack" {
 			break
 		}
 		f.model = frame.Request.Model

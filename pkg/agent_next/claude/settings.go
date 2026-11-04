@@ -42,6 +42,8 @@ type sessionSettings struct {
 	model settingEvidence
 	// modelAlias links the current observation to a selectable row on older CLIs.
 	modelAlias string
+	// modelAliasExact records proof from a host-owned role mapping and native readback.
+	modelAliasExact bool
 	// effort retains the session effort intent and applied level.
 	effort settingEvidence
 	// fast retains the Fast preference, separate from the service state.
@@ -155,6 +157,7 @@ func (s *sessionSettings) observeModel(wireID string) {
 	id := s.resolved(wireID)
 	if id != s.model.observed {
 		s.modelAlias = ""
+		s.modelAliasExact = false
 		s.model.observed = id
 	}
 }
@@ -174,6 +177,23 @@ func (s sessionSettings) currentModel() (protocol.ModelInfo, bool) {
 		return row, true
 	}
 	return s.findModel(s.modelAlias)
+}
+
+// frozenRoleModel returns the exact legacy role mapping only when the host
+// owns model configuration and native settings cannot supply a competing one.
+func (c *Client) frozenRoleModel(alias string) string {
+	launch := c.options.Launch
+	if c.environment("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST") != "1" ||
+		launch.SettingSources == nil || len(launch.SettingSources) != 0 ||
+		launch.SettingsPath != "" || launch.WorkspaceOnly {
+		return ""
+	}
+	switch alias {
+	case "sonnet", "opus", "haiku", "fable":
+		return c.environment("ANTHROPIC_DEFAULT_" + strings.ToUpper(alias) + "_MODEL")
+	default:
+		return ""
+	}
 }
 
 // initialModelAlias describes a fresh launch with no previous native model
@@ -218,6 +238,10 @@ func (s sessionSettings) options() []acp.SessionConfigOption {
 		current := s.model.observed
 		if row, ok := s.currentModel(); ok {
 			current = modelID(row)
+		}
+		if s.modelAliasExact {
+			// Expose the verified selector while keeping concrete model capabilities.
+			current = s.modelAlias
 		}
 		result = append(result, choice("model", "Model", acp.SessionConfigOptionCategoryModel, current, modelOptions(s.models), s.model.metadata()))
 	}
@@ -428,6 +452,7 @@ func (s *session) configure(ctx context.Context, id, value string) error {
 			s.settings.model.acknowledged = modelID(target)
 			s.settings.model.observed = ""
 			s.settings.modelAlias = ""
+			s.settings.modelAliasExact = false
 			s.settings.effort.observed = ""
 			s.mu.Unlock()
 		})
@@ -466,10 +491,19 @@ func (s *session) configure(ctx context.Context, id, value string) error {
 		if value := decodeOptional[protocol.SettingsControlResponse](raw); value != nil {
 			s.mu.Lock()
 			s.settings.observe(*value)
-			// An unchanged concrete model cannot prove a different alias
-			// took effect on an older CLI without resolvedModel.
-			if selectedAlias != "" && (selectedAlias == before.modelAlias || s.settings.model.observed != before.model.observed) {
-				s.settings.bindLegacyModel(selectedAlias, *value)
+			// A legacy ACK alone cannot relabel an unchanged concrete model.
+			// When the host owns the role mapping, require its exact native readback.
+			if selectedAlias != "" {
+				confirmed := selectedAlias == before.modelAlias || s.settings.model.observed != before.model.observed
+				expected := s.client.frozenRoleModel(selectedAlias)
+				if expected != "" {
+					applied := decodeOptional[string](value.Applied["model"])
+					confirmed = applied != nil && *applied == expected
+				}
+				if confirmed {
+					s.settings.bindLegacyModel(selectedAlias, *value)
+					s.settings.modelAliasExact = expected != "" && s.settings.modelAlias == selectedAlias
+				}
 			}
 			s.mu.Unlock()
 		}

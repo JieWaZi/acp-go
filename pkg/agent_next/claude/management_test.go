@@ -388,3 +388,60 @@ func TestLegacyClaudeModelACKDoesNotRelabelUnchangedModel(t *testing.T) {
 	}
 	t.Fatal("missing effective model receipt")
 }
+
+func TestLegacyClaudeModelACKUsesExactFrozenRoleTarget(t *testing.T) {
+	const observed = "claude-opus-4-8[1m]"
+	for _, tc := range []struct {
+		// name distinguishes a trusted role proof from an ordinary model ACK.
+		name string
+		// target is the configured Sonnet role model.
+		target string
+		// useSettings permits project settings to compete with the environment.
+		useSettings bool
+		// want is the effective selectable model ID.
+		want string
+	}{
+		{name: "verified exact target", target: observed, want: "sonnet"},
+		{name: "different target", target: "claude-sonnet-4-6", want: observed},
+		{name: "project settings enabled", target: observed, useSettings: true, want: observed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, dir, ctx := startClientMode(t, agentclient.HostCallbacks{}, "legacy-model-configured-role-ack", func(o *claude.Options) {
+				o.Environment = append(o.Environment, "ANTHROPIC_MODEL=", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
+					"ANTHROPIC_DEFAULT_SONNET_MODEL="+tc.target)
+				if !tc.useSettings {
+					o.Launch.SettingSources = []string{}
+				}
+			})
+			session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+				SessionId: session.SessionId, ConfigId: "model", Value: "sonnet",
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var model *acp.SessionConfigOptionSelect
+			for _, option := range reply.ConfigOptions {
+				if option.Select == nil {
+					continue
+				}
+				switch option.Select.Id {
+				case "model":
+					model = option.Select
+				case "effort":
+					t.Fatal("the role selector replaced the concrete model's capabilities")
+				}
+			}
+			if model == nil {
+				t.Fatal("missing effective model receipt")
+			}
+			evidence, _ := model.Meta["claude.configuration"].(map[string]any)
+			if string(model.CurrentValue) != tc.want || evidence["observed"] != observed {
+				t.Fatalf("selected=%s observed=%q, want selected=%s observed=%s", model.CurrentValue, evidence["observed"], tc.want, observed)
+			}
+		})
+	}
+}
