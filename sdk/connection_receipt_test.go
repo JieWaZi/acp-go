@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const receiptConfigFrame = `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"first","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"peer-model","options":[{"value":"peer-model","name":"Peer Model"}]}]}}}` + "\n"
@@ -218,21 +219,33 @@ func TestRequestReceipt_DistinguishesPeerErrorFromDecodeFailure(t *testing.T) {
 		peerCode int
 	}{
 		{"peer error", `{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"missing session"}}`, -32002},
+		{"error is a string", `{"jsonrpc":"2.0","id":1,"error":"synthetic-peer-detail"}`, 0},
+		{"error is null", `{"jsonrpc":"2.0","id":1,"error":null}`, 0},
+		{"error lacks required fields", `{"jsonrpc":"2.0","id":1,"error":{}}`, 0},
+		{"error has wrong code type", `{"jsonrpc":"2.0","id":1,"error":{"code":"wrong","message":"synthetic-peer-detail"}}`, 0},
+		{"error has null code", `{"jsonrpc":"2.0","id":1,"error":{"code":null,"message":"synthetic-peer-detail"}}`, 0},
+		{"error has null message", `{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":null}}`, 0},
+		{"error has duplicate code", `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"code":-32002,"message":"missing session"}}`, 0},
 		{"wrong result type", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":7}}`, 0},
 		{"missing result", `{"jsonrpc":"2.0","id":1}`, 0},
 		{"null result", `{"jsonrpc":"2.0","id":1,"result":null}`, 0},
 		{"conflicting result and error", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"},"error":{"code":-32002,"message":"missing session"}}`, 0},
+		{"result and null error", `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"},"error":null}`, 0},
+		{"duplicate result", `{"jsonrpc":"2.0","id":1,"result":{},"result":{"stopReason":"end_turn"}}`, 0},
 		{"invalid protocol version", `{"jsonrpc":"1.0","id":1,"result":{"stopReason":"end_turn"}}`, 0},
+		{"invalid protocol version type", `{"jsonrpc":2,"id":1,"result":{"stopReason":"end_turn"}}`, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			conn, requests, responses := receiptPipe(t, &clientFuncs{}, nil, nil)
-			peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt, tt.response+"\n")
-			got := SendClientRequestWithReceipt[PromptResponse](conn, context.Background(), AgentMethodSessionPrompt, nil, RequestWriteHooks{})
+			peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt, terminalUpdateFrame+tt.response+"\n")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			got := SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil, RequestWriteHooks{})
 			if err := receiveLifecycle(t, peerDone); err != nil {
 				t.Fatal(err)
 			}
-			if got.ResultValid || got.Sequence == 0 || got.TransportErr != nil || got.Write.Err != nil {
+			if got.ResultValid || got.NotificationWatermark == 0 || got.Sequence <= got.NotificationWatermark || got.TransportErr != nil || got.Write.Err != nil {
 				t.Fatalf("invalid result was mistaken for a valid terminal or transport error: %+v", got)
 			}
 			if tt.peerCode != 0 {
@@ -241,6 +254,124 @@ func TestRequestReceipt_DistinguishesPeerErrorFromDecodeFailure(t *testing.T) {
 				}
 			} else if got.DecodeErr == nil || got.PeerErr != nil {
 				t.Fatalf("invalid result was not classified as a decode failure: %+v", got)
+			}
+		})
+	}
+}
+
+func TestRequestReceipt_DisregardsAmbiguousAndReverseRequestIDs(t *testing.T) {
+	reverse := make(chan struct{}, 1)
+	client := &clientFuncs{
+		HandleExtensionMethodFunc: func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+			if method == "_reverse" {
+				reverse <- struct{}{}
+			}
+			return nil, nil
+		},
+	}
+	conn, requests, responses := receiptPipe(t, client, nil, nil)
+	done := make(chan error, 1)
+	go func() {
+		decoder := json.NewDecoder(requests)
+		var request anyMessage
+		if err := decoder.Decode(&request); err != nil {
+			done <- err
+			return
+		}
+		if _, err := io.WriteString(responses,
+			`{"jsonrpc":"2.0","id":null,"result":{"stopReason":"end_turn"}}`+"\n"+
+				`{"jsonrpc":"2.0","id":99,"id":1,"result":{"stopReason":"end_turn"}}`+"\n"+
+				`{"jsonrpc":"2.0","id":1,"method":"_reverse","result":null}`+"\n"); err != nil {
+			done <- err
+			return
+		}
+		var reverseResponse anyMessage
+		if err := decoder.Decode(&reverseResponse); err != nil {
+			done <- err
+			return
+		}
+		if reverseResponse.ID == nil || string(*reverseResponse.ID) != "1" || string(reverseResponse.Result) != "null" {
+			done <- errors.New("reverse request did not receive its own response")
+			return
+		}
+		_, err := io.WriteString(responses, bufferedTerminalFrame)
+		done <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got := SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil, RequestWriteHooks{})
+	if !got.ResultValid || got.Sequence == 0 {
+		t.Fatal("the unambiguous outbound response was not received")
+	}
+	assertBufferedTerminal(t, got.Result)
+	receiveLifecycle(t, reverse)
+	if err := receiveLifecycle(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const invalidNativeValue = "12345678901234567890123456789012345678901234567890"
+
+const invalidNativeResult = `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn","usage":{"inputTokens":` + invalidNativeValue + `}}}`
+
+func TestRequestReceipt_DecodeErrorExcludesPeerPayload(t *testing.T) {
+	conn, requests, responses := receiptPipe(t, &clientFuncs{}, nil, nil)
+	peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt,
+		invalidNativeResult+"\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got := SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil, RequestWriteHooks{})
+	if err := receiveLifecycle(t, peerDone); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResultValid || got.DecodeErr == nil || got.TransportErr != nil {
+		t.Fatal("the invalid typed result was not classified as a decode failure")
+	}
+	if strings.Contains(got.DecodeErr.Error(), invalidNativeValue) || errors.Unwrap(got.DecodeErr) != nil {
+		t.Fatal("the public decode error exposes native payload")
+	}
+}
+
+func TestRequestReceipt_LegacyResponseProjection(t *testing.T) {
+	tests := []struct {
+		name       string
+		frame      string
+		wantCode   int
+		wantDetail string
+	}{
+		{name: "null result", frame: `{"jsonrpc":"2.0","id":1,"result":null,"params":null}`},
+		{name: "valid peer error", frame: `{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"missing","data":{"detail":"session unavailable"}}}`, wantCode: -32002, wantDetail: "session unavailable"},
+		{name: "malformed envelope", frame: `{"jsonrpc":"2.0","id":1,"error":"synthetic-peer-detail"}`, wantCode: -32603},
+		{name: "malformed result", frame: invalidNativeResult, wantCode: -32603},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn, requests, responses := receiptPipe(t, &clientFuncs{}, nil, nil)
+			peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt, tt.frame+"\n")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, err := conn.Prompt(ctx, PromptRequest{})
+			if peerErr := receiveLifecycle(t, peerDone); peerErr != nil {
+				t.Fatal(peerErr)
+			}
+			if tt.wantCode == 0 {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			var rpcErr *RequestError
+			if !errors.As(err, &rpcErr) || rpcErr.Code != tt.wantCode {
+				t.Fatalf("wrong legacy JSON-RPC error code: %v", err)
+			}
+			if tt.wantDetail != "" {
+				details, _ := rpcErr.Data.(map[string]any)
+				if details["detail"] != tt.wantDetail {
+					t.Fatal("valid peer error lost its details")
+				}
+			}
+			if strings.Contains(err.Error(), "synthetic-peer-detail") || strings.Contains(err.Error(), invalidNativeValue) {
+				t.Fatal("legacy decode error exposes native payload")
 			}
 		})
 	}

@@ -72,7 +72,9 @@ type queuedNotification struct {
 }
 
 type responseEnvelope struct {
-	msg                   anyMessage
+	result                json.RawMessage
+	peerErr               *RequestError
+	decodeErr             error
 	sequence              uint64
 	notificationWatermark uint64
 }
@@ -492,13 +494,37 @@ func (c *Connection) receive() {
 			continue
 		}
 
-		var msg anyMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
+		fields, unique := decodeObjectMembers(line)
+		if fields == nil {
 			c.loggerOrDefault().Error("failed to parse incoming message", "frame_bytes", len(line))
 			continue
 		}
 
 		sequence++
+		rawMethod, hasMethod := fields["method"]
+		id := fields["id"]
+		if !hasMethod {
+			if id == nil || bytes.Equal(id, []byte("null")) {
+				c.loggerOrDefault().Error("received response without an unambiguous id", "frame_bytes", len(line))
+				continue
+			}
+			c.handleResponse(fields, unique, sequence)
+			continue
+		}
+
+		// Method presence belongs to inbound routing, even if an invalid request
+		// uses the same ID as a pending outbound request.
+		var msg anyMessage
+		version := fields["jsonrpc"]
+		if !unique || json.Unmarshal(rawMethod, &msg.Method) != nil || msg.Method == "" ||
+			(version != nil && json.Unmarshal(version, &msg.JSONRPC) != nil) {
+			c.loggerOrDefault().Error("failed to parse incoming method", "frame_bytes", len(line))
+			continue
+		}
+		msg.Params = fields["params"]
+		if id != nil && !bytes.Equal(id, []byte("null")) {
+			msg.ID = &id
+		}
 
 		// Handle $/cancel_request notifications synchronously so cancellations take effect
 		// immediately and do not participate in notification ordering.
@@ -507,65 +533,59 @@ func (c *Connection) receive() {
 			continue
 		}
 
-		switch {
-		case msg.ID != nil && msg.Method == "":
-			c.handleResponse(&msg, sequence)
-		case msg.Method != "":
-			if msg.ID != nil {
-				idKey, err := canonicalJSONRPCIDKey(*msg.ID)
-				if err != nil {
-					c.loggerOrDefault().Error("failed to canonicalize inbound request id", "id_bytes", len(*msg.ID))
-					idKey = string(*msg.ID)
-				}
-				reqCtx, cancel := context.WithCancelCause(c.ctx)
-
-				c.mu.Lock()
-				c.inflight[idKey] = cancel
-				c.mu.Unlock()
-
-				run := c.prepareMethod(reqCtx, &msg)
-				m := msg
-				go func(m *anyMessage, idKey string, reqCtx context.Context, cancel context.CancelCauseFunc) {
-					defer func() {
-						c.mu.Lock()
-						delete(c.inflight, idKey)
-						c.mu.Unlock()
-
-						cancel(nil)
-					}()
-					c.handleInbound(reqCtx, m, run)
-				}(&m, idKey, reqCtx, cancel)
-				continue
+		if msg.ID != nil {
+			idKey, err := canonicalJSONRPCIDKey(*msg.ID)
+			if err != nil {
+				c.loggerOrDefault().Error("failed to canonicalize inbound request id", "id_bytes", len(*msg.ID))
+				idKey = string(*msg.ID)
 			}
+			reqCtx, cancel := context.WithCancelCause(c.ctx)
 
-			if c.options != nil && c.options.ReceiveNotification != nil && msg.JSONRPC == "2.0" && msg.Result == nil && msg.Error == nil {
-				c.options.ReceiveNotification(ReceiveNotification{Sequence: sequence, Method: msg.Method, Params: msg.Params})
-			}
-			run := c.prepareNotificationDispatch(&msg)
-			if c.options != nil {
-				if err := c.enqueueNotification(&msg, sequence, int64(len(line)), run); err != nil {
-					c.shutdownReceive(err, &queuedNotification{msg: &msg, run: run})
-					return
-				}
-				continue
-			}
+			c.mu.Lock()
+			c.inflight[idKey] = cancel
+			c.mu.Unlock()
 
-			// Queue the notification for sequential processing. The sequence number marks
-			// the response-scoped barrier boundary for requests that observe later responses.
+			run := c.prepareMethod(reqCtx, &msg)
 			m := msg
-			c.notifyMu.Lock()
-			select {
-			case c.notificationQueue <- queuedNotification{seq: sequence, msg: &m, run: run}:
-				c.lastEnqueuedNotificationSeq = sequence
-				c.notifyMu.Unlock()
-			default:
-				c.notifyMu.Unlock()
-				c.loggerOrDefault().Error("failed to queue notification; closing connection", "err", errNotificationQueueOverflow, "capacity", cap(c.notificationQueue), "queued", len(c.notificationQueue))
-				c.shutdownReceive(errNotificationQueueOverflow, &queuedNotification{msg: &msg, run: run})
+			go func(m *anyMessage, idKey string, reqCtx context.Context, cancel context.CancelCauseFunc) {
+				defer func() {
+					c.mu.Lock()
+					delete(c.inflight, idKey)
+					c.mu.Unlock()
+
+					cancel(nil)
+				}()
+				c.handleInbound(reqCtx, m, run)
+			}(&m, idKey, reqCtx, cancel)
+			continue
+		}
+
+		if c.options != nil && c.options.ReceiveNotification != nil && msg.JSONRPC == "2.0" &&
+			fields["result"] == nil && fields["error"] == nil {
+			c.options.ReceiveNotification(ReceiveNotification{Sequence: sequence, Method: msg.Method, Params: msg.Params})
+		}
+		run := c.prepareNotificationDispatch(&msg)
+		if c.options != nil {
+			if err := c.enqueueNotification(&msg, sequence, int64(len(line)), run); err != nil {
+				c.shutdownReceive(err, &queuedNotification{msg: &msg, run: run})
 				return
 			}
+			continue
+		}
+
+		// Queue the notification for sequential processing. The sequence number marks
+		// the response-scoped barrier boundary for requests that observe later responses.
+		m := msg
+		c.notifyMu.Lock()
+		select {
+		case c.notificationQueue <- queuedNotification{seq: sequence, msg: &m, run: run}:
+			c.lastEnqueuedNotificationSeq = sequence
+			c.notifyMu.Unlock()
 		default:
-			c.loggerOrDefault().Error("received message with neither id nor method", "frame_bytes", len(line))
+			c.notifyMu.Unlock()
+			c.loggerOrDefault().Error("failed to queue notification; closing connection", "err", errNotificationQueueOverflow, "capacity", cap(c.notificationQueue), "queued", len(c.notificationQueue))
+			c.shutdownReceive(errNotificationQueueOverflow, &queuedNotification{msg: &msg, run: run})
+			return
 		}
 	}
 
@@ -669,13 +689,101 @@ func (c *Connection) processNotifications() {
 	}
 }
 
-func (c *Connection) handleResponse(msg *anyMessage, sequence uint64) {
-	idStr, err := canonicalJSONRPCIDKey(*msg.ID)
+// decodeObjectMembers retains exact member presence and identifies duplicate
+// names. A duplicate member has a nil value, distinct from an explicit null.
+func decodeObjectMembers(data []byte) (map[string]json.RawMessage, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if opening, err := decoder.Token(); err != nil || opening != json.Delim('{') {
+		return nil, false
+	}
+	fields := make(map[string]json.RawMessage)
+	unique := true
+	for decoder.More() {
+		member, err := decoder.Token()
+		if err != nil {
+			return nil, false
+		}
+		name, ok := member.(string)
+		if !ok {
+			return nil, false
+		}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return nil, false
+		}
+		if _, exists := fields[name]; exists {
+			unique = false
+			value = nil
+		}
+		fields[name] = value
+	}
+	if closing, err := decoder.Token(); err != nil || closing != json.Delim('}') {
+		return nil, false
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, false
+	}
+	return fields, unique
+}
+
+var (
+	errInvalidResponseEnvelope = errors.New("invalid JSON-RPC response envelope")
+	errInvalidResponseError    = errors.New("invalid JSON-RPC response error object")
+	errInvalidResponseResult   = errors.New("invalid JSON-RPC response result")
+)
+
+func decodeResponseEnvelope(fields map[string]json.RawMessage, unique bool) responseEnvelope {
+	var version string
+	result, hasResult := fields["result"]
+	rawError, hasError := fields["error"]
+	if !unique || hasResult == hasError ||
+		json.Unmarshal(fields["jsonrpc"], &version) != nil || version != "2.0" {
+		return responseEnvelope{decodeErr: errInvalidResponseEnvelope}
+	}
+	if hasError {
+		peerErr := decodePeerError(rawError)
+		if peerErr == nil {
+			return responseEnvelope{decodeErr: errInvalidResponseError}
+		}
+		return responseEnvelope{peerErr: peerErr}
+	}
+	return responseEnvelope{result: result}
+}
+
+func decodePeerError(raw json.RawMessage) *RequestError {
+	fields, unique := decodeObjectMembers(raw)
+	if !unique {
+		return nil
+	}
+	var code *int
+	var message *string
+	if json.Unmarshal(fields["code"], &code) != nil || code == nil ||
+		json.Unmarshal(fields["message"], &message) != nil || message == nil {
+		return nil
+	}
+	peerErr := &RequestError{Code: *code, Message: *message}
+	if data := fields["data"]; data != nil && json.Unmarshal(data, &peerErr.Data) != nil {
+		return nil
+	}
+	return peerErr
+}
+
+// json.Unmarshal can echo peer data even when the only failure is a type mismatch.
+func decodeResponseResult(raw json.RawMessage, result any) error {
+	if json.Unmarshal(raw, result) != nil {
+		return errInvalidResponseResult
+	}
+	return nil
+}
+
+func (c *Connection) handleResponse(fields map[string]json.RawMessage, unique bool, sequence uint64) {
+	idStr, err := canonicalJSONRPCIDKey(fields["id"])
 	if err != nil {
-		c.loggerOrDefault().Error("failed to canonicalize response id", "id_bytes", len(*msg.ID))
-		idStr = string(*msg.ID)
+		c.loggerOrDefault().Error("failed to canonicalize response id", "id_bytes", len(fields["id"]))
+		return
 	}
 
+	response := decodeResponseEnvelope(fields, unique)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	pr := c.pending[idStr]
@@ -691,7 +799,9 @@ func (c *Connection) handleResponse(msg *anyMessage, sequence uint64) {
 	c.notifyMu.Unlock()
 	// Publishing the immutable response and retiring pending admission are one
 	// operation, so cancellation cannot fall between them and lose the terminal.
-	pr.ch <- responseEnvelope{msg: *msg, sequence: sequence, notificationWatermark: watermark}
+	response.sequence = sequence
+	response.notificationWatermark = watermark
+	pr.ch <- response
 	delete(c.pending, idStr)
 }
 
@@ -898,11 +1008,14 @@ func SendRequestWithWriteHooks[T any](c *Connection, ctx context.Context, method
 		return result, nil
 	}
 	var responseErr error
-	if resp.msg.Error != nil {
-		responseErr = resp.msg.Error
-	} else if len(resp.msg.Result) > 0 {
-		if err := json.Unmarshal(resp.msg.Result, &result); err != nil {
-			responseErr = NewInternalError(map[string]any{"error": err.Error()})
+	switch {
+	case resp.decodeErr != nil:
+		responseErr = toReqErr(resp.decodeErr)
+	case resp.peerErr != nil:
+		responseErr = resp.peerErr
+	default:
+		if err := decodeResponseResult(resp.result, &result); err != nil {
+			responseErr = toReqErr(err)
 		}
 	}
 	if responseErr == nil {

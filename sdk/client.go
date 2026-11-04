@@ -5,7 +5,6 @@ package acp
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -56,14 +55,17 @@ type RequestReceipt[T any] struct {
 	// ResultValid reports successful decoding of a non-null result.
 	// The caller still validates method-specific semantics.
 	ResultValid bool
-	// PeerErr is the peer's JSON-RPC error, if it returned one.
+	// PeerErr contains private native evidence for adapter classification.
+	// Its message and data may contain secrets. Sanitize them before projecting
+	// errors to the host, CLI or logs.
 	PeerErr *RequestError
 	// TransportErr reports failure while waiting for a response. It retains
 	// the underlying connection or request-context cause.
 	TransportErr error
 	// Write reports the local write admission, bytes and error.
 	Write RequestWriteResult
-	// DecodeErr reports an invalid response envelope or result.
+	// DecodeErr reports a safe classification for an invalid response envelope
+	// or result without including the peer's payload.
 	DecodeErr error
 	// PrepareErr reports failure to encode the request parameters.
 	PrepareErr error
@@ -92,17 +94,16 @@ func SendClientRequestWithReceipt[T any](c *ClientSideConnection, ctx context.Co
 		return receipt
 	}
 
-	msg := response.msg
 	switch {
-	case msg.JSONRPC != "2.0" || (msg.Error != nil && msg.Result != nil):
-		receipt.DecodeErr = errors.New("invalid JSON-RPC response envelope")
-	case msg.Error != nil:
-		receipt.PeerErr = msg.Error
-	case msg.Result == nil || bytes.Equal(msg.Result, []byte("null")):
+	case response.decodeErr != nil:
+		receipt.DecodeErr = response.decodeErr
+	case response.peerErr != nil:
+		receipt.PeerErr = response.peerErr
+	case bytes.Equal(response.result, []byte("null")):
 		receipt.DecodeErr = errors.New("JSON-RPC response has no non-null result")
 	default:
 		var result T
-		if err := json.Unmarshal(msg.Result, &result); err != nil {
+		if err := decodeResponseResult(response.result, &result); err != nil {
 			receipt.DecodeErr = err
 		} else {
 			receipt.Result = result
