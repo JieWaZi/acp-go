@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -314,6 +315,50 @@ func TestModelCatalogExposesNativeAutomaticPermissionSupport(t *testing.T) {
 		if auto := claude.ModelAutoModeSupported(model.Meta); auto != (model.Value == "sonnet") {
 			t.Errorf("model %q auto = %t", model.Value, auto)
 		}
+	}
+}
+
+func TestModelCatalogDistinguishesOmittedSupportFromMissingChoices(t *testing.T) {
+	client, _, ctx := startClientMode(t, agentclient.HostCallbacks{}, "catalog-optional-capabilities", nil)
+	catalog, err := client.ReadModels(ctx)
+	if err != nil || catalog.Options.Ungrouped == nil {
+		t.Fatalf("catalog = %+v, %v", catalog, err)
+	}
+	for _, tc := range []struct {
+		id      acp.SessionConfigValueId
+		options []acp.SessionConfigId
+		effort  []acp.SessionConfigValueId
+		unknown []acp.SessionConfigId
+	}{
+		{"deepseek-v4-flash", []acp.SessionConfigId{"effort"}, []acp.SessionConfigValueId{"default", "low", "medium", "high", "xhigh", "max"}, nil},
+		{"no-configuration", nil, nil, nil},
+		{"legacy-menu", []acp.SessionConfigId{"effort"}, []acp.SessionConfigValueId{"default", "low", "high"}, nil},
+		{"missing-effort-menu", []acp.SessionConfigId{"fast"}, nil, []acp.SessionConfigId{"effort"}},
+		{"unusable-effort-menu", nil, nil, []acp.SessionConfigId{"effort"}},
+	} {
+		t.Run(string(tc.id), func(t *testing.T) {
+			index := slices.IndexFunc(*catalog.Options.Ungrouped, func(row acp.SessionConfigSelectOption) bool { return row.Value == tc.id })
+			if index < 0 {
+				t.Fatal("missing native model")
+			}
+			row, ok := acpmeta.ReadModelConfigCatalog((*catalog.Options.Ungrouped)[index].Meta)
+			var ids []acp.SessionConfigId
+			var effort []acp.SessionConfigValueId
+			for _, option := range row.Options {
+				if option.Select == nil {
+					t.Fatalf("expected native select option, got %+v", option)
+				}
+				ids = append(ids, option.Select.Id)
+				if option.Select.Id == "effort" && option.Select.Options.Ungrouped != nil {
+					for _, choice := range *option.Select.Options.Ungrouped {
+						effort = append(effort, choice.Value)
+					}
+				}
+			}
+			if !ok || !slices.Equal(ids, tc.options) || !slices.Equal(effort, tc.effort) || !slices.Equal(row.UnknownConfigIDs, tc.unknown) {
+				t.Fatalf("reported=%t options=%v effort=%v unknown=%v", ok, ids, effort, row.UnknownConfigIDs)
+			}
+		})
 	}
 }
 

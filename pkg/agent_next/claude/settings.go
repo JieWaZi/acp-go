@@ -186,7 +186,11 @@ func (c *Client) initialModelAlias(effective *protocol.EffectiveSettings) string
 }
 
 func supportsEffort(m protocol.ModelInfo) bool {
-	return len(m.SupportedEffortLevels) > 0 && (m.SupportsEffort || !m.EffortSupportReported)
+	return (m.SupportsEffort || !m.EffortSupportReported) && slices.ContainsFunc(m.SupportedEffortLevels, explicitEffortLevel)
+}
+
+func explicitEffortLevel(level string) bool {
+	return level != "" && level != "default" && level == strings.TrimSpace(level)
 }
 
 func (s sessionSettings) modes() *acp.SessionModeState {
@@ -246,7 +250,7 @@ func choice(id, name string, category acp.SessionConfigOptionCategory, current s
 func effortOption(m protocol.ModelInfo, evidence settingEvidence) acp.SessionConfigOption {
 	rows := acp.SessionConfigSelectOptionsUngrouped{{Value: "default", Name: "Default"}}
 	for _, level := range m.SupportedEffortLevels {
-		if level != "" && level != "default" {
+		if explicitEffortLevel(level) {
 			rows = append(rows, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(level), Name: strings.ToUpper(level[:1]) + level[1:]})
 		}
 	}
@@ -289,15 +293,15 @@ func modelOptions(models []protocol.ModelInfo) acp.SessionConfigSelectOptionsUng
 			name = id
 		}
 		catalog := acpmeta.ModelConfigCatalog{}
+		// Claude's initialize response omits these capabilities when unsupported.
+		// An advertised effort capability without choices is still incomplete.
 		if supportsEffort(m) {
 			catalog.Options = append(catalog.Options, effortOption(m, settingEvidence{}))
-		} else if !m.EffortSupportReported || m.SupportsEffort {
+		} else if m.SupportsEffort {
 			catalog.UnknownConfigIDs = append(catalog.UnknownConfigIDs, "effort")
 		}
 		if m.SupportsFastMode {
 			catalog.Options = append(catalog.Options, fastOption(settingEvidence{}, "", ""))
-		} else if !m.FastSupportReported {
-			catalog.UnknownConfigIDs = append(catalog.UnknownConfigIDs, "fast")
 		}
 		meta := acpmeta.WithModelConfigCatalog(nil, catalog)
 		if m.SupportsAutoMode {

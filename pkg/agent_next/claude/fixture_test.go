@@ -253,6 +253,15 @@ func (f *fixture) control(frame fixtureFrame) {
 				{"value": "sonnet", "displayName": "Sonnet", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "max"}, "supportsAutoMode": true},
 			}
 		}
+		if f.mode == "catalog-optional-capabilities" {
+			response.(map[string]any)["models"] = []map[string]any{
+				{"value": "deepseek-v4-flash", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "xhigh", "max"}, "supportsAutoMode": true},
+				{"value": "no-configuration"},
+				{"value": "legacy-menu", "supportedEffortLevels": []string{"low", "high"}},
+				{"value": "missing-effort-menu", "supportsEffort": true, "supportsFastMode": true},
+				{"value": "unusable-effort-menu", "supportsEffort": true, "supportedEffortLevels": []string{"", "default"}},
+			}
+		}
 		paths := make([]string, 0, len(frame.Request.Plugins))
 		for _, p := range frame.Request.Plugins {
 			if p.Type == "local" && p.SkipMCPDiscovery {
