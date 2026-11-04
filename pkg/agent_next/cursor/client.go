@@ -46,12 +46,16 @@ type Client struct {
 	opts Options
 	// apiKey identifies an explicit launch credential independently of sign-in.
 	apiKey string
-	// mu protects the independent login/logout command and its cleanup.
+	// mu protects management admission, commands and quota consumers.
 	mu sync.Mutex
 	// command remains owned until its native tree has been reaped.
 	command *agentclient.Process
 	// closed rejects new management operations.
 	closed bool
+	// quotaReaders counts admitted Dashboard operations until all callbacks and HTTP work exit.
+	quotaReaders int
+	// quotaIdle is closed on the last exit and is nil when no Dashboard operation is active.
+	quotaIdle chan struct{}
 	// management is canceled when the Cursor wrapper is closed.
 	management     context.Context
 	stopManagement context.CancelFunc
@@ -80,9 +84,6 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	options.PrefixArgs = slices.Clone(options.PrefixArgs)
 	if options.Dashboard != nil {
 		dashboard := *options.Dashboard
-		if dashboard.Endpoint == "" {
-			dashboard.Endpoint = envValue(options.Environment, "CURSOR_API_ENDPOINT")
-		}
 		if dashboard.HTTPClient != nil {
 			client := *dashboard.HTTPClient
 			dashboard.HTTPClient = &client
@@ -167,7 +168,7 @@ func envValue(env []string, key string) string {
 	return ""
 }
 
-// Close retains any partially reaped Cursor management command for retry.
+// Close cancels management work and retains unfinished consumers for retry.
 func (c *Client) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -175,13 +176,25 @@ func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	c.closed = true
 	c.stopManagement()
-	command := c.command
+	command, quotaIdle := c.command, c.quotaIdle
 	c.mu.Unlock()
 	var commandErr error
 	if command != nil {
 		commandErr = c.closeCommand(ctx, command)
 	}
-	return errors.Join(c.Client.Close(ctx), commandErr)
+	nativeErr := c.Client.Close(ctx)
+	if quotaIdle != nil {
+		select {
+		case <-quotaIdle:
+		default:
+			select {
+			case <-quotaIdle:
+			case <-ctx.Done():
+				return errors.Join(nativeErr, commandErr, ctx.Err())
+			}
+		}
+	}
+	return errors.Join(nativeErr, commandErr)
 }
 
 func invalid(message string) *acp.RequestError {

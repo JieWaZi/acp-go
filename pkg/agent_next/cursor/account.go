@@ -55,7 +55,8 @@ type DashboardCredential struct {
 
 // Dashboard is the optional credential-bound Cursor quota reader.
 type Dashboard struct {
-	// Endpoint is the native Dashboard HTTPS endpoint or a loopback test endpoint.
+	// Endpoint is the explicitly trusted Dashboard HTTPS or loopback endpoint.
+	// An empty value uses Cursor's default independently of the CLI environment.
 	Endpoint string
 	// HTTPClient provides optional caller-owned transport.
 	HTTPClient *http.Client
@@ -220,9 +221,18 @@ func (c *Client) ReadAccountUsage(ctx context.Context) (acpmeta.AccountUsage, er
 	if c.opts.Dashboard == nil || c.apiKey != "" {
 		return acpmeta.AccountUsage{}, acp.NewMethodNotFound(acpmeta.AccountUsageMethod)
 	}
-	if c.management.Err() != nil {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
 		return acpmeta.AccountUsage{}, ErrRestartRequired
 	}
+	if c.quotaReaders == 0 {
+		c.quotaIdle = make(chan struct{})
+	}
+	c.quotaReaders++
+	c.mu.Unlock()
+	defer c.finishQuotaRead()
+
 	op, cancel := c.managementContext(ctx, 10*time.Second)
 	defer cancel()
 	usage, err := c.opts.Dashboard.read(op, c.opts.Credential)
@@ -233,6 +243,16 @@ func (c *Client) ReadAccountUsage(ctx context.Context) (acpmeta.AccountUsage, er
 		return acpmeta.AccountUsage{}, ErrRestartRequired
 	}
 	return usage, err
+}
+
+func (c *Client) finishQuotaRead() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.quotaReaders--
+	if c.quotaReaders == 0 {
+		close(c.quotaIdle)
+		c.quotaIdle = nil
+	}
 }
 
 func (d Dashboard) read(ctx context.Context, selection CredentialSelection) (acpmeta.AccountUsage, error) {

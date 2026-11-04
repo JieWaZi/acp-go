@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -925,6 +926,114 @@ func TestDashboardReadsOnlyBoundDefaultCredential(t *testing.T) {
 		t.Errorf("quota while a prompt owns ACP: %v", err)
 	}
 	requireTerminal(t, run(), acp.StopReasonEndTurn)
+}
+
+func TestDashboardDefaultOriginIgnoresCLIEnvironment(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialed := make(chan string, 1)
+	transport := &http.Transport{DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
+		dialed <- address
+		return nil, errors.New("test records the origin without network access")
+	}}
+	defer transport.CloseIdleConnections()
+	selection := cursor.CredentialSelection{Source: cursor.DefaultLogin, ID: "bound"}
+	client, err := cursor.NewClient(ctx, cursor.Options{
+		Executable: executable, Environment: []string{"CURSOR_API_ENDPOINT=http://127.0.0.1:1"}, Credential: selection,
+		Dashboard: &cursor.Dashboard{
+			HTTPClient: &http.Client{Transport: transport},
+			Credential: func(context.Context, cursor.CredentialSelection) (cursor.DashboardCredential, error) {
+				return cursor.DashboardCredential{Selection: selection, AccessToken: "synthetic"}, nil
+			},
+		},
+	}, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(ctx) }()
+	_, _ = client.ReadAccountUsage(ctx)
+	select {
+	case got := <-dialed:
+		if got != "api2.cursor.sh:443" {
+			t.Fatalf("Dashboard destination = %q", got)
+		}
+	default:
+		t.Fatal("Dashboard did not resolve its destination")
+	}
+}
+
+func TestDashboardCloseWaitsForAdmittedCredentialRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := cursor.CredentialSelection{Source: cursor.DefaultLogin, ID: "bound"}
+	entered, cancelled, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	var calls atomic.Int32
+	client, err := cursor.NewClient(ctx, cursor.Options{
+		Executable: executable, Environment: []string{}, Credential: selection,
+		Dashboard: &cursor.Dashboard{
+			Endpoint: "http://127.0.0.1:1",
+			Credential: func(ctx context.Context, _ cursor.CredentialSelection) (cursor.DashboardCredential, error) {
+				if calls.Add(1) == 1 {
+					close(entered)
+					<-ctx.Done()
+					close(cancelled)
+					<-finish
+				}
+				return cursor.DashboardCredential{}, ctx.Err()
+			},
+		},
+	}, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		release.Do(func() { close(finish) })
+		_ = client.Close(ctx)
+	}()
+	read := make(chan error, 1)
+	go func() {
+		_, err := client.ReadAccountUsage(ctx)
+		read <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("quota credential read did not start")
+	}
+	closeCtx, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer stop()
+	if err := client.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close with live credential consumer = %v", err)
+	}
+	select {
+	case <-cancelled:
+	case <-ctx.Done():
+		t.Fatal("close did not cancel the credential read")
+	}
+	if _, err := client.ReadAccountUsage(ctx); !errors.Is(err, cursor.ErrRestartRequired) || calls.Load() != 1 {
+		t.Fatalf("closing owner admitted another credential read: %v, %d calls", err, calls.Load())
+	}
+	release.Do(func() { close(finish) })
+	if err := client.Close(ctx); err != nil {
+		t.Fatalf("retry after credential consumer exited: %v", err)
+	}
+	select {
+	case err := <-read:
+		if !errors.Is(err, cursor.ErrRestartRequired) {
+			t.Fatalf("interrupted quota read = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("closed owner did not return the admitted read")
+	}
 }
 
 func TestNativeForkPublishesOnlyChildConfigurationAndReceipt(t *testing.T) {
