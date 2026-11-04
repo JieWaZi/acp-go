@@ -468,7 +468,7 @@ func matchesLastRequest(delta tokenCounters, last *tokenCounters) bool {
 		return a == nil && b == nil || a != nil && b != nil && *a == *b
 	}
 	return equal(delta.Context, last.Context) && equal(delta.Input, last.Input) &&
-		equal(delta.Read, last.Read) && equal(delta.Write, last.Write) &&
+		equal(delta.Read, last.Read) && value(delta.Write) == value(last.Write) &&
 		equal(delta.Output, last.Output) && equal(delta.Reasoning, last.Reasoning)
 }
 
@@ -522,7 +522,14 @@ func subtractCounters(end, start *tokenCounters) (tokenCounters, bool) {
 		}
 		return pointer(*a - *b)
 	}
-	result := tokenCounters{Input: subtract(end.Input, start.Input), Read: subtract(end.Read, start.Read), Write: subtract(end.Write, start.Write),
+	// The native schema allows only cache writes to be omitted independently
+	// from an otherwise complete report. Compare missing and explicit zero
+	// as equal, but keep the closing cumulative sample's presence.
+	write := end.Write
+	if value(end.Write) != 0 || value(start.Write) != 0 {
+		write = subtract(end.Write, start.Write)
+	}
+	result := tokenCounters{Input: subtract(end.Input, start.Input), Read: subtract(end.Read, start.Read), Write: write,
 		Output: subtract(end.Output, start.Output), Reasoning: subtract(end.Reasoning, start.Reasoning), Context: subtract(end.Context, start.Context)}
 	return result, valid
 }

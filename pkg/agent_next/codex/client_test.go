@@ -158,6 +158,12 @@ func TestAppServerFixture(t *testing.T) {
 				report := func(input, read, output, lastInput int) {
 					last := map[string]any{"inputTokens": lastInput, "cachedInputTokens": 0, "outputTokens": 1, "reasoningOutputTokens": 0, "totalTokens": lastInput + 1}
 					total := map[string]any{"inputTokens": input, "cachedInputTokens": read, "outputTokens": output, "reasoningOutputTokens": 2, "totalTokens": input + output}
+					if mode == "usage_dip_explicit_zero_last" || mode == "usage_dip_explicit_zero_both" {
+						last["cacheWriteInputTokens"] = 0
+					}
+					if mode == "usage_dip_explicit_zero_both" {
+						total["cacheWriteInputTokens"] = 0
+					}
 					emit("thread/tokenUsage/updated", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "tokenUsage": map[string]any{"last": last, "total": total, "modelContextWindow": 100}})
 				}
 				switch turnNumber {
@@ -1286,5 +1292,30 @@ func TestUsageDipAfterAttributionDowngradesCoverage(t *testing.T) {
 	if u.InputTokens == nil || *u.InputTokens != 20 || u.OutputTokens == nil || *u.OutputTokens != 1 ||
 		u.Coverage != "last_request" || u.Complete {
 		t.Fatalf("usage after a late dip = %+v", u)
+	}
+}
+
+func TestUsageDipOptionalZeroKeepsCorroboratedRequests(t *testing.T) {
+	for _, mode := range []string{"usage_dip_explicit_zero_last", "usage_dip_explicit_zero_both"} {
+		t.Run(mode, func(t *testing.T) {
+			c, ctx, session, _ := newFixture(t, mode, agentclient.HostCallbacks{})
+			_ = reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+			got := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+			if got.Outcome == nil || got.Outcome.Turn.Usage == nil {
+				t.Fatalf("missing final usage: %+v", got)
+			}
+			u := got.Outcome.Turn.Usage
+			t.Logf("input=%v output=%v coverage=%s complete=%t", printableReviewCount(u.InputTokens), printableReviewCount(u.OutputTokens), u.Coverage, u.Complete)
+			if u.InputTokens == nil || *u.InputTokens != 22 || u.OutputTokens == nil || *u.OutputTokens != 2 || u.Coverage != "observed_requests" || u.Complete {
+				t.Fatalf("optional zero changed recovered request attribution: %+v", u)
+			}
+			if mode == "usage_dip_explicit_zero_last" {
+				if u.CacheWriteTokens != nil {
+					t.Fatalf("last-request proof introduced cache-write presence: %+v", u)
+				}
+			} else if u.CacheWriteTokens == nil || *u.CacheWriteTokens != 0 {
+				t.Fatalf("explicit cumulative cache-write zero was not retained: %+v", u)
+			}
+		})
 	}
 }
