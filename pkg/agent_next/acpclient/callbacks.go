@@ -58,6 +58,10 @@ func (c *Client) prepareNativeRequest(_ context.Context, frame acp.ReceiveReques
 			if interaction.Reply == nil || (interaction.Permission == nil) == (interaction.Elicitation == nil) {
 				return rejectedCallback(acp.NewInvalidParams(nil)), true
 			}
+			if followup := interaction.Followup; followup != nil &&
+				(followup.Method == "" || followup.Encode == nil || followup.Validate == nil || interaction.Identity.ToolID == "") {
+				return rejectedCallback(acp.NewInvalidParams(nil)), true
+			}
 			private = &interaction
 		} else if progress, err, handled := codec.DecodeProgress(method, frame.Params); handled {
 			if err != nil {
@@ -77,6 +81,9 @@ func (c *Client) prepareNativeRequest(_ context.Context, frame acp.ReceiveReques
 		default:
 			if !strings.HasPrefix(method, "_") {
 				return nil, false
+			}
+			if c.opts.Protocol.BlockUntypedExtensions {
+				return rejectedCallback(acp.NewMethodNotFound(method)), true
 			}
 		}
 	}
@@ -113,6 +120,16 @@ func (c *Client) prepareNativeRequest(_ context.Context, frame acp.ReceiveReques
 	peer, caps := c.peer, c.clientCaps
 	wireSession := peer != nil && !interaction && c.wireSessionLocked(identity.SessionID)
 	admitted := !c.closed && (t != nil || wireSession) && c.reverseCalls < 128 && c.reverseBytes+len(frame.Params) <= maxObservationBytes
+	if admitted && private != nil && private.Followup != nil {
+		_, duplicate := t.followups[identity.ToolID]
+		admitted = !duplicate
+		if admitted {
+			if t.followups == nil {
+				t.followups = make(map[acp.ToolCallId]struct{})
+			}
+			t.followups[identity.ToolID] = struct{}{}
+		}
+	}
 	if admitted {
 		c.reverseCalls++
 		c.reverseBytes += len(frame.Params)
@@ -183,7 +200,49 @@ func (c *Client) runPrivateInteraction(ctx context.Context, t *turn, caps acp.Cl
 		}
 		reply.Elicitation = &result
 	}
+	if followup := request.Followup; followup != nil {
+		if err := c.submitInteractionAnswer(ctx, t, followup, reply); err != nil {
+			return nil, err
+		}
+	}
 	return request.Reply.EncodeReply(reply)
+}
+
+func (c *Client) submitInteractionAnswer(ctx context.Context, t *turn, followup *InteractionFollowup, reply InteractionReply) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	input, err := followup.Encode(reply)
+	if err != nil {
+		return err
+	}
+	op, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	hooks := boundedWrite(op, t.conn, func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.closed || c.turn != t || t.cancelled || t.terminal {
+			return context.Canceled
+		}
+		return op.Err()
+	})
+	var ackErr error
+	receipt := acp.SendClientRequestWithReceipt[json.RawMessage](t.conn, op, followup.Method, input, hooks,
+		func(receipt acp.RequestReceipt[json.RawMessage]) {
+			ackErr = receiptFailure(receipt, followup.Method)
+			if ackErr == nil {
+				ackErr = followup.Validate(receipt.Result)
+			}
+			if ackErr != nil {
+				// An immediately following terminal frame must retain this failure.
+				c.mu.Lock()
+				if c.turn == t && !t.cancelled && !t.terminal {
+					c.failDeliveryLocked(t.delivery, ackErr)
+				}
+				c.mu.Unlock()
+			}
+		})
+	return errors.Join(receiptFailure(receipt, followup.Method), ackErr, ctx.Err())
 }
 
 func (c *Client) wireSessionLocked(id acp.SessionId) bool {
@@ -544,7 +603,7 @@ func (c *Client) HandleExtensionMethod(ctx context.Context, method string, raw j
 	c.mu.Lock()
 	wire := c.peer != nil
 	c.mu.Unlock()
-	if !wire || !strings.HasPrefix(method, "_") {
+	if !wire || c.opts.Protocol.BlockUntypedExtensions || !strings.HasPrefix(method, "_") {
 		return nil, acp.NewMethodNotFound(method)
 	}
 	conn, err := c.begin(ctx)

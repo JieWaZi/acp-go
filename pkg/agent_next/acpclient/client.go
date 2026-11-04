@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -130,6 +131,13 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		}
 		options.Protocol.Catalog = &catalog
 	}
+	if options.Protocol.CwdBoundProcess {
+		dir, err := filepath.Abs(options.Process.Dir)
+		if err != nil {
+			return nil, errors.New("cannot freeze the ACP launch directory")
+		}
+		options.Process.Dir = dir
+	}
 	proc, err := agentclient.NewProcess(options.Process)
 	if err != nil {
 		return nil, err
@@ -172,6 +180,9 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 		if c.host.CompleteElicitation != nil {
 			request.ClientCapabilities.Elicitation.Url = &acp.ElicitationUrlCapabilities{}
 		}
+	}
+	if prepare := c.opts.Protocol.PrepareInitialize; prepare != nil {
+		prepare(&request)
 	}
 	c.clientCaps, _ = clone(request.ClientCapabilities)
 	c.mu.Unlock()

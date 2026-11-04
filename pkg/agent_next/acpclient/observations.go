@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
@@ -53,6 +54,8 @@ type receivedUpdate struct {
 	config json.RawMessage
 	// usage retains context and consumption field presence before SDK projection.
 	usage *usageUpdate
+	// auxiliary retains an optional vendor sample separate from consumption.
+	auxiliary *acpmeta.UsageObservation
 	// note contains the standard observation, including the typed payload.
 	note acp.SessionNotification
 }
@@ -132,6 +135,9 @@ func (c *Client) receive(frame acp.ReceiveNotification) {
 		var usage usageUpdate
 		if json.Unmarshal(raw.Update, &usage) == nil {
 			update.usage = &usage
+			if normalize := c.opts.Protocol.NormalizeUsage; normalize != nil && update.note.Update.UsageUpdate != nil {
+				update.auxiliary = normalize(update.note.Update.UsageUpdate)
+			}
 		}
 	}
 	c.mu.Lock()
@@ -204,7 +210,11 @@ func (c *Client) applyOpeningUpdate(p *opening, update receivedUpdate) {
 	if !c.applySessionUpdateLocked(p.session, &update) {
 		return
 	}
-	if p.replay || sessionUpdate(update.note.Update) {
+	u := update.note.Update
+	if p.replay && (u.UserMessageChunk != nil || u.AgentMessageChunk != nil || u.AgentThoughtChunk != nil || u.ToolCall != nil) {
+		p.restoredHistory = true
+	}
+	if p.replay || sessionUpdate(u) {
 		if len(p.observations) >= maxOpeningFrames || p.observationBytes+update.size > maxOpeningBytes {
 			p.overflow = true
 			return
@@ -266,6 +276,9 @@ func (c *Client) foldTurnUpdateLocked(t *turn, update receivedUpdate) {
 		}
 		if size := nonnegative(update.usage.Size); size != nil && *size > 0 {
 			t.contextUsage.WindowTokens = size
+		}
+		if update.auxiliary != nil {
+			t.usage.recordObservation(*update.auxiliary)
 		}
 		decoded, attributable := t.usage.recordMetadata(update.usage.Meta)
 		t.associated = t.associated || attributable

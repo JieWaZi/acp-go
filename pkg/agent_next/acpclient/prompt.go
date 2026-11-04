@@ -57,12 +57,16 @@ type turn struct {
 	terminal bool
 	// observedOutput records a matched execution frame, independent of delivery.
 	observedOutput bool
+	// inputAccepted records explicit input admission on peers that report it.
+	inputAccepted bool
 	// associated records an explicit turn-scoped native update.
 	associated bool
 	// authLost is set only by an exact native sign-in failure chunk.
 	authLost bool
 	// elicitations binds completion to its original URL request.
 	elicitations map[acp.UnstableElicitationId]struct{}
+	// followups prevent duplicate native reverse requests from submitting an answer twice.
+	followups map[acp.ToolCallId]struct{}
 	// contextUsage holds known session context counters separately from consumption.
 	contextUsage agentclient.ContextUsage
 	// usage keeps invocation accounting separate from auxiliary observations.
@@ -76,7 +80,9 @@ type turn struct {
 type promptResponse struct {
 	// StopReason is validated before it is treated as a native terminal.
 	StopReason acp.StopReason `json:"stopReason"`
-	// Usage is an optional session-cumulative ACP counter, not a turn delta.
+	// UserMessageID is an optional provider receipt for persisted user input.
+	UserMessageID string `json:"userMessageId"`
+	// Usage is an optional ACP counter whose scope depends on the provider.
 	Usage *wireUsage `json:"usage"`
 	// Meta can carry explicitly associated complete usage or a fork position.
 	Meta map[string]any `json:"_meta"`
@@ -248,13 +254,16 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		c.unusable = true
 	}
 	associated := t.outcome != nil && (t.associated || r.ResultValid && t.outcome.StopReason != nil)
+	if c.opts.Protocol.ReadPromptEvidence != nil && r.ResultValid {
+		associated = t.inputAccepted
+	}
 	switch {
 	case preAcceptanceRejection:
 		// An explicit matched refusal outweighs notifications stamped only
 		// with the session. They remain observations, not input acceptance.
 		result.Receipt.Admission = agentclient.AdmissionNotAccepted
 	case t.outcome != nil && r.Write.BytesWritten > 0:
-		if associated || t.authLost {
+		if associated || t.authLost && c.opts.Protocol.ReadPromptEvidence == nil {
 			result.Receipt.Admission = agentclient.AdmissionConfirmed
 		}
 		if associated {
@@ -347,6 +356,18 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 		case acp.StopReasonCancelled:
 			outcome.StopReason, outcome.Turn.Status = &response.StopReason, acpmeta.NativeTurnCancelled
 		}
+		if read := c.opts.Protocol.ReadPromptEvidence; read != nil && outcome.StopReason != nil {
+			evidence := read(response.StopReason, response.UserMessageID, response.Meta)
+			t.inputAccepted = evidence.InputAccepted
+			if evidence.NativeTurnID != "" {
+				outcome.Turn.NativeTurnID = acp.Ptr(evidence.NativeTurnID)
+			}
+			if evidence.Failure != nil {
+				outcome.NativeFailure = freezeProtocolError(evidence.Failure)
+				outcome.Turn.Status = acpmeta.NativeTurnFailed
+				t.authLost = evidence.Failure.Code == -32000
+			}
+		}
 		if outcome.StopReason != nil && acpmeta.ForkMode(c.initialized.Meta) == acpmeta.ForkTurn {
 			outcome.ForkPosition = acpmeta.ForkPosition(response.Meta)
 		}
@@ -354,7 +375,7 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 	rejected := c.preAcceptanceRejection(peer, t.session.id)
 	if rejected {
 		outcome.Turn.Origin = acpmeta.NativeTurnOriginUnknown
-	} else if t.authLost {
+	} else if t.authLost && outcome.NativeFailure == nil {
 		outcome.NativeFailure = freezeProtocolError(acp.NewAuthRequired(map[string]any{"method": acp.AgentMethodSessionPrompt, "classification": "authentication_lost", "restartRequired": true}))
 		if outcome.StopReason != nil || peer != nil {
 			outcome.Turn.Status = acpmeta.NativeTurnFailed

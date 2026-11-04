@@ -55,6 +55,8 @@ type opening struct {
 	replay bool
 	// started marks the native request write gate.
 	started bool
+	// restoredHistory records a transcript frame for the exact requested ID.
+	restoredHistory bool
 	// matched denotes a valid response binding even during final normalization.
 	matched bool
 	// previous contains the last confirmed generation of a known restore.
@@ -325,6 +327,11 @@ func (c *Client) bindOpening(p *opening, r acp.RequestReceipt[setupResult]) {
 			p.err = errors.New("ACP agent restore returned a different native session")
 			return
 		}
+		if p.replay && c.opts.Protocol.RequireLoadEvidence && id == "" && !p.restoredHistory {
+			p.err = &acp.RequestError{Code: -32603, Message: "ACP agent did not verify restored history",
+				Data: map[string]any{"method": acp.AgentMethodSessionLoad, "classification": "session_restore_unverified"}}
+			return
+		}
 		id = p.session.id
 	}
 	if id == "" || id == p.source || c.sessions[id] != p.previous {
@@ -360,6 +367,9 @@ func (c *Client) validateSetup(request setupRequest) error {
 	}
 	if !filepath.IsAbs(request.cwd) || len(request.roots) > 0 && sessions.AdditionalDirectories == nil {
 		return invalid("ACP agent requires an absolute cwd and advertised additional directories")
+	}
+	if c.opts.Protocol.CwdBoundProcess && filepath.Clean(request.cwd) != c.opts.Process.Dir {
+		return invalid("ACP agent requires the session cwd to match the process launch directory")
 	}
 	for _, root := range request.roots {
 		if !filepath.IsAbs(root) {
@@ -444,6 +454,14 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
+	if id := c.opts.Protocol.ModeOption; id != "" {
+		wanted := setting{id: id, value: acp.SessionConfigValueId(request.ModeId)}
+		params := acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+			SessionId: s.id, ConfigId: wanted.id, Value: wanted.value,
+		}}
+		result, err := c.setConfig(op, conn, s, wanted, params)
+		return acp.SetSessionModeResponse{Meta: result.Meta}, err
+	}
 	r := acp.SendClientRequestWithReceipt[acp.SetSessionModeResponse](conn, op, acp.AgentMethodSessionSetMode, request, boundedWrite(op, conn, nil),
 		func(r acp.RequestReceipt[acp.SetSessionModeResponse]) {
 			if r.ResultValid {

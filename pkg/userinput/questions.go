@@ -53,15 +53,19 @@ type Requester interface {
 	UnstableCreateElicitation(context.Context, acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error)
 }
 
-// Ask 验证问题并通过标准 ACP 表单等待真实用户答案。
-func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions) (Result, error) {
-	cancelled := Result{Action: "cancel"}
-	if host == nil || sid == "" || ctx.Err() != nil {
-		return cancelled, nil
-	}
+// QuestionForm is a validated elicitation and its matching answer decoder.
+type QuestionForm struct {
+	// Request is the standard form delivered to the host.
+	Request acp.UnstableCreateElicitationRequest
+	// questions hold the native identities and choices used to validate answers.
+	questions Questions
+}
+
+// PrepareQuestions validates a native question before it is shown to the host.
+func PrepareQuestions(sid acp.SessionId, input Questions) (QuestionForm, error) {
 	data, err := json.Marshal(input)
-	if err != nil || len(data) > 60000 || len(input.Questions) == 0 || len(input.Questions) > 8 {
-		return cancelled, errors.New("invalid user questions")
+	if sid == "" || err != nil || len(data) > 60000 || len(input.Questions) == 0 || len(input.Questions) > 8 {
+		return QuestionForm{}, errors.New("invalid user questions")
 	}
 	properties := map[string]any{}
 	identities := map[string]bool{}
@@ -71,7 +75,7 @@ func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions
 			key = question.Question
 		}
 		if strings.TrimSpace(question.Question) == "" || len(question.Question) > 4096 || identities[key] || len(question.Options) > 64 {
-			return cancelled, errors.New("invalid or duplicate question")
+			return QuestionForm{}, errors.New("invalid or duplicate question")
 		}
 		identities[key] = true
 		field := map[string]any{"type": "string", "title": question.Header, "description": question.Question}
@@ -82,7 +86,7 @@ func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions
 		labels := map[string]bool{}
 		for _, option := range question.Options {
 			if strings.TrimSpace(option.Label) == "" || labels[option.Label] {
-				return cancelled, errors.New("invalid or duplicate question option")
+				return QuestionForm{}, errors.New("invalid or duplicate question option")
 			}
 			labels[option.Label] = true
 			options = append(options, map[string]any{"const": option.Label, "title": option.Label, "description": option.Description})
@@ -106,21 +110,40 @@ func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions
 		request.Form.Message = input.Questions[0].Question
 	}
 	request.Form.Meta = map[string]any{"sessionId": sid}
-	response, err := host.UnstableCreateElicitation(ctx, request)
+	return QuestionForm{Request: request, questions: input}, nil
+}
+
+// Ask validates questions and waits for a standard ACP form answer.
+func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions) (Result, error) {
+	cancelled := Result{Action: "cancel"}
+	if host == nil || sid == "" || ctx.Err() != nil {
+		return cancelled, nil
+	}
+	form, err := PrepareQuestions(sid, input)
+	if err != nil {
+		return cancelled, err
+	}
+	response, err := host.UnstableCreateElicitation(ctx, form.Request)
 	if err != nil {
 		return cancelled, err
 	}
 	if ctx.Err() != nil {
 		return cancelled, nil
 	}
+	return form.Resolve(response), nil
+}
+
+// Resolve validates a host response against the original native questions.
+func (form QuestionForm) Resolve(response acp.UnstableCreateElicitationResponse) Result {
+	cancelled := Result{Action: "cancel"}
 	if response.Decline != nil {
-		return Result{Action: "decline"}, nil
+		return Result{Action: "decline"}
 	}
 	if response.Accept == nil {
-		return cancelled, nil
+		return cancelled
 	}
 	answers := map[string]any{}
-	for i, question := range input.Questions {
+	for i, question := range form.questions.Questions {
 		key := fmt.Sprintf("question_%d", i)
 		value := response.Accept.Content[key]
 		custom, _ := response.Accept.Content[key+"_custom"].(string)
@@ -145,12 +168,12 @@ func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions
 				encoded, _ := json.Marshal(value)
 				var items []string
 				if json.Unmarshal(encoded, &items) != nil || len(items) == 0 {
-					return cancelled, nil
+					return cancelled
 				}
 				seen := map[string]bool{}
 				for _, item := range items {
 					if !valid(item) || seen[item] {
-						return cancelled, nil
+						return cancelled
 					}
 					seen[item] = true
 				}
@@ -158,7 +181,7 @@ func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions
 			} else {
 				text, ok := value.(string)
 				if !ok || !valid(text) {
-					return cancelled, nil
+					return cancelled
 				}
 			}
 		}
@@ -168,5 +191,5 @@ func Ask(ctx context.Context, host Requester, sid acp.SessionId, input Questions
 		}
 		answers[identity] = value
 	}
-	return Result{Action: "accept", Answers: answers}, nil
+	return Result{Action: "accept", Answers: answers}
 }

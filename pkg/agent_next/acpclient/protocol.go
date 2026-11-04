@@ -11,6 +11,20 @@ import (
 
 // Protocol describes observed deviations at specific ACP boundaries.
 type Protocol struct {
+	// PrepareInitialize advertises a provider's documented client capability.
+	PrepareInitialize func(*acp.InitializeRequest)
+	// CwdBoundProcess requires session cwd to match the launch directory.
+	CwdBoundProcess bool
+	// RequireLoadEvidence rejects an ID-less restore response without same-session history replay.
+	RequireLoadEvidence bool
+	// ModeOption selects an advertised native config setter for permission modes.
+	ModeOption acp.SessionConfigId
+	// BlockUntypedExtensions protects providers whose raw methods expose credentials or unscoped mutations.
+	BlockUntypedExtensions bool
+	// ReadPromptEvidence interprets provider-specific input, turn identity and failure fields.
+	ReadPromptEvidence func(acp.StopReason, string, map[string]any) PromptEvidence
+	// NormalizeUsage decodes auxiliary observations and corrects fields with different native meanings.
+	NormalizeUsage func(*acp.SessionUsageUpdate) *acpmeta.UsageObservation
 	// ModelScope is session-scoped unless the native process shares a model.
 	ModelScope ModelScope
 	// PromptUsage selects the native meaning of standard ACP usage.
@@ -31,6 +45,16 @@ type Protocol struct {
 	ParameterizedModelPicker bool
 	// Authentication limits standard ACP authentication and supplies an optional logout command.
 	Authentication Authentication
+}
+
+// PromptEvidence extends an ACP response with proven provider-specific facts.
+type PromptEvidence struct {
+	// NativeTurnID is the provider's stable turn identity, when present.
+	NativeTurnID string
+	// InputAccepted requires explicit native evidence that this input entered the conversation.
+	InputAccepted bool
+	// Failure describes a native prompt failure using safe structured fields.
+	Failure *acp.RequestError
 }
 
 // ModelScope identifies where a native model set takes effect.
@@ -99,6 +123,18 @@ type Interaction struct {
 	Elicitation *acp.UnstableCreateElicitationRequest
 	// Reply converts only host response data into the provider's wire response.
 	Reply InteractionReplyCodec
+	// Followup submits an optional native answer before replying to the reverse request.
+	Followup *InteractionFollowup
+}
+
+// InteractionFollowup describes an answer request on the captured turn's connection.
+type InteractionFollowup struct {
+	// Method is the provider's exact answer method.
+	Method string
+	// Encode converts the host result to the native request without side effects.
+	Encode func(InteractionReply) (any, error)
+	// Validate requires positive native acknowledgement of the answer.
+	Validate func(json.RawMessage) error
 }
 
 // InteractionReplyCodec is a pure native response encoder for a decoded request.
