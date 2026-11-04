@@ -81,23 +81,29 @@ type RequestReceipt[T any] struct {
 // existing pending owner. It returns response evidence before notification
 // dispatch completes. The reader still applies the configured queue limits.
 // WaitForNotifications can check dispatch separately.
-// At most one optional receive hook runs on the reader, before the next frame
-// and potentially before Write returns. Only response fields are available to
-// the hook. It must perform bounded local folding, not I/O, waits, observers or
-// calls into this connection. Do not mutate its borrowed Result or PeerErr.
+// Without a receive hook the caller decodes T after the reader publishes the
+// response. With a non-nil hook both decoding T and the hook run on the reader
+// before the next frame, potentially before Write returns. Both must be bounded
+// local work, without I/O, waits, observers or calls into this connection.
+// Only response fields are available to the hook. Do not mutate its borrowed
+// Result or PeerErr.
 func SendClientRequestWithReceipt[T any](c *ClientSideConnection, ctx context.Context, method string, params any, hooks RequestWriteHooks, receive ...func(RequestReceipt[T])) RequestReceipt[T] {
 	if len(receive) > 1 {
 		return RequestReceipt[T]{PrepareErr: errors.New("only one response receive hook is allowed")}
 	}
 	var receipt RequestReceipt[T]
-	exchange := c.conn.exchangeRequest(ctx, method, params, hooks, func(response responseEnvelope) {
-		receipt = decodeRequestReceipt[T](response)
-		if len(receive) == 1 && receive[0] != nil {
-			receive[0](receipt)
+	var capture func(responseEnvelope)
+	if len(receive) == 1 && receive[0] != nil {
+		hook := receive[0]
+		capture = func(response responseEnvelope) {
+			receipt = decodeRequestReceipt[T](response)
+			hook(receipt)
 		}
-	})
-	// Every exchange return either synchronizes with response publication or
-	// retires pending under the same lock, so the reader cannot mutate this value.
+	}
+	exchange := c.conn.exchangeRequest(ctx, method, params, hooks, capture)
+	if capture == nil {
+		receipt = decodeRequestReceipt[T](exchange.response)
+	}
 	receipt.PrepareErr = exchange.prepareErr
 	receipt.TransportErr = exchange.waitErr
 	receipt.Write = exchange.write

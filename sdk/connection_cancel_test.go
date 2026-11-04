@@ -592,7 +592,6 @@ func TestConnectionSendCancelRequest_BoundsPendingQueue(t *testing.T) {
 
 	c := &Connection{
 		pending:             make(map[string]*pendingResponse),
-		inflight:            make(map[string]context.CancelCauseFunc),
 		cancelRequestSignal: make(chan struct{}, 1),
 		ctx:                 baseCtx,
 		cancel:              baseCancel,

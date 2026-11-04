@@ -94,10 +94,20 @@ type responseEnvelope struct {
 }
 
 type pendingResponse struct {
+	// ch publishes the claimed response once to its waiter.
 	ch chan responseEnvelope
+	// admission identifies the write gate admission that made this ID eligible.
+	admission uint64
+	// claimed is set under Connection.mu when the reader takes responsibility for publishing.
+	claimed bool
 	// receive folds matched response evidence before publication and the next frame.
-	// It must not block or re-enter the connection while pending is serialized.
+	// It runs without the connection lock but must not block or re-enter the connection.
 	receive func(responseEnvelope)
+}
+
+type inboundRequest struct {
+	// cancel affects only the continuation that owns this inbound ID.
+	cancel context.CancelCauseFunc
 }
 
 type cancelRequestParams struct {
@@ -122,8 +132,9 @@ type Connection struct {
 	mu                   sync.Mutex
 	writeGate            chan struct{}
 	nextID               atomic.Uint64
+	writeAdmission       atomic.Uint64
 	pending              map[string]*pendingResponse
-	inflight             map[string]context.CancelCauseFunc
+	inflight             map[string]*inboundRequest
 	pendingCancelRequest []string
 	cancelRequestSignal  chan struct{}
 
@@ -194,7 +205,7 @@ func newConnection(handler MethodHandler, prepare methodPreparer, peerInput io.W
 		handler:             handler,
 		prepareInbound:      prepare,
 		pending:             make(map[string]*pendingResponse),
-		inflight:            make(map[string]context.CancelCauseFunc),
+		inflight:            make(map[string]*inboundRequest),
 		cancelRequestSignal: make(chan struct{}, 1),
 		ctx:                 ctx,
 		cancel:              cancel,
@@ -511,6 +522,9 @@ func (c *Connection) receive() {
 			continue
 		}
 
+		// Take the write admission cutoff before parsing so the frame cannot
+		// claim an ID made eligible while its envelope was being decoded.
+		admissionCutoff := c.writeAdmission.Load()
 		fields, unique := decodeObjectMembers(line)
 		if fields == nil {
 			c.loggerOrDefault().Error("failed to parse incoming message", "frame_bytes", len(line))
@@ -518,78 +532,29 @@ func (c *Connection) receive() {
 		}
 
 		sequence++
-		rawMethod, hasMethod := fields["method"]
-		id := fields["id"]
-		if !hasMethod {
-			if id == nil || bytes.Equal(id, []byte("null")) {
-				c.loggerOrDefault().Error("received response without an unambiguous id", "frame_bytes", len(line))
-				continue
-			}
-			c.handleResponse(fields, unique, sequence)
+		// Even a malformed method-shaped frame cannot answer an outbound request.
+		if _, hasMethod := fields["method"]; !hasMethod {
+			c.handleResponse(fields, unique, sequence, admissionCutoff)
 			continue
 		}
 
-		// Method presence belongs to inbound routing, even if an invalid request
-		// uses the same ID as a pending outbound request.
-		var msg anyMessage
-		version := fields["jsonrpc"]
-		if !unique || json.Unmarshal(rawMethod, &msg.Method) != nil || msg.Method == "" ||
-			(version != nil && json.Unmarshal(version, &msg.JSONRPC) != nil) {
-			c.loggerOrDefault().Error("failed to parse incoming method", "frame_bytes", len(line))
-			continue
-		}
-		msg.Params = fields["params"]
-		if id != nil && !bytes.Equal(id, []byte("null")) {
-			msg.ID = &id
-		}
-
-		// Handle $/cancel_request notifications synchronously so cancellations take effect
-		// immediately and do not participate in notification ordering.
-		if msg.ID == nil && msg.Method == "$/cancel_request" {
-			c.handleCancelRequest(&msg)
-			continue
-		}
-
+		msg, idKey, valid := decodeInboundCall(fields, unique)
 		if msg.ID != nil {
-			idKey, err := canonicalJSONRPCIDKey(*msg.ID)
-			if err != nil {
-				c.loggerOrDefault().Error("failed to canonicalize inbound request id", "id_bytes", len(*msg.ID))
-				idKey = string(*msg.ID)
-			}
-			reqCtx, cancel := context.WithCancelCause(c.ctx)
-
-			c.mu.Lock()
-			c.inflight[idKey] = cancel
-			c.mu.Unlock()
-
-			run := c.prepareMethod(reqCtx, &msg)
-			if run == nil && c.options != nil && c.options.PrepareRequest != nil {
-				if err != nil || msg.JSONRPC != "2.0" || fields["result"] != nil || fields["error"] != nil {
-					run = completeInbound(NewInvalidRequest(nil))
-				} else if prepared, handled := c.options.PrepareRequest(reqCtx, ReceiveRequest{Sequence: sequence, Method: msg.Method, Params: msg.Params}); handled {
-					if prepared == nil {
-						run = completeInbound(NewInternalError(nil))
-					} else {
-						run = prepared
-					}
-				}
-			}
-			m := msg
-			go func(m *anyMessage, idKey string, reqCtx context.Context, cancel context.CancelCauseFunc) {
-				defer func() {
-					c.mu.Lock()
-					delete(c.inflight, idKey)
-					c.mu.Unlock()
-
-					cancel(nil)
-				}()
-				c.handleInbound(reqCtx, m, run)
-			}(&m, idKey, reqCtx, cancel)
+			c.admitInboundRequest(&msg, idKey, sequence, valid)
+			continue
+		}
+		if !valid {
+			c.loggerOrDefault().Error("invalid incoming call", "frame_bytes", len(line))
+			continue
+		}
+		if msg.Method == "$/cancel_request" {
+			// Protocol cancellation targets an admitted request immediately and
+			// does not participate in application notification ordering.
+			c.handleCancelRequest(msg.Params)
 			continue
 		}
 
-		if c.options != nil && c.options.ReceiveNotification != nil && msg.JSONRPC == "2.0" &&
-			fields["result"] == nil && fields["error"] == nil {
+		if c.options != nil && c.options.ReceiveNotification != nil {
 			c.options.ReceiveNotification(ReceiveNotification{Sequence: sequence, Method: msg.Method, Params: msg.Params})
 		}
 		run := c.prepareNotificationDispatch(&msg)
@@ -804,20 +769,96 @@ func decodeResponseResult(raw json.RawMessage, result any) error {
 	return nil
 }
 
-func (c *Connection) handleResponse(fields map[string]json.RawMessage, unique bool, sequence uint64) {
-	idStr, err := canonicalJSONRPCIDKey(fields["id"])
+// decodeInboundCall validates the envelope before either capture or dispatch.
+// An unambiguous request ID may receive a protocol error even for an invalid
+// call, but ID presence alone never makes that frame a notification.
+func decodeInboundCall(fields map[string]json.RawMessage, unique bool) (anyMessage, string, bool) {
+	var msg anyMessage
+	var idKey string
+	if id, hasID := fields["id"]; hasID {
+		var err error
+		idKey, err = canonicalJSONRPCIDKey(id)
+		if err != nil {
+			return msg, "", false
+		}
+		msg.ID = &id
+	}
+	_, hasResult := fields["result"]
+	_, hasError := fields["error"]
+	valid := unique && !hasResult && !hasError &&
+		json.Unmarshal(fields["jsonrpc"], &msg.JSONRPC) == nil && msg.JSONRPC == "2.0" &&
+		json.Unmarshal(fields["method"], &msg.Method) == nil && msg.Method != "" &&
+		(msg.ID == nil || msg.Method != "$/cancel_request")
+	msg.Params = fields["params"]
+	return msg, idKey, valid
+}
+
+func (c *Connection) admitInboundRequest(msg *anyMessage, idKey string, sequence uint64, valid bool) {
+	c.mu.Lock()
+	if c.inflight[idKey] != nil {
+		// A second response using this ID could satisfy the first request's
+		// waiter. Keep its sole owner and let it send the only response.
+		c.mu.Unlock()
+		c.loggerOrDefault().Debug("ignoring duplicate active request id")
+		return
+	}
+	reqCtx, cancel := context.WithCancelCause(c.ctx)
+	owner := &inboundRequest{cancel: cancel}
+	c.inflight[idKey] = owner
+	c.mu.Unlock()
+
+	var run inboundContinuation
+	if !valid {
+		// Own the ID until this rejection is sent, without running business capture.
+		run = completeInbound(NewInvalidRequest(nil))
+	} else {
+		run = c.prepareMethod(reqCtx, msg)
+		if run == nil && c.options != nil && c.options.PrepareRequest != nil {
+			if prepared, handled := c.options.PrepareRequest(reqCtx, ReceiveRequest{Sequence: sequence, Method: msg.Method, Params: msg.Params}); handled {
+				if prepared == nil {
+					run = completeInbound(NewInternalError(nil))
+				} else {
+					run = prepared
+				}
+			}
+		}
+	}
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			if c.inflight[idKey] == owner {
+				delete(c.inflight, idKey)
+			}
+			c.mu.Unlock()
+			cancel(nil)
+		}()
+		c.handleInbound(reqCtx, msg, run)
+	}()
+}
+
+func (c *Connection) handleResponse(fields map[string]json.RawMessage, unique bool, sequence, admissionCutoff uint64) {
+	id := fields["id"]
+	if id == nil || bytes.Equal(id, []byte("null")) {
+		c.loggerOrDefault().Error("received response without an unambiguous id")
+		return
+	}
+	idKey, err := canonicalJSONRPCIDKey(id)
 	if err != nil {
-		c.loggerOrDefault().Error("failed to canonicalize response id", "id_bytes", len(fields["id"]))
+		c.loggerOrDefault().Error("failed to canonicalize response id", "id_bytes", len(id))
 		return
 	}
 
-	response := decodeResponseEnvelope(fields, unique)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	pr := c.pending[idStr]
-	if pr == nil {
+	pr := c.pending[idKey]
+	if pr == nil || pr.admission > admissionCutoff {
+		c.mu.Unlock()
 		return
 	}
+	pr.claimed = true
+	delete(c.pending, idKey)
+	c.mu.Unlock()
+
+	response := decodeResponseEnvelope(fields, unique)
 	c.notifyMu.Lock()
 	watermark := c.lastEnqueuedNotificationSeq
 	if c.completedNotificationSeq > watermark {
@@ -825,42 +866,36 @@ func (c *Connection) handleResponse(fields map[string]json.RawMessage, unique bo
 		panic("completed notification sequence exceeded response watermark")
 	}
 	c.notifyMu.Unlock()
-	// Publishing the immutable response and retiring pending admission are one
-	// operation, so cancellation cannot fall between them and lose the terminal.
 	response.sequence = sequence
 	response.notificationWatermark = watermark
+
+	// Claiming gives the reader sole responsibility for publication. Keep
+	// caller decoding and capture outside connection locks.
 	if pr.receive != nil {
 		pr.receive(response)
 	}
 	pr.ch <- response
-	delete(c.pending, idStr)
 }
 
-func (c *Connection) handleCancelRequest(msg *anyMessage) {
-	var p cancelRequestParams
-	if err := json.Unmarshal(msg.Params, &p); err != nil {
-		c.loggerOrDefault().Error("failed to parse $/cancel_request params", "params_bytes", len(msg.Params))
+func (c *Connection) handleCancelRequest(params json.RawMessage) {
+	fields, unique := decodeObjectMembers(params)
+	id := fields["requestId"]
+	if !unique || id == nil {
+		c.loggerOrDefault().Error("invalid $/cancel_request params", "params_bytes", len(params))
 		return
 	}
-	if len(bytes.TrimSpace(p.RequestID)) == 0 {
-		c.loggerOrDefault().Error("received $/cancel_request without requestId")
-		return
-	}
-
-	idKey, err := canonicalJSONRPCIDKey(p.RequestID)
+	idKey, err := canonicalJSONRPCIDKey(id)
 	if err != nil {
-		c.loggerOrDefault().Error("failed to canonicalize $/cancel_request requestId", "id_bytes", len(p.RequestID))
-		idKey = string(p.RequestID)
+		c.loggerOrDefault().Error("failed to canonicalize $/cancel_request requestId", "id_bytes", len(id))
+		return
 	}
 
 	c.mu.Lock()
-	cancel := c.inflight[idKey]
+	owner := c.inflight[idKey]
 	c.mu.Unlock()
-	if cancel == nil {
-		return
+	if owner != nil {
+		owner.cancel(context.Canceled)
 	}
-
-	cancel(context.Canceled)
 }
 
 func (c *Connection) prepareMethod(ctx context.Context, msg *anyMessage) inboundContinuation {
@@ -964,6 +999,10 @@ func (c *Connection) sendMessage(msg anyMessage) error {
 }
 
 func (c *Connection) writeMessage(ctx context.Context, msg anyMessage, hooks RequestWriteHooks) RequestWriteResult {
+	return c.writeAdmittedMessage(ctx, msg, hooks, nil)
+}
+
+func (c *Connection) writeAdmittedMessage(ctx context.Context, msg anyMessage, hooks RequestWriteHooks, admit func()) RequestWriteResult {
 	if hooks.Context != nil {
 		ctx = hooks.Context
 	}
@@ -992,6 +1031,9 @@ func (c *Connection) writeMessage(ctx context.Context, msg anyMessage, hooks Req
 			return RequestWriteResult{Err: err}
 		}
 	}
+	if admit != nil {
+		admit()
+	}
 	n, err := c.w.Write(b)
 	if err == nil && n != len(b) {
 		err = io.ErrShortWrite
@@ -1017,7 +1059,7 @@ func SendRequest[T any](c *Connection, ctx context.Context, method string, param
 // as SendRequest, with synchronous wire admission and delivery receipts.
 func SendRequestWithWriteHooks[T any](c *Connection, ctx context.Context, method string, params any, hooks RequestWriteHooks) (T, error) {
 	var result T
-	exchange := c.exchangeRequest(ctx, method, params, hooks)
+	exchange := c.exchangeRequest(ctx, method, params, hooks, nil)
 	if exchange.prepareErr != nil {
 		return result, exchange.prepareErr
 	}
@@ -1026,7 +1068,7 @@ func SendRequestWithWriteHooks[T any](c *Connection, ctx context.Context, method
 		writeErr = NewInternalError(map[string]any{"error": exchange.write.Err.Error()})
 	}
 	resp := exchange.response
-	if resp.sequence == 0 {
+	if resp.sequence == 0 || (writeErr != nil && exchange.write.BytesWritten != exchange.write.FrameBytes) {
 		if writeErr != nil {
 			return result, writeErr
 		}
@@ -1067,29 +1109,25 @@ type requestExchange struct {
 	waitErr    error
 }
 
-func (c *Connection) exchangeRequest(ctx context.Context, method string, params any, hooks RequestWriteHooks, receive ...func(responseEnvelope)) requestExchange {
+func (c *Connection) exchangeRequest(ctx context.Context, method string, params any, hooks RequestWriteHooks, receive func(responseEnvelope)) requestExchange {
 	msg, idKey, err := c.prepareRequest(method, params)
 	if err != nil {
 		return requestExchange{prepareErr: err}
 	}
 
-	pr := &pendingResponse{ch: make(chan responseEnvelope, 1)}
-	if len(receive) != 0 {
-		pr.receive = receive[0]
-	}
-	c.mu.Lock()
-	c.pending[idKey] = pr
-	c.mu.Unlock()
-
-	exchange := requestExchange{write: c.writeMessage(ctx, msg, hooks)}
+	pr := &pendingResponse{ch: make(chan responseEnvelope, 1), receive: receive}
+	exchange := requestExchange{write: c.writeAdmittedMessage(ctx, msg, hooks, func() {
+		c.mu.Lock()
+		pr.admission = c.writeAdmission.Add(1)
+		c.pending[idKey] = pr
+		c.mu.Unlock()
+	})}
 	if exchange.write.Err != nil {
-		if exchange.write.FrameBytes == 0 || exchange.write.BytesWritten != exchange.write.FrameBytes {
-			c.cleanupPending(idKey)
-			return exchange
+		// Only a write attempt can have admitted an ID. Retain any response
+		// already claimed; never wait for a new one to arrive.
+		if exchange.write.FrameBytes != 0 {
+			exchange.response, _ = c.finishPending(pr, idKey)
 		}
-		// The transport failed, but a complete write may already have a
-		// response on the same pending request. Never wait for one here.
-		exchange.response, _ = c.takeBufferedResponse(pr, idKey)
 		return exchange
 	}
 
@@ -1191,7 +1229,7 @@ func (c *Connection) waitForResponse(ctx context.Context, pr *pendingResponse, i
 	case <-ctx.Done():
 	case <-c.Done():
 	}
-	if resp, buffered := c.takeBufferedResponse(pr, idKey); buffered {
+	if resp, buffered := c.finishPending(pr, idKey); buffered {
 		return resp, nil
 	}
 	if cause := context.Cause(c.ctx); cause != nil {
@@ -1204,18 +1242,20 @@ func (c *Connection) waitForResponse(ctx context.Context, pr *pendingResponse, i
 	return responseEnvelope{}, errors.New("request context ended without cause")
 }
 
-// takeBufferedResponse observes a published response or retires the pending
-// request without waiting. The reader uses the same lock to publish responses.
-func (c *Connection) takeBufferedResponse(pr *pendingResponse, idKey string) (responseEnvelope, bool) {
+// finishPending arbitrates cancellation against the reader's claim. Once
+// claimed, a response must publish even if the waiter is cancelled or the write
+// reports an error. Only processing of that already claimed frame can delay it.
+func (c *Connection) finishPending(pr *pendingResponse, idKey string) (responseEnvelope, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case resp := <-pr.ch:
-		return resp, true
-	default:
+	claimed := pr.claimed
+	if c.pending[idKey] == pr {
 		delete(c.pending, idKey)
+	}
+	c.mu.Unlock()
+	if !claimed {
 		return responseEnvelope{}, false
 	}
+	return <-pr.ch, true
 }
 
 func (c *Connection) waitNotificationsUpTo(ctx context.Context, target uint64) error {
@@ -1315,12 +1355,6 @@ func (c *Connection) waitForNotificationDrain(target uint64, timeout time.Durati
 		}
 		c.notifyCond.Wait()
 	}
-}
-
-func (c *Connection) cleanupPending(idKey string) {
-	c.mu.Lock()
-	delete(c.pending, idKey)
-	c.mu.Unlock()
 }
 
 // SendRequestNoResult sends a JSON-RPC request that returns no result payload.

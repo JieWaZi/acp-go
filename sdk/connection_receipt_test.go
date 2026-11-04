@@ -410,7 +410,7 @@ func TestRequestReceipt_DisregardsAmbiguousAndReverseRequestIDs(t *testing.T) {
 		if _, err := io.WriteString(responses,
 			`{"jsonrpc":"2.0","id":null,"result":{"stopReason":"end_turn"}}`+"\n"+
 				`{"jsonrpc":"2.0","id":99,"id":1,"result":{"stopReason":"end_turn"}}`+"\n"+
-				`{"jsonrpc":"2.0","id":1,"method":"_reverse","result":null}`+"\n"); err != nil {
+				`{"jsonrpc":"2.0","id":1,"method":"_reverse"}`+"\n"); err != nil {
 			done <- err
 			return
 		}
@@ -549,4 +549,367 @@ func (b *receiptLogBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+type receiptDecodeProbe struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+var receiptDecodeControl atomic.Pointer[receiptDecodeProbe]
+
+type receiptBlockingResult struct{}
+
+func (*receiptBlockingResult) UnmarshalJSON([]byte) error {
+	probe := receiptDecodeControl.Load()
+	if probe.calls.Add(1) == 1 {
+		close(probe.entered)
+	}
+	<-probe.release
+	return nil
+}
+
+func TestRequestReceipt_NoHookDecoderDoesNotOwnReader(t *testing.T) {
+	for _, explicitNil := range []bool{false, true} {
+		name := "omitted"
+		if explicitNil {
+			name = "explicit_nil"
+		}
+		t.Run(name, func(t *testing.T) {
+			probe := &receiptDecodeProbe{entered: make(chan struct{}), release: make(chan struct{})}
+			receiptDecodeControl.Store(probe)
+			release := sync.OnceFunc(func() { close(probe.release) })
+			defer release()
+			next := make(chan struct{})
+			conn, requests, responses := receiptPipe(t, &clientFuncs{}, func(frame ReceiveNotification) {
+				if frame.Method == "_after" {
+					close(next)
+				}
+			}, nil)
+			peerDone := receiptPeerReply(requests, responses, "_decode",
+				`{"jsonrpc":"2.0","id":1,"result":{}}`+"\n"+`{"jsonrpc":"2.0","method":"_after"}`+"\n")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			done := make(chan RequestReceipt[receiptBlockingResult], 1)
+			var hooks []func(RequestReceipt[receiptBlockingResult])
+			if explicitNil {
+				hooks = append(hooks, nil)
+			}
+			go func() {
+				done <- SendClientRequestWithReceipt[receiptBlockingResult](conn, ctx, "_decode", nil, RequestWriteHooks{}, hooks...)
+			}()
+			receiveLifecycle(t, probe.entered)
+			select {
+			case <-next:
+			case <-ctx.Done():
+				t.Fatal("no-hook result decoder blocked the reader from observing the next frame")
+			}
+			release()
+			if got := receiveLifecycle(t, done); !got.ResultValid || probe.calls.Load() != 1 {
+				t.Fatalf("receipt result valid = %v, decoder calls = %d", got.ResultValid, probe.calls.Load())
+			}
+			if err := receiveLifecycle(t, peerDone); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRequestReceipt_ResponseRequiresSuccessfulWriteCommit(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		name := "accepted"
+		if reject {
+			name = "rejected"
+		}
+		t.Run(name, func(t *testing.T) {
+			commitEntered := make(chan struct{})
+			commitRelease := make(chan struct{})
+			release := sync.OnceFunc(func() { close(commitRelease) })
+			defer release()
+			witness := make(chan struct{})
+			conn, requests, responses := receiptPipe(t, &clientFuncs{}, func(frame ReceiveNotification) {
+				if frame.Method == "_witness" {
+					close(witness)
+				}
+			}, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			rejection := errors.New("test write admission rejection")
+			var captures atomic.Int32
+			done := make(chan RequestReceipt[PromptResponse], 1)
+			go func() {
+				done <- SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil,
+					RequestWriteHooks{Commit: func() error {
+						close(commitEntered)
+						<-commitRelease
+						if reject {
+							return rejection
+						}
+						return nil
+					}}, func(RequestReceipt[PromptResponse]) { captures.Add(1) })
+			}()
+			receiveLifecycle(t, commitEntered)
+			if _, err := io.WriteString(responses, `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`+"\n"+
+				`{"jsonrpc":"2.0","method":"_witness"}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			receiveLifecycle(t, witness)
+			release()
+			if reject {
+				got := receiveLifecycle(t, done)
+				if !errors.Is(got.Write.Err, rejection) || got.Write.BytesWritten != 0 || got.Sequence != 0 || got.ResultValid || captures.Load() != 0 {
+					t.Fatalf("rejected write obtained response evidence: %+v, captures=%d", got, captures.Load())
+				}
+				return
+			}
+			peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt,
+				`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"cancelled"}}`+"\n")
+			got := receiveLifecycle(t, done)
+			if !got.ResultValid || got.Result.StopReason != StopReasonCancelled || got.Sequence != 3 || got.NotificationWatermark != 2 || captures.Load() != 1 {
+				t.Fatalf("request did not retain the actual post-admission response: %+v, captures=%d", got, captures.Load())
+			}
+			if err := receiveLifecycle(t, peerDone); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRequestReceipt_ClaimedResponseSurvivesCancelWhileCaptureRuns(t *testing.T) {
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	release := sync.OnceFunc(func() { close(unblock) })
+	defer release()
+	conn, requests, responses := receiptPipe(t, &clientFuncs{}, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstDone := make(chan RequestReceipt[PromptResponse], 1)
+	go func() {
+		firstDone <- SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil,
+			RequestWriteHooks{}, func(RequestReceipt[PromptResponse]) {
+				close(entered)
+				<-unblock
+			})
+	}()
+	peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt, bufferedTerminalFrame)
+	receiveLifecycle(t, entered)
+	cancel()
+	// The deliberately paused capture tests lock ownership. An independent
+	// request must still reach the same transport while that capture is paused.
+	secondDone := make(chan RequestReceipt[PromptResponse], 1)
+	go func() {
+		secondDone <- SendClientRequestWithReceipt[PromptResponse](conn, context.Background(), "_independent", nil, RequestWriteHooks{})
+	}()
+	sent := make(chan anyMessage, 1)
+	go func() {
+		var message anyMessage
+		_ = json.NewDecoder(requests).Decode(&message)
+		sent <- message
+	}()
+	select {
+	case message := <-sent:
+		if message.Method != "_independent" {
+			t.Fatalf("expected the independent request before releasing capture, got %s", message.Method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("running response capture locked registration and writing of an independent request")
+	}
+	release()
+	if got := receiveLifecycle(t, firstDone); !got.ResultValid || got.TransportErr != nil {
+		t.Fatalf("cancellation lost the response already claimed by the reader: %+v", got)
+	}
+	if err := receiveLifecycle(t, peerDone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(responses, `{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveLifecycle(t, secondDone); !got.ResultValid {
+		t.Fatalf("independent response lost: %+v", got)
+	}
+}
+
+func TestConnectionInboundAdmission_PreservesCanonicalOwner(t *testing.T) {
+	for _, prepare := range []bool{false, true} {
+		name := "legacy_handler"
+		if prepare {
+			name = "prepare_request"
+		}
+		t.Run(name, func(t *testing.T) {
+			requests, connWrites := io.Pipe()
+			connReads, responses := io.Pipe()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			owners := make(chan context.Context, 4)
+			invalidNotifications := make(chan string, 4)
+			observed := make(chan struct{}, 2)
+			run := func(ctx context.Context) (any, *RequestError) {
+				<-ctx.Done()
+				return "original response", nil
+			}
+			opts := ConnectionOptions{
+				Context: ctx, NotificationQueueCapacity: 4, NotificationQueueBytes: 4096,
+				CloseTransport: func() error {
+					return errors.Join(requests.Close(), connWrites.Close(), connReads.Close(), responses.Close())
+				},
+				ReceiveNotification: func(frame ReceiveNotification) {
+					if frame.Method == "_witness" {
+						observed <- struct{}{}
+					}
+				},
+			}
+			if prepare {
+				opts.PrepareRequest = func(ctx context.Context, frame ReceiveRequest) (func(context.Context) (any, *RequestError), bool) {
+					if frame.Method == "_native" {
+						owners <- ctx
+						return run, true
+					}
+					return nil, false
+				}
+			}
+			conn, err := NewConnectionWithOptions(func(ctx context.Context, method string, params json.RawMessage) (any, *RequestError) {
+				switch method {
+				case "_native":
+					owners <- ctx
+					return run(ctx)
+				case "_malformed":
+					invalidNotifications <- method
+				case "_barrier":
+					invalidNotifications <- method
+				}
+				return nil, nil
+			}, connWrites, connReads, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := io.WriteString(responses, `{"jsonrpc":"2.0","id":1,"method":"_native"}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			owner := receiveLifecycle(t, owners)
+			if _, err := io.WriteString(responses,
+				`{"jsonrpc":"2.0","id":1.0,"method":"_native"}`+"\n"+
+					`{"jsonrpc":"2.0","id":1e0,"method":"_native","result":null}`+"\n"+
+					`{"jsonrpc":"1.0","method":"$/cancel_request","params":{"requestId":1}}`+"\n"+
+					`{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":42,"requestId":1}}`+"\n"+
+					`{"jsonrpc":"2.0","method":"$/cancel_request","result":null,"params":{"requestId":1}}`+"\n"+
+					`{"jsonrpc":"1.0","method":"_malformed"}`+"\n"+
+					`{"jsonrpc":"2.0","method":"_barrier"}`+"\n"+
+					`{"jsonrpc":"2.0","method":"_witness"}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			receiveLifecycle(t, observed)
+			if owner.Err() != nil {
+				t.Fatalf("invalid cancellation reached the original owner: %v", context.Cause(owner))
+			}
+			if method := receiveLifecycle(t, invalidNotifications); method != "_barrier" {
+				t.Fatalf("invalid notification reached the legacy handler: %s", method)
+			}
+			if _, err := io.WriteString(responses, `{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":1e0}}`+"\n"); err != nil {
+				t.Fatal(err)
+			}
+			receiveLifecycle(t, owner.Done())
+			var message anyMessage
+			if err := json.NewDecoder(requests).Decode(&message); err != nil {
+				t.Fatal(err)
+			}
+			if message.ID == nil || string(*message.ID) != "1" || message.Error != nil || string(message.Result) != `"original response"` {
+				t.Fatalf("duplicate response displaced the first request: %+v", message)
+			}
+			select {
+			case <-owners:
+				t.Fatal("duplicate canonical request captured a second owner")
+			default:
+			}
+		})
+	}
+}
+
+type receiptWriteWaitContext struct {
+	context.Context
+	onWait func()
+}
+
+func (ctx receiptWriteWaitContext) Done() <-chan struct{} {
+	ctx.onWait()
+	return ctx.Context.Done()
+}
+
+func TestRequestReceipt_QueuedRequestCannotClaimResponse(t *testing.T) {
+	writerEntered := make(chan struct{})
+	observed := make(chan struct{})
+	conn, _, responses := receiptPipe(t, &clientFuncs{}, func(frame ReceiveNotification) {
+		if frame.Method == "_witness" {
+			close(observed)
+		}
+	}, func(writer io.Writer) io.Writer {
+		return receiptWriterFunction(func(p []byte) (int, error) {
+			close(writerEntered)
+			return writer.Write(p)
+		})
+	})
+	go SendClientNotificationWithWriteHooks(conn, context.Background(), "_occupy_gate", nil, RequestWriteHooks{})
+	receiveLifecycle(t, writerEntered)
+	waiting := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var captures atomic.Int32
+	done := make(chan RequestReceipt[PromptResponse], 1)
+	go func() {
+		done <- SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil,
+			RequestWriteHooks{Context: receiptWriteWaitContext{
+				Context: ctx,
+				onWait:  sync.OnceFunc(func() { close(waiting) }),
+			}}, func(RequestReceipt[PromptResponse]) { captures.Add(1) })
+	}()
+	receiveLifecycle(t, waiting)
+	if _, err := io.WriteString(responses, bufferedTerminalFrame+
+		`{"jsonrpc":"2.0","method":"_witness"}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	receiveLifecycle(t, observed)
+	cancel()
+	got := receiveLifecycle(t, done)
+	if !errors.Is(got.Write.Err, context.Canceled) || got.Write.FrameBytes != 0 || got.Write.BytesWritten != 0 ||
+		got.Sequence != 0 || got.ResultValid || captures.Load() != 0 {
+		t.Fatalf("request waiting for write gate claimed response evidence: %+v, captures=%d", got, captures.Load())
+	}
+}
+
+func TestRequestReceipt_ClaimedResponseSurvivesWriteErrorWhileCaptureRuns(t *testing.T) {
+	failure := errors.New("write completed with transport failure")
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	release := sync.OnceFunc(func() { close(unblock) })
+	defer release()
+	conn, requests, responses := receiptPipe(t, &clientFuncs{}, nil, func(writer io.Writer) io.Writer {
+		return receiptWriterFunction(func(p []byte) (int, error) {
+			n, err := writer.Write(p)
+			if err != nil {
+				return n, err
+			}
+			<-entered
+			return n, failure
+		})
+	})
+	peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt, bufferedTerminalFrame)
+	done := make(chan RequestReceipt[PromptResponse], 1)
+	go func() {
+		done <- SendClientRequestWithReceipt[PromptResponse](conn, context.Background(), AgentMethodSessionPrompt, nil,
+			RequestWriteHooks{}, func(RequestReceipt[PromptResponse]) {
+				close(entered)
+				<-unblock
+			})
+	}()
+	receiveLifecycle(t, conn.Done())
+	release()
+	if err := receiveLifecycle(t, peerDone); err != nil {
+		t.Fatal(err)
+	}
+	got := receiveLifecycle(t, done)
+	if !got.ResultValid || !errors.Is(got.Write.Err, failure) || got.Write.FrameBytes == 0 ||
+		got.Write.BytesWritten != got.Write.FrameBytes {
+		t.Fatalf("write failure obscured the response already claimed by the reader: %+v", got)
+	}
 }
