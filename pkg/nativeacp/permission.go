@@ -7,25 +7,28 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// toolEvidenceRevision 以非零大小分配保证事件身份不被零大小指针规则合并。
+// toolEvidenceRevision has nonzero size so distinct updates retain distinct pointer identities.
 type toolEvidenceRevision struct {
-	// marker 只保证不同事件拥有独立地址，不保存工具或账号内容。
+	// marker ensures unique addresses without retaining account or tool content.
 	marker byte
 }
 
-// requestPermission 收集标准执行证据，并让当前 CLI 自己决定是否需要补充审批策略。
+// requestPermission freezes turn evidence and delegates any private approval policy.
 func (agent *Agent) requestPermission(
 	ctx context.Context,
 	request acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
 	agent.awaitToolEvidence(ctx, request)
 	agent.mutex.Lock()
-	prompt := agent.prompts[request.SessionId]
+	turnOwner := agent.turnOwners[request.SessionId]
+	var prompt []acp.ContentBlock
+	var turnCtx context.Context
+	if turnOwner != nil {
+		prompt, turnCtx = turnOwner.prompt, turnOwner.context
+	}
 	detail := agent.toolDetails[request.ToolCall.ToolCallId]
 	owner := agent.toolSessions[request.ToolCall.ToolCallId]
-	turnCtx := agent.turnContexts[request.SessionId]
-	active := agent.active[request.SessionId]
-	turnOwner := agent.turnOwners[request.SessionId]
+	active := turnOwner != nil
 	revision := agent.toolRevisions[request.ToolCall.ToolCallId]
 	session, sessionExists := agent.currentSessionLocked(request.SessionId)
 	agent.mutex.Unlock()
@@ -51,14 +54,13 @@ func (agent *Agent) requestPermission(
 				defer agent.mutex.Unlock()
 				current, exists := agent.currentSessionLocked(request.SessionId)
 				return sessionExists && exists && current == session && turnCtx != nil && turnCtx.Err() == nil &&
-					agent.active[request.SessionId] && agent.turnContexts[request.SessionId] == turnCtx &&
 					agent.turnOwners[request.SessionId] == turnOwner &&
 					agent.toolSessions[request.ToolCall.ToolCallId] == request.SessionId && revision != nil &&
 					agent.toolRevisions[request.ToolCall.ToolCallId] == revision
 			},
 		}
 		response, handled, err := adapter.Review(ctx, agent, evidence)
-		// 派生取消由 AfterFunc 异步投递，交付决定前必须直接复核权威执行。
+		// AfterFunc delivery is asynchronous; recheck authoritative cancellation before granting approval.
 		if cancelled() {
 			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 		}
@@ -76,7 +78,7 @@ func (agent *Agent) requestPermission(
 	return response, err
 }
 
-// awaitToolEvidence 允许先到线上的工具通知完成入账；超时仍转人工，不凭缺失证据放行。
+// awaitToolEvidence waits briefly for preceding notifications; missing evidence never grants approval.
 func (agent *Agent) awaitToolEvidence(ctx context.Context, request acp.RequestPermissionRequest) {
 	if agent.config.PermissionAdapter == nil {
 		return
@@ -85,7 +87,7 @@ func (agent *Agent) awaitToolEvidence(ctx context.Context, request acp.RequestPe
 	defer cancel()
 	for {
 		agent.mutex.Lock()
-		ready := !agent.active[request.SessionId] || agent.toolSessions[request.ToolCall.ToolCallId] == request.SessionId
+		ready := agent.turnOwners[request.SessionId] == nil || agent.toolSessions[request.ToolCall.ToolCallId] == request.SessionId
 		if agent.toolChanged == nil {
 			agent.toolChanged = make(chan struct{})
 		}

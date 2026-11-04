@@ -76,7 +76,7 @@ type Connection struct {
 	handler MethodHandler
 
 	mu                   sync.Mutex
-	writeMu              sync.Mutex
+	writeGate            chan struct{}
 	nextID               atomic.Uint64
 	pending              map[string]*pendingResponse
 	inflight             map[string]context.CancelCauseFunc
@@ -141,6 +141,7 @@ func newConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Rea
 	}
 	c := &Connection{
 		w:                   peerInput,
+		writeGate:           make(chan struct{}, 1),
 		r:                   peerOutput,
 		handler:             handler,
 		pending:             make(map[string]*pendingResponse),
@@ -728,26 +729,84 @@ func (c *Connection) handleInbound(ctx context.Context, req *anyMessage) {
 	_ = c.sendMessage(res)
 }
 
+// RequestWriteHooks binds an operation's admission decision to the actual wire write.
+// Callbacks run while the connection owns its write gate. They must not block or
+// call back into the connection. Complete is called only after Commit succeeds.
+type RequestWriteHooks struct {
+	// Context optionally bounds write admission independently of response waiting.
+	Context context.Context
+	// Commit may reject an operation immediately before its frame is written.
+	Commit func() error
+	// Complete records the actual transport result before another frame can write.
+	Complete func(RequestWriteResult)
+}
+
+// RequestWriteResult describes local delivery, not peer acceptance.
+type RequestWriteResult struct {
+	// BytesWritten is the prefix accepted by the transport.
+	BytesWritten int
+	// FrameBytes includes the complete JSON-RPC frame and its delimiter.
+	FrameBytes int
+	// Err reports a failed or incomplete write.
+	Err error
+}
+
 func (c *Connection) sendMessage(msg anyMessage) error {
+	return c.writeMessage(c.ctx, msg, RequestWriteHooks{})
+}
+
+func (c *Connection) writeMessage(ctx context.Context, msg anyMessage, hooks RequestWriteHooks) error {
+	if hooks.Context != nil {
+		ctx = hooks.Context
+	}
 	msg.JSONRPC = "2.0"
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.options != nil && c.ctx.Err() != nil {
+	select {
+	case c.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-c.ctx.Done():
 		return context.Cause(c.ctx)
 	}
-	_, err = c.w.Write(b)
+	defer func() { <-c.writeGate }()
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
+	if err := c.ctx.Err(); err != nil {
+		return context.Cause(c.ctx)
+	}
+	if hooks.Commit != nil {
+		if err := hooks.Commit(); err != nil {
+			return err
+		}
+	}
+	n, err := c.w.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
+	if hooks.Complete != nil {
+		hooks.Complete(RequestWriteResult{BytesWritten: n, FrameBytes: len(b), Err: err})
+	}
+	if err != nil {
+		// A failed write leaves framing uncertain, so the stream cannot be reused.
+		c.closeWithCause(err)
+	}
 	return err
 }
 
 // SendRequest sends a JSON-RPC request and returns a typed result.
 // For methods that do not return a result, use SendRequestNoResult instead.
 func SendRequest[T any](c *Connection, ctx context.Context, method string, params any) (T, error) {
+	return SendRequestWithWriteHooks[T](c, ctx, method, params, RequestWriteHooks{})
+}
+
+// SendRequestWithWriteHooks uses the same request owner and notification barrier
+// as SendRequest, with synchronous wire admission and delivery receipts.
+func SendRequestWithWriteHooks[T any](c *Connection, ctx context.Context, method string, params any, hooks RequestWriteHooks) (T, error) {
 	var result T
 
 	msg, idKey, err := c.prepareRequest(method, params)
@@ -760,7 +819,7 @@ func SendRequest[T any](c *Connection, ctx context.Context, method string, param
 	c.pending[idKey] = pr
 	c.mu.Unlock()
 
-	if err := c.sendMessage(msg); err != nil {
+	if err := c.writeMessage(ctx, msg, hooks); err != nil {
 		c.cleanupPending(idKey)
 		return result, NewInternalError(map[string]any{"error": err.Error()})
 	}
@@ -1001,33 +1060,8 @@ func (c *Connection) cleanupPending(idKey string) {
 
 // SendRequestNoResult sends a JSON-RPC request that returns no result payload.
 func (c *Connection) SendRequestNoResult(ctx context.Context, method string, params any) error {
-	msg, idKey, err := c.prepareRequest(method, params)
-	if err != nil {
-		return err
-	}
-
-	pr := &pendingResponse{ch: make(chan responseEnvelope, 1)}
-	c.mu.Lock()
-	c.pending[idKey] = pr
-	c.mu.Unlock()
-
-	if err := c.sendMessage(msg); err != nil {
-		c.cleanupPending(idKey)
-		return NewInternalError(map[string]any{"error": err.Error()})
-	}
-
-	resp, err := c.waitForResponse(ctx, pr, idKey)
-	if err != nil {
-		return err
-	}
-	if err := c.waitNotificationsUpTo(ctx, resp.notificationWatermark); err != nil {
-		return err
-	}
-
-	if resp.msg.Error != nil {
-		return resp.msg.Error
-	}
-	return nil
+	_, err := SendRequest[json.RawMessage](c, ctx, method, params)
+	return err
 }
 
 func (c *Connection) SendNotification(ctx context.Context, method string, params any) error {
@@ -1042,7 +1076,7 @@ func (c *Connection) SendNotification(ctx context.Context, method string, params
 		return err
 	}
 
-	if err := c.sendMessage(msg); err != nil {
+	if err := c.writeMessage(ctx, msg, RequestWriteHooks{}); err != nil {
 		return NewInternalError(map[string]any{"error": err.Error()})
 	}
 	return nil

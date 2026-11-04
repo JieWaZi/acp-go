@@ -128,10 +128,7 @@ func evidenceReviewAgent(
 				Id: "model", CurrentValue: "actual-model",
 			}}},
 		}},
-		active:        map[acp.SessionId]bool{"s": true},
-		prompts:       map[acp.SessionId][]acp.ContentBlock{"s": {acp.TextBlock("list files")}},
-		turnContexts:  map[acp.SessionId]context.Context{"s": turn},
-		turnOwners:    map[acp.SessionId]*promptWaiter{"s": {context: turn}},
+		turnOwners:    map[acp.SessionId]*promptWaiter{"s": {context: turn, prompt: []acp.ContentBlock{acp.TextBlock("list files")}}},
 		toolSessions:  map[acp.ToolCallId]acp.SessionId{},
 		toolDetails:   map[acp.ToolCallId]acp.ToolCallUpdate{},
 		toolRevisions: map[acp.ToolCallId]*toolEvidenceRevision{},
@@ -312,9 +309,9 @@ func TestReviewRevalidatesToolEvidence(t *testing.T) {
 					if change.name == "inactive" || change.name == "turn-replaced" {
 						agent.mutex.Lock()
 						if change.name == "inactive" {
-							agent.active["s"] = false
+							delete(agent.turnOwners, "s")
 						} else {
-							agent.turnOwners["s"] = &promptWaiter{context: agent.turnContexts["s"]}
+							agent.turnOwners["s"] = &promptWaiter{context: agent.turnOwners["s"].context}
 						}
 						agent.mutex.Unlock()
 					}

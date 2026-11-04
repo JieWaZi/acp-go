@@ -7,29 +7,29 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// CallbackBridge 只暴露厂商回调接入 ACP 宿主所需的稳定能力。
+// CallbackBridge exposes only the host operations required by native callbacks.
 type CallbackBridge interface {
-	// ResolveInteractionSession 根据显式会话或工具归属解析唯一活跃会话。
+	// ResolveInteractionSession resolves explicit or tool-bound session ownership.
 	ResolveInteractionSession(toolCallID, sessionID string) acp.SessionId
-	// UpdateSession 向宿主发布标准会话更新。
+	// UpdateSession publishes a standard host notification.
 	UpdateSession(context.Context, acp.SessionNotification) error
-	// RequestPermission 向宿主发起标准审批。
+	// RequestPermission requests standard host approval.
 	RequestPermission(
 		context.Context,
 		acp.RequestPermissionRequest,
 	) (acp.RequestPermissionResponse, error)
-	// CreateElicitation 向宿主发起结构化交互问答。
+	// CreateElicitation requests structured user input from the host.
 	CreateElicitation(
 		context.Context,
 		acp.UnstableCreateElicitationRequest,
 	) (acp.UnstableCreateElicitationResponse, error)
 }
 
-// CallbackAdapter 把某个 CLI 的私有反向请求封装在其自身适配器中。
+// CallbackAdapter keeps private reverse protocols within their owning adapter.
 type CallbackAdapter interface {
-	// PrepareInitialize 为该 CLI 声明其私有协议需要的客户端能力。
+	// PrepareInitialize declares client capabilities needed by the private protocol.
 	PrepareInitialize(*acp.InitializeRequest)
-	// HandleCallback 处理该 CLI 的私有方法；handled=false 时继续标准分发。
+	// HandleCallback returns handled=false to continue standard dispatch.
 	HandleCallback(
 		context.Context,
 		CallbackBridge,
@@ -38,70 +38,70 @@ type CallbackAdapter interface {
 	) (result any, handled bool, err error)
 }
 
-// SessionBridge 只暴露厂商会话配置适配所需的标准请求能力。
+// SessionBridge exposes native requests needed by configuration adapters.
 type SessionBridge interface {
-	// SendRequest 调用外部 Agent 方法，并把 JSON 结果解码到 response。
+	// SendRequest decodes the native JSON result into response.
 	SendRequest(context.Context, string, any, any) error
 }
 
-// SessionSnapshot 汇集外部 Agent 创建或恢复会话时返回的配置事实。
+// SessionSnapshot retains configuration facts returned by an opened native session.
 type SessionSnapshot struct {
-	// ConfigOptions 是标准 ACP 配置目录。
+	// ConfigOptions contains the standard ACP configuration catalog.
 	ConfigOptions []acp.SessionConfigOption
-	// Modes 是标准 ACP 会话模式目录。
+	// Modes contains the standard session mode catalog.
 	Modes *acp.SessionModeState
-	// Models 是旧实现附带的厂商模型目录原文。
+	// Models retains legacy native model metadata.
 	Models json.RawMessage
-	// WorkingDirectory 是该会话经过宿主传入的工作目录。
+	// WorkingDirectory is the session cwd supplied by the host.
 	WorkingDirectory string
 }
 
-// SessionAdapter 把某个 CLI 的非标准配置目录封装在其自身适配器中。
+// SessionAdapter keeps nonstandard configuration within its owning adapter.
 type SessionAdapter interface {
-	// NormalizeSession 保存一个会话的厂商配置状态，并返回对宿主统一的选项。
+	// NormalizeSession records native configuration and returns normalized host options.
 	NormalizeSession(
 		context.Context,
 		SessionBridge,
 		acp.SessionId,
 		SessionSnapshot,
 	) ([]acp.SessionConfigOption, error)
-	// NormalizeUpdate 同步上游动态配置更新，并返回对宿主统一的选项。
+	// NormalizeUpdate records dynamic native configuration and returns normalized options.
 	NormalizeUpdate(acp.SessionId, []acp.SessionConfigOption) []acp.SessionConfigOption
-	// SetConfigOption 处理厂商配置写入；handled=false 时使用标准通用路径。
+	// SetConfigOption returns handled=false to use standard configuration dispatch.
 	SetConfigOption(
 		context.Context,
 		SessionBridge,
 		acp.SetSessionConfigOptionRequest,
 	) (response acp.SetSessionConfigOptionResponse, handled bool, err error)
-	// ForgetSession 删除已关闭会话的厂商配置状态。
+	// ForgetSession discards private configuration when a session closes.
 	ForgetSession(acp.SessionId)
 }
 
-// PermissionEvidence 汇集执行前审批可验证的当前轮证据。
+// PermissionEvidence contains verifiable evidence for the current execution.
 type PermissionEvidence struct {
-	// Request 是上游提交的标准 ACP 审批请求。
+	// Request is the native standard permission request.
 	Request acp.RequestPermissionRequest
-	// Detail 是此前工具通知累计出的标题、类型、输入与内容。
+	// Detail accumulates prior native tool title, kind, input and content.
 	Detail acp.ToolCallUpdate
-	// Prompt 是当前执行轮的完整用户输入。
+	// Prompt contains the current operation's complete user input.
 	Prompt []acp.ContentBlock
-	// ToolOwner 是该工具通知已经确认的所属会话。
+	// ToolOwner is the session identity observed for this tool.
 	ToolOwner acp.SessionId
-	// Active 表示请求所属执行轮仍然有效。
+	// Active reports whether the request still belongs to an admitted execution.
 	Active bool
-	// unchanged 在原生状态锁内复核当前回合、会话和完整工具事件身份，外部适配器不能伪造。
+	// unchanged rechecks exact turn, session and tool evidence identities under the owner lock.
 	unchanged func() bool
 }
 
-// PermissionBridge 只暴露厂商审批适配器发布审查结果所需的宿主能力。
+// PermissionBridge exposes only host notification delivery for approval adapters.
 type PermissionBridge interface {
-	// UpdateSession 向宿主发布标准会话更新。
+	// UpdateSession publishes a standard host notification.
 	UpdateSession(context.Context, acp.SessionNotification) error
 }
 
-// PermissionAdapter 把某个 CLI 的非标准审批策略封装在其自身目录中。
+// PermissionAdapter keeps private approval policy within its owning adapter.
 type PermissionAdapter interface {
-	// Review 尝试处理审批；handled=false 时由标准宿主继续决定。
+	// Review returns handled=false to continue standard host approval.
 	Review(
 		context.Context,
 		PermissionBridge,
@@ -109,12 +109,12 @@ type PermissionAdapter interface {
 	) (response acp.RequestPermissionResponse, handled bool, err error)
 }
 
-// ResolveInteractionSession 实现 CallbackBridge，不向适配器暴露 Agent 内部状态。
+// ResolveInteractionSession implements CallbackBridge without exposing mutable owner state.
 func (agent *Agent) ResolveInteractionSession(toolCallID, sessionID string) acp.SessionId {
 	return agent.interactionSession(toolCallID, sessionID)
 }
 
-// ResolveInteractionContext 原子解析会话和所属执行代，防止取消后旧交互重新绑定下一轮。
+// ResolveInteractionContext freezes identity and context together, preventing stale callback rebinding.
 func (agent *Agent) ResolveInteractionContext(toolCallID, sessionID string) (acp.SessionId, context.Context) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
@@ -122,16 +122,16 @@ func (agent *Agent) ResolveInteractionContext(toolCallID, sessionID string) (acp
 	if sid == "" {
 		return "", nil
 	}
-	return sid, agent.turnContexts[sid]
+	return sid, agent.turnOwners[sid].context
 }
 
-// UpdateSession 实现 CallbackBridge，统一使用已绑定的 ACP 宿主连接。
+// UpdateSession forwards through the bound host connection.
 func (agent *Agent) UpdateSession(ctx context.Context, request acp.SessionNotification) error {
 	request.SessionId = agent.publicSessionID(request.SessionId)
 	return agent.host.SessionUpdate(ctx, request)
 }
 
-// RequestPermission 实现 CallbackBridge，统一使用已绑定的 ACP 宿主连接。
+// RequestPermission forwards through the bound host connection.
 func (agent *Agent) RequestPermission(
 	ctx context.Context,
 	request acp.RequestPermissionRequest,
@@ -140,7 +140,7 @@ func (agent *Agent) RequestPermission(
 	return agent.host.RequestPermission(ctx, request)
 }
 
-// CreateElicitation 实现 CallbackBridge，统一使用已绑定的 ACP 宿主连接。
+// CreateElicitation forwards through the bound host connection.
 func (agent *Agent) CreateElicitation(
 	ctx context.Context,
 	request acp.UnstableCreateElicitationRequest,
@@ -158,7 +158,7 @@ func (agent *Agent) CreateElicitation(
 	return agent.host.UnstableCreateElicitation(ctx, request)
 }
 
-// SendRequest 实现 SessionBridge，协议编解码仍由 nativeacp 统一拥有。
+// SendRequest implements SessionBridge while nativeacp retains protocol ownership.
 func (agent *Agent) SendRequest(ctx context.Context, method string, request any, response any) error {
 	raw, err := agent.CallNative(ctx, method, request)
 	if err != nil {
@@ -170,12 +170,12 @@ func (agent *Agent) SendRequest(ctx context.Context, method string, request any,
 	return json.Unmarshal(raw, response)
 }
 
-// CallNative 为兼容层提供窄原生请求入口，保留 SDK 的原始结果和协议错误。
+// CallNative exposes a narrow native request with original SDK results and protocol errors.
 func (agent *Agent) CallNative(ctx context.Context, method string, request any) (json.RawMessage, error) {
 	return sendNativeRequest[json.RawMessage](agent, ctx, method, request)
 }
 
-// publicSessionID 仅在适配器显式启用时转换宿主可见标识。
+// publicSessionID maps host-visible identity only when explicitly configured.
 func (agent *Agent) publicSessionID(id acp.SessionId) acp.SessionId {
 	if agent.config.PublicSessionID == nil {
 		return id
@@ -183,7 +183,7 @@ func (agent *Agent) publicSessionID(id acp.SessionId) acp.SessionId {
 	return agent.config.PublicSessionID(id)
 }
 
-// publicCallback 映射标准顶层与 elicitation 元数据，不更改工具输入中的同名字段。
+// publicCallback maps top-level and elicitation identities without rewriting tool inputs.
 func (agent *Agent) publicCallback(data json.RawMessage) json.RawMessage {
 	if agent.config.PublicSessionID == nil {
 		return data

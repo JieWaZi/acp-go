@@ -11,3 +11,7 @@
 `agent.go` 与手写 `extensions.go` 增加 `SessionLifecycleOwner` opt-in。接管者直接收到同样校验的 `session/prompt` 和 `session/cancel`。SDK 保留请求和连接取消，session 级排他与原生中断由 Adapter 决定。默认继续走上游生成 dispatch。验证见 `session_lifecycle_test.go`。
 
 本地验证在此目录运行 `GOWORK=off go test -race .`；上层 Adapter 与使用方须引用同一 SDK 版本。
+
+`connection.go` 的 `SendRequestWithWriteHooks` 使用既有 pending 请求所有者，在同一连接写入门内执行同步准入及真实字节回执。写入等待 context 可与原生响应等待分开；取消发生在编码或写入准入前时不提交请求。部分写入或写入错误使连接失效，避免后续帧复用损坏的 JSONL 流。所有请求、通知、响应共用该写入门，既有通知水位屏障保留。验证见 `connection_write_test.go`。
+
+`pkg/nativeacp` 消费这些钩子，以同一 Prompt 所有者处理准备、FIFO／拒绝并发、交互取消、原生终态和有序取消写入。未提交的 Prompt 不发送原生 cancel；已提交后等待真实终态，宽限期耗尽关闭连接。Adapter 无需另存一套 submitted/cancel 状态。该功能需要更新后的 SDK；仅使用本地 go.work 通过不能证明远端固定版本已发布。

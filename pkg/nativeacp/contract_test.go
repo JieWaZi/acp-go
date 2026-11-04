@@ -146,7 +146,7 @@ func TestPromptNewSessionAndSupportedClose(t *testing.T) {
 	if _, err := peer.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: "new"}); err != nil {
 		t.Fatal(err)
 	}
-	awaitPrompt(t, running, true)
+	awaitPrompt(t, running, false)
 	awaitPrompt(t, promptAgentAsync(agent, context.Background(), "new", "closed"), true)
 }
 
@@ -184,26 +184,19 @@ func TestNativeUnboundCallbackWaitingIsCancelable(t *testing.T) {
 	}
 }
 
-// TestPromptRestoreReplacesLiveQueue 验证显式恢复废弃旧执行代且新执行不会被旧清理删除。
-func TestPromptRestoreReplacesLiveQueue(t *testing.T) {
+// TestPromptRestoreRejectsLiveQueue preserves the sole native execution owner.
+func TestPromptRestoreRejectsLiveQueue(t *testing.T) {
 	agent, peer, host := startLifecycleBridge(t, true, true)
 	old := promptAgentAsync(agent, context.Background(), "a", "old")
 	expectUpdate(t, host, "a:old")
-	queued := promptAgentAsync(agent, context.Background(), "a", "old-queued")
-	waitQueue(t, agent, "a", 1)
-	if _, err := peer.ResumeSession(context.Background(), acp.ResumeSessionRequest{SessionId: "a", Cwd: "/fixture"}); err != nil {
-		t.Fatal(err)
+	if _, err := peer.ResumeSession(context.Background(), acp.ResumeSessionRequest{SessionId: "a", Cwd: "/fixture"}); err == nil {
+		t.Fatal("restore replaced an active native turn")
 	}
+	releaseNative(t, peer, "a")
+	awaitPrompt(t, old, false)
+	restoreGeneration(t, peer, "resume")
 	fresh := promptAgentAsync(agent, context.Background(), "a", "fresh")
 	expectUpdate(t, host, "a:fresh")
-	awaitPrompt(t, old, true)
-	awaitPrompt(t, queued, true)
-	agent.mutex.Lock()
-	active := agent.active["a"]
-	agent.mutex.Unlock()
-	if !active {
-		t.Fatal("old execution removed restored active state")
-	}
 	releaseNative(t, peer, "a")
 	awaitPrompt(t, fresh, false)
 }
@@ -217,7 +210,7 @@ func TestPromptActiveContextCancellationNotifiesNative(t *testing.T) {
 	next := promptAgentAsync(agent, context.Background(), "a", "next")
 	waitQueue(t, agent, "a", 1)
 	cancel()
-	awaitPrompt(t, running, true)
+	awaitPrompt(t, running, false)
 	expectUpdate(t, host, "a:next")
 	raw, err := peer.CallExtension(context.Background(), "_cancels", nil)
 	if err != nil || string(raw) != `["a"]` {

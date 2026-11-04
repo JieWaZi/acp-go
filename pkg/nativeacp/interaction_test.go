@@ -10,7 +10,7 @@ import (
 
 // TestInteractionRejectsConflictingSession 验证未知身份和跨会话工具不能落到唯一活跃聊天。
 func TestInteractionRejectsConflictingSession(t *testing.T) {
-	agent := &Agent{active: map[acp.SessionId]bool{"active": true}, toolSessions: map[acp.ToolCallId]acp.SessionId{"old-tool": "old"}}
+	agent := &Agent{turnOwners: map[acp.SessionId]*promptWaiter{"active": {context: context.Background()}}, toolSessions: map[acp.ToolCallId]acp.SessionId{"old-tool": "old"}}
 	if agent.interactionSession("", "unknown") != "" || agent.interactionSession("old-tool", "active") != "" || agent.interactionSession("old-tool", "") != "" {
 		t.Fatal("foreign interaction routed to active session")
 	}

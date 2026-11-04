@@ -1,5 +1,5 @@
-// Package nativeacp 使用现有 ACP SDK 连接原生 CLI 或开源 stdio Adapter。
-// NeuxBot 本地修改：原生 stdio 连接显式启用背压，并由已有 Agent 生命周期解除阻塞读写；见根 PATCHES.md。
+// Package nativeacp connects installed stdio agents through the ACP SDK.
+// NeuxBot modifications bind bounded transport and process shutdown to one owner; see sdk/PATCHES.md.
 package nativeacp
 
 import (
@@ -18,115 +18,115 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-const maxNativeDiagnosticBytes = 4 << 10
+const (
+	maxNativeDiagnosticBytes       = 4 << 10
+	maxNativeDiagnosticRecordBytes = 64 << 10
+)
 
 const (
 	nativeNotificationQueueCapacity = 256
 	nativeNotificationQueueBytes    = 16 << 20
 )
 
-// Config 描述外部 ACP 进程；不会下载程序或修改用户配置。
+// Config describes an installed native process without installing or changing user configuration.
 type Config struct {
-	// PublicSessionID 可选地映射发往宿主的回调身份；内部队列与原生状态仍使用原生标识。
+	// PublicSessionID maps outgoing callback identities without changing native session ownership.
 	PublicSessionID func(acp.SessionId) acp.SessionId
-	// PromptFIFO 为新适配器开启每会话排队与可取消的执行生命周期。
+	// PromptFIFO selects queued admission; false rejects overlapping prompts using the same lifecycle.
 	PromptFIFO bool
-	// StrictCloseSession 原样调用原生 close，保留不支持时的方法错误。
+	// StrictCloseSession forwards native close even when support was not advertised.
 	StrictCloseSession bool
-	// Command 是已安装可执行文件的路径或名称。
+	// Command is the installed executable path or command name.
 	Command string
-	// Args 是包含 ACP 子命令的完整参数列表。
+	// Args contains the complete native protocol launch arguments.
 	Args []string
-	// VersionArgs 可选的 CLI 版本参数，不包含 ACP 或权限参数。
+	// VersionArgs contains an optional version probe independent of protocol arguments.
 	VersionArgs []string
-	// RuntimeName 在上游完全省略实现信息时标识 CLI。
+	// RuntimeName identifies the runtime when native implementation metadata is absent.
 	RuntimeName string
-	// Environment 是完整子进程环境；nil 表示继承当前环境。
+	// Environment is the complete child environment; nil snapshots the parent at construction.
 	Environment []string
-	// WorkingDirectory 是进程启动目录；Session cwd 仍由调用者指定。
+	// WorkingDirectory is the process directory; each session carries its own cwd.
 	WorkingDirectory string
-	// Logger 接收独立于协议 stdout 的诊断。
+	// Logger receives diagnostics separately from protocol stdout.
 	Logger *slog.Logger
-	// CallbackAdapter 处理当前 CLI 的私有反向请求；nil 表示只接受标准 ACP。
+	// CallbackAdapter handles private reverse requests; nil accepts only standard ACP callbacks.
 	CallbackAdapter CallbackAdapter
-	// SessionAdapter 处理当前 CLI 的非标准模型或思考配置；nil 表示标准 ACP。
+	// PreparePrompt runs after admission with cancellable preparation ownership.
+	PreparePrompt func(context.Context, acp.PromptRequest) error
+	// RedactDiagnostic sanitizes whole stderr records before logging or retention.
+	RedactDiagnostic func(string) string
+	// FilterSessionUpdate runs before delivery without I/O; PromptCommitted is safe to read.
+	// True forwards the update.
+	FilterSessionUpdate func(acp.SessionNotification) bool
+	// SessionAdapter handles private model or reasoning configuration; nil uses standard ACP.
 	SessionAdapter SessionAdapter
-	// EnrichConfigOptions 纯函数补充已规范化目录；nil 保持原行为。可能持锁调用，禁止 RPC 或重入 Agent。
+	// EnrichConfigOptions is a pure catalog projection; it must not perform I/O or reenter Agent.
 	EnrichConfigOptions func(SessionSnapshot) []acp.SessionConfigOption
-	// PermissionAdapter 处理当前 CLI 的非标准审批策略；nil 表示完全交给宿主。
+	// PermissionAdapter handles private approval policies; nil delegates to the host.
 	PermissionAdapter PermissionAdapter
 }
 
-// Agent 实现标准 ACP Agent，协议传输、请求关联和通知排序全部由 Go SDK 拥有。
+// Agent owns native execution; the SDK owns transport, request correlation and notification order.
 type Agent struct {
-	// conn 是连接外部 Agent 的 SDK JSON-RPC 连接。
+	// conn is the sole native JSON-RPC connection.
 	conn *acp.Connection
-	// command 拥有唯一外部进程。
+	// command owns the external process.
 	command *exec.Cmd
-	// input 用于结束进程的标准输入。
+	// input closes the native process input stream.
 	input io.WriteCloser
-	// output 用于解除 SDK 的读取阻塞。
+	// output unblocks the SDK reader during shutdown.
 	output io.ReadCloser
-	// cancel 终止进程生命周期。
+	// cancel terminates the process lifetime.
 	cancel context.CancelFunc
-	// done 在进程被回收后关闭。
+	// done closes after the process has been reaped.
 	done chan struct{}
-	// waitErr 保存外部进程的最终退出状态。
+	// waitErr records the process exit status.
 	waitErr error
-	// waitMu 保护 waitErr。
+	// waitMu protects waitErr.
 	waitMu sync.Mutex
-	// stderr 保存 CLI 原始诊断尾部。
+	// stderr retains only sanitized diagnostic records.
 	stderr *diagnosticWriter
-	// closed 在主动关闭开始时关闭，解除回调等待。
+	// closed closes when explicit shutdown begins and releases pending callbacks.
 	closed chan struct{}
-	// versionOnce 保证版本只在初始化时探测一次。
+	// versionOnce limits runtime probing to one initialization attempt.
 	versionOnce sync.Once
-	// version 保存实际 CLI 版本，探测失败保持空。
+	// version retains the observed version, or remains empty when unknown.
 	version string
-	// closeOnce 保证关闭幂等。
+	// closeOnce makes explicit shutdown idempotent.
 	closeOnce sync.Once
-	// mutex 保护宿主连接、初始化能力和会话配置。
+	// mutex protects host binding, native session state and prompt ownership.
 	mutex sync.Mutex
-	// host 是 acpserver 注入的宿主连接。
+	// host is the ACP server connection supplied by the caller.
 	host *acp.AgentSideConnection
-	// bound 在宿主连接注入后关闭。
+	// bound closes when the host is bound.
 	bound chan struct{}
-	// capabilities 保存上游的实际能力。
+	// capabilities retains capabilities actually advertised by the native process.
 	capabilities acp.AgentCapabilities
-	// sessions 保存配置标识与原生模型协议的会话映射。
+	// sessions maps native identities to the currently opened session generation.
 	sessions map[acp.SessionId]*sessionOptions
-	// active 保存活跃 Prompt，用于路由缺少 sessionId 的厂商回调。
-	active map[acp.SessionId]bool
-	// turnOwners 防止已关闭队列的清理删除恢复后新一轮的状态。
+	// turnOwners is the sole index of admitted operations, retained through ordered cancellation.
 	turnOwners map[acp.SessionId]*promptWaiter
-	// promptCanceling 按持久会话标识记录在途原生取消，屏障跨恢复后的执行代共享。
-	promptCanceling map[acp.SessionId]int
-	// toolSessions 保存已收到工具更新的所属会话。
+	// toolSessions retains the session identity observed in each tool notification.
 	toolSessions map[acp.ToolCallId]acp.SessionId
-	// config 保存协议特性开关。
+	// config freezes protocol configuration for this native instance.
 	config Config
-	// prompts 保存当前执行的用户证据，执行结束后立即移除。
-	prompts map[acp.SessionId][]acp.ContentBlock
-	// toolDetails 保存上游增量工具参数，供执行前风险审查使用。
+	// toolDetails accumulates native tool evidence for permission review.
 	toolDetails map[acp.ToolCallId]acp.ToolCallUpdate
-	// toolRevisions 为每次原生工具事件保存不可复用的证据身份。
+	// toolRevisions distinguishes individual native tool evidence updates.
 	toolRevisions map[acp.ToolCallId]*toolEvidenceRevision
-	// toolChanged 在先行工具通知入账时唤醒并发到达的审批请求。
+	// toolChanged wakes approval requests waiting for preceding tool notifications.
 	toolChanged chan struct{}
-	// silentLoads 屏蔽只用于恢复配置的历史回放，宿主 Resume 不重复展示旧消息。
+	// silentLoads suppresses history when loading only to recover configuration.
 	silentLoads map[acp.SessionId]bool
-	// turnContexts 把阻塞交互限定到所属执行。
-	turnContexts map[acp.SessionId]context.Context
-	// turnCancels 使 session/cancel 在原生回复前撤销待审查授权。
-	turnCancels map[acp.SessionId]context.CancelFunc
-	// messageSequence 为本进程内无原生身份的消息段分配不复用的标识。
+	// messageSequence assigns non-reusable identities to messages without native IDs.
 	messageSequence uint64
 }
 
 var _ acp.Agent = (*Agent)(nil)
 var _ acp.AgentLoader = (*Agent)(nil)
 
-// NewAgent 启动已安装的 ACP 程序；调用者通过 Close 释放进程。
+// NewAgent starts an installed program; its caller owns Close.
 func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	if ctx == nil || config.Logger == nil || strings.TrimSpace(config.Command) == "" {
 		return nil, errors.New("native ACP requires context, command and logger")
@@ -142,12 +142,16 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, err
 	}
 	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	command := exec.CommandContext(lifetime, resolved, config.Args...)
-	prepareProcess(command)
-	command.Env = config.Environment
+	config.Command = resolved
+	command, err := CommandContext(lifetime, resolved, config.Args, config.Environment)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	config.Environment = append([]string{}, command.Env...)
 	command.Dir = config.WorkingDirectory
 	command.WaitDelay = 2 * time.Second
-	stderr := &diagnosticWriter{logger: config.Logger}
+	stderr := &diagnosticWriter{logger: config.Logger, redact: config.RedactDiagnostic}
 	command.Stderr = stderr
 	input, err := command.StdinPipe()
 	if err != nil {
@@ -167,25 +171,20 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 		return nil, fmt.Errorf("starting native ACP: %w", err)
 	}
 	agent := &Agent{
-		command:         command,
-		input:           input,
-		output:          output,
-		cancel:          cancel,
-		done:            make(chan struct{}),
-		stderr:          stderr,
-		closed:          make(chan struct{}),
-		bound:           make(chan struct{}),
-		sessions:        make(map[acp.SessionId]*sessionOptions),
-		active:          make(map[acp.SessionId]bool),
-		turnOwners:      make(map[acp.SessionId]*promptWaiter),
-		promptCanceling: make(map[acp.SessionId]int),
-		toolSessions:    make(map[acp.ToolCallId]acp.SessionId),
-		config:          config,
-		prompts:         make(map[acp.SessionId][]acp.ContentBlock),
-		toolDetails:     make(map[acp.ToolCallId]acp.ToolCallUpdate),
-		toolRevisions:   make(map[acp.ToolCallId]*toolEvidenceRevision),
-		turnContexts:    make(map[acp.SessionId]context.Context),
-		turnCancels:     make(map[acp.SessionId]context.CancelFunc),
+		command:       command,
+		input:         input,
+		output:        output,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		stderr:        stderr,
+		closed:        make(chan struct{}),
+		bound:         make(chan struct{}),
+		sessions:      make(map[acp.SessionId]*sessionOptions),
+		turnOwners:    make(map[acp.SessionId]*promptWaiter),
+		toolSessions:  make(map[acp.ToolCallId]acp.SessionId),
+		config:        config,
+		toolDetails:   make(map[acp.ToolCallId]acp.ToolCallUpdate),
+		toolRevisions: make(map[acp.ToolCallId]*toolEvidenceRevision),
 	}
 	agent.conn, err = acp.NewConnectionWithOptions(agent.handle, input, output, acp.ConnectionOptions{
 		Context:                   lifetime,
@@ -202,13 +201,14 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	}
 	go func() {
 		<-agent.conn.Done()
-		// 主动关闭已解除 stdio 等待，继续沿原有有界退出窗口收集 stderr；异常断连立即终止进程。
+		// Explicit shutdown drains stderr within its bounded exit window; disconnection terminates the process.
 		select {
 		case <-agent.closed:
 		default:
 			cancel()
 		}
 		waitErr := command.Wait()
+		stderr.flush()
 		agent.waitMu.Lock()
 		agent.waitErr = waitErr
 		agent.waitMu.Unlock()
@@ -217,47 +217,161 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	return agent, nil
 }
 
-// diagnosticWriter 将 CLI 原始诊断写入日志。
+// diagnosticWriter only retains complete sanitized records. Raw partial lines never
+// reach either logs or exit errors, including when the process writes in chunks.
 type diagnosticWriter struct {
-	// logger 是只写诊断通道的结构化日志器。
+	// logger receives sanitized diagnostic lines.
 	logger *slog.Logger
-	// mutex 保护原始 stderr 尾部。
+	// redact is a pure whole-line sanitizer; nil suppresses native content.
+	redact func(string) string
+	// mutex protects the partial line and safe tail.
 	mutex sync.Mutex
-	// tail 最多保留最近 64 KiB 错误诊断。
+	// pending buffers a bounded record until its delimiter arrives.
+	pending []byte
+	// depth tracks structured payloads across pretty-printed lines.
+	depth int
+	// quote tracks JSON and inspected object strings within a payload.
+	quote byte
+	// escaped records a string escape across pipe chunks.
+	escaped bool
+	// ansi strips terminal control sequences before record parsing and redaction.
+	ansi byte
+	// overflow discards the entire oversized line, including later chunks.
+	overflow bool
+	// tail retains at most 64 KiB of sanitized diagnostics.
 	tail []byte
 }
 
-// Write 消费原生进程诊断，限制单次日志大小后交给宿主日志通道。
 func (writer *diagnosticWriter) Write(data []byte) (int, error) {
 	writer.mutex.Lock()
-	const maxTailBytes = 64 << 10
-	if len(data) >= maxTailBytes {
-		writer.tail = append(writer.tail[:0], data[len(data)-maxTailBytes:]...)
-	} else {
-		writer.tail = append(writer.tail, data...)
-		if len(writer.tail) > maxTailBytes {
-			writer.tail = append([]byte(nil), writer.tail[len(writer.tail)-maxTailBytes:]...)
+	defer writer.mutex.Unlock()
+	for _, b := range data {
+		if writer.stripControl(b) {
+			continue
 		}
-	}
-	writer.mutex.Unlock()
-	diagnostic := string(data)
-	if len(diagnostic) > maxNativeDiagnosticBytes {
-		diagnostic = diagnostic[len(diagnostic)-maxNativeDiagnosticBytes:]
-	}
-	if diagnostic != "" {
-		writer.logger.Warn("native ACP stderr", "stderr", diagnostic)
+		if writer.depth > 0 && writer.quote != 0 {
+			if writer.escaped {
+				writer.escaped = false
+			} else if b == '\\' {
+				writer.escaped = true
+			} else if b == writer.quote {
+				writer.quote = 0
+			}
+		} else {
+			switch b {
+			case '{', '[':
+				writer.depth++
+			case '}', ']':
+				if writer.depth > 0 {
+					writer.depth--
+				}
+			case '"', '\'', '`':
+				if writer.depth > 0 {
+					writer.quote = b
+				}
+			}
+		}
+		if b == '\n' && writer.depth == 0 {
+			writer.line()
+		} else if !writer.overflow {
+			if len(writer.pending) == maxNativeDiagnosticRecordBytes {
+				writer.pending = nil
+				writer.overflow = true
+			} else {
+				writer.pending = append(writer.pending, b)
+			}
+		}
 	}
 	return len(data), nil
 }
 
-// String 返回已收集的 CLI 原始 stderr 尾部。
+// stripControl consumes CSI, OSC and two-byte terminal escape sequences incrementally.
+func (writer *diagnosticWriter) stripControl(b byte) bool {
+	switch writer.ansi {
+	case 1:
+		switch b {
+		case '[':
+			writer.ansi = 2
+		case ']':
+			writer.ansi = 3
+		default:
+			writer.ansi = 0
+		}
+		return true
+	case 2:
+		if b >= 0x40 && b <= 0x7e {
+			writer.ansi = 0
+		}
+		return true
+	case 3:
+		if b == 7 {
+			writer.ansi = 0
+		} else if b == 27 {
+			writer.ansi = 4
+		}
+		return true
+	case 4:
+		if b == '\\' {
+			writer.ansi = 0
+		} else {
+			writer.ansi = 3
+		}
+		return true
+	}
+	if b == 27 {
+		writer.ansi = 1
+		return true
+	}
+	return false
+}
+
+// line runs under mutex and never publishes any unredacted bytes.
+func (writer *diagnosticWriter) line() {
+	var safe string
+	if writer.overflow {
+		safe = "[oversized diagnostic suppressed]"
+	} else if len(writer.pending) > 0 {
+		if writer.redact == nil {
+			safe = "[native diagnostic suppressed]"
+		} else {
+			safe = writer.redact(string(writer.pending))
+		}
+	}
+	writer.pending, writer.overflow = nil, false
+	if safe == "" {
+		return
+	}
+	if len(safe) > maxNativeDiagnosticBytes {
+		safe = safe[:maxNativeDiagnosticBytes]
+	}
+	writer.tail = append(writer.tail, safe...)
+	writer.tail = append(writer.tail, '\n')
+	const limit = 64 << 10
+	if len(writer.tail) > limit {
+		writer.tail = append([]byte(nil), writer.tail[len(writer.tail)-limit:]...)
+	}
+	if writer.logger != nil {
+		writer.logger.Warn("native ACP stderr", "stderr", safe)
+	}
+}
+
+// flush is called only after Wait has drained the stderr copier.
+func (writer *diagnosticWriter) flush() {
+	writer.mutex.Lock()
+	defer writer.mutex.Unlock()
+	if writer.depth != 0 || writer.quote != 0 {
+		writer.overflow = true
+	}
+	writer.line()
+}
+
 func (writer *diagnosticWriter) String() string {
 	writer.mutex.Lock()
 	defer writer.mutex.Unlock()
 	return string(writer.tail)
 }
 
-// SetAgentConnection 绑定一次宿主连接，并释放启动期间的回调。
+// SetAgentConnection binds the host once and releases startup callbacks.
 func (agent *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
@@ -267,7 +381,7 @@ func (agent *Agent) SetAgentConnection(connection *acp.AgentSideConnection) {
 	}
 }
 
-// Close 先结束拥有的 SDK 连接以解除 stdio 等待，再在有界窗口内终止并回收程序；重复关闭安全。
+// Close interrupts owned transport, reaps the process within the caller deadline, and permits retries.
 func (agent *Agent) Close(ctx context.Context) error {
 	select {
 	case <-agent.closed:
@@ -281,12 +395,14 @@ func (agent *Agent) Close(ctx context.Context) error {
 	}
 	select {
 	case <-agent.done:
-		return agent.exitError()
+		err := agent.exitError()
+		agent.closeOnce.Do(func() { close(agent.closed); agent.conn.Close(); agent.closePromptQueues() })
+		return err
 	default:
 	}
 	agent.closeOnce.Do(func() {
 		close(agent.closed)
-		// 不依赖已被输出背压占用的协议流发送关闭命令，先由连接所有者解除 stdio 等待。
+		// Close the owned transport first; protocol shutdown could itself be blocked by backpressure.
 		agent.conn.Close()
 		agent.closePromptQueues()
 	})
@@ -308,7 +424,7 @@ func (agent *Agent) Close(ctx context.Context) error {
 	}
 }
 
-// exitError 仅在非主动关闭时报告真实退出错误。
+// exitError preserves the actual process exit with sanitized diagnostics.
 func (agent *Agent) exitError() error {
 	agent.waitMu.Lock()
 	defer agent.waitMu.Unlock()
@@ -321,7 +437,7 @@ func (agent *Agent) exitError() error {
 	return fmt.Errorf("native ACP process exited: %w", agent.waitErr)
 }
 
-// transportError 在连接结束时附加 CLI 退出状态和原始 stderr。
+// transportError appends safe exit details after a transport disconnect.
 func (agent *Agent) transportError(err error) error {
 	if err == nil {
 		return nil
@@ -340,13 +456,13 @@ func (agent *Agent) transportError(err error) error {
 	return err
 }
 
-// sendNativeRequest 保留 SDK 协议错误，并在进程退出时附加原始 CLI 诊断。
+// sendNativeRequest preserves structured protocol errors and appends safe process diagnostics.
 func sendNativeRequest[T any](agent *Agent, ctx context.Context, method string, request any) (T, error) {
 	response, err := acp.SendRequest[T](agent.conn, ctx, method, request)
 	return response, agent.transportError(err)
 }
 
-// Initialize 保留真实能力，不伪造上游不支持的 Session 或授权功能。
+// Initialize retains actual native capabilities without inventing unsupported features.
 func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	if agent.config.CallbackAdapter != nil {
 		agent.config.CallbackAdapter.PrepareInitialize(&request)
@@ -361,89 +477,69 @@ func (agent *Agent) Initialize(ctx context.Context, request acp.InitializeReques
 	return response, err
 }
 
-// Prompt 原样转发内容，取消时补发标准 session/cancel。
+// Prompt shares the same admission, preparation and native completion path.
 func (agent *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.PromptResponse, error) {
-	if agent.config.PromptFIFO {
-		return agent.promptFIFO(ctx, request)
-	}
-	agent.mutex.Lock()
-	if agent.active[request.SessionId] {
-		agent.mutex.Unlock()
-		return acp.PromptResponse{}, acp.NewInvalidParams(nil)
-	}
-	turnCtx, turnCancel := context.WithCancel(ctx)
-	defer turnCancel()
-	agent.turnContexts[request.SessionId] = turnCtx
-	agent.turnCancels[request.SessionId] = turnCancel
-	agent.active[request.SessionId] = true
-	if state := agent.sessions[request.SessionId]; state != nil {
-		state.messageID = ""
-		state.messageKnownID = ""
-	}
-	agent.prompts[request.SessionId] = append([]acp.ContentBlock{}, request.Prompt...)
-	agent.mutex.Unlock()
-	defer func() {
-		agent.mutex.Lock()
-		delete(agent.active, request.SessionId)
-		delete(agent.prompts, request.SessionId)
-		delete(agent.turnContexts, request.SessionId)
-		delete(agent.turnCancels, request.SessionId)
-		for id, sid := range agent.toolSessions {
-			if sid == request.SessionId {
-				delete(agent.toolSessions, id)
-				delete(agent.toolDetails, id)
-				delete(agent.toolRevisions, id)
-			}
-		}
-		agent.mutex.Unlock()
-	}()
-	response, err := sendNativeRequest[acp.PromptResponse](agent, ctx, "session/prompt", request)
-	if ctx.Err() != nil {
-		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-		defer cancel()
-		_ = agent.Cancel(cancelCtx, acp.CancelNotification{SessionId: request.SessionId})
-	}
+	response, _, err := agent.PromptWithReceipt(ctx, request)
 	return response, err
 }
 
-// Cancel 请求原生 Agent 中断当前 Session 的执行。
+// ManagesSessionLifecycle prevents outer dispatch from abandoning native completion.
+func (agent *Agent) ManagesSessionLifecycle() bool { return true }
+
+// Cancel revokes interactions immediately and orders native cancellation after submission.
 func (agent *Agent) Cancel(ctx context.Context, request acp.CancelNotification) error {
-	if agent.config.PromptFIFO {
-		return agent.cancelFIFO(ctx, request)
-	}
-	agent.mutex.Lock()
-	cancel := agent.turnCancels[request.SessionId]
-	agent.mutex.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	return agent.conn.SendNotification(ctx, "session/cancel", request)
+	return agent.cancelPromptOwner(ctx, request, nil)
 }
 
-// CloseSession 对支持 close 的 Agent 释放 Session，否则取消并释放本地映射；上游资源随进程退出回收。
+// CloseSession seals admission and settles the native operation before closing its session.
 func (agent *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	release, err := agent.beginSessionTransition(request.SessionId, true)
+	if err != nil {
+		return acp.CloseSessionResponse{}, err
+	}
+	defer release()
+	agent.mutex.Lock()
+	state := agent.sessions[request.SessionId]
+	agent.mutex.Unlock()
+	defer func() {
+		agent.mutex.Lock()
+		defer agent.mutex.Unlock()
+		if agent.sessions[request.SessionId] == state {
+			delete(agent.sessions, request.SessionId)
+		}
+	}()
 	agent.mutex.Lock()
 	supported := agent.capabilities.SessionCapabilities.Close != nil
-	if state := agent.sessions[request.SessionId]; state != nil && state.queue != nil {
-		state.queue.close()
-	}
-	delete(agent.sessions, request.SessionId)
+	owner := agent.turnOwners[request.SessionId]
 	agent.mutex.Unlock()
+	if owner != nil {
+		if err := agent.cancelPromptOwner(ctx, acp.CancelNotification{SessionId: request.SessionId}, owner); err != nil {
+			return acp.CloseSessionResponse{}, err
+		}
+		select {
+		case <-owner.done:
+		case <-ctx.Done():
+			agent.conn.Close()
+			return acp.CloseSessionResponse{}, ctx.Err()
+		case <-agent.conn.Done():
+			return acp.CloseSessionResponse{}, agent.transportError(agent.conn.Err())
+		}
+	}
 	if agent.config.SessionAdapter != nil {
 		agent.config.SessionAdapter.ForgetSession(request.SessionId)
 	}
 	if supported || agent.config.StrictCloseSession {
 		return sendNativeRequest[acp.CloseSessionResponse](agent, ctx, "session/close", request)
 	}
-	return acp.CloseSessionResponse{}, agent.Cancel(ctx, acp.CancelNotification{SessionId: request.SessionId})
+	return acp.CloseSessionResponse{}, nil
 }
 
-// HandleExtensionMethod 转发调用者显式发出的 ACP 扩展。
+// HandleExtensionMethod forwards extensions explicitly requested by the caller.
 func (agent *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	return sendNativeRequest[json.RawMessage](agent, ctx, method, params)
 }
 
-// handle 只负责类型化转交 SDK 回调；JSON-RPC、排序、取消和背压由 SDK 处理。
+// handle delegates typed callbacks; framing, ordering and backpressure remain SDK responsibilities.
 func (agent *Agent) handle(ctx context.Context, method string, params json.RawMessage) (any, *acp.RequestError) {
 	select {
 	case <-agent.bound:
@@ -463,14 +559,14 @@ func (agent *Agent) handle(ctx context.Context, method string, params json.RawMe
 	return nil, acp.NewInternalError(map[string]any{"message": "native ACP client callback failed"})
 }
 
-// decodeCall 复用 SDK 类型解码上游回调，并保留 SDK 的校验与错误响应。
+// decodeCall uses SDK request types and preserves their validation errors.
 func decodeCall[P any, R any](ctx context.Context, data json.RawMessage, call func(context.Context, P) (R, error)) (any, error) {
 	var request P
 	if err := json.Unmarshal(data, &request); err != nil {
 		return nil, acp.NewInvalidParams(nil)
 	}
 	if validator, ok := any(&request).(interface {
-		// Validate 复用 SDK 的请求字段与联合类型校验。
+		// Validate preserves SDK field and union validation.
 		Validate() error
 	}); ok {
 		if err := validator.Validate(); err != nil {
@@ -480,5 +576,5 @@ func decodeCall[P any, R any](ctx context.Context, data json.RawMessage, call fu
 	return call(ctx, request)
 }
 
-// Done 在原生进程被完整回收后关闭，供拥有独立配置的适配器清理该执行代。
+// Done closes after the native process has been fully reaped.
 func (agent *Agent) Done() <-chan struct{} { return agent.done }

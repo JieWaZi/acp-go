@@ -1,6 +1,7 @@
 package nativeacp
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,7 +9,7 @@ import (
 	"strings"
 )
 
-// EnvironmentValue 按子进程实际环境读取变量，nil 表示继承宿主。
+// EnvironmentValue reads the effective child environment; nil inherits the parent.
 func EnvironmentValue(environment []string, name string) string {
 	if environment == nil {
 		return os.Getenv(name)
@@ -22,7 +23,7 @@ func EnvironmentValue(environment []string, name string) string {
 	return ""
 }
 
-// WithEnvironment 返回覆盖指定变量的独立环境副本，不修改宿主进程。
+// WithEnvironment returns a new child environment without mutating the parent.
 func WithEnvironment(environment []string, name, value string) []string {
 	if environment == nil {
 		environment = os.Environ()
@@ -37,7 +38,7 @@ func WithEnvironment(environment []string, name, value string) []string {
 	return append(result, name+"="+value)
 }
 
-// ResolveCommand 在子进程 PATH 内解析程序，显式路径失败不会回退到其他安装。
+// ResolveCommand searches the child PATH; an explicit path never falls back to another installation.
 func ResolveCommand(command string, environment []string) (string, error) {
 	if strings.ContainsAny(command, `/\`) {
 		path, err := filepath.Abs(command)
@@ -68,10 +69,30 @@ func ResolveCommand(command string, environment []string) (string, error) {
 	return "", &exec.Error{Name: command, Err: exec.ErrNotFound}
 }
 
-// commandSuffixes 覆盖 npm 在 Windows 上创建的命令入口。
+// commandSuffixes includes executable and npm batch entry points on Windows.
 func commandSuffixes() []string {
 	if runtime.GOOS == "windows" {
 		return []string{"", ".exe", ".cmd", ".bat"}
 	}
 	return []string{""}
+}
+
+// CommandContext freezes the resolved executable and complete child environment.
+// Runtime, version and authentication callers share the same platform launcher.
+func CommandContext(ctx context.Context, executable string, args []string, environment []string) (*exec.Cmd, error) {
+	if environment == nil {
+		environment = os.Environ()
+	}
+	environment = append([]string{}, environment...)
+	resolved, err := ResolveCommand(executable, environment)
+	if err != nil {
+		return nil, err
+	}
+	command, err := platformCommand(ctx, resolved, append([]string(nil), args...), environment)
+	if err != nil {
+		return nil, err
+	}
+	command.Env = environment
+	prepareProcess(command)
+	return command, nil
 }

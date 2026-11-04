@@ -10,39 +10,41 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// sessionOptions 将宿主统一配置标识映射到上游声明的实际标识。
+// sessionOptions maps normalized host configuration to native session state.
 type sessionOptions struct {
-	// workingDirectory 保存原生会话实际 cwd，供 opt-in 审查使用。
+	// transitioning excludes concurrent lifecycle RPCs and prompt admission.
+	transitioning bool
+	// workingDirectory retains the observed session cwd for permission evidence.
 	workingDirectory string
-	// queue 保存显式开启的会话执行队列。
+	// queue owns prompt admission for this opened session generation.
 	queue *promptQueue
-	// configMutex 串行化一次配置操作中的多项原生参数更新。
+	// configMutex serializes configuration writes that require multiple native calls.
 	configMutex sync.Mutex
-	// ids 按 model/reasoning 等规范化标识保存原生配置标识。
+	// ids maps normalized categories to native configuration IDs.
 	ids map[acp.SessionConfigId]acp.SessionConfigId
-	// options 是最后一次会话返回的配置目录。
+	// options retains the last observed configuration catalog.
 	options []acp.SessionConfigOption
-	// models 保存当前会话代的旧版模型目录，恢复时以新响应克隆替换。
+	// models retains the legacy native model catalog for this generation.
 	models json.RawMessage
-	// messageID 是当前连续助手消息段的身份，工具或新一轮开始时清空。
+	// messageID identifies the current contiguous assistant message segment.
 	messageID string
-	// messageInfo 保留当前消息已经明确声明的阶段，后续无元数据增量不覆盖它。
+	// messageInfo preserves an explicit native phase across metadata-free deltas.
 	messageInfo acpmeta.MessageInfo
-	// messageKnownID 保留最近一个明确阶段的原生身份，工具活动不撤销它已经声明的阶段。
+	// messageKnownID remembers an explicitly phased native identity across tool activity.
 	messageKnownID string
-	// messageKnownInfo 只用于恢复同一原生身份的明确阶段，不保存历史正文或其他消息。
+	// messageKnownInfo restores phase metadata only for the matching native identity.
 	messageKnownInfo acpmeta.MessageInfo
 }
 
-// nativeSessionResponse 兼容当前仍提供 models 的外部 ACP 实现。
+// nativeSessionResponse accepts native implementations still returning a models catalog.
 type nativeSessionResponse struct {
-	// NewSessionResponse 包含 SDK 定义的公共会话字段。
+	// NewSessionResponse embeds the standard session response.
 	acp.NewSessionResponse
-	// Models 保存尚未迁移到 configOptions 的厂商模型目录原文。
+	// Models retains native model metadata not yet represented as configOptions.
 	Models json.RawMessage `json:"models,omitempty"`
 }
 
-// NewSession 创建原生会话，并统一模型与思考配置的入口。
+// NewSession opens a native session and normalizes its model and reasoning catalog.
 func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
@@ -57,8 +59,13 @@ func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionReques
 	return response.NewSessionResponse, nil
 }
 
-// LoadSession 恢复上游历史，保留其真实模型与模式目录。
+// LoadSession restores native history and its observed configuration catalog.
 func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	release, err := agent.beginSessionTransition(request.SessionId, false)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	defer release()
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
 	}
@@ -72,11 +79,16 @@ func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequ
 	return acp.LoadSessionResponse{Meta: response.Meta, ConfigOptions: response.ConfigOptions, Modes: response.Modes}, nil
 }
 
-// ResumeSession 仅调用上游明确声明支持的无历史恢复方法。
+// ResumeSession invokes native resume without replaying history.
 func (agent *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
 ) (acp.ResumeSessionResponse, error) {
+	release, err := agent.beginSessionTransition(request.SessionId, false)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+	defer release()
 	response, err := sendNativeRequest[nativeSessionResponse](agent, ctx, "session/resume", request)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
@@ -87,7 +99,36 @@ func (agent *Agent) ResumeSession(
 	return acp.ResumeSessionResponse{Meta: response.Meta, ConfigOptions: response.ConfigOptions, Modes: response.Modes}, nil
 }
 
-// normalizeSession 为一个会话保存原生配置标识和旧版模型目录。
+// beginSessionTransition reserves the native identity before issuing lifecycle RPCs.
+// An active execution cannot be silently replaced by a load or resume response.
+func (agent *Agent) beginSessionTransition(id acp.SessionId, closing bool) (func(), error) {
+	agent.mutex.Lock()
+	defer agent.mutex.Unlock()
+	state := agent.sessions[id]
+	if state != nil && state.transitioning {
+		return nil, acp.NewInvalidParams(map[string]any{"message": "session lifecycle operation is already active"})
+	}
+	if !closing && agent.turnOwners[id] != nil {
+		return nil, acp.NewInvalidParams(map[string]any{"message": "cannot restore an active native execution"})
+	}
+	if state == nil {
+		state = &sessionOptions{}
+		agent.sessions[id] = state
+	}
+	state.transitioning = true
+	if state.queue != nil {
+		state.queue.close()
+	}
+	return func() {
+		agent.mutex.Lock()
+		defer agent.mutex.Unlock()
+		if agent.sessions[id] == state {
+			state.transitioning = false
+		}
+	}, nil
+}
+
+// normalizeSession installs configuration and admission state for the opened generation.
 func (agent *Agent) normalizeSession(
 	ctx context.Context,
 	response *nativeSessionResponse,
@@ -115,17 +156,15 @@ func (agent *Agent) normalizeSession(
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state.options = response.ConfigOptions
-	if agent.config.PromptFIFO {
-		if old := agent.sessions[id]; old != nil && old.queue != nil {
-			old.queue.close()
-		}
-		state.queue = &promptQueue{waiting: []*promptWaiter{}}
+	if old := agent.sessions[id]; old != nil && old.queue != nil {
+		old.queue.close()
 	}
+	state.queue = &promptQueue{}
 	agent.sessions[id] = state
 	return nil
 }
 
-// NormalizeOptions 仅统一能力类别明确的配置标识，不改变模型或选项值。
+// NormalizeOptions changes category identifiers without changing native option values.
 func NormalizeOptions(
 	options []acp.SessionConfigOption,
 	ids map[acp.SessionConfigId]acp.SessionConfigId,
@@ -156,7 +195,7 @@ func NormalizeOptions(
 	return result
 }
 
-// SetSessionConfigOption 将规范化标识还原为原生标识，模型值始终保持原样。
+// SetSessionConfigOption resolves normalized identifiers while preserving native model values.
 func (agent *Agent) SetSessionConfigOption(
 	ctx context.Context,
 	request acp.SetSessionConfigOptionRequest,
@@ -207,7 +246,7 @@ func (agent *Agent) SetSessionConfigOption(
 	return response, nil
 }
 
-// normalizeUpdate 关联工具所属会话并同步动态配置目录。
+// normalizeUpdate records tool ownership and updates the observed catalog.
 func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
@@ -261,7 +300,7 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	}
 }
 
-// enrichConfigOptions 仅向显式启用的纯投影提供当前会话代事实；模型原文克隆避免外部修改保存的目录。
+// enrichConfigOptions supplies an immutable catalog snapshot to the configured pure projection.
 func (agent *Agent) enrichConfigOptions(
 	state *sessionOptions,
 	options []acp.SessionConfigOption,
@@ -276,17 +315,17 @@ func (agent *Agent) enrichConfigOptions(
 	})
 }
 
-// interactionSession 只在会话归属唯一时路由缺少会话标识的请求。
+// interactionSession resolves missing session identities only when ownership is unambiguous.
 func (agent *Agent) interactionSession(toolID string, explicit string) acp.SessionId {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	return agent.interactionSessionLocked(toolID, explicit)
 }
 
-// interactionSessionLocked 在调用方持有状态锁时解析归属，允许同时冻结所属执行代。
+// interactionSessionLocked resolves the identity while the caller holds the ownership lock.
 func (agent *Agent) interactionSessionLocked(toolID string, explicit string) acp.SessionId {
 	if explicit != "" {
-		if agent.active[acp.SessionId(explicit)] {
+		if agent.turnOwners[acp.SessionId(explicit)] != nil {
 			if owner := agent.toolSessions[acp.ToolCallId(toolID)]; owner != "" && owner != acp.SessionId(explicit) {
 				return ""
 			}
@@ -295,20 +334,20 @@ func (agent *Agent) interactionSessionLocked(toolID string, explicit string) acp
 		return ""
 	}
 	if sid := agent.toolSessions[acp.ToolCallId(toolID)]; sid != "" {
-		if agent.active[sid] {
+		if agent.turnOwners[sid] != nil {
 			return sid
 		}
 		return ""
 	}
-	if len(agent.active) == 1 {
-		for sid := range agent.active {
+	if len(agent.turnOwners) == 1 {
+		for sid := range agent.turnOwners {
 			return sid
 		}
 	}
 	return ""
 }
 
-// cleanMessage 选择第一个非空文本作为交互说明。
+// cleanMessage selects the first nonempty interaction description.
 func cleanMessage(parts ...string) string {
 	for _, part := range parts {
 		if strings.TrimSpace(part) != "" {

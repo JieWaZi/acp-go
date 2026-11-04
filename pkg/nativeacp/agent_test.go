@@ -236,18 +236,19 @@ func TestNativeStartFailure(t *testing.T) {
 	}
 }
 
-// TestNativeStderrIsVisibleRaw 验证原生 ACP 失败诊断保留 CLI 原始内容。
-func TestNativeStderrIsVisibleRaw(t *testing.T) {
+// TestNativeStderrRequiresRedaction 验证原生 ACP 失败诊断保留 CLI 原始内容。
+func TestNativeStderrRequiresRedaction(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
 	agent, err := nativeacp.NewAgent(context.Background(), nativeacp.Config{
-		Command:     binary,
-		Args:        []string{"-test.run=^TestACPProcess$"},
-		Environment: append(os.Environ(), "NATIVE_ACP_TEST=stderr"),
-		Logger:      slog.New(slog.NewTextHandler(&output, nil)),
+		Command:          binary,
+		Args:             []string{"-test.run=^TestACPProcess$"},
+		Environment:      append(os.Environ(), "NATIVE_ACP_TEST=stderr"),
+		RedactDiagnostic: func(s string) string { return strings.ReplaceAll(s, "secret-value", "[redacted]") },
+		Logger:           slog.New(slog.NewTextHandler(&output, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -261,22 +262,23 @@ func TestNativeStderrIsVisibleRaw(t *testing.T) {
 	if !strings.Contains(diagnostic, "fixture failure") {
 		t.Fatalf("stderr 诊断不可见：%q", diagnostic)
 	}
-	if !strings.Contains(diagnostic, "api_key=secret-value") {
+	if strings.Contains(diagnostic, "api_key=secret-value") || !strings.Contains(diagnostic, "[redacted]") {
 		t.Fatalf("stderr 原始诊断丢失：%q", diagnostic)
 	}
 }
 
-// TestNativeRequestReportsRawCLIExit 验证请求失败时附加原始 CLI 退出诊断。
-func TestNativeRequestReportsRawCLIExit(t *testing.T) {
+// TestNativeRequestReportsSafeCLIExit 验证请求失败时附加原始 CLI 退出诊断。
+func TestNativeRequestReportsSafeCLIExit(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent, err := nativeacp.NewAgent(context.Background(), nativeacp.Config{
-		Command:     binary,
-		Args:        []string{"-test.run=^TestACPProcess$"},
-		Environment: append(os.Environ(), "NATIVE_ACP_TEST=stderr"),
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Command:          binary,
+		Args:             []string{"-test.run=^TestACPProcess$"},
+		Environment:      append(os.Environ(), "NATIVE_ACP_TEST=stderr"),
+		RedactDiagnostic: func(s string) string { return strings.ReplaceAll(s, "secret-value", "[redacted]") },
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -284,8 +286,8 @@ func TestNativeRequestReportsRawCLIExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_, err = agent.Initialize(ctx, acp.InitializeRequest{})
-	if err == nil || !strings.Contains(err.Error(), "api_key=secret-value") {
-		t.Fatalf("native CLI raw error missing: %v", err)
+	if err == nil || strings.Contains(err.Error(), "secret-value") || !strings.Contains(err.Error(), "[redacted]") {
+		t.Fatalf("native CLI safe error missing: %v", err)
 	}
 	_ = agent.Close(ctx)
 }

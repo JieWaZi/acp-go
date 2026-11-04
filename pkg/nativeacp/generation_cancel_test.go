@@ -9,28 +9,6 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// completionGateContext 在旧 SDK 请求完成后暂停调用者取消检查，精确控制恢复时序。
-type completionGateContext struct {
-	// Context 提供真实父级取消，SDK 派生上下文仍按原规则取消。
-	context.Context
-	// entered 在取消检查到达闸门时关闭。
-	entered chan struct{}
-	// release 允许检查继续，不向生产实现注入测试钩子。
-	release chan struct{}
-	// once 使重复 Err 查询安全共享同一闸门。
-	once sync.Once
-}
-
-// Err 只阻塞已取消的父上下文检查，不影响请求建立和原生响应等待。
-func (gate *completionGateContext) Err() error {
-	err := gate.Context.Err()
-	if err != nil {
-		gate.once.Do(func() { close(gate.entered) })
-		<-gate.release
-	}
-	return err
-}
-
 // notificationGateContext 暂停 SDK 发送通知前的上下文检查，模拟在途取消通知。
 type notificationGateContext struct {
 	// Context 保留无取消的基础上下文。
@@ -74,34 +52,27 @@ func restoreGeneration(t *testing.T, peer *acp.ClientSideConnection, method stri
 	}
 }
 
-// TestOldPromptCancellationCannotCancelRestoredGeneration 捕获旧请求完成后按持久 ID 误取消新执行的回归。
+// TestOldPromptCancellationCannotCancelRestoredGeneration checks exact owner identity.
 func TestOldPromptCancellationCannotCancelRestoredGeneration(t *testing.T) {
 	for _, method := range []string{"load", "resume"} {
 		t.Run(method, func(t *testing.T) {
 			agent, peer, host := startLifecycleBridge(t, true, true)
-			base, cancel := context.WithCancel(context.Background())
-			gate := &completionGateContext{Context: base, entered: make(chan struct{}), release: make(chan struct{})}
-			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { close(gate.release) }) }
-			defer release()
-			old := promptAgentAsync(agent, gate, "a", "old")
+			old := promptAgentAsync(agent, context.Background(), "a", "old")
 			expectUpdate(t, host, "a:old")
-			cancel()
-			awaitGate(t, gate.entered)
+			agent.mutex.Lock()
+			owner := agent.turnOwners["a"]
+			agent.mutex.Unlock()
+			releaseNative(t, peer, "a")
+			awaitPrompt(t, old, false)
 			restoreGeneration(t, peer, method)
 			fresh := promptAgentAsync(agent, context.Background(), "a", "fresh")
 			expectUpdate(t, host, "a:fresh")
-			release()
-			awaitPrompt(t, old, true)
-			agent.mutex.Lock()
-			freshCanceled := agent.turnContexts["a"] == nil || agent.turnContexts["a"].Err() != nil
-			agent.mutex.Unlock()
-			if freshCanceled {
-				t.Fatal("old automatic cancellation canceled restored execution")
+			if err := agent.cancelPromptOwner(context.Background(), acp.CancelNotification{SessionId: "a"}, owner); err != nil {
+				t.Fatal(err)
 			}
 			raw, err := peer.CallExtension(context.Background(), "_cancels", nil)
 			if err != nil || string(raw) != `[]` {
-				t.Fatalf("old generation sent native session cancel: %s %v", raw, err)
+				t.Fatalf("stale cancellation reached native generation: %s %v", raw, err)
 			}
 			releaseNative(t, peer, "a")
 			awaitPrompt(t, fresh, false)
@@ -109,7 +80,9 @@ func TestOldPromptCancellationCannotCancelRestoredGeneration(t *testing.T) {
 	}
 }
 
-// TestPendingNativeCancelBlocksRestoredGeneration 捕获旧代取消通知未发送就放行新代的回归。
+// TestPendingNativeCancelBlocksRestoredGeneration covers terminal receipt before the
+// cancellation notification has finished writing. Neither restore nor a successor
+// can enter while that old native cancellation could still affect it.
 func TestPendingNativeCancelBlocksRestoredGeneration(t *testing.T) {
 	for _, method := range []string{"load", "resume"} {
 		t.Run(method, func(t *testing.T) {
@@ -117,29 +90,33 @@ func TestPendingNativeCancelBlocksRestoredGeneration(t *testing.T) {
 			old := promptAgentAsync(agent, context.Background(), "a", "old")
 			expectUpdate(t, host, "a:old")
 			gate := &notificationGateContext{Context: context.Background(), entered: make(chan struct{}), release: make(chan struct{})}
-			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { close(gate.release) }) }
+			var once sync.Once
+			release := func() { once.Do(func() { close(gate.release) }) }
 			defer release()
 			canceled := make(chan error, 1)
 			go func() { canceled <- agent.Cancel(gate, acp.CancelNotification{SessionId: "a"}) }()
 			awaitGate(t, gate.entered)
-			awaitPrompt(t, old, true)
-			restoreGeneration(t, peer, method)
-			fresh := promptAgentAsync(agent, context.Background(), "a", "fresh")
-			// 等待 fresh 已进入新队列；旧实现会直接发原生 prompt，因此永远达不到一个等待者。
-			waitQueue(t, agent, "a", 1)
+			releaseNative(t, peer, "a")
+			var err error
+			if method == "load" {
+				_, err = peer.LoadSession(context.Background(), acp.LoadSessionRequest{SessionId: "a", Cwd: "/fixture", McpServers: []acp.McpServer{}})
+			} else {
+				_, err = peer.ResumeSession(context.Background(), acp.ResumeSessionRequest{SessionId: "a", Cwd: "/fixture"})
+			}
+			if err == nil {
+				t.Fatal("restore crossed an unfinished cancellation")
+			}
 			select {
-			case update := <-host.updates:
-				t.Fatalf("restored generation started before native cancel delivery: %s", update)
+			case <-old:
+				t.Fatal("owner released before cancel write completed")
 			default:
 			}
 			release()
 			awaitPrompt(t, canceled, false)
+			awaitPrompt(t, old, false)
+			restoreGeneration(t, peer, method)
+			fresh := promptAgentAsync(agent, context.Background(), "a", "fresh")
 			expectUpdate(t, host, "a:fresh")
-			raw, err := peer.CallExtension(context.Background(), "_cancels", nil)
-			if err != nil || string(raw) != `["a"]` {
-				t.Fatalf("missing native cancel: %s %v", raw, err)
-			}
 			releaseNative(t, peer, "a")
 			awaitPrompt(t, fresh, false)
 		})

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -12,13 +11,15 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// RuntimeVersion 读取同一 CLI 的版本，不执行模型请求；失败保持未知，输出和等待均有界。
+// RuntimeVersion probes the same launcher with bounded output and duration; failures remain unknown.
 func RuntimeVersion(ctx context.Context, command string, args, environment []string, cwd string) string {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, command, args...)
-	prepareProcess(cmd)
-	cmd.Env, cmd.Dir = environment, cwd
+	cmd, err := CommandContext(ctx, command, args, environment)
+	if err != nil {
+		return ""
+	}
+	cmd.Dir = cwd
 	cmd.WaitDelay = time.Second
 	output := &versionOutput{}
 	cmd.Stdout, cmd.Stderr = output, io.Discard
@@ -32,13 +33,13 @@ func RuntimeVersion(ctx context.Context, command string, args, environment []str
 	return version
 }
 
-// versionOutput 限制异常 CLI 输出，避免版本探测占用无限内存。
+// versionOutput bounds memory consumed by a misbehaving version probe.
 type versionOutput struct {
-	// Buffer 保存受限的单行版本输出。
+	// Buffer retains the bounded version output.
 	bytes.Buffer
 }
 
-// Write 拒绝超过版本信息上限的输出。
+// Write rejects output beyond the version information budget.
 func (b *versionOutput) Write(data []byte) (int, error) {
 	if b.Len()+len(data) > 1024 {
 		return 0, io.ErrShortBuffer
@@ -46,7 +47,7 @@ func (b *versionOutput) Write(data []byte) (int, error) {
 	return b.Buffer.Write(data)
 }
 
-// completeRuntimeVersion 补齐上游握手省略的运行时版本；不覆盖原生元数据。
+// completeRuntimeVersion fills missing runtime metadata without replacing native observations.
 func (agent *Agent) completeRuntimeVersion(ctx context.Context, response *acp.InitializeResponse) {
 	if len(agent.config.VersionArgs) == 0 {
 		return
@@ -55,7 +56,7 @@ func (agent *Agent) completeRuntimeVersion(ctx context.Context, response *acp.In
 		return
 	}
 	agent.versionOnce.Do(func() {
-		agent.version = RuntimeVersion(ctx, agent.command.Path, agent.config.VersionArgs, agent.config.Environment, agent.config.WorkingDirectory)
+		agent.version = RuntimeVersion(ctx, agent.config.Command, agent.config.VersionArgs, agent.config.Environment, agent.config.WorkingDirectory)
 	})
 	if agent.version == "" {
 		return

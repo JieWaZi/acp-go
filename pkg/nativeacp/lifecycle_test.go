@@ -203,7 +203,7 @@ func TestPromptQueueContextCancellation(t *testing.T) {
 	awaitPrompt(t, next, false)
 }
 
-// TestPromptCancelReleasesOnlyCurrentSession 捕获原生忽略 cancel 时本地等待无法结束的回归。
+// TestPromptCancelReleasesOnlyCurrentSession waits for the native cancellation terminal.
 func TestPromptCancelReleasesOnlyCurrentSession(t *testing.T) {
 	agent, peer, host := startLifecycleBridge(t, true, true)
 	first := promptAgentAsync(agent, context.Background(), "a", "first")
@@ -215,7 +215,7 @@ func TestPromptCancelReleasesOnlyCurrentSession(t *testing.T) {
 	if err := peer.Cancel(context.Background(), acp.CancelNotification{SessionId: "a"}); err != nil {
 		t.Fatal(err)
 	}
-	awaitPrompt(t, first, true)
+	awaitPrompt(t, first, false)
 	expectUpdate(t, host, "a:next")
 	select {
 	case err := <-other:
@@ -248,7 +248,7 @@ func TestPromptCloseSessionDiscardsOldQueueAndAllowsRestore(t *testing.T) {
 			if !errors.As(err, &requestErr) || requestErr.Code != -32601 {
 				t.Fatalf("close must retain native error: %v", err)
 			}
-			awaitPrompt(t, current, true)
+			awaitPrompt(t, current, false)
 			awaitPrompt(t, old, true)
 			awaitPrompt(t, promptAgentAsync(agent, context.Background(), "a", "closed"), true)
 			if method == "load" {
@@ -316,6 +316,8 @@ func TestLifecycleProcess(t *testing.T) {
 	var mutex sync.Mutex
 	gates := map[string]chan struct{}{}
 	supportedClose := false
+	completeCancel := true
+	cancelled := map[string]bool{}
 	cancels := []string{}
 	connection = acp.NewConnection(func(ctx context.Context, method string, raw json.RawMessage) (any, *acp.RequestError) {
 		<-ready
@@ -346,6 +348,13 @@ func TestLifecycleProcess(t *testing.T) {
 			_ = connection.SendNotification(ctx, "session/update", map[string]any{"sessionId": request.SessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": acp.TextBlock(request.Prompt[0].Text.Text)}})
 			select {
 			case <-gate:
+				mutex.Lock()
+				wasCancelled := cancelled[request.SessionID]
+				delete(cancelled, request.SessionID)
+				mutex.Unlock()
+				if wasCancelled {
+					return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+				}
 				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 			case <-ctx.Done():
 				return nil, acp.NewInternalError(nil)
@@ -353,8 +362,20 @@ func TestLifecycleProcess(t *testing.T) {
 		case "session/cancel":
 			mutex.Lock()
 			cancels = append(cancels, request.SessionID)
+			if completeCancel {
+				if gate := gates[request.SessionID]; gate != nil {
+					cancelled[request.SessionID] = true
+					delete(gates, request.SessionID)
+					close(gate)
+				}
+			}
 			mutex.Unlock()
 			return nil, nil
+		case "_ignore_cancel":
+			mutex.Lock()
+			completeCancel = false
+			mutex.Unlock()
+			return map[string]any{}, nil
 		case "_release":
 			mutex.Lock()
 			gate := gates[request.SessionID]
