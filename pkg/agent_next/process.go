@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -299,6 +300,21 @@ func (p *Process) stop() error {
 	return nil
 }
 
+func (p *Process) beginStop() (bool, error) {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	select {
+	case <-p.stopped:
+		return false, nil
+	default:
+	}
+	graceful, err := p.tree.terminate(p.child)
+	if err != nil {
+		return false, processOperationError("terminate agent process tree", err)
+	}
+	return graceful, nil
+}
+
 // Stdin returns the parent writer after successful Start. Closing it sends EOF;
 // Close also closes it if the caller leaves it open.
 func (p *Process) Stdin() io.WriteCloser {
@@ -395,11 +411,27 @@ func (p *Process) runCleanup(attempt *processCleanup) {
 		attempt.err = p.tree.release()
 		return
 	}
+	pipeErr := closeProcessFile(p.stdin)
+	graceful, err := p.beginStop()
+	if err != nil {
+		attempt.err = errors.Join(pipeErr, err)
+		return
+	}
+	if graceful {
+		// A provider may persist its transcript on EOF or SIGTERM. The owner
+		// keeps the same bounded stop attempt even if a Close waiter detaches.
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-p.reaped:
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
 	if err := p.stop(); err != nil {
 		attempt.err = err
 		return
 	}
-	pipeErr := errors.Join(closeProcessFile(p.stdin), closeProcessFile(p.stdout))
+	pipeErr = errors.Join(pipeErr, closeProcessFile(p.stdout))
 	<-p.reaped
 	select {
 	case <-p.drained:
@@ -514,6 +546,12 @@ type processRecords struct {
 	escape byte
 	// depth counts open brackets inside a structured record.
 	depth int
+	// inspect distinguishes indented util.inspect output from JSON framing.
+	inspect bool
+	// inspectLine defers the continuation decision until the next byte arrives.
+	inspectLine bool
+	// jsonRecord limits JSON strings to their actual double-quote delimiter.
+	jsonRecord bool
 	// quote tracks a string delimiter inside a structured record.
 	quote byte
 	// backslash tracks escaping within a quoted string.
@@ -585,6 +623,16 @@ func (r *processRecords) stripTerminal(b byte) bool {
 }
 
 func (r *processRecords) add(b byte) {
+	if r.inspectLine {
+		r.inspectLine = false
+		r.quote, r.backslash = 0, false
+		if b != ' ' && b != '\t' && b != '}' && b != ']' {
+			// An unindented line is independent even if the inspect dump was
+			// truncated. Discard the incomplete dump before framing this byte.
+			r.dropping = true
+			r.publish()
+		}
+	}
 	if r.ambiguous {
 		switch b {
 		case '\n':
@@ -603,7 +651,13 @@ func (r *processRecords) add(b byte) {
 		}
 		r.ambiguous = false
 		switch {
-		case b == '"' || b == '{' || b == '[' || ((!r.nextLine || r.indentation) && b != '}' && b != ']'):
+		case b == '"' || b == '{' || b == '[':
+			r.depth, r.jsonRecord = 1, true
+		case r.indentation && b != '}' && b != ']':
+			r.depth, r.inspect = 1, true
+		case !r.nextLine && b != '}' && b != ']':
+			// Inline non-JSON payloads have no proven indentation boundary.
+			// Keep them whole so an unknown serializer cannot leak fragments.
 			r.depth = 1
 		case r.nextLine:
 			if r.boundary <= len(r.buf) {
@@ -615,6 +669,8 @@ func (r *processRecords) add(b byte) {
 	}
 	if r.depth > 0 {
 		switch {
+		case r.inspect && b == '\n':
+			r.inspectLine = true
 		case r.quote != 0:
 			if r.backslash {
 				r.backslash = false
@@ -623,12 +679,15 @@ func (r *processRecords) add(b byte) {
 			} else if b == r.quote {
 				r.quote = 0
 			}
-		case b == '"' || b == '\'' || b == '`':
+		case b == '"' || (!r.jsonRecord && (b == '\'' || b == '`')):
 			r.quote = b
 		case b == '{' || b == '[':
 			r.depth++
 		case b == '}' || b == ']':
 			r.depth--
+			if r.depth == 0 {
+				r.inspect, r.jsonRecord = false, false
+			}
 		}
 	} else {
 		switch b {
@@ -688,6 +747,10 @@ func (r *processRecords) publish() {
 	r.dropping = false
 	r.beginMatch, r.endMatch = 0, 0
 	r.sawBegin, r.sawEnd = false, false
+	r.depth, r.quote = 0, 0
+	r.inspect, r.inspectLine, r.jsonRecord, r.backslash = false, false, false, false
+	r.ambiguous, r.nextLine, r.indentation = false, false, false
+	r.boundary = 0
 }
 
 func (r *processRecords) finish() {

@@ -9,8 +9,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -41,6 +44,23 @@ func TestProcessChild(t *testing.T) {
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		fmt.Fprint(os.Stdout, line)
 		os.Exit(0)
+	case "graceful":
+		ending := make(chan os.Signal, 1)
+		signal.Notify(ending, syscall.SIGTERM)
+		fmt.Fprintln(os.Stdout, "ready")
+		<-ending
+		if err := os.WriteFile(os.Getenv("AGENT_NEXT_TEST_FLUSH"), []byte("flushed"), 0600); err != nil {
+			os.Exit(35)
+		}
+		os.Exit(0)
+	case "ignore-term":
+		signal.Ignore(syscall.SIGTERM)
+		fmt.Fprintln(os.Stdout, "ready")
+		time.Sleep(25 * time.Second)
+		os.Exit(36)
+	case "broken-inspect":
+		fmt.Fprint(os.Stderr, "broken inspect {\n  token: 'synthetic',\nFATAL ERROR: actionable crash\nlatest safe tail\n")
+		os.Exit(17)
 	case "diagnostic":
 		fmt.Fprint(os.Stderr, "FATAL ERROR: startup failed\n")
 		fmt.Fprint(os.Stderr, "fixture {\n  token: '\x1b[31mse")
@@ -358,6 +378,75 @@ func TestProcessSuppressesRawDiagnosticsWithoutRedactor(t *testing.T) {
 	}
 }
 
+func TestProcessCloseAllowsNativeFlush(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows closes the owned job without a POSIX grace signal")
+	}
+	ctx := processTestContext(t)
+	marker := filepath.Join(t.TempDir(), "flushed")
+	spec := processFixture(t, "graceful")
+	spec.Env = append(os.Environ(), "AGENT_NEXT_TEST_FLUSH="+marker)
+	p := startProcessFixture(t, ctx, spec)
+	line, err := bufio.NewReader(p.Stdout()).ReadString('\n')
+	if err != nil || line != "ready\n" {
+		t.Fatalf("native flush handler was not ready: %q, %v", line, err)
+	}
+	if err := p.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exit, err := p.Wait(ctx)
+	if err != nil || exit.Code != 0 || exit.Signal != "" {
+		t.Fatalf("native flush was interrupted: %+v, %v", exit, err)
+	}
+	if body, err := os.ReadFile(marker); err != nil || string(body) != "flushed" {
+		t.Fatalf("native persistence was skipped: %q, %v", body, err)
+	}
+}
+
+func TestProcessCloseAtNativeEOF(t *testing.T) {
+	ctx := processTestContext(t)
+	p := startProcessFixture(t, ctx, processFixture(t, "exit"))
+	readProcessOutput(t, ctx, p)
+	if err := p.Close(ctx); err != nil {
+		t.Fatalf("closing at native EOF misclassified exit as a cleanup failure: %v", err)
+	}
+	exit, err := p.Wait(ctx)
+	if err != nil || exit.Code != 19 {
+		t.Fatalf("cleanup overwrote the native exit: %+v, %v", exit, err)
+	}
+}
+
+func TestProcessCloseEscalatesUnresponsiveChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses job termination")
+	}
+	ctx := processTestContext(t)
+	p := startProcessFixture(t, ctx, processFixture(t, "ignore-term"))
+	line, err := bufio.NewReader(p.Stdout()).ReadString('\n')
+	if err != nil || line != "ready\n" {
+		t.Fatalf("signal policy was not ready: %q, %v", line, err)
+	}
+	started := time.Now()
+	if err := p.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exit, err := p.Wait(ctx)
+	if err != nil || exit.Signal != "killed" || time.Since(started) < 1900*time.Millisecond {
+		t.Fatalf("stop did not honor the grace window before escalation: %+v, %v", exit, err)
+	}
+}
+
+func TestProcessRecoversDiagnosticAfterTruncatedInspect(t *testing.T) {
+	ctx := processTestContext(t)
+	spec := processFixture(t, "broken-inspect")
+	spec.Redact = RedactProcessDiagnostic
+	p := startProcessFixture(t, ctx, spec)
+	exit, err := p.Wait(ctx)
+	if err != nil || exit.Code != 17 || exit.Diagnostic != "FATAL ERROR: actionable crash" || exit.Tail != "latest safe tail" {
+		t.Fatalf("truncated inspect swallowed independent crash records: %+v, %v", exit, err)
+	}
+}
+
 func TestProcessSharedRedactorOmitsCredentialRecords(t *testing.T) {
 	for _, unsafe := range []string{
 		"Authorization: Bearer unknown-value",
@@ -373,5 +462,37 @@ func TestProcessSharedRedactorOmitsCredentialRecords(t *testing.T) {
 	}
 	if got := RedactProcessDiagnostic("authentication failed: sign in again"); got != "authentication failed: sign in again" {
 		t.Errorf("safe diagnostic was lost: %q", got)
+	}
+}
+
+func TestProcessDiagnosticRecordRecoveryAcrossChunks(t *testing.T) {
+	for _, prefix := range []string{
+		"inspect {\n  token: 'synthetic',\n",
+		"inspect {\n  token: 'unterminated\n",
+		"inspect {\n  payload: '" + strings.Repeat("x", processRecordLimit) + "\n",
+	} {
+		for _, stride := range []int{1, 7, 4096} {
+			var records []string
+			parser := processRecords{emit: func(record string) { records = append(records, record) }}
+			body := prefix + "FATAL ERROR: recovered\nlast safe record"
+			for offset := 0; offset < len(body); offset += stride {
+				end := min(offset+stride, len(body))
+				_, _ = parser.Write([]byte(body[offset:end]))
+			}
+			parser.finish()
+			if len(records) != 2 || records[0] != "FATAL ERROR: recovered" || records[1] != "last safe record" {
+				t.Fatalf("stride %d lost recovery or exposed incomplete payload: %q", stride, records)
+			}
+		}
+	}
+	var records []string
+	parser := processRecords{emit: func(record string) { records = append(records, record) }}
+	jsonRecord := "json {\n\"note\": \"it's one payload\",\n\"nested\": {\"ok\":true}\n}"
+	for _, b := range []byte(jsonRecord + "\nlast") {
+		_, _ = parser.Write([]byte{b})
+	}
+	parser.finish()
+	if len(records) != 2 || records[0] != jsonRecord || records[1] != "last" {
+		t.Fatalf("unindented JSON was incorrectly split as inspect: %q", records)
 	}
 }

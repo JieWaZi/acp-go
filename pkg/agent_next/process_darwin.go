@@ -65,15 +65,21 @@ func groupSignalError(pid int, err error) error {
 	if !errors.Is(err, unix.EPERM) {
 		return err
 	}
-	// Darwin also returns EPERM for a group containing only zombies. Do not
-	// mistake a real permission failure against a live member for success.
+	// Darwin also returns EPERM while the unreaped leader is exiting, before
+	// its exported state becomes SZOMB. The owner still waits for native exit;
+	// this classification only says there is no live target left to signal.
 	members, lookupErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pid)
 	if lookupErr != nil {
 		return errors.Join(err, lookupErr)
 	}
-	const zombie = 5 // SZOMB in Darwin's sys/proc.h.
+	const zombie = 5           // SZOMB in Darwin's sys/proc.h.
+	const exiting = 0x00002000 // P_WEXIT in Darwin's sys/proc.h.
 	for _, member := range members {
-		if member.Proc.P_stat != zombie {
+		if member.Proc.P_stat == zombie {
+			continue
+		}
+		// Only this owner's unreaped leader has a reserved, stable PID.
+		if int(member.Proc.P_pid) != pid || member.Proc.P_flag&exiting == 0 {
 			return err
 		}
 	}

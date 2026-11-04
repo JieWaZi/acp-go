@@ -26,6 +26,8 @@ func (*processTree) observeExit(int) error { return nil }
 
 func (*processTree) usesLeaderIdentity() bool { return false }
 
+func (*processTree) terminate(*os.Process) (bool, error) { return false, nil }
+
 func (*processTree) stop(*os.Process) error { return nil }
 
 func (*processTree) release() error { return nil }

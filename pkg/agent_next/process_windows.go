@@ -122,6 +122,8 @@ func (*processTree) observeExit(int) error { return nil }
 
 func (*processTree) usesLeaderIdentity() bool { return false }
 
+func (*processTree) terminate(*os.Process) (bool, error) { return false, nil }
+
 func (tree *processTree) stop(child *os.Process) error {
 	if tree.assigned {
 		return windows.TerminateJobObject(tree.job, 1)

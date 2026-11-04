@@ -34,6 +34,14 @@ func (tree *processTree) observeExit(pid int) error { return tree.observer.wait(
 
 func (*processTree) usesLeaderIdentity() bool { return true }
 
+func (*processTree) terminate(child *os.Process) (bool, error) {
+	err := unix.Kill(-child.Pid, unix.SIGTERM)
+	if errors.Is(err, unix.ESRCH) {
+		return true, nil
+	}
+	return true, groupSignalError(child.Pid, err)
+}
+
 func (*processTree) stop(child *os.Process) error {
 	err := unix.Kill(-child.Pid, unix.SIGKILL)
 	if errors.Is(err, unix.ESRCH) {
