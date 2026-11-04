@@ -293,8 +293,9 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	model := modelOption(s.config.options)
 	modelWrite := model != nil && model.Id == wanted.id
 	legacy := modelWrite && s.config.legacy
+	processWide := modelWrite && c.opts.Protocol.ModelScope == ModelPerProcess
 	confirmedCurrent := settingConfirmed(s.config, wanted) || legacy && s.config.legacyRequested == wanted.value
-	if confirmedCurrent && (!modelWrite || c.opts.Protocol.ModelScope == ModelPerSession || c.processModel == wanted.value) {
+	if confirmedCurrent && (!processWide || c.processModel == wanted.value) {
 		options := s.config.options
 		c.mu.Unlock()
 		result, err := clone(acp.SetSessionConfigOptionResponse{ConfigOptions: options})
@@ -316,6 +317,10 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 			return ErrRestartRequired
 		}
 		initial = s.config.sequence
+		if processWide {
+			// A rejected or interrupted write can still change the process model.
+			c.processModel = ""
+		}
 		return nil
 	})
 	r := acp.SendClientRequestWithReceipt[setupResult](conn, ctx, method, params, hooks, func(r acp.RequestReceipt[setupResult]) {
@@ -331,9 +336,6 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 			s.config.legacyRequested = wanted.value
 			confirmed = true
 		}
-		if modelWrite && confirmed && c.opts.Protocol.ModelScope == ModelPerProcess {
-			c.processModel = wanted.value
-		}
 	})
 	if err := sessionReceiptFailure(c, r, method, s.id); err != nil {
 		if r.PeerErr == nil && r.Write.BytesWritten > 0 && !confirmed {
@@ -346,6 +348,9 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 		return acp.SetSessionConfigOptionResponse{}, errors.Join(normalizationErr, errUnconfirmedSetting)
 	}
 	c.mu.Lock()
+	if processWide {
+		c.processModel = wanted.value
+	}
 	options := s.config.options
 	c.mu.Unlock()
 	meta := copyMeta(r.Result.Meta)

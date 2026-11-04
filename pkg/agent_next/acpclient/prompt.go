@@ -325,12 +325,14 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 	if response != nil {
 		standard := t.session.usage.consume(c.opts.Protocol.PromptUsage, response.Usage)
 		if native, ok := acpmeta.ReadTurnUsage(response.Meta); ok {
-			if standard != nil {
-				native.Observations = append(native.Observations, standard.Observations...)
-			}
 			outcome.Turn.Usage = &native
-		} else if standard != nil {
+		} else if standard != nil && (t.usage == nil || c.opts.Protocol.PromptUsage == UsageInvocation) {
 			outcome.Turn.Usage = standard
+		}
+		if standard != nil && outcome.Turn.Usage != standard && len(standard.Observations) != 0 {
+			invocation := *outcome.Turn.Usage
+			invocation.Observations = slices.Concat(invocation.Observations, standard.Observations)
+			outcome.Turn.Usage = &invocation
 		}
 		switch response.StopReason {
 		case acp.StopReasonEndTurn, acp.StopReasonMaxTokens, acp.StopReasonMaxTurnRequests, acp.StopReasonRefusal:

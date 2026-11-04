@@ -22,7 +22,10 @@ type wireUsage struct {
 type usageCounter struct {
 	// fresh proves a zero baseline only for the first response of a new session.
 	fresh bool
-	// previous is the immediate prior response; gaps cannot be billed as one turn.
+	// highWater survives gaps and regressions of the same native counter.
+	highWater wireUsage
+	// previous is the immediate prior response; a missing or regressed component
+	// cannot bound the usage of the next invocation.
 	previous wireUsage
 }
 
@@ -30,32 +33,16 @@ func (counter *usageCounter) consume(scope PromptUsageScope, value *wireUsage) *
 	if scope == UsageUnavailable {
 		return nil
 	}
-	fresh, previous := counter.fresh || scope == UsageInvocation, counter.previous
-	counter.fresh = false
+	var sample wireUsage
+	if scope == UsageSessionCumulative {
+		sample = counter.advance(value)
+	} else if value != nil {
+		sample = *value
+	}
 	if value == nil {
-		counter.previous = wireUsage{}
 		return nil
 	}
-	counter.previous = *value
-	delta := func(current, baseline *int64) *int64 {
-		current = nonnegative(current)
-		if current == nil {
-			return nil
-		}
-		if fresh {
-			return current
-		}
-		baseline = nonnegative(baseline)
-		if baseline == nil || *current < *baseline {
-			return nil
-		}
-		return acp.Ptr(*current - *baseline)
-	}
-	invocation := wireUsage{
-		Input: delta(value.Input, previous.Input), Output: delta(value.Output, previous.Output),
-		CacheRead: delta(value.CacheRead, previous.CacheRead), CacheWrite: delta(value.CacheWrite, previous.CacheWrite),
-		Thought: delta(value.Thought, previous.Thought),
-	}.normalized()
+	invocation := sample.normalized()
 	result := &acpmeta.TurnUsage{
 		InputTokens: invocation.InputTokens, CacheReadTokens: invocation.CacheReadTokens,
 		CacheWriteTokens: invocation.CacheWriteTokens, OutputTokens: invocation.OutputTokens,
@@ -69,6 +56,42 @@ func (counter *usageCounter) consume(scope PromptUsageScope, value *wireUsage) *
 		}}
 	}
 	return result
+}
+
+func (counter *usageCounter) advance(value *wireUsage) wireUsage {
+	fresh, previous := counter.fresh, counter.previous
+	counter.fresh = false
+	if value == nil {
+		counter.previous = wireUsage{}
+		return wireUsage{}
+	}
+	counter.previous = *value
+	delta := func(current, adjacent *int64, highWater **int64) *int64 {
+		current = nonnegative(current)
+		if current == nil {
+			return nil
+		}
+		baseline := *highWater
+		if baseline != nil && *current < *baseline {
+			return nil
+		}
+		*highWater = current
+		if fresh {
+			return current
+		}
+		if baseline == nil || adjacent == nil || *adjacent != *baseline {
+			return nil
+		}
+		return acp.Ptr(*current - *baseline)
+	}
+	high := &counter.highWater
+	return wireUsage{
+		Input:      delta(value.Input, previous.Input, &high.Input),
+		Output:     delta(value.Output, previous.Output, &high.Output),
+		CacheRead:  delta(value.CacheRead, previous.CacheRead, &high.CacheRead),
+		CacheWrite: delta(value.CacheWrite, previous.CacheWrite, &high.CacheWrite),
+		Thought:    delta(value.Thought, previous.Thought, &high.Thought),
+	}
 }
 
 func (value wireUsage) normalized() acpmeta.ModelUsage {

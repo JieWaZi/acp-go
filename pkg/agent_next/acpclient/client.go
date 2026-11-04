@@ -86,7 +86,7 @@ type Client struct {
 	opening *opening
 	// turn is the reserved foreground invocation, including preparation and settlement.
 	turn *turn
-	// processModel is the last model the process confirmed, scoped to this transport.
+	// processModel is the confirmed model on this transport, empty after an uncertain set.
 	processModel acp.SessionConfigValueId
 	// catalog caches an explicitly discovered native catalog for this credential.
 	catalog *acpmeta.ModelCatalog

@@ -37,6 +37,7 @@ func TestCursorFixture(t *testing.T) {
 	var promptID json.RawMessage
 	var prompts, opens int
 	var callbackWaiting bool
+	activeModel := ""
 	usage := func() map[string]any {
 		return map[string]any{"inputTokens": prompts * 17, "cachedReadTokens": 0, "cachedWriteTokens": 0}
 	}
@@ -85,11 +86,12 @@ func TestCursorFixture(t *testing.T) {
 			reply(msg.ID, map[string]any{})
 		case "session/new":
 			opens++
-			if scenario == "process-model" {
+			if scenario == "process-model" || scenario == "family-failed-model" {
 				id, model := "one", "model-a"
 				if opens == 2 {
 					id, model = "two", "model-b"
 				}
+				activeModel = model
 				reply(msg.ID, map[string]any{"sessionId": id, "configOptions": modelOptions(model, opens == 1)})
 				continue
 			}
@@ -115,9 +117,14 @@ func TestCursorFixture(t *testing.T) {
 				reply(msg.ID, map[string]any{})
 				continue
 			}
-			if scenario == "process-model" {
+			if scenario == "process-model" || scenario == "family-failed-model" {
 				switch msg.Params["configId"] {
 				case "native-model":
+					activeModel = fmt.Sprint(msg.Params["value"])
+					if scenario == "family-failed-model" && activeModel == "model-b" {
+						_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": -32602, "message": "could not confirm model save"}})
+						continue
+					}
 					reply(msg.ID, map[string]any{"configOptions": modelOptions(fmt.Sprint(msg.Params["value"]), false)})
 				case "native-fast":
 					reply(msg.ID, map[string]any{"configOptions": modelOptions("model-a", msg.Params["value"] == true)})
@@ -161,6 +168,42 @@ func TestCursorFixture(t *testing.T) {
 				continue
 			}
 			tokens := usage()
+			if scenario == "family-failed-model" {
+				reply(msg.ID, map[string]any{"stopReason": "end_turn", "_meta": acpmeta.WithTurnUsage(nil, acpmeta.TurnUsage{Model: activeModel, InputTokens: acp.Ptr(int64(1)), Coverage: "invocation", Source: "fixture.actual-model"})})
+				continue
+			}
+			if scenario == "family-usage-dip" {
+				values := []int{100, 80, 110, 116, 94, 98, 120, 126}
+				tokens = map[string]any{"inputTokens": values[prompts-1], "outputTokens": values[prompts-1] / 2, "cachedReadTokens": 0, "cachedWriteTokens": 0}
+			}
+			if scenario == "family-usage-gap" {
+				values := []map[string]any{
+					{"inputTokens": 100, "outputTokens": 50, "cachedReadTokens": 2, "cachedWriteTokens": 1},
+					{"inputTokens": 110, "outputTokens": 55, "cachedReadTokens": 3},
+					{"inputTokens": 120, "outputTokens": 60, "cachedReadTokens": 4, "cachedWriteTokens": 2},
+					nil,
+					{"inputTokens": 140, "outputTokens": 70, "cachedReadTokens": 7, "cachedWriteTokens": 4},
+					{"inputTokens": 150, "outputTokens": 75, "cachedReadTokens": 8, "cachedWriteTokens": 5},
+				}
+				tokens = values[prompts-1]
+			}
+			if scenario == "family-scoped-usage" {
+				response := map[string]any{"stopReason": "end_turn", "usage": map[string]any{
+					"inputTokens": 100 + (prompts-1)*11, "outputTokens": 50 + (prompts-1)*6, "cachedReadTokens": 0, "cachedWriteTokens": 0,
+				}}
+				if prompts <= 2 {
+					notify("one", "usage_update", map[string]any{"used": 9, "size": 100, "_meta": acpmeta.WithTurnUsage(nil, acpmeta.TurnUsage{
+						InputTokens: acp.Ptr(int64(7)), OutputTokens: acp.Ptr(int64(4)), Source: "fixture.invocation", Coverage: "invocation", Complete: true,
+					})})
+				}
+				if prompts == 2 {
+					response["_meta"] = acpmeta.WithTurnUsage(nil, acpmeta.TurnUsage{
+						InputTokens: acp.Ptr(int64(8)), OutputTokens: acp.Ptr(int64(5)), Source: "fixture.final", Coverage: "invocation", Complete: true,
+					})
+				}
+				reply(msg.ID, response)
+				continue
+			}
 			if scenario == "unknown-cache" {
 				delete(tokens, "cachedWriteTokens")
 			}
@@ -296,8 +339,17 @@ func reserve(t *testing.T, client *cursor.Client, ctx context.Context, opts agen
 
 func requireTerminal(t *testing.T, result agentclient.PromptResult, reason acp.StopReason) {
 	t.Helper()
+	requireStopReason(t, result, reason)
+	usage := result.Outcome.Turn.Usage
+	if usage == nil || usage.InputTokens == nil || *usage.InputTokens != 17 || usage.OutputTokens != nil {
+		t.Fatalf("native usage = %#v", usage)
+	}
+}
+
+func requireStopReason(t *testing.T, result agentclient.PromptResult, reason acp.StopReason) {
+	t.Helper()
 	o := result.Outcome
-	if o == nil || o.StopReason == nil || *o.StopReason != reason || o.Turn.Usage == nil || o.Turn.Usage.InputTokens == nil || *o.Turn.Usage.InputTokens != 17 || o.Turn.Usage.OutputTokens != nil || result.Receipt.Admission != agentclient.AdmissionConfirmed {
+	if o == nil || o.StopReason == nil || *o.StopReason != reason || result.Receipt.Admission != agentclient.AdmissionConfirmed {
 		t.Fatalf("native facts = %#v / %#v", result.Receipt, o)
 	}
 	if result.Receipt.Input.NativeInputID != nil {
@@ -857,5 +909,133 @@ func TestForkReceiptFailureDoesNotPublishChildAdmission(t *testing.T) {
 	}
 	if _, err := client.CloseSession(ctx, acp.CloseSessionRequest{SessionId: result.SessionId}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFamilyReviewUsageDipCannotLowerHighWater(t *testing.T) {
+	client, ctx, trace := candidate(t, "family-usage-dip", agentclient.HostCallbacks{})
+	openOne(t, client, ctx, trace)
+	for i, want := range []struct{ input, output, observed int64 }{
+		{100, 50, 100}, {-1, -1, 80}, {-1, -1, 110}, {6, 3, 116},
+		{-1, -1, 94}, {-1, -1, 98}, {-1, -1, 120}, {6, 3, 126},
+	} {
+		if i == 4 {
+			if _, err := client.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: "one", Cwd: filepath.Dir(trace)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		result := reserve(t, client, ctx, agentclient.PromptOptions{})()
+		requireStopReason(t, result, acp.StopReasonEndTurn)
+		u := result.Outcome.Turn.Usage
+		if u == nil || u.Complete != (want.input >= 0) || len(u.Observations) != 1 || u.Observations[0].Coverage != "session_cumulative" {
+			t.Fatalf("turn %d: usage = %+v", i+1, u)
+		}
+		checkTokenCount(t, u.InputTokens, want.input)
+		checkTokenCount(t, u.OutputTokens, want.output)
+		checkTokenCount(t, u.Observations[0].Tokens.InputTokens, want.observed)
+	}
+}
+
+func TestFamilyReviewUsageGapsRequireNewAdjacentBaseline(t *testing.T) {
+	client, ctx, trace := candidate(t, "family-usage-gap", agentclient.HostCallbacks{})
+	openOne(t, client, ctx, trace)
+	for i, want := range []struct{ input, output, read, write int64 }{
+		{97, 50, 2, 1}, {-1, 5, 1, -1}, {-1, 5, 1, -1},
+		{-1, -1, -1, -1}, {-1, -1, -1, -1}, {8, 5, 1, 1},
+	} {
+		result := reserve(t, client, ctx, agentclient.PromptOptions{})()
+		requireStopReason(t, result, acp.StopReasonEndTurn)
+		u := result.Outcome.Turn.Usage
+		if i == 3 {
+			if u != nil {
+				t.Fatalf("absent native sample produced usage: %+v", u)
+			}
+			continue
+		}
+		if u == nil || u.Complete != (want.input >= 0) {
+			t.Fatalf("turn %d: usage = %+v", i+1, u)
+		}
+		checkTokenCount(t, u.InputTokens, want.input)
+		checkTokenCount(t, u.OutputTokens, want.output)
+		checkTokenCount(t, u.CacheReadTokens, want.read)
+		checkTokenCount(t, u.CacheWriteTokens, want.write)
+	}
+}
+
+func checkTokenCount(t *testing.T, got *int64, want int64) {
+	t.Helper()
+	if want < 0 && got == nil || want >= 0 && got != nil && *got == want {
+		return
+	}
+	if got == nil {
+		t.Fatalf("token count unknown, want %d", want)
+	}
+	t.Fatalf("token count %d, want %d (-1 is unknown)", *got, want)
+}
+
+func TestFamilyReviewExplicitUsageSurvivesRestoredCumulativeBaseline(t *testing.T) {
+	client, ctx, trace := candidate(t, "family-scoped-usage", agentclient.HostCallbacks{})
+	openOne(t, client, ctx, trace)
+	if _, err := client.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: "one", Cwd: filepath.Dir(trace)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct {
+		source                  string
+		input, output, observed int64
+	}{
+		{"fixture.invocation", 7, 4, 100},
+		{"fixture.final", 8, 5, 111},
+		{"acp/prompt", 11, 6, 122},
+	} {
+		result := reserve(t, client, ctx, agentclient.PromptOptions{})()
+		requireStopReason(t, result, acp.StopReasonEndTurn)
+		u := result.Outcome.Turn.Usage
+		if u == nil || u.Source != want.source || u.Coverage != "invocation" || !u.Complete || len(u.Observations) != 1 || u.Observations[0].Coverage != "session_cumulative" {
+			t.Fatalf("usage for %s: %+v", want.source, u)
+		}
+		checkTokenCount(t, u.InputTokens, want.input)
+		checkTokenCount(t, u.OutputTokens, want.output)
+		checkTokenCount(t, u.Observations[0].Tokens.InputTokens, want.observed)
+	}
+}
+
+func TestFamilyReviewFailedModelSetterInvalidatesProcessEvidence(t *testing.T) {
+	c, ctx, trace := candidate(t, "family-failed-model", agentclient.HostCallbacks{})
+	openOne(t, c, ctx, trace)
+	b := openOne(t, c, ctx, trace)
+	first := reserve(t, c, ctx, agentclient.PromptOptions{})()
+	if first.Outcome == nil || first.Outcome.Turn.Usage == nil || first.Outcome.Turn.Usage.Model != "model-a" {
+		t.Fatalf("could not establish model-a: %+v", first)
+	}
+	_, err := c.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		SessionId: b.SessionId, ConfigId: "native-model", Value: "model-b",
+	}})
+	if err == nil {
+		t.Fatal("fixture did not reject model-b confirmation")
+	}
+	second := reserve(t, c, ctx, agentclient.PromptOptions{})()
+	requireStopReason(t, second, acp.StopReasonEndTurn)
+	if second.Outcome.Turn.Usage == nil || second.Outcome.Turn.Usage.Model != "model-a" {
+		t.Fatalf("prompt intended model-a but native actually used %v", second.Outcome.Turn.Usage)
+	}
+	wire, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sequence []string
+	for _, line := range strings.Split(string(wire), "\n") {
+		if strings.Contains(line, `"configId":"native-model"`) {
+			if strings.Contains(line, `"value":"model-a"`) {
+				sequence = append(sequence, "model-a")
+			} else if strings.Contains(line, `"value":"model-b"`) {
+				sequence = append(sequence, "model-b")
+			}
+		}
+		if strings.Contains(line, `"method":"session/prompt"`) {
+			sequence = append(sequence, "prompt")
+		}
+	}
+	if strings.Join(sequence, ",") != "model-a,prompt,model-b,model-a,prompt" {
+		t.Fatalf("model write order: %v", sequence)
 	}
 }

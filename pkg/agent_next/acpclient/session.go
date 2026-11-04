@@ -23,7 +23,7 @@ type session struct {
 	id acp.SessionId
 	// config contains the current native options, including real setter keys.
 	config configuration
-	// usage tracks the native cumulative counter since the last valid response.
+	// usage keeps cumulative evidence for the native session counter.
 	usage usageCounter
 	// toolOwners fences known stale callback/tool identities across turns.
 	toolOwners map[acp.ToolCallId]string
@@ -218,6 +218,8 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	}
 	if p.previous != nil {
 		p.session.config, p.session.modes = p.previous.config, p.previous.modes
+		// Restore the same counter without treating the old generation as adjacent.
+		p.session.usage.highWater = p.previous.usage.highWater
 		p.session.instructions = p.previous.instructions
 		p.session.usedInputIDs = p.previous.usedInputIDs
 		p.session.toolOwners = p.previous.toolOwners
