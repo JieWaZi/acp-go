@@ -15,6 +15,11 @@ import (
 )
 
 func (s *session) receive(frame protocol.Message) {
+	var cwdErr error
+	if init, ok := frame.(*protocol.SystemInitMessage); ok && s.launch.workspace != nil {
+		// Native paths are resolved outside the admission lock.
+		cwdErr = s.launch.workspace.verifyNativeDirectory(init.CWD)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fault != nil {
@@ -24,6 +29,10 @@ func (s *session) receive(frame protocol.Message) {
 	case *protocol.SystemInitMessage:
 		if m.SessionID != "" && m.SessionID != string(s.id) {
 			s.faultAndStopLocked(errors.New("Claude reported a different session ID"))
+			return
+		}
+		if cwdErr != nil {
+			s.faultAndStopLocked(cwdErr)
 			return
 		}
 		s.init = *m
@@ -48,9 +57,6 @@ func (s *session) receive(frame protocol.Message) {
 		}
 	case *protocol.UserMessage:
 		if s.matches(m.SessionID) {
-			if in := s.sent[m.UUID]; in != nil && m.ParentToolUseID == nil {
-				in.echoed = true
-			}
 			s.toolResultsLocked(m)
 		}
 	case *protocol.ToolProgressMessage:
@@ -82,7 +88,7 @@ func (s *session) systemLocked(m *protocol.SystemMessage) {
 		if m.State == "running" || m.State == "requires_action" {
 			// A state snapshot proves the native boundary, but it carries
 			// no input ID and cannot prove which pending input it consumed.
-			s.nativeInvocationLocked(protocol.TurnIdentity{}, false)
+			s.observeLivenessLocked()
 		} else if m.State == "idle" && s.current == nil {
 			s.nativeQueued = 0
 			s.signalLocked()
@@ -97,19 +103,18 @@ func (s *session) systemLocked(m *protocol.SystemMessage) {
 		s.initialization.Commands = slices.Clone(m.Commands)
 		s.announceCommandsLocked()
 	case "compact_boundary", "status":
-		if s.current == nil && m.Subtype == "compact_boundary" && m.CompactMetadata != nil && m.CompactMetadata.Trigger == "manual" {
-			s.nativeInvocationLocked(protocol.TurnIdentity{}, true)
-		}
-		if inv := s.current; inv != nil {
-			if m.Subtype == "compact_boundary" && m.CompactMetadata != nil && m.CompactMetadata.Trigger == "manual" || m.CompactResult == "success" {
-				inv.compactConfirmed = true
-			}
-		}
+		s.observeCompactionLocked(m)
+	case "thinking_tokens":
+		s.observeMainLocked(m.TurnIdentity)
 	case "api_retry":
 		if inv := s.current; inv != nil {
 			s.sendTurnLocked(inv, metaEvent(), map[string]any{"claude.retry": map[string]any{
 				"attempt": m.RetryAttempt, "max_attempts": m.MaxRetries, "delay_ms": m.RetryDelayMS, "http_status": m.RetryHTTPStatus,
 			}})
+		}
+	case "model_refusal_fallback":
+		if s.current != nil && m.FallbackScope != "local" {
+			s.current.output.evict(m.RetractedMessages)
 		}
 	case "conversation_reset":
 		s.counters = newQueryCounters(false)
@@ -161,152 +166,6 @@ func (s *session) rateLimitLocked(m *protocol.RateLimitMessage) {
 	}
 }
 
-func consumedIDs(identity protocol.TurnIdentity) []string {
-	ids := identity.UserMessageUUIDs
-	if len(ids) == 0 && identity.UserMessageUUID != "" {
-		ids = []string{identity.UserMessageUUID}
-	}
-	out := make([]string, 0, min(len(ids), maxPendingInputs))
-	for _, id := range ids {
-		if !isUUID(id) || slices.Contains(out, id) {
-			continue
-		}
-		out = append(out, id)
-		if len(out) == maxPendingInputs {
-			break
-		}
-	}
-	return out
-}
-
-// nativeInvocationLocked resolves the native owner before recording consumed
-// UUIDs. A bare running notification can nominate an opening input; the
-// subsequent main-thread reply must independently prove its consumption.
-func (s *session) nativeInvocationLocked(identity protocol.TurnIdentity, legacy bool) *invocation {
-	ids := consumedIDs(identity)
-	explicit := identity.UserMessageUUID != "" || len(identity.UserMessageUUIDs) > 0
-	provider := identity.ResumeReason != "" || identity.Origin != nil && identity.Origin.Kind != "" && identity.Origin.Kind != "human"
-	human := identity.Origin != nil && identity.Origin.Kind == "human"
-	inv := s.current
-	pending, related, allRetired := false, false, len(ids) > 0
-	for _, id := range ids {
-		if _, retired := s.retiredInputs[id]; retired {
-			continue
-		}
-		allRetired = false
-		if s.sent[id] != nil {
-			pending = true
-		}
-		if inv != nil {
-			_, seen := inv.seenInputs[id]
-			related = related || seen
-		}
-	}
-	if allRetired || inv != nil && explicit && !pending && !related && !provider && inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost {
-		return nil
-	}
-	opening := s.openingHostLocked()
-	if !explicit && !provider && legacy && opening != nil && opening.echoed &&
-		(inv == nil || inv.openingHost == opening && !inv.outcome.ObservedOutput) {
-		ids = []string{opening.identity.InputID}
-	}
-	if inv == nil {
-		origin := acpmeta.NativeTurnOriginUnknown
-		if provider || len(s.sent) == 0 {
-			origin = acpmeta.NativeTurnOriginProvider
-		}
-		inv = s.beginNativeLocked(origin)
-		if inv == nil {
-			return nil
-		}
-		inv.openingHost = opening
-	}
-	if inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginUnknown {
-		switch {
-		case provider:
-			inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginProvider
-		case inv.openingHost != nil && !inv.outcome.ObservedOutput &&
-			slices.Contains(ids, inv.openingHost.identity.InputID):
-			inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginHost
-		case human && (pending || related):
-			// Result frames can name an input already consumed by this
-			// invocation, after it has left the pending UUID registry.
-			inv.outcome.Turn.Origin = acpmeta.NativeTurnOriginHost
-		}
-	}
-	for _, id := range ids {
-		s.consumeLocked(inv, id)
-	}
-	if inv.outcome.Turn.Origin == acpmeta.NativeTurnOriginHost && inv.scope.HostInvocationID == "" && len(inv.inputs) > 0 {
-		inv.scope.HostInvocationID = inv.inputs[0].identity.HostInvocationID
-	}
-	for _, in := range inv.inputs {
-		s.reconcileCancellationLocked(in)
-	}
-	return inv
-}
-
-func (s *session) openingHostLocked() *input {
-	if len(s.sent) != 1 || s.nativeQueued != 0 {
-		return nil
-	}
-	for _, in := range s.sent {
-		if !in.mayFollowProvider && in.message.Priority == "" {
-			return in
-		}
-	}
-	return nil
-}
-
-func (s *session) beginNativeLocked(origin string) *invocation {
-	if len(s.retiredInputs) >= maxRememberedIDs || !s.ledger.reserve() {
-		s.faultAndStopLocked(errCapacity)
-		return nil
-	}
-	id, err := newUUID()
-	if err != nil {
-		s.ledger.complete(agentclient.NativeOutcome{}, false)
-		s.faultAndStopLocked(err)
-		return nil
-	}
-	ctx, cancel := context.WithCancel(s.ctx)
-	inv := &invocation{outcome: agentclient.NativeOutcome{
-		Turn: acpmeta.NativeTurn{InvocationID: id, Origin: origin}, PossibleSideEffects: true,
-	}, scope: agentclient.Scope{SessionID: s.id, NativeInvocationID: id}, seenInputs: make(map[string]struct{}),
-		ctx: ctx, cancel: cancel, closed: make(chan struct{}), partialUsage: make(map[string]requestUsage),
-	}
-	s.current = inv
-	s.epoch++
-	s.signalLocked()
-	return inv
-}
-
-func (s *session) consumeLocked(inv *invocation, id string) {
-	if len(inv.seenInputs) >= maxPendingInputs {
-		return
-	}
-	if _, seen := inv.seenInputs[id]; seen {
-		return
-	}
-	if _, retired := s.retiredInputs[id]; retired {
-		return
-	}
-	inv.seenInputs[id] = struct{}{}
-	inv.outcome.Turn.ConsumedInputIDs = append(inv.outcome.Turn.ConsumedInputIDs, id)
-	in := s.sent[id]
-	if in == nil {
-		return
-	}
-	delete(s.sent, id)
-	in.inv = inv
-	in.phase = consumed
-	in.submission = agentclient.SubmissionSent
-	in.admission = agentclient.AdmissionConfirmed
-	inv.inputs = append(inv.inputs, in)
-	inv.compact = inv.compact || in.compact
-	s.signalLocked()
-}
-
 func (s *session) resultLocked(m *protocol.ResultMessage) {
 	if startup := decodeOptional[struct {
 		Reason string `json:"startup_failure_reason"`
@@ -336,7 +195,7 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 		confirmed := s.current != nil && slices.Contains(s.current.outcome.Turn.ConsumedInputIDs, m.UserMessageUUID)
 		if !confirmed {
 			if in := s.sent[m.UserMessageUUID]; in != nil {
-				s.retiredInputs[m.UserMessageUUID] = struct{}{}
+				s.withdrawnInputs[m.UserMessageUUID] = struct{}{}
 				in.admission = agentclient.AdmissionNotAccepted
 				s.finishInputLocked(in, errors.New("Claude rejected native input delivery"))
 			}
@@ -344,37 +203,9 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 		}
 	}
 	gap := m.ResultIndex != nil && (s.lastResultSeen && *m.ResultIndex-s.lastResultIndex > 1 || !s.lastResultSeen && *m.ResultIndex > 0)
-	var inv, lost *invocation
-	if gap {
-		defer func() {
-			if lost != nil {
-				s.publishAfterDeliveryLocked(lost)
-			}
-		}()
-		s.counters = newQueryCounters(true)
-		if current := s.current; current != nil {
-			related := slices.ContainsFunc(consumedIDs(m.TurnIdentity), func(id string) bool {
-				_, known := current.seenInputs[id]
-				return known
-			})
-			if !related {
-				current.outcome.OperationError = errors.New("Claude native result sequence gap")
-				s.freezeNativeLocked(current)
-				lost = current
-			}
-		}
-		// Sequence proves this terminal exists even when no UUID or origin
-		// relates it to a waiter. Do not borrow either from the lost turn.
-		if s.current == nil && len(consumedIDs(m.TurnIdentity)) == 0 && m.ResumeReason == "" &&
-			(m.Origin == nil || m.Origin.Kind == "" || m.Origin.Kind == "human") {
-			inv = s.beginNativeLocked(acpmeta.NativeTurnOriginUnknown)
-		}
-	}
-	if inv == nil {
-		inv = s.nativeInvocationLocked(m.TurnIdentity, !gap)
-	}
-	if inv == nil {
-		return
+	if m.ResultIndex != nil {
+		s.lastResultIndex = *m.ResultIndex
+		s.lastResultSeen = true
 	}
 	if m.UUID != "" && len(m.UUID) <= 512 {
 		if len(s.terminalIDs) >= maxRememberedIDs {
@@ -382,11 +213,16 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 			return
 		}
 		s.terminalIDs[m.UUID] = struct{}{}
-		inv.outcome.Turn.TerminalEventID = acp.Ptr(m.UUID)
 	}
-	if m.ResultIndex != nil {
-		s.lastResultIndex = *m.ResultIndex
-		s.lastResultSeen = true
+	inv, lost := s.associateResultLocked(m.TurnIdentity, gap)
+	if inv == nil {
+		if lost != nil {
+			s.publishAfterDeliveryLocked(lost)
+		}
+		return
+	}
+	if m.UUID != "" && len(m.UUID) <= 512 {
+		inv.outcome.Turn.TerminalEventID = acp.Ptr(m.UUID)
 	}
 	if m.QueuedTurnCount != nil && *m.QueuedTurnCount >= 0 {
 		s.nativeQueued = *m.QueuedTurnCount
@@ -404,23 +240,24 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 	switch {
 	case reason != nil && *reason == acp.StopReasonCancelled:
 		inv.outcome.Turn.Status = acpmeta.NativeTurnCancelled
-	case failure != nil:
+	case failure != nil || nativeFailed(m) || m.TerminalReason == "max_turns":
 		inv.outcome.Turn.Status = acpmeta.NativeTurnFailed
 	default:
 		inv.outcome.Turn.Status = acpmeta.NativeTurnCompleted
 	}
-	if inv.compact && failure == nil && inv.outcome.Turn.Status == acpmeta.NativeTurnCompleted && !inv.compactConfirmed {
+	if inv.compact && failure == nil && inv.outcome.Turn.Status == acpmeta.NativeTurnCompleted && (inv.manualCompact == nil || inv.opening.initiator != inv.manualCompact || inv.manualCompact.inv != inv) {
 		inv.outcome.OperationError = errors.New("Claude did not confirm manual compaction")
 	}
-	if text := firstString(m.Result, inv.completeText); failure == nil && m.Subtype == "success" && m.LocalCommand == "" && inv.outcome.Turn.Status != acpmeta.NativeTurnCancelled && text != "" {
-		id := inv.lastMessage
-		if id == "" {
-			id = inv.outcome.Turn.InvocationID
-		}
-		inv.outcome.ObservedOutput = true
-		inv.outcome.FinalMessage = &agentclient.FinalMessage{ID: id, Text: text}
-		if inv.completeText == "" && inv.streamText == "" {
-			s.textLocked(inv, id, text, false, true)
+	if failure == nil && m.Subtype == "success" && m.LocalCommand == "" && inv.outcome.Turn.Status != acpmeta.NativeTurnCancelled {
+		if text := firstString(m.Result, inv.output.answerText()); text != "" {
+			id := inv.output.messageID(inv, false)
+			inv.outcome.ObservedOutput = true
+			inv.outcome.FinalMessage = &agentclient.FinalMessage{ID: id, Text: text}
+			if !inv.output.rendered {
+				s.textLocked(inv, id, text, false, true)
+			}
+		} else if inv.output.limited {
+			inv.outcome.Unavailable = append(inv.outcome.Unavailable, acpmeta.ReceiptResultTextUnavailable)
 		}
 	}
 	if lost == nil {
@@ -428,7 +265,6 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 	} else {
 		s.freezeNativeLocked(inv)
 		s.publishAfterDeliveryLocked(lost, inv)
-		lost = nil
 	}
 	s.refreshContextLocked()
 }
@@ -481,7 +317,7 @@ func (s *session) assistantLocked(m *protocol.AssistantMessage) {
 		}
 		return
 	}
-	inv := s.nativeInvocationLocked(m.TurnIdentity, true)
+	inv := s.observeMainLocked(m.TurnIdentity)
 	if inv == nil {
 		return
 	}
@@ -490,34 +326,25 @@ func (s *session) assistantLocked(m *protocol.AssistantMessage) {
 		inv.recordUsage(m.Message.ID, m.Message.Model, reportedUsage(*m.Message.Usage))
 	}
 	s.applyContextLocked(inv, m)
-	s.messageIdentity(inv, m.Message.ID)
-	var complete, thinking strings.Builder
+	o := &inv.output
+	frame, accepted := o.acceptFrame(m)
+	if !accepted {
+		return
+	}
+	o.beginRequest(m.Message.ID)
+	o.evict(m.Supersedes)
+	if m.Error != "" && m.Error != "max_output_tokens" {
+		return
+	}
 	for _, block := range m.Message.Content {
 		switch block.Type {
 		case "text":
-			if m.ParentToolUseID == nil {
-				complete.WriteString(block.Text)
-			}
+			s.completeAssistantBlockLocked(inv, frame, block.Text, false, m.Aborted)
 		case "thinking":
-			if m.ParentToolUseID == nil {
-				thinking.WriteString(block.Thinking)
-			}
+			s.completeAssistantBlockLocked(inv, frame, block.Thinking, true, m.Aborted)
 		case "tool_use", "server_tool_use":
-			s.startToolLocked(toolOwner{scope: inv.scope}, block)
+			s.assistantToolLocked(inv, block)
 		}
-	}
-	if m.ParentToolUseID != nil {
-		return
-	}
-	if complete.Len() > 0 && complete.String() != inv.completeText {
-		if strings.HasPrefix(complete.String(), inv.streamText) {
-			s.textLocked(inv, inv.lastMessage, strings.TrimPrefix(complete.String(), inv.streamText), false, true)
-		}
-		inv.completeText = boundedText(complete.String())
-	}
-	if thinking.Len() > 0 && strings.HasPrefix(thinking.String(), inv.streamThought) {
-		s.textLocked(inv, inv.lastMessage, strings.TrimPrefix(thinking.String(), inv.streamThought), true, true)
-		inv.streamThought = boundedText(thinking.String())
 	}
 }
 
@@ -529,26 +356,31 @@ func (s *session) streamLocked(m *protocol.StreamEventMessage) {
 		}
 		return
 	}
-	inv := s.nativeInvocationLocked(m.TurnIdentity, true)
+	e := m.Event
+	switch e.Type {
+	case "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop":
+	default:
+		return
+	}
+	inv := s.observeMainLocked(m.TurnIdentity)
 	if inv == nil {
 		return
 	}
-	e := m.Event
 	switch e.Type {
 	case "message_start":
-		if e.Message == nil || m.ParentToolUseID != nil {
+		if e.Message == nil {
 			return
 		}
 		inv.model = e.Message.Model
-		s.messageIdentity(inv, e.Message.ID)
+		inv.output.beginRequest(e.Message.ID)
 		if e.Message.Usage != nil {
 			inv.recordUsage(e.Message.ID, e.Message.Model, reportedUsage(*e.Message.Usage))
 		}
 	case "message_delta":
-		if e.Usage == nil || m.ParentToolUseID != nil {
+		if e.Usage == nil {
 			return
 		}
-		inv.recordUsage(inv.nativeMessage, inv.model, acpmeta.TurnUsage{
+		inv.recordUsage(inv.output.request, inv.model, acpmeta.TurnUsage{
 			InputTokens: e.Usage.InputTokens, CacheReadTokens: e.Usage.CacheReadInputTokens,
 			CacheWriteTokens: e.Usage.CacheCreationInputTokens, OutputTokens: nonnegative(e.Usage.OutputTokens),
 		})
@@ -556,51 +388,25 @@ func (s *session) streamLocked(m *protocol.StreamEventMessage) {
 		if e.ContentBlock == nil {
 			return
 		}
-		block := *e.ContentBlock
-		if block.Type == "tool_use" || block.Type == "server_tool_use" {
-			s.startToolLocked(toolOwner{scope: inv.scope}, block)
-		}
-		if block.Type == "text" && block.Text != "" && m.ParentToolUseID == nil {
-			if inv.lastMessage == "" {
-				s.messageIdentity(inv, "")
-			}
-			s.textLocked(inv, inv.lastMessage, block.Text, false, false)
-			inv.streamText = boundedConcat(inv.streamText, block.Text)
+		switch block := *e.ContentBlock; block.Type {
+		case "tool_use", "server_tool_use":
+			s.assistantToolLocked(inv, block)
+		case "text":
+			s.assistantDeltaLocked(inv, e.Index, block.Text, false)
+		case "thinking":
+			s.assistantDeltaLocked(inv, e.Index, block.Thinking, true)
 		}
 	case "content_block_delta":
-		if e.Delta == nil || m.ParentToolUseID != nil {
+		if e.Delta == nil {
 			return
-		}
-		if inv.lastMessage == "" {
-			s.messageIdentity(inv, "")
 		}
 		switch e.Delta.Type {
 		case "text_delta":
-			s.textLocked(inv, inv.lastMessage, e.Delta.Text, false, false)
-			inv.streamText = boundedConcat(inv.streamText, e.Delta.Text)
+			s.assistantDeltaLocked(inv, e.Index, e.Delta.Text, false)
 		case "thinking_delta":
-			s.textLocked(inv, inv.lastMessage, e.Delta.Thinking, true, false)
-			inv.streamThought = boundedConcat(inv.streamThought, e.Delta.Thinking)
+			s.assistantDeltaLocked(inv, e.Index, e.Delta.Thinking, true)
 		}
 	}
-}
-
-func (s *session) messageIdentity(inv *invocation, native string) {
-	if inv.lastMessage != "" && (native == "" || native == inv.nativeMessage || inv.nativeMessage == "") {
-		if inv.nativeMessage == "" {
-			inv.nativeMessage = native
-		}
-		return
-	}
-	id, err := newUUID()
-	if err != nil {
-		id = inv.outcome.Turn.InvocationID
-	}
-	inv.lastMessage = id
-	inv.nativeMessage = native
-	inv.streamText = ""
-	inv.streamThought = ""
-	inv.completeText = ""
 }
 
 func (s *session) textLocked(inv *invocation, id, text string, thinking, complete bool) {
@@ -624,20 +430,6 @@ func (s *session) textLocked(inv *invocation, id, text string, thinking, complet
 		update.AgentMessageChunk.Meta = acpmeta.WithMessageInfo(nil, info)
 	}
 	s.sendTurnLocked(inv, update, nil)
-}
-
-func boundedConcat(s, extra string) string {
-	if len(s) > maxTextBytes || len(extra) > maxTextBytes-len(s) {
-		return s
-	}
-	return s + extra
-}
-
-func boundedText(text string) string {
-	if len(text) > maxTextBytes {
-		return ""
-	}
-	return text
 }
 
 func (s *session) applyContextLocked(inv *invocation, m protocol.Message) {

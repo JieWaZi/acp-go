@@ -14,14 +14,15 @@ import (
 )
 
 const (
-	maxOutcomes         = 128
-	maxPageCount        = 16
-	maxPageBytes        = 512 << 10
-	maxOutcomeBytes     = 128 << 10
-	maxTextBytes        = 64 << 10
-	maxObservations     = 256
-	maxObservationBytes = 2 << 20
-	maxObservationFrame = 256 << 10
+	maxOutcomes                         = 128
+	maxPageCount                        = 16
+	maxPageBytes                        = 512 << 10
+	maxOutcomeBytes                     = 128 << 10
+	receiptUsageObservationsUnavailable = "turn.usage.observations"
+	maxTextBytes                        = 64 << 10
+	maxObservations                     = 256
+	maxObservationBytes                 = 2 << 20
+	maxObservationFrame                 = 256 << 10
 )
 
 var errObservationBudget = errors.New("Claude observation capacity exhausted")
@@ -98,6 +99,15 @@ func boundOutcome(o *agentclient.NativeOutcome) {
 	}
 	if outcomeSize(*o) <= maxOutcomeBytes {
 		return
+	}
+	// Drop overlapping evidence first; the primary accounting and result
+	// answer take priority within the canonical retention budget.
+	if u := o.Turn.Usage; u != nil && len(u.Observations) > 0 {
+		u.Observations = nil
+		o.Unavailable = append(o.Unavailable, receiptUsageObservationsUnavailable)
+		if outcomeSize(*o) <= maxOutcomeBytes {
+			return
+		}
 	}
 	if o.FinalMessage != nil {
 		o.FinalMessage = nil
@@ -223,12 +233,8 @@ func (s *session) freezeNativeLocked(inv *invocation) {
 	inv.sealedAt = time.Now()
 	inv.cancel()
 	close(inv.closed)
-	s.retireForegroundTasksLocked(inv)
 	if s.current == inv {
 		s.current = nil
-	}
-	for _, id := range inv.outcome.Turn.ConsumedInputIDs {
-		s.retiredInputs[id] = struct{}{}
 	}
 	if inv.outcome.Turn.Usage == nil {
 		inv.outcome.Turn.Usage = partialSnapshot(inv)
@@ -288,14 +294,16 @@ func (s *session) deliver() {
 		}
 		s.observationCount--
 		s.observationBytes -= d.bytes
-		deadline := time.Now().Add(s.client.options.ObservationTimeout)
+		now := time.Now()
+		deadline := s.observationDeadlineLocked(now)
 		if d.inv != nil && !d.inv.sealedAt.IsZero() {
 			deadline = minTime(deadline, d.inv.sealedAt.Add(s.client.options.ObservationTimeout))
-			if !deadline.After(time.Now()) && d.inv.deliveryErr == nil {
-				d.inv.deliveryErr = context.DeadlineExceeded
-			}
 		}
-		skip := s.observerErr != nil || (d.inv != nil && d.inv.deliveryErr != nil)
+		expired := !deadline.After(now)
+		if expired && d.inv != nil && d.inv.deliveryErr == nil {
+			d.inv.deliveryErr = context.DeadlineExceeded
+		}
+		skip := expired || s.observerErr != nil || (d.inv != nil && d.inv.deliveryErr != nil)
 		s.mu.Unlock()
 		if skip {
 			continue
@@ -322,6 +330,23 @@ func (s *session) deliver() {
 			s.mu.Unlock()
 		}
 	}
+}
+
+// A sealed terminal bounds the entire delivery prefix preceding its marker.
+// Unrelated session notifications cannot each spend a fresh receipt budget.
+func (s *session) observationDeadlineLocked(now time.Time) time.Time {
+	limit := s.client.options.ObservationTimeout
+	deadline := now.Add(limit)
+	for _, queued := range s.deliveries {
+		if len(queued.terminal) == 0 {
+			continue
+		}
+		for _, inv := range queued.terminal {
+			deadline = minTime(deadline, inv.sealedAt.Add(limit))
+		}
+		break
+	}
+	return deadline
 }
 
 func (s *session) finalizeOutcomeLocked(inv *invocation) {

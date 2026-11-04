@@ -89,3 +89,47 @@ func TestBackgroundToolObservationKeepsLaunchingScope(t *testing.T) {
 		t.Fatalf("late tool scope = %+v, old = %+v, new = %+v", scope, first.Outcome, second.Outcome)
 	}
 }
+
+func TestWorkspaceApprovalRequiresMatchingCallDirectoryAndTarget(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{"workspace-approval", "allow"},
+		{"workspace-path-substitution", "deny"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			calls := make(chan acp.RequestPermissionRequest, 1)
+			client, path, ctx := startMode(t, agentclient.HostCallbacks{RequestPermission: func(_ context.Context, _ agentclient.Scope, req acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+				calls <- req
+				return acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
+					Selected: &acp.RequestPermissionOutcomeSelected{OptionId: "allow_once"},
+				}}, nil
+			}}, tc.mode, func(o *claude.Options) {
+				o.Launch = claude.LaunchOptions{WorkspaceOnly: true, ExcludedWriteDirectories: []string{"protected"}}
+			})
+			r := receive(t, ctx, launchPrompt(t, client, ctx, "file approval"))
+			if r.Outcome == nil || r.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+				t.Fatalf("result = %+v", r)
+			}
+			reply := string(marker(t, ctx, filepath.Join(filepath.Dir(path), "interaction-permission-followup")))
+			if !strings.Contains(reply, "behavior:"+tc.want) || len(calls) != map[string]int{"allow": 1, "deny": 0}[tc.want] {
+				t.Fatalf("native reply = %q, permission calls = %d", reply, len(calls))
+			}
+		})
+	}
+}
+
+func TestWorkspaceHookRejectsCallDirectoryInExcludedRoot(t *testing.T) {
+	client, path, ctx := startMode(t, agentclient.HostCallbacks{}, "rereview-hook-cwd", func(o *claude.Options) {
+		o.Launch = claude.LaunchOptions{WorkspaceOnly: true, ExcludedWriteDirectories: []string{"blocked"}}
+	})
+	r := receive(t, ctx, launchPrompt(t, client, ctx, "write with changed cwd"))
+	if r.Outcome == nil || r.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+		t.Fatalf("result = %+v", r)
+	}
+	reply := string(marker(t, ctx, filepath.Join(filepath.Dir(path), "interaction-wrong-cwd-hook")))
+	if !strings.Contains(reply, "permissionDecision:deny") {
+		t.Fatalf("native hook reply = %q", reply)
+	}
+}

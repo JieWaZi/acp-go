@@ -200,6 +200,12 @@ type MCPServerStatus struct {
 
 // SystemMessage carries native system events without dedicated message types.
 type SystemMessage struct {
+	// RetractedMessages identifies frames removed by native refusal fallback.
+	RetractedMessages []string `json:"retracted_message_uuids,omitempty"`
+	// FallbackScope distinguishes main-session fallback from sidechain fallback.
+	FallbackScope string `json:"scope,omitempty"`
+	// TurnIdentity carries input UUID evidence on native thinking progress.
+	TurnIdentity
 	// BackgroundTasks replaces the prior native snapshot when present.
 	BackgroundTasks *[]BackgroundTask `json:"tasks,omitempty"`
 	// CompactResult is an explicit success or failure from a compaction status frame.
@@ -236,8 +242,6 @@ type SystemMessage struct {
 
 // TaskMessage 合并 Task/Todo plan 所需的四类 system task 消息字段。
 type TaskMessage struct {
-	// IsBackgrounded marks a task whose execution can outlive its spawning turn.
-	IsBackgrounded bool `json:"is_backgrounded,omitempty"`
 	// RunID distinguishes resumed runs of the same task.
 	RunID string `json:"run_id,omitempty"`
 	// ParentTaskID identifies a tracked subagent that launched this task.
@@ -270,6 +274,10 @@ type TaskMessage struct {
 
 // AssistantMessage 是完成或组装后的 assistant 消息。
 type AssistantMessage struct {
+	// Supersedes identifies earlier native frames retracted by a fallback.
+	Supersedes []string `json:"supersedes,omitempty"`
+	// Aborted reports that the native stream stopped mid-block.
+	Aborted bool `json:"aborted,omitempty"`
 	// AgentID identifies the native subagent task when one owns this frame.
 	AgentID string `json:"agent_id,omitempty"`
 	// TurnIdentity carries native input correlation on this frame.
@@ -1080,6 +1088,10 @@ type HookCallbackRequest struct {
 
 // PreToolUseInput selects the native evidence needed for a write decision.
 type PreToolUseInput struct {
+	// CWD is the native working directory at this tool call.
+	CWD string `json:"cwd"`
+	// ToolUseID identifies the native tool that can later request approval.
+	ToolUseID string `json:"tool_use_id"`
 	// Event must be PreToolUse.
 	Event string `json:"hook_event_name"`
 	// SessionID binds the request to this native generation.

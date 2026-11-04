@@ -48,7 +48,7 @@ func newWorkspacePolicy(o LaunchOptions, cwd string, additional []string) (*work
 		paths = append(paths, filepath.Join(root, ".claude", "settings.json"), filepath.Join(root, ".claude", "settings.local.json"))
 	}
 	for _, raw := range paths {
-		path, err := p.resolve(raw)
+		path, err := resolveWorkspacePath(p.cwd, raw)
 		if err != nil {
 			return nil, err
 		}
@@ -126,43 +126,85 @@ func writesFile(tool string) bool {
 	}
 }
 
-func (p *workspacePolicy) hook(sessionID string, req protocol.HookCallbackRequest) protocol.HookCallbackResult {
-	result := func(decision, reason string) protocol.HookCallbackResult {
-		return protocol.HookCallbackResult{Output: &protocol.HookSpecificOutput{Event: "PreToolUse", Decision: decision, Reason: reason}}
-	}
-	input := decodeOptional[protocol.PreToolUseInput](req.Input)
-	if req.CallbackID != writeHookID || input == nil || input.SessionID != sessionID || input.Event != "PreToolUse" || !writesFile(input.Tool) {
-		return result("deny", "Unverified workspace write request.")
-	}
-	switch p.decision(input.Tool, input.Input) {
-	case "ask":
-		return result("ask", "This path is outside the permitted workspace roots.")
-	case "deny":
-		return result("deny", "This path is protected or could not be verified.")
-	default:
-		return protocol.HookCallbackResult{}
-	}
+// workspaceWrite binds a file approval to the native tool's own directory and
+// the physical target checked by PreToolUse.
+type workspaceWrite struct {
+	cwd     string
+	tool    string
+	rawPath string
+	target  string
 }
 
-func (p *workspacePolicy) decision(tool string, raw json.RawMessage) string {
-	if !writesFile(tool) {
+func (p *workspacePolicy) verifyNativeDirectory(cwd string) error {
+	actual, err := realDirectory(cwd)
+	if err != nil || actual != p.cwd {
+		return errors.New("Claude reported a working directory different from the admitted workspace")
+	}
+	return nil
+}
+
+func (p *workspacePolicy) hook(sessionID string, req protocol.HookCallbackRequest) (string, *workspaceWrite, protocol.HookCallbackResult) {
+	input := decodeOptional[protocol.PreToolUseInput](req.Input)
+	if req.CallbackID != writeHookID || input == nil || input.SessionID != sessionID ||
+		input.Event != "PreToolUse" || !writesFile(input.Tool) {
+		return "", nil, workspaceHookDecision("deny", "Unverified workspace write request.")
+	}
+	id := input.ToolUseID
+	cwd, err := realDirectory(input.CWD)
+	path := fileWritePath(input.Tool, input.Input)
+	if err != nil || p.pathPolicy(cwd) != "" {
+		return id, nil, workspaceHookDecision("deny", "The native working directory is outside the admitted workspace.")
+	}
+	target, err := resolveWorkspacePath(cwd, path)
+	if err != nil || p.pathPolicy(target) == "deny" {
+		return id, nil, workspaceHookDecision("deny", "This path is protected or could not be verified.")
+	}
+	write := &workspaceWrite{cwd: cwd, tool: input.Tool, rawPath: path, target: target}
+	if p.pathPolicy(target) == "ask" {
+		return id, write, workspaceHookDecision("ask", "This path is outside the permitted workspace roots.")
+	}
+	return id, write, protocol.HookCallbackResult{}
+}
+
+func workspaceHookDecision(decision, reason string) protocol.HookCallbackResult {
+	return protocol.HookCallbackResult{Output: &protocol.HookSpecificOutput{
+		Event: "PreToolUse", Decision: decision, Reason: reason,
+	}}
+}
+
+func (p *workspacePolicy) approval(write *workspaceWrite, req protocol.CanUseToolControlRequest) string {
+	if !writesFile(req.ToolName) {
 		return ""
 	}
+	if write == nil || write.tool != req.ToolName || write.rawPath != fileWritePath(req.ToolName, req.Input) {
+		return "deny"
+	}
+	cwd, err := realDirectory(write.cwd)
+	if err != nil || cwd != write.cwd || p.pathPolicy(cwd) != "" {
+		return "deny"
+	}
+	target, err := resolveWorkspacePath(cwd, write.rawPath)
+	if err != nil || target != write.target {
+		return "deny"
+	}
+	return p.pathPolicy(target)
+}
+
+func fileWritePath(tool string, raw json.RawMessage) string {
 	input := decodeOptional[struct {
 		File     string `json:"file_path"`
 		Notebook string `json:"notebook_path"`
 	}](raw)
 	if input == nil || input.File != "" && input.Notebook != "" {
-		return "deny"
+		return ""
 	}
-	path := input.File
 	if tool == "NotebookEdit" {
-		path = input.Notebook
+		return input.Notebook
 	}
-	path, err := p.resolve(path)
-	if err != nil {
-		return "deny"
-	}
+	return input.File
+}
+
+func (p *workspacePolicy) pathPolicy(path string) string {
 	if filepath.Base(filepath.Dir(path)) == ".claude" &&
 		(filepath.Base(path) == "settings.json" || filepath.Base(path) == "settings.local.json") {
 		return "deny"
@@ -180,7 +222,7 @@ func (p *workspacePolicy) decision(tool string, raw json.RawMessage) string {
 	return "ask"
 }
 
-func (p *workspacePolicy) resolve(raw string) (string, error) {
+func resolveWorkspacePath(cwd, raw string) (string, error) {
 	if raw == "" || strings.ContainsRune(raw, 0) {
 		return "", errors.New("missing Claude workspace path")
 	}
@@ -190,7 +232,7 @@ func (p *workspacePolicy) resolve(raw string) (string, error) {
 		}
 	}
 	if !filepath.IsAbs(raw) {
-		raw = filepath.Join(p.cwd, raw)
+		raw = filepath.Join(cwd, raw)
 	}
 	return resolveExistingParent(filepath.Clean(raw), 0)
 }

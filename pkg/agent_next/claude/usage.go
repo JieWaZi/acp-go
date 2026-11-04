@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/json"
+	"maps"
 	"math"
 	"math/big"
 	"strings"
@@ -170,24 +171,42 @@ func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, r
 	}
 	// A missing or zeroized report breaks adjacency for that counter alone.
 	// The next usable report seeds a new boundary without claiming the gap.
-	models, comparable := modelDeltas(q.models, modelReport)
+	models, nextModelBoundary := modelDeltas(q.models, modelReport)
 	cost := costDelta(q.cost, costReport)
-	q.models, q.cost = modelReport, costReport
+	q.models, q.cost = nextModelBoundary, costReport
 
-	if comparable {
+	var observations []acpmeta.UsageObservation
+	if models != nil {
 		rows := make([]acpmeta.ModelUsage, 0, len(models))
 		for _, row := range models {
 			rows = append(rows, row)
 		}
-		summary := turnCounters(sumCounters(rows), "claude.result.modelUsage", queryCoverage, true)
+		totals := sumCounters(rows)
+		complete := totals.InputTokens != nil && totals.OutputTokens != nil &&
+			totals.CacheReadTokens != nil && totals.CacheWriteTokens != nil
+		summary := turnCounters(totals, "claude.result.modelUsage", queryCoverage, complete)
 		summary.Models = models
 		if len(models) == 1 {
 			for id := range models {
 				summary.Model = id
 			}
 		}
-		if knownUsage(summary) {
+		// Select one scope for the primary totals. A partial pipeline
+		// cannot replace an independently verified main-loop component.
+		hasEvidence := knownUsage(summary) || totals.ReasoningTokens != nil
+		for _, row := range models {
+			if row.InputTokens != nil || row.OutputTokens != nil || row.CacheReadTokens != nil ||
+				row.CacheWriteTokens != nil || row.ReasoningTokens != nil || row.Cost != nil {
+				hasEvidence = true
+				break
+			}
+		}
+		if complete || !knownUsage(reported) && partial == nil && hasEvidence {
 			reported = summary
+		} else if hasEvidence {
+			observations = append(observations, acpmeta.UsageObservation{
+				Source: summary.Source, Coverage: summary.Coverage, Complete: summary.Complete, Tokens: totals, Models: models,
+			})
 		}
 	}
 	if reported.Coverage == mainLoopCoverage {
@@ -203,6 +222,7 @@ func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, r
 			reported.Models = partial.Models
 		}
 	}
+	reported.Observations = observations
 	reported.Cost = cost
 	reported.ContextKnown = inv.outcome.ContextUsage.UsedTokens != nil && inv.outcome.ContextUsage.WindowTokens != nil
 	if !knownUsage(reported) && len(reported.Models) == 0 && reported.Cost == nil {
@@ -220,20 +240,33 @@ func zeroPipeline(rows map[string]protocol.ModelUsage) bool {
 	return true
 }
 
-func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]acpmeta.ModelUsage, bool) {
+func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]acpmeta.ModelUsage, map[string]protocol.ModelUsage) {
 	if previous == nil || current == nil {
-		return nil, false
-	}
-	for model := range previous {
-		if _, exists := current[model]; !exists {
-			return nil, false
-		}
+		return nil, current
 	}
 	rows := make(map[string]acpmeta.ModelUsage, len(current))
+	var next map[string]protocol.ModelUsage
+	for model := range previous {
+		if _, exists := current[model]; !exists {
+			if next == nil {
+				next = maps.Clone(current)
+			}
+			if len(next) >= maxUsageRows {
+				// Dropping a missing model's history would turn its next
+				// appearance into a false delta from zero.
+				return nil, nil
+			}
+			next[model] = protocol.ModelUsage{}
+			rows[model] = acpmeta.ModelUsage{}
+		}
+	}
+	if next == nil {
+		next = current
+	}
 	for model, to := range current {
 		from, had := previous[model]
 		if model == "" {
-			return nil, false
+			return nil, nil
 		}
 		delta := func(key string, before, after int64) *int64 {
 			if !to.KnownCounters[key] || had && !from.KnownCounters[key] {
@@ -266,7 +299,7 @@ func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]a
 		}
 		rows[model] = row
 	}
-	return rows, true
+	return rows, next
 }
 
 func deltaCounter(from, to int64) *int64 {

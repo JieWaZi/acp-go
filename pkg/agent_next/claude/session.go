@@ -61,10 +61,11 @@ type session struct {
 	lastResultIndex   int64
 	lastResultSeen    bool
 	terminalIDs       map[string]struct{}
-	retiredInputs     map[string]struct{}
+	withdrawnInputs   map[string]struct{}
 	tools             map[string]*toolRecord
 	nativeTasks       map[string]*taskRecord
 	taskOwnershipFull bool
+	workspaceWrites   map[string]*workspaceWrite
 	// tasks counts admitted controls, interaction callbacks and asynchronous cleanup.
 	tasks            int
 	setting          bool
@@ -127,7 +128,7 @@ func (c *Client) open(ctx context.Context, req openRequest) (*session, error) {
 	s := &session{client: c, id: req.id, launch: plan, process: process, ctx: lifetime, cancel: end,
 		changed: make(chan struct{}), closeGate: make(chan struct{}, 1),
 		deliveryDone: make(chan struct{}), sent: make(map[string]*input), used: make(map[string]struct{}),
-		terminalIDs: make(map[string]struct{}), retiredInputs: make(map[string]struct{}), tools: make(map[string]*toolRecord), nativeTasks: make(map[string]*taskRecord),
+		terminalIDs: make(map[string]struct{}), withdrawnInputs: make(map[string]struct{}), tools: make(map[string]*toolRecord), nativeTasks: make(map[string]*taskRecord), workspaceWrites: make(map[string]*workspaceWrite),
 		interactions: make(map[string]context.CancelFunc), counters: newQueryCounters(req.resume || req.forkSource != ""),
 	}
 	c.mu.Lock()
@@ -173,9 +174,7 @@ func (c *Client) open(ctx context.Context, req openRequest) (*session, error) {
 	if err == nil && c.closing {
 		err = errClosed
 	}
-	if err == nil {
-		err = s.fault
-	}
+	err = firstError(s.fault, err)
 	if err == nil {
 		select {
 		case <-s.process.Done():
@@ -203,7 +202,7 @@ func (s *session) handshake(ctx context.Context) error {
 		off := false
 		req.SystemPromptSnapshot = &off
 	}
-	for _, path := range s.client.options.Launch.PluginDirectories {
+	for _, path := range s.launch.initializePlugins {
 		req.Plugins = append(req.Plugins, protocol.LocalPlugin{Type: "local", Path: path, SkipMCPDiscovery: true})
 	}
 	if s.launch.workspace != nil {
@@ -232,7 +231,7 @@ func (s *session) handshake(ctx context.Context) error {
 		return errors.New("Claude rejected the configured plugins")
 	}
 	var status protocol.MCPStatusResponse
-	if s.launch.mcpConfigured || len(req.Plugins) > 0 {
+	if s.launch.mcpConfigured || len(s.client.options.Launch.PluginDirectories) > 0 {
 		bounded, cancel := context.WithTimeout(ctx, s.client.options.ControlTimeout)
 		_ = s.wire.call(bounded, protocol.MCPStatusRequest{Subtype: "mcp_status"}, &status, nil, nil)
 		cancel()

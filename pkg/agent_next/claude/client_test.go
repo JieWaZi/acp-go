@@ -26,8 +26,17 @@ func start(t *testing.T, host agentclient.HostCallbacks) (sessionClient, string,
 
 func startMode(t *testing.T, host agentclient.HostCallbacks, mode string, configure func(*claude.Options)) (sessionClient, string, context.Context) {
 	t.Helper()
+	client, dir, ctx := startClientMode(t, host, mode, configure)
+	opened, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir})
+	if err != nil || opened.SessionId == "" {
+		t.Fatalf("open = %#v, %v", opened, err)
+	}
+	return sessionClient{client, opened.SessionId}, filepath.Join(dir, "input"), ctx
+}
+
+func startClientMode(t *testing.T, host agentclient.HostCallbacks, mode string, configure func(*claude.Options)) (*claude.Client, string, context.Context) {
+	t.Helper()
 	dir := t.TempDir()
-	marker := filepath.Join(dir, "input")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 	options := claude.Options{
@@ -50,11 +59,7 @@ func startMode(t *testing.T, host agentclient.HostCallbacks, mode string, config
 	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1, ClientCapabilities: acp.ClientCapabilities{Meta: map[string]any{acpmeta.NativeTurnReceiptsCapability: true}, Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}}}); err != nil {
 		t.Fatal(err)
 	}
-	opened, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir})
-	if err != nil || opened.SessionId == "" {
-		t.Fatalf("open = %#v, %v", opened, err)
-	}
-	return sessionClient{client, opened.SessionId}, marker, ctx
+	return client, dir, ctx
 }
 
 func (client sessionClient) prompt(value string) acp.PromptRequest {

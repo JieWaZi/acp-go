@@ -493,3 +493,74 @@ func TestCumulativeModelAndCostBoundariesAreIndependent(t *testing.T) {
 	check(receive(t, ctx, launchPrompt(t, client, ctx, "after compact")), 10, "query_pipeline", "")
 	check(receive(t, ctx, launchPrompt(t, client, ctx, "clear")), 5, "query_pipeline", "0.005000000000000000")
 }
+
+func TestReceiptDeadlineIncludesEarlierSessionObservations(t *testing.T) {
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{
+		Observe: func(ctx context.Context, scope agentclient.Scope, _ acp.SessionNotification) error {
+			if scope.NativeInvocationID == "" {
+				timer := time.NewTimer(75 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		},
+	}, "rereview-observation-prefix", func(o *claude.Options) {
+		o.ObservationTimeout = 100 * time.Millisecond
+	})
+	deadline, stop := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer stop()
+	r := receive(t, deadline, launchPrompt(t, client, ctx, "complete within the receipt budget"))
+	if r.Outcome == nil || r.Outcome.Turn.Status != acpmeta.NativeTurnCompleted || r.Outcome.Turn.Usage == nil {
+		t.Fatalf("native outcome = %+v", r.Outcome)
+	}
+}
+
+func TestMultipleAssistantBlocksReconcileStreamAndNativeFinalText(t *testing.T) {
+	text := make(chan string, 8)
+	client, _, ctx := startMode(t, notifyText(text), "rereview-multiple-assistant-blocks", nil)
+	r := receive(t, ctx, launchPrompt(t, client, ctx, "collect both blocks"))
+	if r.Outcome == nil || r.Outcome.FinalMessage == nil || r.Outcome.FinalMessage.Text != "first second" {
+		t.Fatalf("final message = %+v", r.Outcome)
+	}
+	var output strings.Builder
+	for len(text) > 0 {
+		output.WriteString(<-text)
+	}
+	if output.String() != "first second" {
+		t.Fatalf("stream = %q", output.String())
+	}
+}
+
+func TestToolNarrationDoesNotBecomeFinalAnswer(t *testing.T) {
+	text := make(chan string, 8)
+	client, _, ctx := startMode(t, notifyText(text), "rereview-tool-narration", nil)
+	r := receive(t, ctx, launchPrompt(t, client, ctx, "use a tool"))
+	if r.Outcome == nil || r.Outcome.FinalMessage != nil || r.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+		t.Fatalf("outcome = %+v", r.Outcome)
+	}
+	if got := receive(t, ctx, text); got != "I will use a tool." {
+		t.Fatalf("narration = %q", got)
+	}
+}
+
+func TestRefusalFallbackSupersedesNativeTextInCanonicalAnswer(t *testing.T) {
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{}, "rereview-fallback-supersedes", nil)
+	r := receive(t, ctx, launchPrompt(t, client, ctx, "retry fallback"))
+	if r.Outcome == nil || r.Outcome.FinalMessage == nil || r.Outcome.FinalMessage.Text != "replacement answer" {
+		t.Fatalf("native outcome = %+v", r.Outcome)
+	}
+}
+
+func TestMaxTurnsKeepsNativeFailureStatusAndACPStopReason(t *testing.T) {
+	client, _, ctx := startMode(t, agentclient.HostCallbacks{}, "rereview-max-turns", nil)
+	r := receive(t, ctx, launchPrompt(t, client, ctx, "reach native turn budget"))
+	if r.Outcome == nil || r.Outcome.Turn.Status != acpmeta.NativeTurnFailed ||
+		r.Outcome.StopReason == nil || *r.Outcome.StopReason != acp.StopReasonMaxTurnRequests ||
+		r.Outcome.Turn.Usage == nil {
+		t.Fatalf("native outcome = %+v", r.Outcome)
+	}
+}

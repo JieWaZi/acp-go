@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -374,5 +375,202 @@ func TestKnownForegroundSubagentPermissionUsesLaunchingOwner(t *testing.T) {
 	answer := string(marker(t, ctx, filepath.Join(dir, "interaction-foreground-agent-tool")))
 	if !strings.Contains(answer, "behavior:allow") {
 		t.Fatalf("native reply = %q", answer)
+	}
+}
+
+func TestRereviewNumberedRerunOfRetiredUUID(t *testing.T) {
+	peer, id, dir, ctx := startACP(t, "rereview-retired-rerun", nil, nil)
+	if _, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("original")}}); err != nil {
+		t.Fatal(err)
+	}
+	marker(t, ctx, filepath.Join(dir, "emitted-rerun"))
+	until := time.Now().Add(300 * time.Millisecond)
+	var page acpmeta.NativeTurnReceiptsResponse
+	for {
+		raw, err := peer.CallExtension(ctx, acpmeta.NativeTurnReceiptsMethod, acpmeta.NativeTurnReceiptsRequest{SessionID: string(id)})
+		if err != nil || json.Unmarshal(raw, &page) != nil {
+			t.Fatalf("receipts=%s, %v", raw, err)
+		}
+		if len(page.Receipts) == 2 {
+			if page.Receipts[1].Turn.Origin != "provider" || page.Receipts[1].Turn.Status != "completed" {
+				t.Fatalf("second=%+v", page.Receipts[1])
+			}
+			return
+		}
+		if time.Now().After(until) {
+			t.Fatalf("only %d receipt(s) after producer delivered numbered native rerun of exact retired UUID: %s", len(page.Receipts), raw)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+func TestRereviewPartialPipelineDoesNotHideKnownMainLoop(t *testing.T) {
+	assertUsage := func(t *testing.T, u *acpmeta.TurnUsage) {
+		t.Helper()
+		if u == nil || u.Coverage != "main_loop" || u.InputTokens == nil || *u.InputTokens != 7 ||
+			u.OutputTokens == nil || *u.OutputTokens != 4 || len(u.Observations) != 1 {
+			t.Fatalf("main-loop accounting with scoped evidence = %+v", u)
+		}
+		o := u.Observations[0]
+		row := o.Models["sonnet"]
+		if o.Source != "claude.result.modelUsage" || o.Coverage != "query_pipeline" || o.Complete ||
+			o.Tokens.InputTokens == nil || *o.Tokens.InputTokens != 7 || o.Tokens.OutputTokens != nil ||
+			o.Tokens.CacheReadTokens != nil || o.Tokens.CacheWriteTokens != nil ||
+			row.InputTokens == nil || *row.InputTokens != 7 || row.OutputTokens != nil {
+			t.Fatalf("partial pipeline = %+v", o)
+		}
+	}
+	t.Run("direct", func(t *testing.T) {
+		c, _, ctx := startMode(t, agentclient.HostCallbacks{}, "rereview-partial-counter", nil)
+		_ = receive(t, ctx, launchPrompt(t, c, ctx, "baseline"))
+		second := receive(t, ctx, launchPrompt(t, c, ctx, "second"))
+		if second.Outcome == nil {
+			t.Fatalf("no outcome %+v", second)
+		}
+		assertUsage(t, second.Outcome.Turn.Usage)
+	})
+	t.Run("ACP prompt and retained receipt", func(t *testing.T) {
+		peer, id, _, ctx := startACP(t, "rereview-partial-counter", nil, nil)
+		prompt := func(text string) acp.PromptResponse {
+			t.Helper()
+			result, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return result
+		}
+		_ = prompt("baseline")
+		result := prompt("second")
+		turn, ok := acpmeta.ReadNativeTurn(result.Meta)
+		if !ok {
+			t.Fatalf("native turn = %+v", result)
+		}
+		assertUsage(t, turn.Usage)
+		raw, err := peer.CallExtension(ctx, acpmeta.NativeTurnReceiptsMethod, acpmeta.NativeTurnReceiptsRequest{SessionID: string(id)})
+		var page acpmeta.NativeTurnReceiptsResponse
+		if err != nil || json.Unmarshal(raw, &page) != nil || len(page.Receipts) != 2 || page.Receipts[1].Turn.InvocationID != turn.InvocationID {
+			t.Fatalf("receipt page = %s, %v", raw, err)
+		}
+		assertUsage(t, page.Receipts[1].Turn.Usage)
+	})
+}
+
+func TestPartialModelBoundaryPreservesOtherRows(t *testing.T) {
+	c, _, ctx := startMode(t, agentclient.HostCallbacks{}, "rereview-model-gap", nil)
+	_ = receive(t, ctx, launchPrompt(t, c, ctx, "baseline"))
+	for _, input := range []string{"row disappears", "row returns"} {
+		result := receive(t, ctx, launchPrompt(t, c, ctx, input))
+		if result.Outcome == nil || result.Outcome.Turn.Usage == nil {
+			t.Fatalf("%s outcome = %+v", input, result)
+		}
+		usage := result.Outcome.Turn.Usage
+		if len(usage.Observations) != 1 {
+			t.Fatalf("%s observation = %+v", input, usage)
+		}
+		o := usage.Observations[0]
+		known := o.Models["sonnet"].InputTokens
+		if o.Complete || o.Tokens.InputTokens != nil || known == nil || *known != 7 || o.Models["opus"].InputTokens != nil {
+			t.Fatalf("%s observation = %+v", input, o)
+		}
+	}
+}
+
+func TestReceiptBudgetPreservesPrimaryUsageAndAnswer(t *testing.T) {
+	peer, id, _, ctx := startACP(t, "rereview-observation-budget", nil, nil)
+	if _, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock("bounded receipt")}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := peer.CallExtension(ctx, acpmeta.NativeTurnReceiptsMethod, acpmeta.NativeTurnReceiptsRequest{SessionID: string(id)})
+	var page acpmeta.NativeTurnReceiptsResponse
+	if err != nil || json.Unmarshal(raw, &page) != nil || len(page.Receipts) != 1 {
+		t.Fatalf("receipt page size = %d, %v", len(raw), err)
+	}
+	r := page.Receipts[0]
+	u := r.Turn.Usage
+	if u == nil || u.InputTokens == nil || *u.InputTokens != 7 || len(u.Observations) != 0 ||
+		!slices.Contains(r.Unavailable, "turn.usage.observations") || r.ResultText != "known result" {
+		t.Fatalf("bounded receipt = %+v", r)
+	}
+}
+
+func TestRereviewCancelDoesNotInterruptToolOnlyProviderFold(t *testing.T) {
+	events := make(chan agentclient.Scope, 2)
+	host := agentclient.HostCallbacks{Observe: func(_ context.Context, scope agentclient.Scope, n acp.SessionNotification) error {
+		if n.Update.AgentMessageChunk != nil {
+			events <- scope
+		}
+		return nil
+	}}
+	c, path, ctx := startMode(t, host, "rereview-unstamped-provider", func(o *claude.Options) { o.ControlTimeout = 200 * time.Millisecond })
+	request, cancel := context.WithCancel(ctx)
+	defer cancel()
+	result := launchPrompt(t, c, request, "fold")
+	scope := receive(t, ctx, events)
+	cancel()
+	got := receive(t, ctx, result)
+	if bytes, err := os.ReadFile(filepath.Join(filepath.Dir(path), "interrupt")); err == nil {
+		t.Fatalf("cancel of folded H interrupted pre-existing tool-only P, interrupt=%s, scope=%+v receipt=%+v", bytes, scope, got.Receipt)
+	}
+}
+func TestRereviewLateBackgroundSnapshotKeepsTaskOwner(t *testing.T) {
+	tools := make(chan string, 8)
+	peer, id, _, ctx := startACP(t, "rereview-late-background", func(n acp.SessionNotification) {
+		if n.Update.ToolCall != nil {
+			tools <- string(n.Update.ToolCall.ToolCallId)
+		}
+	}, nil)
+	for _, text := range []string{"first", "second"} {
+		if _, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock(text)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for len(tools) > 0 {
+		if <-tools == "late-background-tool" {
+			return
+		}
+	}
+	t.Fatal("native snapshot retained the same live background run, but no observation of its first tool reached ACP")
+}
+func TestRereviewGenericCompactStatusCannotConfirmManual(t *testing.T) {
+	peer, id, _, ctx := startACP(t, "rereview-false-compact", nil, nil)
+	raw, err := peer.CallExtension(ctx, "_session/compact", acpmeta.CompactRequest{SessionID: string(id)})
+	if err == nil {
+		t.Fatalf("automatic compact boundary and unqualified status accepted as manual compact: %s", raw)
+	}
+}
+
+func TestRereviewWorkspaceRejectsContradictoryNativeCWD(t *testing.T) {
+	client, dir, ctx := startClientMode(t, agentclient.HostCallbacks{}, "rereview-workspace-cwd", func(o *claude.Options) {
+		o.Launch = claude.LaunchOptions{WorkspaceOnly: true, ExcludedWriteDirectories: []string{"blocked"}}
+	})
+	opened, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir})
+	if err == nil || opened.SessionId != "" || !strings.Contains(err.Error(), "working directory") {
+		t.Fatalf("workspace accepted contradictory native cwd: response=%+v, error=%v", opened, err)
+	}
+}
+
+func TestBackgroundLevelCannotReviveEndedNativeRun(t *testing.T) {
+	for _, tc := range []struct {
+		mode     string
+		observed bool
+	}{
+		{"rereview-ended-background", false},
+		{"rereview-restarted-background", true},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			tools := make(chan struct{}, 1)
+			peer, id, _, ctx := startACP(t, tc.mode, func(n acp.SessionNotification) {
+				if n.Update.ToolCall != nil && n.Update.ToolCall.ToolCallId == "late-background-tool" {
+					tools <- struct{}{}
+				}
+			}, nil)
+			for _, value := range []string{"first", "second"} {
+				if _, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock(value)}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if (len(tools) > 0) != tc.observed {
+				t.Fatalf("tool observation = %v", len(tools) > 0)
+			}
+		})
 	}
 }

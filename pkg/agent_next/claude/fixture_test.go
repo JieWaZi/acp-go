@@ -40,6 +40,10 @@ func TestClaudeFixture(t *testing.T) {
 			}
 		case arg == "--settings" && i+1 < len(os.Args):
 			_ = json.Unmarshal([]byte(os.Args[i+1]), &f.workspace)
+		case strings.HasPrefix(arg, "--plugin-dir-no-mcp="):
+			f.pluginArgv = append(f.pluginArgv, strings.TrimPrefix(arg, "--plugin-dir-no-mcp="))
+		case arg == "--await-initialize":
+			f.awaitInitialize = true
 		case arg == "--fork-session":
 			f.fork = true
 		case arg == "--strict-mcp-config":
@@ -99,26 +103,33 @@ type fixtureFrame struct {
 		Hooks   map[string][]struct {
 			IDs []string `json:"hookCallbackIds"`
 		}
-		Append   *string `json:"appendSystemPrompt"`
+		Append  *string `json:"appendSystemPrompt"`
+		Plugins []struct {
+			Type             string
+			Path             string
+			SkipMCPDiscovery bool `json:"skipMcpDiscovery"`
+		}
 		Settings map[string]any
 	}
 }
 
 type fixture struct {
-	input       *bufio.Reader
-	dir         string
-	mode        string
-	source      string
-	fork        bool
-	id          string
-	model       string
-	active      string
-	index       int
-	strict      bool
-	snapshotOff bool
-	settings    map[string]any
-	workspace   map[string]any
-	hookID      string
+	input           *bufio.Reader
+	dir             string
+	mode            string
+	source          string
+	fork            bool
+	id              string
+	model           string
+	active          string
+	index           int
+	strict          bool
+	snapshotOff     bool
+	awaitInitialize bool
+	pluginArgv      []string
+	settings        map[string]any
+	workspace       map[string]any
+	hookID          string
 }
 
 func (f *fixture) emit(frame map[string]any) {
@@ -184,7 +195,15 @@ func (f *fixture) control(frame fixtureFrame) {
 	switch frame.Request.Subtype {
 	case "initialize":
 		f.settings = map[string]any{}
-		init := map[string]any{"type": "system", "subtype": "init", "model": f.model, "permissionMode": "default", "claude_code_version": "2.1.309", "capabilities": []string{"cancel_queued"}}
+		cwd, _ := os.Getwd()
+		init := map[string]any{"type": "system", "subtype": "init", "cwd": cwd, "model": f.model, "permissionMode": "default", "claude_code_version": "2.1.309", "capabilities": []string{"cancel_queued"}}
+		if f.mode == "rereview-workspace-cwd" || f.mode == "rereview-hook-cwd" {
+			forbidden := filepath.Join(f.dir, "blocked")
+			_ = os.Mkdir(forbidden, 0700)
+			if f.mode == "rereview-workspace-cwd" {
+				init["cwd"] = forbidden
+			}
+		}
 		f.emit(init)
 		f.mark("launch", fmt.Sprintf("strict=%t snapshot=%t instructions=%v", f.strict, f.snapshotOff, optionalString(frame.Request.Append)))
 		if hooks := frame.Request.Hooks["PreToolUse"]; len(hooks) > 0 && len(hooks[0].IDs) > 0 {
@@ -194,6 +213,20 @@ func (f *fixture) control(frame fixtureFrame) {
 			{"value": "sonnet", "displayName": "Sonnet", "supportsEffort": true, "supportedEffortLevels": []string{"low", "high"}, "supportsFastMode": true},
 			{"value": "opus", "displayName": "Opus", "supportsEffort": false, "supportsFastMode": false},
 		}}
+		paths := make([]string, 0, len(frame.Request.Plugins))
+		for _, p := range frame.Request.Plugins {
+			if p.Type == "local" && p.SkipMCPDiscovery {
+				paths = append(paths, p.Path)
+			}
+		}
+		f.mark("plugin-delivery", fmt.Sprintf("await=%t argv=%v payload=%v", f.awaitInitialize, f.pluginArgv, paths))
+		if f.mode == "rereview-plugin-reject" {
+			response.(map[string]any)["plugins_applied"] = false
+		}
+		if f.mode == "rereview-plugin-ack" && len(frame.Request.Plugins) == 1 {
+			p := frame.Request.Plugins[0]
+			response.(map[string]any)["plugins_applied"] = p.Type == "local" && p.SkipMCPDiscovery && p.Path != ""
+		}
 	case "get_settings":
 		effective := map[string]any{"fastMode": f.settings["fastMode"]}
 		if f.workspace != nil {
@@ -268,7 +301,22 @@ func (f *fixture) control(frame fixtureFrame) {
 
 func (f *fixture) controlReply(frame fixtureFrame) {
 	f.mark("interaction-"+frame.Response.RequestID, fmt.Sprint(frame.Response.Response))
-	if f.mode == "approval" || f.mode == "ask" || f.mode == "workspace" || f.mode == "review-stale-permission" || f.mode == "review-foreground-agent" {
+	if f.mode == "workspace-approval" || f.mode == "workspace-path-substitution" {
+		if frame.Response.RequestID == "tool-request" {
+			path := "safe.txt"
+			if f.mode == "workspace-path-substitution" {
+				path = "protected/entry"
+			}
+			f.emit(map[string]any{"type": "control_request", "request_id": "permission-followup", "request": map[string]any{
+				"subtype": "can_use_tool", "tool_name": "Write", "tool_use_id": "workspace-tool", "input": map[string]any{"file_path": path},
+			}})
+		} else {
+			f.result(f.active, "interaction complete", "completed")
+			f.active = ""
+		}
+		return
+	}
+	if f.mode == "approval" || f.mode == "ask" || f.mode == "workspace" || f.mode == "review-stale-permission" || f.mode == "review-foreground-agent" || f.mode == "rereview-workspace-cwd" || f.mode == "rereview-hook-cwd" {
 		f.result(f.active, "interaction complete", "completed")
 		f.active = ""
 	}
@@ -288,6 +336,118 @@ func (f *fixture) user(frame fixtureFrame) {
 	}
 	f.active = frame.UUID
 	switch f.mode {
+	case "rereview-retired-rerun":
+		f.assistant(frame.UUID, "original host", false)
+		f.result(frame.UUID, "", "aborted_streaming")
+		f.assistant(frame.UUID, "provider retry of interrupted send", true)
+		f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "provider-rerun-terminal", "result_index": 1,
+			"resume_reason": "interrupted_turn", "user_message_uuid": frame.UUID, "user_message_uuids": []string{frame.UUID},
+			"result": "new provider answer", "usage": map[string]any{"input_tokens": 17, "output_tokens": 4}})
+		f.mark("emitted-rerun", "true")
+	case "rereview-partial-counter":
+		if f.index == 0 {
+			f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "complete-baseline", "result_index": 0,
+				"user_message_uuid": frame.UUID, "usage": map[string]any{"input_tokens": 3, "output_tokens": 2},
+				"modelUsage": map[string]any{"sonnet": map[string]any{"inputTokens": 3, "outputTokens": 2}}})
+		} else {
+			f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "partial-current", "result_index": 1,
+				"user_message_uuid": frame.UUID, "usage": map[string]any{"input_tokens": 7, "output_tokens": 4},
+				"modelUsage": map[string]any{"sonnet": map[string]any{"inputTokens": 10}}})
+		}
+		f.index++
+	case "rereview-model-gap", "rereview-observation-budget":
+		models := map[string]any{}
+		if f.mode == "rereview-model-gap" {
+			models["sonnet"] = map[string]any{"inputTokens": 10 + 7*f.index}
+			if f.index != 1 {
+				models["opus"] = map[string]any{"inputTokens": 20 + 5*f.index}
+			}
+		} else {
+			models[strings.Repeat("m", 140<<10)] = map[string]any{"inputTokens": 7}
+		}
+		f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": fmt.Sprintf("model-evidence-%d", f.index),
+			"result_index": f.index, "user_message_uuid": frame.UUID, "result": "known result", "modelUsage": models,
+			"usage": map[string]any{"input_tokens": 7, "output_tokens": 4}})
+		f.index++
+	case "rereview-unstamped-provider":
+		f.emit(map[string]any{"type": "system", "subtype": "session_state_changed", "state": "running"})
+		f.emit(map[string]any{"type": "stream_event", "uuid": "p-first", "parent_tool_use_id": nil, "event": map[string]any{
+			"type": "message_start", "message": map[string]any{"id": "p-tool-request", "role": "assistant", "model": "sonnet", "content": []any{}},
+		}})
+		f.emit(map[string]any{"type": "assistant", "uuid": "p-tool", "parent_tool_use_id": nil,
+			"message": map[string]any{"id": "p-tool-request", "model": "sonnet", "content": []any{map[string]any{
+				"type": "tool_use", "id": "p-tool-use", "name": "Bash", "input": map[string]any{"command": "printf provider"},
+			}}}})
+		f.assistant(frame.UUID, "provider folded host after tool", false)
+	case "rereview-late-background", "rereview-ended-background", "rereview-restarted-background":
+		if f.index == 0 {
+			f.assistant(frame.UUID, "first host", false)
+			f.emitTaskOwner(frame.UUID, false)
+			f.result(frame.UUID, "first host", "completed")
+			run := "run-1"
+			if f.mode != "rereview-late-background" {
+				f.emit(map[string]any{"type": "system", "subtype": "task_notification", "task_id": "old-background-agent-A",
+					"run_id": "run-1", "status": "stopped"})
+				if f.mode == "rereview-restarted-background" {
+					run = "run-2"
+				}
+			}
+			f.emit(map[string]any{"type": "system", "subtype": "background_tasks_changed", "tasks": []any{map[string]any{
+				"task_id": "old-background-agent-A", "task_type": "local_agent", "run_id": run,
+			}}})
+			return
+		}
+		f.assistant(frame.UUID, "second host", false)
+		f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": "spawn-tool", "agent_id": "old-background-agent-A", "uuid": "late-background-assistant",
+			"message": map[string]any{"content": []any{map[string]any{"type": "tool_use", "id": "late-background-tool", "name": "Bash", "input": map[string]any{"command": "printf late"}}}}})
+		f.result(frame.UUID, "second host", "completed")
+	case "rereview-fallback-supersedes":
+		for i, text := range []string{"refused content", "replacement answer"} {
+			part := map[string]any{"type": "assistant", "parent_tool_use_id": nil, "user_message_uuid": frame.UUID, "uuid": fmt.Sprintf("fallback-frame-%d", i),
+				"message": map[string]any{"id": "fallback-message", "model": f.model, "content": []any{map[string]any{"type": "text", "text": text}}},
+			}
+			if i > 0 {
+				part["supersedes"] = []string{"fallback-frame-0"}
+			}
+			f.emit(part)
+		}
+		f.result(frame.UUID, "", "completed")
+	case "rereview-max-turns":
+		f.emit(map[string]any{"type": "result", "subtype": "error_max_turns", "terminal_reason": "max_turns", "result_index": 0,
+			"uuid": "max-turns-result", "user_message_uuid": frame.UUID, "is_error": true, "usage": map[string]any{"input_tokens": 43, "output_tokens": 7},
+		})
+	case "rereview-multiple-assistant-blocks":
+		f.emit(map[string]any{"type": "stream_event", "parent_tool_use_id": nil, "user_message_uuid": frame.UUID,
+			"event": map[string]any{"type": "message_start", "message": map[string]any{"id": "multi-message", "model": f.model}},
+		})
+		for i, text := range []string{"first ", "second"} {
+			f.emit(map[string]any{"type": "stream_event", "parent_tool_use_id": nil,
+				"event": map[string]any{"type": "content_block_delta", "index": i, "delta": map[string]any{"type": "text_delta", "text": text}},
+			})
+			f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": nil, "user_message_uuid": frame.UUID, "uuid": fmt.Sprintf("complete-%d", i),
+				"message": map[string]any{"id": "multi-message", "model": f.model, "content": []any{map[string]any{"type": "text", "text": text}}},
+			})
+		}
+		f.result(frame.UUID, "", "completed")
+	case "rereview-tool-narration":
+		f.emit(map[string]any{"type": "assistant", "parent_tool_use_id": nil, "user_message_uuid": frame.UUID, "uuid": "narration-frame",
+			"message": map[string]any{"id": "narration-message", "model": f.model, "content": []any{
+				map[string]any{"type": "text", "text": "I will use a tool."},
+				map[string]any{"type": "tool_use", "name": "Bash", "id": "narration-tool", "input": map[string]any{"command": "printf sample"}},
+			}},
+		})
+		f.result(frame.UUID, "", "completed")
+	case "rereview-observation-prefix":
+		for i := 0; i < 5; i++ {
+			f.emit(map[string]any{"type": "system", "subtype": "commands_changed", "commands": []any{}})
+		}
+		f.assistant(frame.UUID, "complete despite slow session updates", false)
+		f.result(frame.UUID, "complete despite slow session updates", "completed")
+	case "rereview-false-compact":
+		f.emit(map[string]any{"type": "system", "subtype": "session_state_changed", "state": "running"})
+		f.emit(map[string]any{"type": "system", "subtype": "compact_boundary", "compact_metadata": map[string]any{"trigger": "auto", "pre_tokens": 100}})
+		f.emit(map[string]any{"type": "system", "subtype": "status", "compact_result": "success"})
+		f.result(frame.UUID, "local completion", "completed")
 	case "review-cancel-fold":
 		// The native producer has accepted stdin, while P owns the output stream.
 	case "review-running-before-uuid":
@@ -424,11 +584,23 @@ func (f *fixture) user(frame fixtureFrame) {
 		f.emit(map[string]any{"type": "control_request", "request_id": "tool-request", "request": map[string]any{
 			"subtype": "can_use_tool", "tool_name": tool, "tool_use_id": "tool-1", "input": payload,
 		}})
-	case "workspace":
-		f.assistant(frame.UUID, "check protected write", false)
+	case "rereview-workspace-cwd", "rereview-hook-cwd":
+		f.assistant(frame.UUID, "check native relative write", false)
+		f.emit(map[string]any{"type": "control_request", "request_id": "wrong-cwd-hook", "request": map[string]any{
+			"subtype": "hook_callback", "callback_id": f.hookID, "input": map[string]any{
+				"hook_event_name": "PreToolUse", "session_id": f.id, "cwd": filepath.Join(f.dir, "blocked"), "tool_use_id": "cwd-write", "tool_name": "Write", "tool_input": map[string]any{"file_path": "wrong-cwd-write.txt"},
+			},
+		}})
+	case "workspace", "workspace-approval", "workspace-path-substitution":
+		f.assistant(frame.UUID, "check native file write", false)
+		cwd, _ := os.Getwd()
+		path := "protected/entry"
+		if f.mode != "workspace" {
+			path = "safe.txt"
+		}
 		f.emit(map[string]any{"type": "control_request", "request_id": "tool-request", "request": map[string]any{
 			"subtype": "hook_callback", "callback_id": f.hookID, "input": map[string]any{
-				"hook_event_name": "PreToolUse", "session_id": f.id, "tool_name": "Write", "tool_input": map[string]any{"file_path": "protected/entry"},
+				"hook_event_name": "PreToolUse", "session_id": f.id, "cwd": cwd, "tool_use_id": "workspace-tool", "tool_name": "Write", "tool_input": map[string]any{"file_path": path},
 			},
 		}})
 	case "large":

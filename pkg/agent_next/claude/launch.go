@@ -38,7 +38,9 @@ type launchPlan struct {
 	instructions  *string
 	snapshotOff   bool
 	mcpConfigured bool
-	workspace     *workspacePolicy
+	// initializePlugins is set only when the managed-hook startup barrier owns delivery.
+	initializePlugins []string
+	workspace         *workspacePolicy
 }
 
 func freezeLaunch(o LaunchOptions) (LaunchOptions, error) {
@@ -147,8 +149,22 @@ func (c *Client) prepareLaunch(req openRequest, old *session) (launchPlan, error
 	} else if o.SettingsPath != "" {
 		args = append(args, "--settings", o.SettingsPath)
 	}
-	if policy != nil || len(o.PluginDirectories) > 0 {
+	// The native SDK chooses one plugin delivery route at process launch.
+	// Managed hooks already require an initialize barrier, so deliver plugins
+	// there too; otherwise use the SDK's argv path without MCP discovery.
+	var initializePlugins []string
+	if policy != nil {
 		args = append(args, "--await-initialize")
+		if len(o.PluginDirectories) > 0 {
+			if acpmeta.VerifiedForkMode(c.version, "2.1.261", "initialize") != "initialize" {
+				return launchPlan{}, errors.New("Claude CLI 2.1.261 or later is required for plugins with managed workspace hooks")
+			}
+			initializePlugins = o.PluginDirectories
+		}
+	} else {
+		for _, path := range o.PluginDirectories {
+			args = append(args, "--plugin-dir-no-mcp="+path)
+		}
 	}
 	if snapshotOff {
 		args = append(args, "--system-prompt-snapshot", "off")
@@ -162,7 +178,7 @@ func (c *Client) prepareLaunch(req openRequest, old *session) (launchPlan, error
 	for _, root := range roots {
 		args = append(args, "--add-dir", root)
 	}
-	data, _ := json.Marshal([]any{cwd, args, instructions})
+	data, _ := json.Marshal([]any{cwd, args, instructions, initializePlugins})
 	fingerprint := sha256.Sum256(data)
 	switch {
 	case req.forkSource != "":
@@ -173,7 +189,7 @@ func (c *Client) prepareLaunch(req openRequest, old *session) (launchPlan, error
 		args = append(args, "--session-id="+string(req.id))
 	}
 	return launchPlan{cwd: cwd, args: args, fingerprint: fingerprint, instructions: instructions, snapshotOff: snapshotOff,
-		mcpConfigured: len(req.mcp) > 0, workspace: policy}, nil
+		mcpConfigured: len(req.mcp) > 0, initializePlugins: initializePlugins, workspace: policy}, nil
 }
 
 func nativeMCP(servers []acp.McpServer) (string, error) {

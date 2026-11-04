@@ -50,7 +50,6 @@ type input struct {
 	cancelReason    error
 	cancelDeadline  time.Time
 	controlStarted  bool
-	echoed          bool
 	// mayFollowProvider distinguishes an input sent while P was already visible.
 	mayFollowProvider bool
 	inv               *invocation
@@ -64,29 +63,25 @@ type input struct {
 
 type invocation struct {
 	// outcome is accumulated by the ordered reader and frozen before delivery.
-	outcome          agentclient.NativeOutcome
-	scope            agentclient.Scope
-	inputs           []*input
-	seenInputs       map[string]struct{}
-	ctx              context.Context
-	cancel           context.CancelFunc
-	terminal         bool
-	sealedAt         time.Time
-	finalized        bool
-	openingHost      *input
-	compact          bool
-	compactConfirmed bool
-	cancelRequested  bool
-	closed           chan struct{}
-	deliveryErr      error
-	lastMessage      string
-	completeText     string
-	nativeMessage    string
-	model            string
-	streamText       string
-	streamThought    string
-	partialUsage     map[string]requestUsage
-	rejectedLimit    *protocol.RateLimitInfo
+	outcome         agentclient.NativeOutcome
+	scope           agentclient.Scope
+	inputs          []*input
+	seenInputs      map[string]struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
+	terminal        bool
+	sealedAt        time.Time
+	finalized       bool
+	opening         nativeOpening
+	compact         bool
+	manualCompact   *input
+	cancelRequested bool
+	closed          chan struct{}
+	deliveryErr     error
+	model           string
+	output          assistantOutput
+	partialUsage    map[string]requestUsage
+	rejectedLimit   *protocol.RateLimitInfo
 }
 
 // ReservePrompt freezes input and its exact generation without starting native I/O.
@@ -393,7 +388,7 @@ func (s *session) reconcileCancellationLocked(in *input) {
 	}
 	switch in.inv.outcome.Turn.Origin {
 	case acpmeta.NativeTurnOriginHost:
-		if time.Now().Before(in.cancelDeadline) {
+		if in.inv.opening.initiator == in && time.Now().Before(in.cancelDeadline) {
 			s.interruptByLocked(in.inv, in.cancelDeadline)
 		}
 	case acpmeta.NativeTurnOriginProvider:
@@ -458,7 +453,7 @@ func (s *session) recallInput(ctx context.Context, in *input) {
 		if s.sent[in.identity.InputID] != in {
 			return
 		}
-		s.retiredInputs[in.identity.InputID] = struct{}{}
+		s.withdrawnInputs[in.identity.InputID] = struct{}{}
 		in.admission = agentclient.AdmissionNotAccepted
 		s.finishInputLocked(in, in.cancelReason)
 	})

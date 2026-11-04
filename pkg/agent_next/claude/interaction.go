@@ -50,6 +50,7 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 		tool = s.permissionToolLocked(inv, request)
 	}
 	scope := agentScope(inv)
+	write := s.workspaceWrites[request.ToolUseID]
 	s.taskLocked(func() {
 		defer cancel()
 		defer func() { s.mu.Lock(); delete(s.interactions, m.RequestID); s.mu.Unlock() }()
@@ -62,20 +63,24 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 				opErr = errors.New("Claude workspace hook is unavailable")
 				break
 			}
-			result = s.launch.workspace.hook(string(s.id), hook)
+			result = s.handleWorkspaceHook(ctx, hook)
 		case protocol.ControlCanUseTool:
 			denied := denyTool(request.ToolUseID, "No verified live Claude execution owns this request.")
 			if tool == nil {
 				result = denied
 				break
 			}
-			decision, err := s.permission(ctx, scope, request)
+			decision, err := s.permission(ctx, scope, request, write)
 			if err != nil {
 				s.mu.Lock()
 				if !inv.terminal && inv.deliveryErr == nil {
 					inv.deliveryErr = err
 				}
 				s.mu.Unlock()
+			}
+			if decision.Behavior == "allow" && s.launch.workspace != nil &&
+				s.launch.workspace.approval(write, request) == "deny" {
+				decision = denied
 			}
 			result = decision
 			allow = decision.Behavior == "allow"
@@ -99,7 +104,8 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 			guard = func() error {
 				s.mu.Lock()
 				defer s.mu.Unlock()
-				if ctx.Err() != nil || !s.liveToolLocked(inv, tool) {
+				if ctx.Err() != nil || !s.liveToolLocked(inv, tool) ||
+					(s.launch.workspace != nil && writesFile(request.ToolName) && s.workspaceWrites[request.ToolUseID] != write) {
 					return errStale
 				}
 				return nil
@@ -110,6 +116,23 @@ func (s *session) interactionLocked(m *protocol.ControlRequestMessage) {
 			_ = send(denyTool(request.ToolUseID, "Claude tool approval expired."), nil, nil)
 		}
 	})
+}
+
+func (s *session) handleWorkspaceHook(ctx context.Context, req protocol.HookCallbackRequest) protocol.HookCallbackResult {
+	id, write, response := s.launch.workspace.hook(string(s.id), req)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.open || s.closing || s.fault != nil || ctx.Err() != nil {
+		return workspaceHookDecision("deny", "The Claude workspace is no longer active.")
+	}
+	if id != "" && len(id) <= 512 {
+		if write == nil {
+			delete(s.workspaceWrites, id)
+		} else if len(s.workspaceWrites) < maxRememberedIDs || s.workspaceWrites[id] != nil {
+			s.workspaceWrites[id] = write
+		}
+	}
+	return response
 }
 
 func agentScope(inv *invocation) agentclient.Scope {
@@ -123,7 +146,7 @@ func denyTool(id, reason string) protocol.PermissionResult {
 	return protocol.PermissionResult{Behavior: "deny", Message: reason, ToolUseID: id}
 }
 
-func (s *session) permission(ctx context.Context, scope agentclient.Scope, req protocol.CanUseToolControlRequest) (protocol.PermissionResult, error) {
+func (s *session) permission(ctx context.Context, scope agentclient.Scope, req protocol.CanUseToolControlRequest, write *workspaceWrite) (protocol.PermissionResult, error) {
 	denied := denyTool(req.ToolUseID, "The Claude tool request was not approved.")
 	if ctx.Err() != nil {
 		return denied, nil
@@ -133,7 +156,7 @@ func (s *session) permission(ctx context.Context, scope agentclient.Scope, req p
 	}
 	workspace := ""
 	if p := s.launch.workspace; p != nil {
-		workspace = p.decision(req.ToolName, req.Input)
+		workspace = p.approval(write, req)
 		if workspace == "deny" {
 			return denied, nil
 		}

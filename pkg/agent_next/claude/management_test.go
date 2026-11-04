@@ -10,6 +10,7 @@ import (
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
+	"github.com/JieWaZi/acp-go/pkg/agent_next/claude"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
@@ -124,5 +125,40 @@ func TestCompactUsesNativeManualBoundary(t *testing.T) {
 	result, err := client.Compact(ctx, acpmeta.CompactRequest{SessionID: string(client.id)})
 	if err != nil || result.Status != acpmeta.NativeTurnCompleted {
 		t.Fatalf("compact = %+v, %v", result, err)
+	}
+}
+
+func TestPluginLaunchUsesOnlyOneNativeDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		workspace bool
+		admit     bool
+	}{
+		{"argv without an acknowledgement", "", false, true},
+		{"initialize with an acknowledgement", "rereview-plugin-ack", true, true},
+		{"initialize rejected by native peer", "rereview-plugin-reject", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, dir, ctx := startClientMode(t, agentclient.HostCallbacks{}, tc.mode, func(o *claude.Options) {
+				o.Launch.PluginDirectories = []string{plugin}
+				o.Launch.WorkspaceOnly = tc.workspace
+			})
+			reply, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir})
+			if tc.admit != (err == nil && reply.SessionId != "") {
+				t.Fatalf("plugin launch = %+v, %v", reply, err)
+			}
+			want := fmt.Sprintf("await=false argv=[%s] payload=[]", plugin)
+			if tc.workspace {
+				want = fmt.Sprintf("await=true argv=[] payload=[%s]", plugin)
+			}
+			if got := string(marker(t, ctx, filepath.Join(dir, "plugin-delivery"))); got != want {
+				t.Fatalf("delivery = %q, want %q", got, want)
+			}
+		})
 	}
 }

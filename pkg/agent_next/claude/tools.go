@@ -11,9 +11,10 @@ import (
 // toolOwner is the native lineage of a tool, frozen independently of which
 // foreground invocation is currently active.
 type toolOwner struct {
-	scope  agentclient.Scope
-	agent  string
-	parent string
+	scope          agentclient.Scope
+	agent          string
+	parent         string
+	taskGeneration uint64
 }
 
 type toolRecord struct {
@@ -22,13 +23,25 @@ type toolRecord struct {
 	completed bool
 }
 
+type taskPhase uint8
+
+const (
+	taskUnobserved taskPhase = iota
+	taskRunning
+	taskEnded
+)
+
+// taskRecord folds native run evidence. Its launching scope remains stable
+// across foreground completion and native task restarts.
 type taskRecord struct {
-	scope      agentclient.Scope
-	run        string
-	tool       string
-	live       bool
-	background bool
-	ambient    bool
+	scope            agentclient.Scope
+	run              string
+	tool             string
+	generation       uint64
+	phase            taskPhase
+	listed           bool
+	ambient          bool
+	terminalReported bool
 }
 
 func (s *session) nativeTaskLocked(id string) *taskRecord {
@@ -43,7 +56,7 @@ func (s *session) nativeTaskLocked(id string) *taskRecord {
 		s.taskOwnershipFull = true
 		return nil
 	}
-	task = &taskRecord{live: true}
+	task = &taskRecord{generation: 1}
 	s.nativeTasks[id] = task
 	return task
 }
@@ -65,7 +78,14 @@ func (s *session) sidechainOwnerLocked(agent string, parent *string) toolOwner {
 	if task == nil && owner.scope.NativeInvocationID != "" {
 		task = s.nativeTaskLocked(agent)
 	}
-	if task == nil || !task.live {
+	if task == nil || task.phase == taskEnded {
+		return toolOwner{}
+	}
+	if owner.scope.NativeInvocationID != "" && parent != nil {
+		// A native child frame is a live edge even before task_started.
+		task.phase = taskRunning
+	}
+	if task.phase != taskRunning {
 		return toolOwner{}
 	}
 	if task.scope.NativeInvocationID == "" {
@@ -75,6 +95,10 @@ func (s *session) sidechainOwnerLocked(agent string, parent *string) toolOwner {
 		return toolOwner{}
 	}
 	owner.scope = task.scope
+	if owner.parent == "" {
+		owner.parent = task.tool
+	}
+	owner.taskGeneration = task.generation
 	return owner
 }
 
@@ -93,7 +117,9 @@ func (s *session) permissionToolLocked(inv *invocation, req protocol.CanUseToolC
 	owner := toolOwner{scope: inv.scope}
 	if req.AgentID != "" {
 		owner = s.sidechainOwnerLocked(req.AgentID, nil)
-		if owner.scope.NativeInvocationID != inv.scope.NativeInvocationID {
+		if owner.scope.NativeInvocationID != inv.scope.NativeInvocationID || owner.taskGeneration > 1 {
+			// can_use_tool has no run_id. After a restart, require an
+			// observed tool identity before granting a new child request.
 			return nil
 		}
 	} else {
@@ -104,7 +130,7 @@ func (s *session) permissionToolLocked(inv *invocation, req protocol.CanUseToolC
 			return nil
 		}
 		for _, task := range s.nativeTasks {
-			if task.live {
+			if task.phase == taskRunning {
 				return nil
 			}
 		}
@@ -119,49 +145,61 @@ func (s *session) liveToolLocked(inv *invocation, tool *toolRecord) bool {
 	}
 	if tool.owner.agent != "" {
 		task := s.nativeTasks[tool.owner.agent]
-		return task != nil && task.live && task.scope.NativeInvocationID == tool.owner.scope.NativeInvocationID
+		return task != nil && task.phase == taskRunning && task.generation == tool.owner.taskGeneration &&
+			task.scope.NativeInvocationID == tool.owner.scope.NativeInvocationID
 	}
 	return true
 }
 
 func (s *session) observeBackgroundLocked(tasks []protocol.BackgroundTask) {
 	present := make(map[string]bool, min(len(tasks), maxRememberedIDs))
-	s.background = 0
+	untracked := 0
 	for _, reported := range tasks {
-		if !reported.Ambient {
-			s.background++
-		}
 		task := s.nativeTaskLocked(reported.TaskID)
 		if task == nil {
+			if !reported.Ambient {
+				untracked++
+			}
 			continue
 		}
+		// An older entry proves this snapshot predates a newer edge. Do not
+		// treat that newer run as absent from a snapshot that could not see it.
 		present[reported.TaskID] = true
-		if !task.advance(reported.RunID) {
+		if !task.advance(reported.RunID) || task.phase == taskEnded {
 			continue
 		}
-		task.background = true
+		task.phase = taskRunning
+		task.listed = true
 		task.ambient = reported.Ambient
 		s.linkTaskLocked(task, "", reported.ParentTaskID)
 	}
+	s.background = untracked
 	for id, task := range s.nativeTasks {
-		if task.background && !present[id] {
-			task.live = false
-			task.background = false
+		if task.listed && !present[id] {
+			task.phase = taskEnded
+			task.listed = false
+		}
+		if task.listed && task.phase == taskRunning && !task.ambient {
+			s.background++
 		}
 	}
 }
 
 func (t *taskRecord) advance(run string) bool {
-	if run == "" {
+	if run == "" || run == t.run {
 		return true
 	}
 	if t.run != "" && run < t.run {
 		return false
 	}
-	if run != t.run {
-		t.run = run
-		t.live = true
+	if t.run != "" {
+		t.generation++
+		t.phase = taskUnobserved
+		t.listed = false
+		t.ambient = false
+		t.terminalReported = false
 	}
+	t.run = run
 	return true
 }
 
@@ -198,6 +236,11 @@ func (s *session) startToolLocked(owner toolOwner, block protocol.ContentBlock) 
 		return nil
 	}
 	if existing := s.tools[block.ID]; existing != nil {
+		if existing.owner.parent == "" && existing.owner.agent == owner.agent &&
+			existing.owner.taskGeneration == owner.taskGeneration &&
+			existing.owner.scope.NativeInvocationID == owner.scope.NativeInvocationID && existing.name == block.Name {
+			existing.owner.parent = owner.parent
+		}
 		return nil
 	}
 	if len(s.tools) >= maxRememberedIDs {
@@ -268,6 +311,12 @@ func (s *session) toolProgressLocked(m *protocol.ToolProgressMessage) {
 		m.TaskID != "" && record.owner.agent != "" && record.owner.agent != m.TaskID {
 		return
 	}
+	if record.owner.agent != "" {
+		task := s.nativeTasks[record.owner.agent]
+		if task == nil || task.phase != taskRunning || task.generation != record.owner.taskGeneration {
+			return
+		}
+	}
 	s.sendToolLocked(record.owner, acp.UpdateToolCall(acp.ToolCallId(m.ToolUseID),
 		acp.WithUpdateStatus(acp.ToolCallStatusInProgress)), nil)
 }
@@ -278,29 +327,31 @@ func (s *session) taskUpdateLocked(m *protocol.TaskMessage) {
 		return
 	}
 	task.ambient = task.ambient || m.Ambient || m.SkipTranscript
-	task.background = task.background || m.IsBackgrounded
 	s.linkTaskLocked(task, m.ToolUseID, m.ParentTaskID)
 	state := m.Status
 	if m.Subtype == "task_updated" {
-		var patch struct {
-			Status         string
-			IsBackgrounded bool `json:"is_backgrounded"`
+		var patch struct{ Status string }
+		if json.Unmarshal(m.Patch, &patch) == nil && patch.Status != "" {
+			state = patch.Status
 		}
-		if json.Unmarshal(m.Patch, &patch) == nil {
-			if patch.Status != "" {
-				state = patch.Status
-			}
-			task.background = task.background || patch.IsBackgrounded
-		}
+	}
+	terminal := state == "completed" || state == "failed" || state == "stopped" || state == "killed"
+	if task.phase == taskEnded && (!terminal || m.Subtype != "task_notification" || task.terminalReported) {
+		return
+	}
+	if terminal && m.Subtype == "task_notification" {
+		task.terminalReported = true
 	}
 	status := acp.ToolCallStatusInProgress
 	switch state {
 	case "completed":
 		status = acp.ToolCallStatusCompleted
-		task.live = false
+		task.phase = taskEnded
 	case "failed", "stopped", "killed":
 		status = acp.ToolCallStatusFailed
-		task.live = false
+		task.phase = taskEnded
+	default:
+		task.phase = taskRunning
 	}
 	if task.ambient || task.tool == "" {
 		return
@@ -309,13 +360,6 @@ func (s *session) taskUpdateLocked(m *protocol.TaskMessage) {
 	if m.Summary != "" {
 		update.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(m.Summary))}
 	}
-	s.sendToolLocked(toolOwner{scope: task.scope, agent: m.TaskID}, update, map[string]any{"claude.task_id": m.TaskID})
-}
-
-func (s *session) retireForegroundTasksLocked(inv *invocation) {
-	for _, task := range s.nativeTasks {
-		if task.scope.NativeInvocationID == inv.scope.NativeInvocationID && !task.background {
-			task.live = false
-		}
-	}
+	s.sendToolLocked(toolOwner{scope: task.scope, agent: m.TaskID, taskGeneration: task.generation}, update,
+		map[string]any{"claude.task_id": m.TaskID})
 }
