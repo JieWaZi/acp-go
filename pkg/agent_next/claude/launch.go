@@ -65,7 +65,7 @@ func claudeLaunchOverride(arg string) bool {
 		"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode", "--restricted",
 		"--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools":
 		return true
-	case "--cwd", "--add-dir", "--project-config-root", "--worktree", "--tmux", "--file", "--deep-link-cwd-b64",
+	case "--cwd", "--add-dir", "--project-config-root", "--worktree", "--tmux", "--file", "--debug-file", "--deep-link-cwd-b64",
 		"--mcp-config", "--strict-mcp-config", "--plugin-dir", "--plugin-dir-no-mcp", "--plugin-url",
 		"--channels", "--dangerously-load-development-channels", "--chrome", "--ide":
 		return true

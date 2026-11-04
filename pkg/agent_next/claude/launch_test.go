@@ -25,6 +25,8 @@ func TestLaunchRejectsNativeOverridesInPrefix(t *testing.T) {
 		{"alternate workspace", []string{"--project-config-root=foreign"}},
 		{"additional workspace", []string{"--add-dir", "foreign"}},
 		{"attached worktree", []string{"-wforeign"}},
+		{"debug file outside workspace", []string{"--debug-file", "../protected/claude.log"}},
+		{"inline debug file outside workspace", []string{"--debug-file=../protected/claude.log"}},
 		{"mcp after wrapper separator", []string{"-test.run=^TestClaudeFixture$", "--", "--mcp-config=foreign.json"}},
 		{"plugin discovery", []string{"--plugin-dir", "foreign"}},
 		{"plugin without mcp", []string{"--plugin-dir-no-mcp=foreign"}},
