@@ -30,3 +30,40 @@ func TestMessageInfoPreservesMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestMessageInfoReplacementIsExplicitAndIndependent(t *testing.T) {
+	body := ""
+	info := MessageInfo{Phase: MessagePhaseCommentary, Complete: true, Source: MessageSourceNativePhase, ReplacementText: &body}
+	wire := WithMessageInfo(nil, info)
+	body = "mutated input"
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := ReadMessageInfo(decoded)
+	if !ok || first.ReplacementText == nil || *first.ReplacementText != "" {
+		t.Fatalf("explicit empty replacement lost: %+v", first)
+	}
+	*first.ReplacementText = "mutated snapshot"
+	second, ok := ReadMessageInfo(decoded)
+	if !ok || second.ReplacementText == nil || *second.ReplacementText != "" {
+		t.Fatalf("replacement aliases metadata: %+v", second)
+	}
+	info.ReplacementText = nil
+	if legacy, ok := ReadMessageInfo(WithMessageInfo(nil, info)); !ok || legacy.ReplacementText != nil {
+		t.Fatalf("legacy metadata invented replacement: %+v", legacy)
+	}
+	for _, raw := range []map[string]any{
+		{"phase": "commentary", "complete": false, "source": "native_phase", "replacement_text": "invalid"},
+		{"phase": "unknown", "complete": true, "source": "adapter_segment", "replacement_text": "invalid"},
+		{"phase": "commentary", "complete": true, "source": "native_phase", "replacement_text": nil},
+	} {
+		if actual, ok := ReadMessageInfo(map[string]any{messageInfoKey: raw}); ok {
+			t.Fatalf("invalid replacement accepted: %+v", actual)
+		}
+	}
+}

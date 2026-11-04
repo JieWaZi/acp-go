@@ -1,10 +1,13 @@
 package codex
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
 	"net/url"
 	"strings"
@@ -158,9 +161,7 @@ func (c *Client) receiveLocked(method string, raw json.RawMessage) {
 	case "item/started", "item/completed":
 		c.receiveItemLocked(t, event.Item, method == "item/completed")
 	case "item/agentMessage/delta":
-		t.streamed[event.ItemID] += len(event.Delta)
-		t.outcome.ObservedOutput = true
-		c.queueLocked(t, agentMessage(event.ItemID, event.Delta, acpmeta.MessagePhaseUnknown, false), nil)
+		c.streamMessageLocked(t, event.ItemID, event.Delta)
 	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta":
 		c.queueLocked(t, acp.UpdateAgentThoughtText(event.Delta), nil)
 	case "item/commandExecution/outputDelta", "item/fileChange/outputDelta", "item/fileChange/patchUpdated":
@@ -179,13 +180,57 @@ func (c *Client) receiveLocked(method string, raw json.RawMessage) {
 	}
 }
 
-func messageMeta(id, phase string, complete bool) map[string]any {
+// messagePrefix compares the full native body with all emitted deltas without
+// retaining a second transcript.
+type messagePrefix struct {
+	// size is the streamed byte count, capped above the maximum native body.
+	size int
+	// digest identifies the streamed prefix while it could still match.
+	digest hash.Hash
+}
+
+func (c *Client) streamMessageLocked(t *turn, id, delta string) {
+	if _, complete := t.completedMessages[id]; complete {
+		return
+	}
+	t.outcome.ObservedOutput = true
+	if c.host.Observe == nil || t.outcome.DeliveryError != nil {
+		return
+	}
+	if delta != "" {
+		prefix := t.streamed[id]
+		if prefix == nil {
+			if len(t.streamed) == maxPendingUpdates {
+				t.outcome.DeliveryError = errObservationBudget
+				return
+			}
+			prefix = &messagePrefix{digest: sha256.New()}
+			t.streamed[id] = prefix
+		}
+		prefix.size = min(prefix.size+len(delta), maxFrameBytes+1)
+		if prefix.size <= maxFrameBytes {
+			_, _ = prefix.digest.Write([]byte(delta))
+		}
+	}
+	c.queueLocked(t, agentMessage(id, delta, acpmeta.MessagePhaseUnknown, false, nil), nil)
+}
+
+func (p *messagePrefix) matches(text string) bool {
+	if len(text) < p.size {
+		return false
+	}
+	expected := sha256.Sum256([]byte(text[:p.size]))
+	var actual [sha256.Size]byte
+	return bytes.Equal(expected[:], p.digest.Sum(actual[:0]))
+}
+
+func messageMeta(id, phase string, complete bool, replacement *string) map[string]any {
 	meta := map[string]any{"message_id": id}
 	source := acpmeta.MessageSourceNativeMessage
 	if phase != acpmeta.MessagePhaseUnknown {
 		source = acpmeta.MessageSourceNativePhase
 	}
-	return acpmeta.WithMessageInfo(meta, acpmeta.MessageInfo{Phase: phase, Complete: complete, Source: source})
+	return acpmeta.WithMessageInfo(meta, acpmeta.MessageInfo{Phase: phase, Complete: complete, Source: source, ReplacementText: replacement})
 }
 
 func (c *Client) receiveItemLocked(t *turn, item protocol.ThreadItem, complete bool) {
@@ -220,9 +265,20 @@ func (c *Client) receiveItemLocked(t *turn, item protocol.ThreadItem, complete b
 			t.finalCandidate = &agentclient.FinalMessage{ID: item.ID, Text: *item.Text}
 		}
 		t.outcome.ObservedOutput = true
-		offset := min(len(*item.Text), t.streamed[item.ID])
-		t.streamed[item.ID] = len(*item.Text)
-		c.queueLocked(t, agentMessage(item.ID, (*item.Text)[offset:], phase, true), nil)
+		text := *item.Text
+		var replacement *string
+		if prefix := t.streamed[item.ID]; prefix != nil {
+			delete(t.streamed, item.ID)
+			if prefix.matches(text) {
+				text = text[prefix.size:]
+			} else {
+				// A full body belongs only in the replacement field. Legacy
+				// consumers treat the standard content block as an append.
+				replacement = item.Text
+				text = ""
+			}
+		}
+		c.queueLocked(t, agentMessage(item.ID, text, phase, true, replacement), nil)
 	case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "imageGeneration", "collabAgentToolCall":
 		c.toolItemLocked(t, item, complete)
 	}
@@ -714,10 +770,10 @@ func (c *Client) retainEarlyLocked(t *turn, method string, raw json.RawMessage) 
 	t.early = append(t.early, earlyFrame{method: method, params: raw})
 }
 
-func agentMessage(id, text, phase string, complete bool) acp.SessionUpdate {
+func agentMessage(id, text, phase string, complete bool, replacement *string) acp.SessionUpdate {
 	update := acp.UpdateAgentMessageText(text)
 	update.AgentMessageChunk.MessageId = pointer(id)
-	update.AgentMessageChunk.Meta = messageMeta(id, phase, complete)
+	update.AgentMessageChunk.Meta = messageMeta(id, phase, complete, replacement)
 	return update
 }
 

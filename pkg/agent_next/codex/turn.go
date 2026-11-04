@@ -119,8 +119,8 @@ type turn struct {
 	tools map[string]acp.ToolCallStatus
 	// toolOutput holds the accumulated terminal text for snapshot consumers.
 	toolOutput map[string]string
-	// streamed tracks text that has already been emitted for a native message.
-	streamed map[string]int
+	// streamed retains bounded prefix evidence for incomplete native messages.
+	streamed map[string]*messagePrefix
 	// steerInputs retains attempted native input identities for this exact turn.
 	steerInputs map[string]struct{}
 	// steerPending counts committed controls awaiting their own native evidence.
@@ -198,7 +198,7 @@ func (c *Client) installTurnLocked(ctx context.Context, s *session, compact, ret
 		session: s, compact: compact, mode: s.mode, prepare: prepare, stopPrepare: stopPrepare, native: native, stopNative: stopNative,
 		observeCtx: observeCtx, stopObserve: stopObserve, ready: make(chan struct{}), terminal: make(chan struct{}), released: make(chan struct{}),
 		updates: make(chan observation, maxPendingUpdates), observerDone: make(chan struct{}),
-		admission: agentclient.AdmissionNotAccepted, tools: make(map[string]acp.ToolCallStatus), toolOutput: make(map[string]string), streamed: make(map[string]int),
+		admission: agentclient.AdmissionNotAccepted, tools: make(map[string]acp.ToolCallStatus), toolOutput: make(map[string]string), streamed: make(map[string]*messagePrefix),
 		steerInputs: make(map[string]struct{}), completedMessages: make(map[string]struct{}), model: value(s.settings.Observed.Model),
 		previous: s.usageCheckpoint, usageGap: s.usageCheckpoint == nil || s.usageCheckpoint.disputed,
 		outcome: agentclient.NativeOutcome{Turn: acpmeta.NativeTurn{InvocationID: newID(), Origin: acpmeta.NativeTurnOriginHost}},

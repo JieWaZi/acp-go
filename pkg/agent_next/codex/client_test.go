@@ -143,6 +143,21 @@ func TestAppServerFixture(t *testing.T) {
 		case "turn/start":
 			turnNumber++
 			nativeTurn = fmt.Sprintf("turn-%d", turnNumber)
+			if mode == "message_reconciliation" {
+				ack(turn("inProgress"))
+				for _, test := range reconciliationCases {
+					for _, delta := range test.deltas {
+						emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": test.id, "delta": delta})
+					}
+					item := map[string]any{"id": test.id, "type": "agentMessage", "text": test.body, "phase": test.phase}
+					event := map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "item": item}
+					emit("item/completed", event)
+					emit("item/completed", event)
+					emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": test.id, "delta": "stale after complete"})
+				}
+				emit("turn/completed", turn("completed"))
+				continue
+			}
 			if mode == "malformed_live" {
 				ack(turn("inProgress"))
 				fmt.Fprintln(os.Stdout, "this is not a native frame")

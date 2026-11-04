@@ -48,7 +48,7 @@ func (c *Client) replayHistory(ctx context.Context, s *session, inline []protoco
 			}
 		case "agentMessage":
 			if item.Text != nil {
-				updates = append(updates, agentMessage(item.ID, *item.Text, acpmeta.MessagePhaseUnknown, true))
+				updates = append(updates, agentMessage(item.ID, *item.Text, acpmeta.MessagePhaseUnknown, true, nil))
 			}
 		case "reasoning":
 			for _, text := range item.Summary {
@@ -56,7 +56,7 @@ func (c *Client) replayHistory(ctx context.Context, s *session, inline []protoco
 			}
 		}
 		for _, update := range updates {
-			notification := acp.SessionNotification{SessionId: s.id, Update: update, Meta: messageMeta(item.ID, acpmeta.MessagePhaseUnknown, true)}
+			notification := acp.SessionNotification{SessionId: s.id, Update: update, Meta: messageMeta(item.ID, acpmeta.MessagePhaseUnknown, true, nil)}
 			if err := c.host.Observe(ctx, agentclient.Scope{SessionID: s.id}, notification); err != nil {
 				return err
 			}

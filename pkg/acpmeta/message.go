@@ -25,6 +25,8 @@ type MessageInfo struct {
 	Complete bool
 	// Source 区分原生阶段、原生消息与本地消息段的证据来源。
 	Source string
+	// ReplacementText 是原生完成消息的权威全文。nil 表示仍使用增量，空字符串表示清空正文。
+	ReplacementText *string
 }
 
 // WithMessageInfo 克隆元数据后写入消息事实，保留所有厂商的并行证据。
@@ -33,7 +35,11 @@ func WithMessageInfo(meta map[string]any, info MessageInfo) map[string]any {
 	for key, value := range meta {
 		result[key] = value
 	}
-	result[messageInfoKey] = map[string]any{"phase": info.Phase, "complete": info.Complete, "source": info.Source}
+	facts := map[string]any{"phase": info.Phase, "complete": info.Complete, "source": info.Source}
+	if info.ReplacementText != nil {
+		facts["replacement_text"] = *info.ReplacementText
+	}
+	result[messageInfoKey] = facts
 	return result
 }
 
@@ -51,5 +57,13 @@ func ReadMessageInfo(meta map[string]any) (MessageInfo, bool) {
 	if !phaseOK || !completeOK || !sourceOK || !validPhase || !validSource || phase == MessagePhaseFinal && source != MessageSourceNativePhase {
 		return MessageInfo{}, false
 	}
-	return MessageInfo{Phase: phase, Complete: complete, Source: source}, true
+	info := MessageInfo{Phase: phase, Complete: complete, Source: source}
+	if raw, exists := value["replacement_text"]; exists {
+		text, ok := raw.(string)
+		if !ok || !complete || source == MessageSourceAdapterSegment {
+			return MessageInfo{}, false
+		}
+		info.ReplacementText = &text
+	}
+	return info, true
 }
