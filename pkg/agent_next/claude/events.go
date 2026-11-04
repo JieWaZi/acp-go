@@ -231,7 +231,7 @@ func (s *session) resultLocked(m *protocol.ResultMessage) {
 	if m.QueuedTurnCount != nil && *m.QueuedTurnCount >= 0 {
 		s.nativeQueued = *m.QueuedTurnCount
 	}
-	if m.FastModeState != "" && s.settings.observeFast(m.FastModeState) {
+	if s.settings.observeFast(m.FastModeState, m.FastModeDisabledReason) {
 		s.announceSettingsLocked()
 	}
 	if inv.outcome.ContextUsage.WindowTokens == nil && inv.model != "" && m.ModelUsage[inv.model].ContextWindow > 0 {

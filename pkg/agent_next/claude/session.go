@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"time"
 
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
 	"github.com/JieWaZi/acp-go/pkg/agent_next/claude/protocol"
@@ -155,7 +156,7 @@ func (c *Client) open(ctx context.Context, req openRequest) (*session, error) {
 		s.wire.onWriteFailure = s.failWrite
 		go s.deliver()
 		go s.wire.read(s.receive, s.disconnected)
-		err = s.handshake(operation)
+		err = s.handshake(operation, !req.resume && req.forkSource == "")
 	} else {
 		close(s.deliveryDone)
 	}
@@ -196,7 +197,7 @@ func (c *Client) open(ctx context.Context, req openRequest) (*session, error) {
 	return s, nil
 }
 
-func (s *session) handshake(ctx context.Context) error {
+func (s *session) handshake(ctx context.Context, fresh bool) error {
 	req := protocol.InitializeControlRequest{Subtype: protocol.ControlInitialize, AppendSystemPrompt: s.launch.instructions}
 	if s.launch.snapshotOff {
 		off := false
@@ -213,7 +214,7 @@ func (s *session) handshake(ctx context.Context) error {
 		return err
 	}
 	var effective protocol.SettingsControlResponse
-	if s.launch.workspace != nil || modelOffersFast(response.Models) {
+	if s.launch.workspace != nil || len(response.Models) > 0 {
 		err := s.wire.call(ctx, protocol.GetSettingsControlRequest{Subtype: "get_settings"}, &effective, nil, nil)
 		if s.launch.workspace != nil {
 			if err != nil {
@@ -232,9 +233,7 @@ func (s *session) handshake(ctx context.Context) error {
 	}
 	var status protocol.MCPStatusResponse
 	if s.launch.mcpConfigured || len(s.client.options.Launch.PluginDirectories) > 0 {
-		bounded, cancel := context.WithTimeout(ctx, s.client.options.ControlTimeout)
-		_ = s.wire.call(bounded, protocol.MCPStatusRequest{Subtype: "mcp_status"}, &status, nil, nil)
-		cancel()
+		status = s.launchMCPStatus(ctx)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -248,7 +247,36 @@ func (s *session) handshake(ctx context.Context) error {
 	}
 	s.initialization = response
 	s.settings = initialSettings(s.init, response, effective, s.client.bypassEnabled())
+	if fresh {
+		s.settings.bindLegacyModel(s.client.initialModelAlias(effective.Effective), effective)
+	}
 	return nil
+}
+
+// launchMCPStatus waits for native asynchronous MCP handshakes. Claude 2.1.159
+// and 2.1.309 can acknowledge initialize while servers are still pending.
+func (s *session) launchMCPStatus(ctx context.Context) (latest protocol.MCPStatusResponse) {
+	ctx, cancel := context.WithTimeout(ctx, s.client.options.ControlTimeout)
+	defer cancel()
+	for {
+		var status protocol.MCPStatusResponse
+		if err := s.wire.call(ctx, protocol.MCPStatusRequest{Subtype: "mcp_status"}, &status, nil, nil); err != nil || status.Servers == nil {
+			return latest
+		}
+		latest = status
+		if !slices.ContainsFunc(status.Servers, func(server protocol.MCPServerStatus) bool {
+			return server.Status == "pending"
+		}) {
+			return latest
+		}
+		retry := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return latest
+		case <-retry.C:
+		}
+	}
 }
 
 func (s *session) response() acp.NewSessionResponse {

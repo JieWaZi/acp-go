@@ -140,7 +140,9 @@ func (c *Client) prepareLaunch(req openRequest, old *session) (launchPlan, error
 			sources = []string{"user"}
 		}
 	}
-	args := append(streamArgs(), "--setting-sources="+strings.Join(sources, ","))
+	// The host may apply another advertised mode after opening. Begin from
+	// an explicit default so a settings file cannot silently select bypass.
+	args := append(streamArgs(), "--setting-sources="+strings.Join(sources, ","), "--permission-mode", "default")
 	if o.Tools != nil {
 		args = append(args, "--tools="+strings.Join(o.Tools, ","))
 	}

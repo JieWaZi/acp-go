@@ -250,6 +250,15 @@ func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, r
 		modelReport = nil
 	}
 	costReport := result.TotalCostUSD
+	// The query estimate cannot be separated into price bases. If any model
+	// reports an organization rate or a fallback guess, keep only the token
+	// counts and independently supported model estimates.
+	for _, row := range result.ModelUsage {
+		if !listCostBasis(row.CostBasis) {
+			costReport = nil
+			break
+		}
+	}
 	if costReport != nil && unreliableTerminal {
 		if amount, err := costReport.Float64(); err != nil || amount == 0 {
 			costReport = nil
@@ -389,8 +398,18 @@ func (m *modelCounters) observe(sample protocol.ModelUsage) acpmeta.ModelUsage {
 		m.cost.adjacent = false
 		*m.costBasis = sample.CostBasis
 	}
-	row.Cost = observeCost(&m.cost, sample.CostUSD)
+	cost := sample.CostUSD
+	if !listCostBasis(sample.CostBasis) {
+		cost = nil
+	}
+	row.Cost = observeCost(&m.cost, cost)
 	return row
+}
+
+// listCostBasis accepts the CLI list estimate, including versions that
+// predate costBasis. Managed rates and guesses have no comparable list cost.
+func listCostBasis(basis string) bool {
+	return basis == "" || basis == "list"
 }
 
 func observeTokens(counter *cumulativeCounter[int64], sample int64, present bool) *int64 {

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
@@ -215,7 +217,7 @@ func (c *Client) ReadModels(ctx context.Context) (acpmeta.ModelCatalog, error) {
 		rows := modelOptions(init.Models)
 		result.Options.Ungrouped = &rows
 		for _, row := range init.Models {
-			if row.Value == "default" && row.ResolvedModel != "" {
+			if row.Value == "default" {
 				result.DefaultID = acp.Ptr(acp.SessionConfigValueId(modelID(row)))
 				break
 			}
@@ -225,41 +227,145 @@ func (c *Client) ReadModels(ctx context.Context) (acpmeta.ModelCatalog, error) {
 	return result, err
 }
 
+// LoginStatus is the native account observation for the frozen environment.
+type LoginStatus struct {
+	// Authenticated reports whether the CLI recognizes a selected credential.
+	Authenticated bool
+	// Kind distinguishes subscriptions, API keys and external cloud credentials.
+	Kind string
+	// Email is the subscription label when reported.
+	Email *string
+	// Plan is the subscription type when reported.
+	Plan *string
+	// OrganizationID is the UUID reported by the native status command.
+	OrganizationID string
+	// AccountID is the UUID in native OAuth metadata matching the current status.
+	AccountID string
+	// ConfigDirectory is the native configuration root when the CLI reports it.
+	ConfigDirectory string
+}
+
+// ReadLoginStatus reads native identity without a version probe or session.
+func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
+	output, err := c.command(ctx, 5*time.Second, "auth", "status", "--json")
+	status := decodeOptional[struct {
+		// LoggedIn is absent when the command failed to report a status.
+		LoggedIn *bool `json:"loggedIn"`
+		// Method is the native sign-in method.
+		Method string `json:"authMethod"`
+		// Provider identifies the active API backend.
+		Provider string `json:"apiProvider"`
+		// Email and Plan describe the native subscription.
+		Email *string `json:"email"`
+		Plan  *string `json:"subscriptionType"`
+		// OrganizationID is emitted for Claude.ai subscriptions.
+		OrganizationID string `json:"orgId"`
+		// ConfigDirectory is available on newer CLI builds.
+		ConfigDirectory string `json:"configDirectory"`
+	}](output)
+	var exited commandExit
+	if err != nil && !(errors.As(err, &exited) && exited == 1 && status != nil && status.LoggedIn != nil && !*status.LoggedIn) {
+		return LoginStatus{}, err
+	}
+	if status == nil || status.LoggedIn == nil {
+		return LoginStatus{}, errors.New("Claude returned unreadable account status")
+	}
+	result := LoginStatus{Authenticated: *status.LoggedIn, ConfigDirectory: status.ConfigDirectory}
+	if !result.Authenticated {
+		return result, nil
+	}
+	result.Kind = "unknown"
+	switch {
+	case status.Provider == "bedrock" || status.Provider == "vertex" || status.Provider == "foundry":
+		result.Kind = status.Provider
+	case status.Method == "claude.ai" || status.Method == "claudeai" || status.Method == "oauth":
+		result.Kind, result.Email, result.Plan = "subscription", status.Email, status.Plan
+		if isUUID(status.OrganizationID) {
+			result.OrganizationID = strings.ToLower(status.OrganizationID)
+			if !c.accountUsesEnvironment() && status.Email != nil && *status.Email != "" {
+				result.AccountID = c.subscriptionAccountID(result.OrganizationID, *status.Email)
+			}
+		}
+	case status.Method == "apiKey" || status.Method == "api_key" || status.Method == "anthropicConsole":
+		result.Kind = "api_key"
+	case status.Method == "oauth_token":
+		// Claude Code 2.1.159 reports the same method for a gateway token
+		// and a Claude subscription token. Only the frozen environment
+		// distinguishes the credential source in this response.
+		switch {
+		case c.environment("ANTHROPIC_AUTH_TOKEN") != "" && c.environment("CLAUDE_CODE_OAUTH_TOKEN") == "":
+			result.Kind = "api_key"
+		case c.environment("CLAUDE_CODE_OAUTH_TOKEN") != "" && c.environment("ANTHROPIC_AUTH_TOKEN") == "":
+			result.Kind, result.Email, result.Plan = "subscription", status.Email, status.Plan
+		}
+	}
+	return result, nil
+}
+
+// subscriptionAccountID complements the native status's orgId with its
+// persisted OAuth account UUID. CLI 2.1.159 and 2.1.309 use .claude.json;
+// the older build first checks the account directory's legacy .config.json.
+func (c *Client) subscriptionAccountID(orgID, email string) string {
+	config := c.environment("CLAUDE_CONFIG_DIR")
+	home := firstString(c.environment("HOME"), c.environment("USERPROFILE"))
+	if config == "" {
+		if home == "" {
+			return ""
+		}
+		config = filepath.Join(home, ".claude")
+	} else {
+		home = config
+	}
+	if !filepath.IsAbs(config) {
+		config = filepath.Join(c.options.WorkingDirectory, config)
+	}
+	if !filepath.IsAbs(home) {
+		home = filepath.Join(c.options.WorkingDirectory, home)
+	}
+	path := filepath.Join(config, ".config.json")
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		path = filepath.Join(home, ".claude.json")
+		info, err = os.Lstat(path)
+	}
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	data, err := readBoundedFile(path, 16<<20)
+	if err != nil {
+		return ""
+	}
+	record := decodeOptional[struct {
+		// OAuthAccount is native non-secret identity metadata.
+		OAuthAccount struct {
+			// AccountID is the user UUID written by the native OAuth login.
+			AccountID string `json:"accountUuid"`
+			// OrganizationID is the organization written by the same login.
+			OrganizationID string `json:"organizationUuid"`
+			// Email is compared with the current CLI status for consistency.
+			Email string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}](data)
+	if record == nil || !strings.EqualFold(record.OAuthAccount.OrganizationID, orgID) ||
+		!strings.EqualFold(record.OAuthAccount.Email, email) || !isUUID(record.OAuthAccount.AccountID) {
+		return ""
+	}
+	return strings.ToLower(record.OAuthAccount.AccountID)
+}
+
 // ReadAccount obtains the native account observation without opening a session.
 func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
 	if err := c.ready(); err != nil {
 		return acpmeta.AccountInfo{}, err
 	}
-	output, err := c.command(ctx, 5*time.Second, "auth", "status", "--json")
-	status := decodeOptional[struct {
-		LoggedIn *bool   `json:"loggedIn"`
-		Method   string  `json:"authMethod"`
-		Provider string  `json:"apiProvider"`
-		Email    *string `json:"email"`
-		Plan     *string `json:"subscriptionType"`
-	}](output)
-	var exited commandExit
-	if err != nil && !(errors.As(err, &exited) && exited == 1 && status != nil && status.LoggedIn != nil && !*status.LoggedIn) {
+	status, err := c.ReadLoginStatus(ctx)
+	if err != nil {
 		return acpmeta.AccountInfo{}, err
 	}
-	if status == nil || status.LoggedIn == nil {
-		return acpmeta.AccountInfo{}, errors.New("Claude returned unreadable account status")
-	}
-	if !*status.LoggedIn {
+	if !status.Authenticated {
 		return acpmeta.AccountInfo{RequiresAuthentication: true}, nil
 	}
-	account := &acpmeta.AccountIdentity{Kind: "unknown"}
-	switch status.Method {
-	case "claude.ai", "claudeai", "oauth":
-		account.Kind, account.Label, account.Plan = "subscription", status.Email, status.Plan
-	case "apiKey", "api_key", "anthropicConsole":
-		account.Kind = "api_key"
-	default:
-		if status.Provider == "bedrock" || status.Provider == "vertex" || status.Provider == "foundry" {
-			account.Kind = status.Provider
-		}
-	}
-	return acpmeta.AccountInfo{Account: account}, nil
+	return acpmeta.AccountInfo{Account: &acpmeta.AccountIdentity{Kind: status.Kind, Label: status.Email, Plan: status.Plan}}, nil
 }
 
 // ReadAccountUsage reads native subscription windows separately from turn usage.

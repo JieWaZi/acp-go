@@ -343,6 +343,8 @@ type ResultMessage struct {
 	TotalCostUSD *json.Number `json:"total_cost_usd,omitempty"`
 	// FastModeState is the native service observation at completion.
 	FastModeState string `json:"fast_mode_state,omitempty"`
+	// FastModeDisabledReason is the native account or service restriction.
+	FastModeDisabledReason string `json:"fast_mode_disabled_reason,omitempty"`
 	// QueuedTurnCount is the count of pending native user sends, when reported.
 	QueuedTurnCount *int `json:"queued_turn_count,omitempty"`
 	// messageBase preserves the top-level discriminator and raw JSON.
@@ -1149,6 +1151,13 @@ type SettingsControlResponse struct {
 
 // EffectiveSettings contains the narrow fields required to verify launch policy.
 type EffectiveSettings struct {
+	// Model is the merged model setting before native alias resolution.
+	Model string `json:"model"`
+	// Environment selects model overrides from the native settings environment.
+	Environment struct {
+		// Model overrides the settings model through ANTHROPIC_MODEL.
+		Model string `json:"ANTHROPIC_MODEL"`
+	} `json:"env"`
 	// FastMode is the merged preference, separate from the observed service state.
 	FastMode *bool `json:"fastMode"`
 	// AllowManagedHooksOnly confirms the restricted hook sources.

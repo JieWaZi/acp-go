@@ -735,3 +735,22 @@ func readPromptUsage(t *testing.T, peer *acp.ClientSideConnection, id acp.Sessio
 	}
 	return turn.Usage
 }
+
+func TestUnpricedNativeClaudeUsageKeepsTokensWithoutGuessingCost(t *testing.T) {
+	peer, id, _, ctx := startACP(t, "pricing-basis", nil, nil)
+	for _, basis := range []string{"list", "managed", "managed", "unknown", "unknown", "re-established list", "list"} {
+		u := readPromptUsage(t, peer, id, ctx)
+		model := u.Models["sonnet"]
+		if !u.Complete || u.InputTokens == nil || *u.InputTokens != 20 ||
+			model.OutputTokens == nil || *model.OutputTokens != 20 {
+			t.Fatalf("%s: token accounting = %+v, model = %+v", basis, u, model)
+		}
+		if basis != "list" {
+			if u.Cost != nil || model.Cost != nil {
+				t.Errorf("%s: unsupported pricing evidence entered the ledger, query=%+v model=%+v", basis, u.Cost, model.Cost)
+			}
+		} else if u.Cost == nil || model.Cost == nil || string(u.Cost.Amount) != "1.000000000000000000" || u.Cost.Amount != model.Cost.Amount {
+			t.Errorf("%s: list estimate = %+v / %+v", basis, u.Cost, model.Cost)
+		}
+	}
+}

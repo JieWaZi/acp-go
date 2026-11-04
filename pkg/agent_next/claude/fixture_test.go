@@ -27,6 +27,18 @@ func TestClaudeFixture(t *testing.T) {
 			fmt.Fprintln(os.Stdout, "2.1.309 (Claude Code)")
 			os.Exit(0)
 		case arg == "status":
+			if f.mode == "subscription-identity" {
+				f.emit(map[string]any{
+					"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "email": "local@example.test",
+					"orgId": "c58fe389-3a47-4d19-aa06-104f4450dff8", "subscriptionType": "pro",
+					"configDirectory": os.Getenv("CLAUDE_CONFIG_DIR"),
+				})
+				os.Exit(0)
+			}
+			if f.mode == "legacy-auth-token" {
+				f.emit(map[string]any{"loggedIn": true, "authMethod": "oauth_token", "apiProvider": "firstParty"})
+				os.Exit(0)
+			}
 			f.emit(map[string]any{"loggedIn": true, "authMethod": "claude.ai", "email": "local@example.test", "subscriptionType": "pro"})
 			os.Exit(0)
 		case arg == "login" || arg == "logout":
@@ -42,6 +54,8 @@ func TestClaudeFixture(t *testing.T) {
 			_ = json.Unmarshal([]byte(os.Args[i+1]), &f.workspace)
 		case strings.HasPrefix(arg, "--plugin-dir-no-mcp="):
 			f.pluginArgv = append(f.pluginArgv, strings.TrimPrefix(arg, "--plugin-dir-no-mcp="))
+		case arg == "--permission-mode" && i+1 < len(os.Args):
+			f.permissionMode = os.Args[i+1]
 		case arg == "--await-initialize":
 			f.awaitInitialize = true
 		case arg == "--fork-session":
@@ -65,6 +79,12 @@ func TestClaudeFixture(t *testing.T) {
 	}
 	f.input = bufio.NewReader(os.Stdin)
 	f.model = "sonnet"
+	if f.mode == "legacy-model-aliases" {
+		f.model = "claude-opus-4-8[1m]"
+		if os.Getenv("ANTHROPIC_MODEL") == "sonnet" {
+			f.model = "claude-sonnet-4-6"
+		}
+	}
 	for {
 		line, err := f.input.ReadBytes('\n')
 		if err != nil {
@@ -126,10 +146,14 @@ type fixture struct {
 	strict          bool
 	snapshotOff     bool
 	awaitInitialize bool
-	pluginArgv      []string
-	settings        map[string]any
-	workspace       map[string]any
-	hookID          string
+	// permissionMode captures the mode explicitly selected at launch.
+	permissionMode string
+	// mcpStatusReads tracks a server still connecting after initialize.
+	mcpStatusReads int
+	pluginArgv     []string
+	settings       map[string]any
+	workspace      map[string]any
+	hookID         string
 }
 
 func (f *fixture) emit(frame map[string]any) {
@@ -174,6 +198,15 @@ func (f *fixture) result(id, text, terminal string) {
 		frame["is_error"] = true
 		frame["api_error_status"] = 429
 	}
+	if f.mode == "pricing-basis" {
+		basis := []string{"list", "managed", "managed", "unknown", "unknown", "list", "list"}[f.index]
+		used := (f.index + 1) * 20
+		frame["modelUsage"] = map[string]any{f.model: map[string]any{
+			"inputTokens": used, "outputTokens": used, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+			"costUSD": f.index + 1, "costBasis": basis,
+		}}
+		frame["total_cost_usd"] = f.index + 1
+	}
 	if f.mode == "usage-gap" && f.index != 1 {
 		used := 20
 		if f.index >= 2 {
@@ -205,7 +238,7 @@ func (f *fixture) control(frame fixtureFrame) {
 			}
 		}
 		f.emit(init)
-		f.mark("launch", fmt.Sprintf("strict=%t snapshot=%t instructions=%v", f.strict, f.snapshotOff, optionalString(frame.Request.Append)))
+		f.mark("launch", fmt.Sprintf("strict=%t snapshot=%t instructions=%v mode=%s", f.strict, f.snapshotOff, optionalString(frame.Request.Append), f.permissionMode))
 		if hooks := frame.Request.Hooks["PreToolUse"]; len(hooks) > 0 && len(hooks[0].IDs) > 0 {
 			f.hookID = hooks[0].IDs[0]
 		}
@@ -213,6 +246,13 @@ func (f *fixture) control(frame fixtureFrame) {
 			{"value": "sonnet", "displayName": "Sonnet", "supportsEffort": true, "supportedEffortLevels": []string{"low", "high"}, "supportsFastMode": true},
 			{"value": "opus", "displayName": "Opus", "supportsEffort": false, "supportsFastMode": false},
 		}}
+		if f.mode == "legacy-model-aliases" {
+			response.(map[string]any)["fast_mode_disabled_reason"] = "extra_usage_disabled"
+			response.(map[string]any)["models"] = []map[string]any{
+				{"value": "default", "displayName": "Default (recommended)", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "xhigh", "max"}, "supportsFastMode": true},
+				{"value": "sonnet", "displayName": "Sonnet", "supportsEffort": true, "supportedEffortLevels": []string{"low", "medium", "high", "max"}, "supportsAutoMode": true},
+			}
+		}
 		paths := make([]string, 0, len(frame.Request.Plugins))
 		for _, p := range frame.Request.Plugins {
 			if p.Type == "local" && p.SkipMCPDiscovery {
@@ -236,9 +276,26 @@ func (f *fixture) control(frame fixtureFrame) {
 		response = map[string]any{"applied": map[string]any{"model": f.model, "effort": f.settings["effortLevel"]}, "effective": effective}
 	case "set_model":
 		f.model = frame.Request.Model
+		if f.mode == "legacy-model-aliases" {
+			switch f.model {
+			case "default":
+				f.model = "claude-opus-4-8[1m]"
+			case "sonnet":
+				f.model = "claude-sonnet-4-6"
+			}
+		}
 	case "apply_flag_settings":
 		for key, value := range frame.Request.Settings {
 			f.settings[key] = value
+		}
+	case "mcp_status":
+		if f.mode == "mcp-pending" {
+			status := "pending"
+			if f.mcpStatusReads > 0 {
+				status = "connected"
+			}
+			f.mcpStatusReads++
+			response = map[string]any{"mcpServers": []map[string]string{{"name": "local", "status": status}}}
 		}
 	case "get_context_usage":
 		response = map[string]any{"totalTokens": 17, "rawMaxTokens": 1000}

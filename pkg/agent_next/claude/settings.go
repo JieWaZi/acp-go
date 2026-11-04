@@ -13,9 +13,12 @@ import (
 )
 
 type settingEvidence struct {
-	requested    string
+	// requested records the last explicit native setter intent.
+	requested string
+	// acknowledged records the last intent accepted by the native setter.
 	acknowledged string
-	observed     string
+	// observed is the native readback, independent of setter acceptance.
+	observed string
 }
 
 func (s settingEvidence) metadata() map[string]any {
@@ -33,18 +36,29 @@ func (s settingEvidence) metadata() map[string]any {
 }
 
 type sessionSettings struct {
-	models    []protocol.ModelInfo
-	model     settingEvidence
-	effort    settingEvidence
-	fast      settingEvidence
+	// models contains the selectable rows reported by this process.
+	models []protocol.ModelInfo
+	// model retains the requested choice and the concrete wire observation.
+	model settingEvidence
+	// modelAlias links the current observation to a selectable row on older CLIs.
+	modelAlias string
+	// effort retains the session effort intent and applied level.
+	effort settingEvidence
+	// fast retains the Fast preference, separate from the service state.
+	fast settingEvidence
+	// fastState is the reported native service state (off, on or cooldown).
 	fastState string
-	mode      string
-	bypass    bool
+	// fastDisabledReason is the native account or service restriction when reported.
+	fastDisabledReason string
+	// mode is the current native permission mode.
+	mode string
+	// bypass declares whether the launch policy allows bypassing permissions.
+	bypass bool
 }
 
 func initialSettings(init protocol.SystemInitMessage, hello protocol.InitializeControlResponse, effective protocol.SettingsControlResponse, bypass bool) sessionSettings {
 	s := sessionSettings{models: hello.Models, bypass: bypass, mode: "default"}
-	s.observeFast(hello.FastModeState)
+	s.observeFast(hello.FastModeState, hello.FastModeDisabledReason)
 	s.observeInit(init)
 	s.observe(effective)
 	return s
@@ -53,7 +67,7 @@ func initialSettings(init protocol.SystemInitMessage, hello protocol.InitializeC
 func (s *sessionSettings) observeInit(init protocol.SystemInitMessage) bool {
 	before := *s
 	if init.Model != "" {
-		s.model.observed = s.resolved(init.Model)
+		s.observeModel(init.Model)
 	}
 	if len(init.Effort) > 0 {
 		s.effort.observed = effortValue(init.Effort)
@@ -61,28 +75,44 @@ func (s *sessionSettings) observeInit(init protocol.SystemInitMessage) bool {
 	if init.PermissionMode != "" {
 		s.mode = init.PermissionMode
 	}
-	s.observeFast(init.FastModeState)
-	return before.model != s.model || before.effort != s.effort || before.mode != s.mode || before.fastState != s.fastState
+	fastChanged := s.observeFast(init.FastModeState, init.FastModeDisabledReason)
+	return before.model != s.model || before.effort != s.effort || before.mode != s.mode || fastChanged
 }
 
 func (s *sessionSettings) observe(effective protocol.SettingsControlResponse) {
 	if model := decodeOptional[string](effective.Applied["model"]); model != nil && *model != "" {
-		s.model.observed = s.resolved(*model)
+		s.observeModel(*model)
 	}
 	if raw := effective.Applied["effort"]; len(raw) > 0 {
 		s.effort.observed = effortValue(raw)
 	}
-	if effective.Effective != nil && effective.Effective.FastMode != nil {
-		s.fast.observed = onOff(*effective.Effective.FastMode)
+	if effective.Effective != nil {
+		s.fast.observed = "default"
+		if effective.Effective.FastMode != nil {
+			s.fast.observed = onOff(*effective.Effective.FastMode)
+		}
 	}
 }
 
-func (s *sessionSettings) observeFast(value string) bool {
-	if value == s.fastState || value != "on" && value != "off" && value != "cooldown" {
-		return false
+func (s *sessionSettings) observeFast(state, reason string) bool {
+	previousState, previousReason := s.fastState, s.fastDisabledReason
+	switch state {
+	case "on", "off", "cooldown":
+		s.fastState = state
+		// Native frames without a state or reason may predate both fields.
+		// A known state without a reason is a fresh observation.
+		if reason == "" {
+			s.fastDisabledReason = ""
+		}
 	}
-	s.fastState = value
-	return true
+	// The fixed SDK declares these enum values. Never forward arbitrary text
+	// from a provider response as a diagnostic.
+	switch reason {
+	case "free", "preference", "extra_usage_disabled", "network_error", "unknown",
+		"not_first_party", "disabled_by_env", "model_not_allowed", "sdk_opt_in_required", "pending":
+		s.fastDisabledReason = reason
+	}
+	return previousState != s.fastState || previousReason != s.fastDisabledReason
 }
 
 func effortValue(raw json.RawMessage) string {
@@ -103,6 +133,9 @@ func modelID(row protocol.ModelInfo) string {
 }
 
 func (s sessionSettings) findModel(id string) (protocol.ModelInfo, bool) {
+	if id == "" {
+		return protocol.ModelInfo{}, false
+	}
 	for _, m := range s.models {
 		if modelID(m) == id || m.Value == id {
 			return m, true
@@ -118,12 +151,40 @@ func (s sessionSettings) resolved(id string) string {
 	return id
 }
 
-func (s sessionSettings) currentModel() (protocol.ModelInfo, bool) {
-	return s.findModel(s.model.observed)
+func (s *sessionSettings) observeModel(wireID string) {
+	id := s.resolved(wireID)
+	if id != s.model.observed {
+		s.modelAlias = ""
+		s.model.observed = id
+	}
 }
 
-func modelOffersFast(models []protocol.ModelInfo) bool {
-	return slices.ContainsFunc(models, func(model protocol.ModelInfo) bool { return model.SupportsFastMode })
+// bindLegacyModel associates a native alias with a verified settings readback.
+// Newer catalog rows already provide this relation via resolvedModel.
+func (s *sessionSettings) bindLegacyModel(alias string, response protocol.SettingsControlResponse) {
+	wireID := decodeOptional[string](response.Applied["model"])
+	row, found := s.findModel(alias)
+	if found && row.ResolvedModel == "" && wireID != nil && *wireID != "" {
+		s.modelAlias = row.Value
+	}
+}
+
+func (s sessionSettings) currentModel() (protocol.ModelInfo, bool) {
+	if row, ok := s.findModel(s.model.observed); ok {
+		return row, true
+	}
+	return s.findModel(s.modelAlias)
+}
+
+// initialModelAlias describes a fresh launch with no previous native model
+// selection. Legacy CLI readback expands aliases while its catalog does not.
+func (c *Client) initialModelAlias(effective *protocol.EffectiveSettings) string {
+	if effective == nil || slices.ContainsFunc(c.options.PrefixArgs, func(arg string) bool {
+		return arg == "--model" || strings.HasPrefix(arg, "--model=")
+	}) {
+		return ""
+	}
+	return firstString(effective.Environment.Model, c.environment("ANTHROPIC_MODEL"), effective.Model, "default")
 }
 
 func supportsEffort(m protocol.ModelInfo) bool {
@@ -152,14 +213,18 @@ func (s sessionSettings) options() []acp.SessionConfigOption {
 	}
 	result := []acp.SessionConfigOption{choice("mode", "Mode", acp.SessionConfigOptionCategoryMode, s.mode, modeOptions, nil)}
 	if len(s.models) > 0 || s.model.observed != "" {
-		result = append(result, choice("model", "Model", acp.SessionConfigOptionCategoryModel, s.model.observed, modelOptions(s.models), s.model.metadata()))
+		current := s.model.observed
+		if row, ok := s.currentModel(); ok {
+			current = modelID(row)
+		}
+		result = append(result, choice("model", "Model", acp.SessionConfigOptionCategoryModel, current, modelOptions(s.models), s.model.metadata()))
 	}
 	if m, ok := s.currentModel(); ok {
 		if supportsEffort(m) {
 			result = append(result, effortOption(m, s.effort))
 		}
 		if m.SupportsFastMode {
-			result = append(result, fastOption(s.fast, s.fastState))
+			result = append(result, fastOption(s.fast, s.fastState, s.fastDisabledReason))
 		}
 	}
 	return result
@@ -190,14 +255,26 @@ func effortOption(m protocol.ModelInfo, evidence settingEvidence) acp.SessionCon
 	return choice("effort", "Effort", acp.SessionConfigOptionCategoryThoughtLevel, evidence.observed, rows, evidence.metadata())
 }
 
-func fastOption(evidence settingEvidence, state string) acp.SessionConfigOption {
+func fastOption(evidence settingEvidence, state, reason string) acp.SessionConfigOption {
 	meta := evidence.metadata()
 	if state != "" {
 		meta["claude.fast-mode-state"] = state
 	}
+	if reason != "" {
+		meta["claude.fast-mode-disabled-reason"] = reason
+	}
 	return choice("fast", "Fast mode", "", evidence.observed, acp.SessionConfigSelectOptionsUngrouped{
 		{Value: "default", Name: "Default"}, {Value: "on", Name: "On"}, {Value: "off", Name: "Off"},
 	}, meta)
+}
+
+const modelAutoModeKey = "claude.supports-auto-mode"
+
+// ModelAutoModeSupported reports whether this catalog row advertises native
+// automatic permission handling. Absent metadata does not grant the mode.
+func ModelAutoModeSupported(meta map[string]any) bool {
+	supported, _ := meta[modelAutoModeKey].(bool)
+	return supported
 }
 
 func modelOptions(models []protocol.ModelInfo) acp.SessionConfigSelectOptionsUngrouped {
@@ -220,11 +297,15 @@ func modelOptions(models []protocol.ModelInfo) acp.SessionConfigSelectOptionsUng
 			catalog.UnknownConfigIDs = append(catalog.UnknownConfigIDs, "effort")
 		}
 		if m.SupportsFastMode {
-			catalog.Options = append(catalog.Options, fastOption(settingEvidence{}, ""))
+			catalog.Options = append(catalog.Options, fastOption(settingEvidence{}, "", ""))
 		} else if !m.FastSupportReported {
 			catalog.UnknownConfigIDs = append(catalog.UnknownConfigIDs, "fast")
 		}
-		rows = append(rows, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(id), Name: name, Description: &m.Description, Meta: acpmeta.WithModelConfigCatalog(nil, catalog)})
+		meta := acpmeta.WithModelConfigCatalog(nil, catalog)
+		if m.SupportsAutoMode {
+			meta[modelAutoModeKey] = true
+		}
+		rows = append(rows, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(id), Name: name, Description: &m.Description, Meta: meta})
 	}
 	return rows
 }
@@ -308,6 +389,7 @@ func (s *session) configure(ctx context.Context, id, value string) error {
 		return s.setFlag(ctx, id, value, native)
 	}
 	model, modelKnown := before.currentModel()
+	var selectedAlias string
 	switch id {
 	case "mode":
 		if !slices.ContainsFunc(before.modes().AvailableModes, func(m acp.SessionMode) bool { return string(m.Id) == value }) {
@@ -343,12 +425,14 @@ func (s *session) configure(ctx context.Context, id, value string) error {
 			s.mu.Lock()
 			s.settings.model.acknowledged = modelID(target)
 			s.settings.model.observed = ""
+			s.settings.modelAlias = ""
 			s.settings.effort.observed = ""
 			s.mu.Unlock()
 		})
 		if err != nil {
 			return err
 		}
+		selectedAlias = target.Value
 	case "effort":
 		if !modelKnown || !supportsEffort(model) || value != "default" && !slices.Contains(model.SupportedEffortLevels, value) {
 			return acp.NewInvalidParams(nil)
@@ -380,6 +464,9 @@ func (s *session) configure(ctx context.Context, id, value string) error {
 		if value := decodeOptional[protocol.SettingsControlResponse](raw); value != nil {
 			s.mu.Lock()
 			s.settings.observe(*value)
+			if selectedAlias != "" {
+				s.settings.bindLegacyModel(selectedAlias, *value)
+			}
 			s.mu.Unlock()
 		}
 	})
