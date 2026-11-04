@@ -27,12 +27,12 @@ func (a *Agent) handleMCPStartupStatus(ctx context.Context, status protocol.MCPS
 
 	if status.ThreadID != nil {
 		if state, ok := a.sessions.get(*status.ThreadID); ok {
-			a.publishMCPStartupFailure(ctx, state, snapshot)
+			a.publishMCPStartupFailure(ctx, state, snapshot, true)
 		}
 		return
 	}
 	for _, state := range a.sessions.snapshot() {
-		a.publishMCPStartupFailure(ctx, state, snapshot)
+		a.publishMCPStartupFailure(ctx, state, snapshot, true)
 	}
 }
 
@@ -66,7 +66,7 @@ func (a *Agent) publishKnownMCPStartupFailures(state *sessionState, names []stri
 	}
 	a.mcpMu.Unlock()
 	for _, status := range statuses {
-		a.publishMCPStartupFailure(a.runtimeCtx, state, status)
+		a.publishMCPStartupFailure(a.runtimeCtx, state, status, false)
 	}
 }
 
@@ -75,6 +75,7 @@ func (a *Agent) publishMCPStartupFailure(
 	ctx context.Context,
 	state *sessionState,
 	snapshot mcpStatusSnapshot,
+	async bool,
 ) {
 	status := snapshot.notification
 	if !a.sessions.isCurrent(state) || (status.Status != protocol.PurpleFailed && status.Status != protocol.Cancelled) {
@@ -111,8 +112,19 @@ func (a *Agent) publishMCPStartupFailure(
 		acp.WithStartContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(message))}),
 	)
 	if updater := a.currentSessionUpdater(); updater != nil {
-		if err := updater.SessionUpdate(ctx, acp.SessionNotification{SessionId: acp.SessionId(state.id), Update: update}); err != nil {
-			a.logger.Debug("Failed to publish MCP startup failure", "session_id", state.id, "server", status.Name, "error", err)
+		send := func() {
+			if a.sessions.isCurrent(state) {
+				if err := updater.SessionUpdate(ctx, acp.SessionNotification{SessionId: acp.SessionId(state.id), Update: update}); err != nil {
+					a.logger.Debug("Failed to publish MCP startup failure", "session_id", state.id, "server", status.Name, "error", err)
+				}
+			}
+		}
+		if async && a.delivery != nil {
+			if err := a.delivery.enqueue(send); err != nil {
+				a.logger.Warn("Could not queue Codex MCP startup status", "session_id", state.id, "error", err)
+			}
+		} else {
+			send()
 		}
 	}
 }

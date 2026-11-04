@@ -49,7 +49,7 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 	wantMeta := map[string]any{
 		"developerInstructions": map[string]any{"metadataKey": "developerInstructions", "new": true, "resume": true, "load": true, "fork": false},
 		"steering":              map[string]any{"supported": true},
-		"native_management":     map[string]any{"account_read": true, "account_usage": true, "compact": true, "schema_version": "0.148.0", "provider_support": "unknown"},
+		"native_management":     map[string]any{"account_read": true, "account_usage": true, "compact": true, "codex_thread_archive": ThreadArchiveMethod, "codex_thread_unarchive": ThreadUnarchiveMethod, "codex_session_settings": SessionSettingsMethod, "schema_version": "0.148.0", "provider_support": "unknown"},
 		"fork":                  map[string]any{"mode": "unsupported"},
 	}
 	if !reflect.DeepEqual(response.Meta, wantMeta) {

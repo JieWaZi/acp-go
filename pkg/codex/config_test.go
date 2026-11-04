@@ -249,7 +249,7 @@ func TestServiceTierSelectionUsesActualWireValues(t *testing.T) {
 		if err := config.Select("service_tier", tc.selection); err != nil {
 			t.Fatal(err)
 		}
-		params := turnParamsForSession(state, nil, nil)
+		params := mustTurnParams(t, state)
 		raw, err := json.Marshal(params)
 		if err != nil {
 			t.Fatal(err)
@@ -274,21 +274,21 @@ func TestObservedModelDoesNotBecomeTurnOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := &sessionState{id: "thread", configuration: config}
-	params := turnParamsForSession(state, nil, nil)
+	params := mustTurnParams(t, state)
 	if params.Model != nil || params.Effort != nil {
 		t.Fatalf("observed values sent as overrides: %+v", params)
 	}
 	if err = config.Select(modelConfigID, "slow-model"); err != nil {
 		t.Fatal(err)
 	}
-	params = turnParamsForSession(state, nil, nil)
+	params = mustTurnParams(t, state)
 	if params.Model == nil || *params.Model != "slow-model" || params.Effort != nil {
 		t.Fatalf("unexpected requested overrides: %+v", params)
 	}
 	if err = config.Select(reasoningEffortConfigID, "low"); err != nil {
 		t.Fatal(err)
 	}
-	params = turnParamsForSession(state, nil, nil)
+	params = mustTurnParams(t, state)
 	if params.Effort == nil || *params.Effort != "low" {
 		t.Fatalf("selected effort missing: %+v", params)
 	}
@@ -365,4 +365,14 @@ func TestModelCatalogRetainsKnownEffortAlongsideUnknownTier(t *testing.T) {
 	}
 	selectOption(t, catalog.Options, reasoningEffortConfigID)
 
+}
+
+// mustTurnParams retrieves a valid session's wire settings.
+func mustTurnParams(t *testing.T, state *sessionState) protocol.TurnStartParams {
+	t.Helper()
+	params, err := turnParamsForSession(state, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return params
 }

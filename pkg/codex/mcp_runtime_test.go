@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
@@ -110,11 +111,11 @@ func TestToolRequestUserInputUsesACPForm(t *testing.T) {
 		}},
 	}}
 	agent, state := newElicitationTestAgent(t, requester, true, true)
-	prompt := newActivePrompt(agent.runtimeCtx, 7)
-	prompt.setTurn("turn-input")
+	prompt := newNativeTurn(agent.runtimeCtx, 7)
 	state.mu.Lock()
-	state.activePrompt = prompt
+	state.activeTurn = prompt
 	state.mu.Unlock()
+	agent.onTurnStarted(state, prompt, "turn-input")
 	request, err := protocol.DecodeServerRequest([]byte(`{
 		"id":"input-1","method":"item/tool/requestUserInput","params":{
 			"isBlocking":true,"itemId":"item-input","threadId":"thread-elicit","turnId":"turn-input",
@@ -169,6 +170,15 @@ func TestMCPServerElicitationUsesACPAndCompletesURL(t *testing.T) {
 		t.Fatalf("解码 serverRequest/resolved 失败: %v", err)
 	}
 	agent.handleNotification(context.Background(), resolved)
+	drained := make(chan struct{})
+	if err := agent.delivery.enqueue(func() { close(drained) }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("elicitation completion did not drain")
+	}
 	if len(requester.completed) != 1 || requester.completed[0].ElicitationId != "url-1" {
 		t.Fatalf("URL elicitation 完成通知为 %#v", requester.completed)
 	}
@@ -199,10 +209,19 @@ func TestMCPServerElicitationFallsBackToPermission(t *testing.T) {
 	}
 }
 
+// mcpStartupUpdater records asynchronous ACP startup notifications.
+type mcpStartupUpdater chan acp.SessionNotification
+
+// SessionUpdate delivers one recorded notification to the test.
+func (u mcpStartupUpdater) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
+	u <- notification
+	return nil
+}
+
 // TestMCPStartupStatusIgnoresOlderSameNameFailure 验证版本水位隔离旧会话的同名失败状态。
 func TestMCPStartupStatusIgnoresOlderSameNameFailure(t *testing.T) {
 	agent, state := newElicitationTestAgent(t, &recordingElicitationRequester{}, false, false)
-	updater := &recordingSessionUpdater{}
+	updater := make(mcpStartupUpdater, 2)
 	agent.connectionMu.Lock()
 	agent.sessionUpdater = updater
 	agent.connectionMu.Unlock()
@@ -212,16 +231,22 @@ func TestMCPStartupStatusIgnoresOlderSameNameFailure(t *testing.T) {
 	})
 	afterVersion := agent.currentMCPStatusVersion()
 	agent.publishKnownMCPStartupFailures(state, []string{"shared"}, afterVersion)
-	if len(updater.notifications) != 0 {
-		t.Fatalf("新会话错误消费了旧 MCP 状态: %#v", updater.notifications)
+	select {
+	case event := <-updater:
+		t.Fatalf("previous MCP startup event leaked: %#v", event)
+	default:
 	}
 	newError := "new failure"
 	agent.handleMCPStartupStatus(context.Background(), protocol.MCPServerStatusUpdatedNotification{
 		Name: "shared", Status: protocol.PurpleFailed, Error: &newError,
 	})
-	if len(updater.notifications) != 1 || updater.notifications[0].Update.ToolCall == nil ||
-		updater.notifications[0].Update.ToolCall.Status != acp.ToolCallStatusFailed {
-		t.Fatalf("当前 MCP 启动失败通知为 %#v", updater.notifications)
+	select {
+	case event := <-updater:
+		if event.Update.ToolCall == nil || event.Update.ToolCall.Status != acp.ToolCallStatusFailed {
+			t.Fatalf("unexpected startup event: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("current MCP startup failure was not delivered")
 	}
 }
 

@@ -14,8 +14,8 @@ import (
 	"testing"
 )
 
-// TestHandwrittenGoDeclarationsHaveComments 锁住 V1 对手写声明的中文注释要求。
-// 生成协议保留 Schema 文档，因此只按 Code generated 标记豁免，不依赖文件名猜测。
+// TestHandwrittenGoDeclarationsHaveComments checks meaningful comments on handwritten declarations.
+// Generated protocol comments belong to the schema and are identified by the generator marker.
 func TestHandwrittenGoDeclarationsHaveComments(t *testing.T) {
 	repositoryRoot := filepath.Clean(filepath.Join("..", ".."))
 	fileSet := token.NewFileSet()

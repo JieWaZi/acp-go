@@ -232,95 +232,42 @@ func generate(ctx context.Context, cfg generatorConfig) ([]byte, error) {
 	return formatted, nil
 }
 
-// preserveOpenJSONFields 将 V1 DTO 中开放 JsonValue 收窄为不丢字节语义的 json.RawMessage。
+// preserveOpenJSONFields keeps open JSON fields lossless across the generated protocol.
 func preserveOpenJSONFields(generated []byte) ([]byte, error) {
 	replacements := []struct {
-		// source 是 quicktype 为开放 JSON 字段生成的 interface{} 类型。
+		// field is the generated Go field name.
+		field string
+		// source is its exact generated Go type before adaptation.
 		source string
-		// replacement 使用 RawMessage 保持数字精度和未知字段。
-		replacement string
+		// target retains open JSON as bytes until its owner interprets it.
+		target string
+		// count guards the number of fields affected by each known schema shape.
+		count int
 	}{
-		{
-			source:      "LogoutAccountResponse                   map[string]interface{}",
-			replacement: "LogoutAccountResponse                   map[string]json.RawMessage",
-		},
-		{
-			source:      "TurnInterruptResponse                   map[string]interface{}",
-			replacement: "TurnInterruptResponse                   map[string]json.RawMessage",
-		},
-		{
-			source:      "Desktop                         map[string]interface{}",
-			replacement: "Desktop                         map[string]json.RawMessage",
-		},
-		{source: "Config         interface{}", replacement: "Config         json.RawMessage"},
-		{
-			source:      "Extensions map[string]interface{}",
-			replacement: "Extensions map[string]json.RawMessage",
-		},
-		{source: "Arguments  interface{}", replacement: "Arguments  json.RawMessage"},
-		{
-			source:      "Results               []interface{}",
-			replacement: "Results               []json.RawMessage",
-		},
-		{source: "Meta              interface{}", replacement: "Meta              json.RawMessage"},
-		{
-			source:      "Content           []interface{}",
-			replacement: "Content           []json.RawMessage",
-		},
-		{
-			source:      "StructuredContent interface{}",
-			replacement: "StructuredContent json.RawMessage",
-		},
-		{
-			source:      "Config                map[string]interface{} `json:\"config,omitempty\"`",
-			replacement: "Config                map[string]json.RawMessage `json:\"config,omitempty\"`",
-		},
-		{
-			source:      "Config                map[string]interface{}  `json:\"config,omitempty\"`",
-			replacement: "Config                map[string]json.RawMessage  `json:\"config,omitempty\"`",
-		},
-		{
-			source:      "OutputSchema interface{}",
-			replacement: "OutputSchema json.RawMessage",
-		},
-		{
-			source:      "Config  Config                 `json:\"config\"`",
-			replacement: "Config  json.RawMessage       `json:\"config\"`",
-		},
-		{
-			source:      "Meta            interface{} `json:\"_meta,omitempty\"`",
-			replacement: "Meta            json.RawMessage `json:\"_meta,omitempty\"`",
-		},
-		{
-			source:      "RequestedSchema interface{} `json:\"requestedSchema,omitempty\"`",
-			replacement: "RequestedSchema json.RawMessage `json:\"requestedSchema,omitempty\"`",
-		},
-		{
-			source:      "Meta   interface{}                `json:\"_meta,omitempty\"`",
-			replacement: "Meta   json.RawMessage            `json:\"_meta,omitempty\"`",
-		},
-		{
-			source:      "Content interface{} `json:\"content,omitempty\"`",
-			replacement: "Content json.RawMessage `json:\"content,omitempty\"`",
-		},
+		{"LogoutAccountResponse", "map[string]interface{}", "map[string]json.RawMessage", 1},
+		{"TurnInterruptResponse", "map[string]interface{}", "map[string]json.RawMessage", 1},
+		{"Desktop", "map[string]interface{}", "map[string]json.RawMessage", 1},
+		{"Config", "interface{}", "json.RawMessage", 1},
+		{"Extensions", "map[string]interface{}", "map[string]json.RawMessage", 1},
+		{"Arguments", "interface{}", "json.RawMessage", 1},
+		{"Results", "[]interface{}", "[]json.RawMessage", 1},
+		{"Meta", "interface{}", "json.RawMessage", 3},
+		{"Content", "[]interface{}", "[]json.RawMessage", 1},
+		{"StructuredContent", "interface{}", "json.RawMessage", 1},
+		{"Config", "map[string]interface{}", "map[string]json.RawMessage", 3},
+		{"OutputSchema", "interface{}", "json.RawMessage", 1},
+		{"Config", "Config", "json.RawMessage", 1},
+		{"RequestedSchema", "interface{}", "json.RawMessage", 1},
+		{"Content", "interface{}", "json.RawMessage", 1},
 	}
 
 	result := generated
 	for _, replacement := range replacements {
-		oldValue := []byte(replacement.source)
-		expected := 1
-		// thread/start 与 thread/fork 的配置字段拥有相同的生成声明。
-		if replacement.source == "Config                map[string]interface{} `json:\"config,omitempty\"`" {
-			expected = 2
+		pattern := regexp.MustCompile("(?m)^\t" + replacement.field + "[ \t]+" + regexp.QuoteMeta(replacement.source) + "[ \t]+(`json:)")
+		if count := len(pattern.FindAll(result, -1)); count != replacement.count {
+			return nil, fmt.Errorf("open JSON field %s %s occurred %d times, want %d", replacement.field, replacement.source, count, replacement.count)
 		}
-		if count := bytes.Count(result, oldValue); count != expected {
-			return nil, fmt.Errorf(
-				"open JSON source field %q occurred %d times, unexpected count",
-				replacement.source,
-				count,
-			)
-		}
-		result = bytes.ReplaceAll(result, oldValue, []byte(replacement.replacement))
+		result = pattern.ReplaceAll(result, []byte("\t"+replacement.field+" "+replacement.target+" ${1}"))
 	}
 	return result, nil
 }
@@ -339,7 +286,7 @@ func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
 			replacement: "",
 		},
 		{
-			source:      "\tPlan                ThreadItemType = \"plan\"\n",
+			source:      "\tThreadItemTypePlan  ThreadItemType = \"plan\"\n",
 			replacement: "",
 		},
 		{
@@ -405,8 +352,8 @@ func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
 		oldValue := []byte(replacement.source)
 		if count := bytes.Count(result, oldValue); count != 1 {
 			return nil, fmt.Errorf(
-				"experimental V1 source fragment occurred %d times, want exactly once",
-				count,
+				"experimental V1 source fragment %q occurred %d times, want exactly once",
+				replacement.source, count,
 			)
 		}
 		result = bytes.Replace(result, oldValue, []byte(replacement.replacement), 1)
@@ -449,7 +396,7 @@ func preserveOptionalNullableFields(generated []byte) ([]byte, error) {
 	field := regexp.MustCompile("ServiceTier[ \t]+\\*string[ \t]+`json:\"serviceTier,omitempty\"`")
 	for _, name := range []string{
 		"ThreadStartParams", "ThreadResumeParams", "ThreadForkParams", "TurnStartParams",
-		"ThreadStartResponse", "ThreadResumeResponse", "ThreadForkResponse",
+		"ThreadStartResponse", "ThreadResumeResponse", "ThreadForkResponse", "ThreadSettings",
 	} {
 		start := bytes.Index(result, []byte("type "+name+" struct {"))
 		if start < 0 {
@@ -470,25 +417,41 @@ func preserveOptionalNullableFields(generated []byte) ([]byte, error) {
 	return result, nil
 }
 
-// preserveQuotaPercentPresence keeps an omitted quota percentage distinct from zero.
+// preserveQuotaPercentPresence keeps unknown quota numbers distinct from reported zero.
 func preserveQuotaPercentPresence(generated []byte) ([]byte, error) {
-	const name = "PrimaryClass"
-	start := bytes.Index(generated, []byte("type "+name+" struct {"))
-	if start < 0 {
-		return nil, fmt.Errorf("missing quota window DTO %s", name)
+	result := generated
+	for _, field := range []struct {
+		// dto scopes the field to a generated schema root or nested type.
+		dto string
+		// name is the Go field whose scalar zero would lose wire presence.
+		name string
+		// jsonName is the native JSON property.
+		jsonName string
+	}{
+		{"PrimaryClass", "UsedPercent", "usedPercent"},
+		{"IndividualLimitClass", "RemainingPercent", "remainingPercent"},
+		{"IndividualLimitClass", "ResetsAt", "resetsAt"},
+		{"RateLimitResetCreditsClass", "AvailableCount", "availableCount"},
+		{"CreditElement", "GrantedAt", "grantedAt"},
+	} {
+		start := bytes.Index(result, []byte("type "+field.dto+" struct {"))
+		if start < 0 {
+			return nil, fmt.Errorf("missing quota DTO %s", field.dto)
+		}
+		end := bytes.Index(result[start:], []byte("\n}"))
+		if end < 0 {
+			return nil, fmt.Errorf("unterminated quota DTO %s", field.dto)
+		}
+		end += start
+		pattern := regexp.MustCompile(field.name + "[ \t]+int64[ \t]+`json:\"" + field.jsonName + "\"`")
+		section := result[start:end]
+		if len(pattern.FindAll(section, -1)) != 1 {
+			return nil, fmt.Errorf("expected one quota field %s.%s", field.dto, field.name)
+		}
+		section = pattern.ReplaceAll(section, []byte(field.name+" *int64 `json:\""+field.jsonName+",omitempty\"`"))
+		result = append(append(append([]byte{}, result[:start]...), section...), result[end:]...)
 	}
-	end := bytes.Index(generated[start:], []byte("\n}"))
-	if end < 0 {
-		return nil, fmt.Errorf("unterminated quota window DTO %s", name)
-	}
-	end += start
-	field := regexp.MustCompile("UsedPercent[ \t]+int64[ \t]+`json:\"usedPercent\"`")
-	section := generated[start:end]
-	if len(field.FindAll(section, -1)) != 1 {
-		return nil, fmt.Errorf("expected one quota percentage field in %s", name)
-	}
-	section = field.ReplaceAll(section, []byte("UsedPercent *int64 `json:\"usedPercent,omitempty\"`"))
-	return append(append(append([]byte{}, generated[:start]...), section...), generated[end:]...), nil
+	return result, nil
 }
 
 // checkFreshness 重新生成到内存，并与目标文件逐字节比较而不修改工作树。

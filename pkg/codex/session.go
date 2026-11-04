@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
@@ -12,62 +13,65 @@ import (
 )
 
 var (
-	// ErrSessionNotFound 表示 ACP SessionID 没有当前本地 generation。
+	// ErrSessionNotFound indicates no installed thread for the ACP session ID.
 	ErrSessionNotFound = errors.New("codex session not found")
-	// ErrSessionClosing 表示 session 正处于 close fence 或 open 结果已经过期。
+	// ErrSessionClosing indicates an active close fence or an obsolete open attempt.
 	ErrSessionClosing = errors.New("codex session is closing")
 	// ErrSessionOpening indicates another request owns this session's open attempt.
 	ErrSessionOpening = errors.New("codex session is opening")
-	// ErrPromptActive 表示同 session 已有 pending/active turn，拒绝产生 rival turn。
+	// ErrSessionAlreadyOpen indicates that a native thread already has an installed owner.
+	ErrSessionAlreadyOpen = errors.New("codex session is already open")
+	// ErrPromptActive rejects concurrent input on an occupied native lane.
 	ErrPromptActive = errors.New("codex session already has an active prompt")
 )
 
-// sessionState 保存一个已安装 ACP session 的最小 runtime 状态。
+// sessionState owns a native thread subscription and its current invocation.
 type sessionState struct {
-	// id 同时作为 ACP SessionID 与 Codex ThreadID。
+	// id is both the native thread ID and the ACP session ID.
 	id string
-	// cwd 是创建或恢复请求指定的工作目录。
+	// cwd is the frozen native working directory for this subscription.
 	cwd string
-	// additionalDirectories 是 Session 创建或恢复时冻结的附加工作目录。
+	// additionalDirectories holds additional project roots selected at open time.
 	additionalDirectories []string
-	// generation 防止旧 open、notification 和 control 覆盖重开状态。
+	// generation fences stale opens, notifications, and callbacks.
 	generation uint64
-	// mu 保护 activePrompt。
+	// mu protects mutable thread and invocation state.
 	mu sync.Mutex
-	// usageTotal 是同一会话最后确认的累计值；恢复或回退后未知。
+	// usageTotal is the last trustworthy cumulative native usage checkpoint.
 	usageTotal *turnUsage
-	// activePrompt 是该 session 唯一 pending/active turn。
-	activePrompt *activePrompt
-	// configuration 是 config 子组件维护的 model、effort 与安全模式状态。
+	// activeTurn is the sole invocation admitted to this thread.
+	activeTurn *nativeTurn
+	// configuration owns native settings, requested overrides, and observed values.
 	configuration *sessionConfiguration
-	// terminalOutputMode 保存 session 创建时的客户端输出能力快照。
+	// terminalOutputMode snapshots the ACP output capability at session open.
 	terminalOutputMode terminalOutputMode
-	// promptClosed 阻止 close fence 建立后仍持有旧 state 的并发请求安装 prompt。
-	promptClosed bool
-	// mcpServers 保存本次 ACP open 请求声明的清洗后 MCP server 名称。
+	// replayingHistory reserves the native thread until ACP history delivery finishes.
+	replayingHistory bool
+	// turnAdmissionClosed fences calls holding a retiring state pointer.
+	turnAdmissionClosed bool
+	// mcpServers contains MCP names requested on this thread.
 	mcpServers map[string]struct{}
-	// mcpStartupReported 防止重复启动状态产生重复失败工具项。
+	// mcpStartupReported deduplicates startup reports within the subscription.
 	mcpStartupReported map[string]protocol.MCPServerStatusUpdatedNotificationStatus
-	// mcpStartupAfterVersion 只接受本次 thread open 之后产生的启动状态。
+	// mcpStartupAfterVersion rejects status reports older than this open attempt.
 	mcpStartupAfterVersion uint64
 }
 
-// sessionStore 管理 session generation、open identity 与可重入 close fence。
-// 状态机保证并发打开、关闭与替换 Session 时只有当前 generation 可以完成安装。
+// sessionStore linearizes native thread admission, installation and release.
 type sessionStore struct {
-	// mu 保护全部 map 与 generation 变更。
+	// mu protects mutable thread and invocation state.
 	mu sync.Mutex
-	// sessions 保存当前已安装状态。
+	// sessions holds installed native thread owners.
 	sessions map[string]*sessionState
-	// generations 保存每个 SessionID 的单调 generation。
+	// generations records the monotonically increasing fence for each thread.
 	generations map[string]uint64
-	// opening 保存最新一次 in-flight open 的 generation 身份。
+	// opening records the generation reserving a pending native open.
 	opening map[string]uint64
-	// closing 保存可重入 close fence 计数。
+	// closing counts active release operations fencing a thread.
 	closing map[string]int
 }
 
-// newSessionStore 创建空 session registry。
+// newSessionStore creates an empty thread registry.
 func newSessionStore() *sessionStore {
 	return &sessionStore{
 		sessions:    make(map[string]*sessionState),
@@ -77,7 +81,7 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-// beginOpen 记录当前 generation 的打开身份；close fence 内拒绝启动远端 I/O。
+// beginOpen reserves a thread only when no current owner can be replaced.
 func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -85,6 +89,9 @@ func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
 		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionClosing)
 	}
 	generation := s.generations[sessionID]
+	if s.sessions[sessionID] != nil {
+		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionAlreadyOpen)
+	}
 	if current, opening := s.opening[sessionID]; opening && current == generation {
 		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionOpening)
 	}
@@ -92,7 +99,7 @@ func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
 	return generation, nil
 }
 
-// install 仅在 generation、最新 open 身份与 close fence 全部匹配时安装状态。
+// install commits a session with the given working directory.
 func (s *sessionStore) install(
 	sessionID string,
 	cwd string,
@@ -106,16 +113,18 @@ func (s *sessionStore) install(
 		generation,
 		configuration,
 		terminalMode,
+		false,
 	)
 }
 
-// installWorkspace 仅在 generation 当前时安装完整工作范围状态。
+// installWorkspace publishes a subscription only for the still-current open attempt.
 func (s *sessionStore) installWorkspace(
 	sessionID string,
 	workspace codexWorkspace,
 	generation uint64,
 	configuration *sessionConfiguration,
 	terminalMode terminalOutputMode,
+	replayingHistory bool,
 ) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -133,13 +142,14 @@ func (s *sessionStore) installWorkspace(
 		generation:         generation,
 		configuration:      configuration,
 		terminalOutputMode: terminalMode,
+		replayingHistory:   replayingHistory,
 	}
 	s.sessions[sessionID] = state
 	delete(s.opening, sessionID)
 	return state, true
 }
 
-// workspace 返回 Session 冻结工作范围的深拷贝。
+// workspace returns a copy of the frozen project roots.
 func (s *sessionState) workspace() codexWorkspace {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,7 +159,7 @@ func (s *sessionState) workspace() codexWorkspace {
 	}
 }
 
-// abandonOpen 删除仍属于当前 generation 的失败 open 记录。
+// abandonOpen releases the matching failed open attempt.
 func (s *sessionStore) abandonOpen(sessionID string, generation uint64) {
 	s.mu.Lock()
 	if openGeneration, opening := s.opening[sessionID]; opening && openGeneration == generation {
@@ -158,7 +168,7 @@ func (s *sessionStore) abandonOpen(sessionID string, generation uint64) {
 	s.mu.Unlock()
 }
 
-// openCanProceed 验证前置配置读取结束后，本次 open 身份仍未被 close 或更新 open 取代。
+// openCanProceed revalidates the native open reservation after preparation.
 func (s *sessionStore) openCanProceed(sessionID string, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -166,8 +176,7 @@ func (s *sessionStore) openCanProceed(sessionID string, generation uint64) bool 
 	return opening && openGeneration == generation && s.closing[sessionID] == 0 && s.generations[sessionID] == generation
 }
 
-// beginStaleCleanup 为仍是最新 open 的过期结果建立 close fence。
-// 若已有更新 open 覆盖身份，则返回 false，禁止旧请求 unsubscribe 新订阅。
+// beginStaleCleanup grants release authority only to the matching open attempt.
 func (s *sessionStore) beginStaleCleanup(sessionID string, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -183,19 +192,29 @@ func (s *sessionStore) beginStaleCleanup(sessionID string, generation uint64) bo
 	return true
 }
 
-// beginClose 提升 generation、建立 fence，并返回关闭前安装的状态。
+// beginClose fences an explicitly addressed ACP session.
 func (s *sessionStore) beginClose(sessionID string) (uint64, *sessionState) {
+	generation, state, _ := s.beginCloseOwned(sessionID, nil)
+	return generation, state
+}
+
+// beginCloseOwned fences cleanup only while the expected state still owns the thread.
+// A nil expected state indicates an explicit ACP close addressed by session ID.
+func (s *sessionStore) beginCloseOwned(sessionID string, expected *sessionState) (uint64, *sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if expected != nil && s.sessions[sessionID] != expected {
+		return 0, nil, false
+	}
 	s.generations[sessionID]++
 	generation := s.generations[sessionID]
 	s.closing[sessionID]++
 	state := s.sessions[sessionID]
 	delete(s.sessions, sessionID)
-	return generation, state
+	return generation, state, true
 }
 
-// endClose 释放一层 close fence，保留并发 close/cleanup 的隔离。
+// endClose releases one operation’s close fence.
 func (s *sessionStore) endClose(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -207,7 +226,7 @@ func (s *sessionStore) endClose(sessionID string) {
 	s.closing[sessionID] = count - 1
 }
 
-// get 返回当前安装状态。
+// get returns the installed native thread owner.
 func (s *sessionStore) get(sessionID string) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -215,7 +234,7 @@ func (s *sessionStore) get(sessionID string) (*sessionState, bool) {
 	return state, ok
 }
 
-// snapshot 返回当前安装 session 的指针快照；调用方仍须用 isCurrent 复核 generation。
+// snapshot copies the installed thread pointers for later generation checks.
 func (s *sessionStore) snapshot() []*sessionState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -226,7 +245,7 @@ func (s *sessionStore) snapshot() []*sessionState {
 	return result
 }
 
-// isCurrent 验证状态指针与 generation 仍是当前安装身份。
+// isCurrent checks both the generation and pointer identity.
 func (s *sessionStore) isCurrent(state *sessionState) bool {
 	if state == nil {
 		return false
@@ -236,8 +255,7 @@ func (s *sessionStore) isCurrent(state *sessionState) bool {
 	return s.closing[state.id] == 0 && s.generations[state.id] == state.generation && s.sessions[state.id] == state
 }
 
-// withCurrent 在 store→state 统一锁序下验证当前身份并执行一次短变更。
-// callback 不得调用 sessionStore；持有 store 锁直到变更结束，使 close 与配置更新形成全序。
+// withCurrent serializes a short mutation with close using store-to-thread lock order.
 func (s *sessionStore) withCurrent(sessionID string, callback func(*sessionState) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -250,7 +268,7 @@ func (s *sessionStore) withCurrent(sessionID string, callback func(*sessionState
 	return callback(state)
 }
 
-// closeAll 提升所有 generation、移除 session，并返回需要取消的状态快照。
+// closeAll retires installed subscriptions and returns the former owners.
 func (s *sessionStore) closeAll() []*sessionState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -263,7 +281,7 @@ func (s *sessionStore) closeAll() []*sessionState {
 	return states
 }
 
-// NewSession 把 ACP session/new 映射为 Codex thread/start 并安装 generation 状态。
+// NewSession opens and installs a native thread with independent settings evidence.
 func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	if err := a.requireInitialized(); err != nil {
 		return acp.NewSessionResponse{}, err
@@ -286,60 +304,46 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	settings, err := parseOpenSettings(request.Meta)
+	if err != nil {
+
+		return acp.NewSessionResponse{}, err
+	}
+	settings.applyOpenEffort(config)
 	mcpAfterVersion := a.currentMCPStatusVersion()
 	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{
 		Cwd:                   &workspace.CWD,
 		Config:                config,
 		DeveloperInstructions: instructions,
+		Model:                 settings.Model,
+		ServiceTier:           settings.ServiceTier,
 	})
 	if err != nil {
-		return acp.NewSessionResponse{}, fmt.Errorf("starting codex thread: %w", err)
+		return acp.NewSessionResponse{}, codexOperationFailure("thread_start", err, nil)
 	}
 	if response.Thread.ID == "" {
 		return acp.NewSessionResponse{}, errors.New("starting codex thread: empty thread id")
 	}
-	configuration, err := a.configurationForSession(ctx, response.Model, response.ReasoningEffort)
-	if err != nil {
-		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
-		defer cancelCleanup()
-		unsubscribeErr := a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID)
-		return acp.NewSessionResponse{}, fmt.Errorf(
-			"configuring new codex thread %q: %w",
-			response.Thread.ID,
-			errors.Join(err, unsubscribeErr),
-		)
-	}
-	configuration.observedServiceTier = response.ServiceTier
 	generation, err := a.sessions.beginOpen(response.Thread.ID)
 	if err != nil {
-		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
-		defer cancelCleanup()
-		return acp.NewSessionResponse{}, errors.Join(err, a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID))
+		return acp.NewSessionResponse{}, err
 	}
-	state, installed := a.sessions.installWorkspace(
-		response.Thread.ID,
-		workspace,
-		generation,
-		configuration,
-		a.currentTerminalOutputMode(),
-	)
-	if !installed {
-		return acp.NewSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
+	state, err := a.installOpenedSession(ctx, response.Thread.ID, generation, workspace, settings,
+		"thread_start", response.Model, response.ReasoningEffort, response.ServiceTier, false)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
 	}
-	// thread/start 创建的新线程具有独立的零基线，不能套用到恢复或 fork。
-	state.mu.Lock()
-	state.usageTotal = &turnUsage{CacheWriteTokens: new(int64)}
-	state.mu.Unlock()
 	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
 	modes, options := sessionConfigurationResponse(state)
 	return acp.NewSessionResponse{
 		SessionId:     acp.SessionId(response.Thread.ID),
+		Meta:          sessionSettingsMetadata(state),
 		Modes:         modes,
 		ConfigOptions: options,
 	}, nil
 }
 
-// ResumeSession 使用 thread/resume 恢复订阅，并受 generation/close fence 保护。
+// ResumeSession restores a saved native thread without replaying transcript history.
 func (a *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
@@ -357,10 +361,10 @@ func (a *Agent) ResumeSession(
 		return acp.ResumeSessionResponse{}, err
 	}
 	modes, options := sessionConfigurationResponse(state)
-	return acp.ResumeSessionResponse{Modes: modes, ConfigOptions: options}, nil
+	return acp.ResumeSessionResponse{Modes: modes, ConfigOptions: options, Meta: sessionSettingsMetadata(state)}, nil
 }
 
-// LoadSession 先恢复并读取完整 Thread 历史，再安装 Session 状态。
+// LoadSession restores a thread and reserves it until ACP history replay finishes.
 func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	thread, state, err := a.openExistingSession(
 		ctx,
@@ -377,18 +381,17 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 	if err = a.replayThreadHistory(ctx, state, thread); err != nil {
 		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
 		defer cancelCleanup()
-		_, closeErr := a.CloseSession(cleanupCtx, acp.CloseSessionRequest{SessionId: request.SessionId})
-		return acp.LoadSessionResponse{}, fmt.Errorf(
-			"replaying codex thread %q: %w",
-			request.SessionId,
-			errors.Join(err, closeErr),
-		)
+		closeErr := a.closeThread(cleanupCtx, state.id, state)
+		return acp.LoadSessionResponse{}, codexOperationFailure("thread_history_replay", err, closeErr)
 	}
+	state.mu.Lock()
+	state.replayingHistory = false
+	state.mu.Unlock()
 	modes, options := sessionConfigurationResponse(state)
-	return acp.LoadSessionResponse{Modes: modes, ConfigOptions: options}, nil
+	return acp.LoadSessionResponse{Modes: modes, ConfigOptions: options, Meta: sessionSettingsMetadata(state)}, nil
 }
 
-// openExistingSession 复用 resume/load 的 generation 状态机，并按需在安装前读取历史。
+// openExistingSession reserves, restores and validates a native thread.
 func (a *Agent) openExistingSession(
 	ctx context.Context,
 	sessionID string,
@@ -430,19 +433,24 @@ func (a *Agent) openExistingSession(
 		a.sessions.abandonOpen(sessionID, generation)
 		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, ErrSessionClosing)
 	}
+	settings, err := parseOpenSettings(meta)
+	if err != nil {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, nil, err
+	}
+	settings.applyOpenEffort(config)
 	mcpAfterVersion := a.currentMCPStatusVersion()
 	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{
 		ThreadID:              sessionID,
 		Cwd:                   &workspace.CWD,
 		Config:                config,
 		DeveloperInstructions: instructions,
+		Model:                 settings.Model,
+		ServiceTier:           settings.ServiceTier,
 	})
 	if err != nil {
 		a.sessions.abandonOpen(sessionID, generation)
-		return protocol.Thread{}, nil, mapCodexSessionOpenError(
-			sessionID,
-			fmt.Errorf("resuming codex thread %q: %w", sessionID, err),
-		)
+		return protocol.Thread{}, nil, codexOperationFailure("thread_resume", mapCodexSessionOpenError(sessionID, err), nil)
 	}
 	if response.Thread.ID != sessionID {
 		return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, fmt.Errorf("resumed thread identity %q does not match %q", response.Thread.ID, sessionID))
@@ -454,78 +462,97 @@ func (a *Agent) openExistingSession(
 			ThreadID: sessionID, IncludeTurns: &includeTurns,
 		})
 		if readErr != nil {
-			return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, readErr)
+			return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, codexOperationFailure("thread_read", readErr, nil))
 		}
 		if readResponse.Thread.ID != sessionID {
 			return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, fmt.Errorf("read thread identity %q does not match %q", readResponse.Thread.ID, sessionID))
 		}
 		thread = readResponse.Thread
 	}
-	configuration, err := a.configurationForSession(ctx, response.Model, response.ReasoningEffort)
+	state, err := a.installOpenedSession(ctx, sessionID, generation, workspace, settings,
+		"thread_resume", response.Model, response.ReasoningEffort, response.ServiceTier, includeHistory)
 	if err != nil {
-		return protocol.Thread{}, nil, a.cleanupFailedSubscribedOpen(ctx, sessionID, generation, err)
-	}
-	configuration.observedServiceTier = response.ServiceTier
-	state, installed := a.sessions.installWorkspace(
-		sessionID,
-		workspace,
-		generation,
-		configuration,
-		a.currentTerminalOutputMode(),
-	)
-	if !installed {
-		return protocol.Thread{}, nil, a.closeStaleOpen(ctx, sessionID, generation)
+		return protocol.Thread{}, nil, err
 	}
 	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
 	return thread, state, nil
 }
 
-// newAppServerCleanupContext 从原请求中只保留 value，用独立 deadline 确保 unsubscribe/cancel 能实际写出。
+// installOpenedSession commits one native subscription or releases that exact open attempt.
+func (a *Agent) installOpenedSession(ctx context.Context, id string, generation uint64, workspace codexWorkspace, settings OpenSettings,
+	source, model string, effort *string, tier protocol.OptionalNullable[string], replaying bool,
+) (*sessionState, error) {
+	configuration, err := a.configurationForSession(ctx, model, effort)
+	if err != nil {
+		return nil, a.cleanupFailedSubscribedOpen(ctx, id, generation, err)
+	}
+	configuration.observe(source, model, effort, tier)
+	configuration.applyOpenIntent(settings)
+	state, installed := a.sessions.installWorkspace(id, workspace, generation, configuration, a.currentTerminalOutputMode(), replaying)
+	if !installed {
+		return nil, a.closeStaleOpen(ctx, id, generation)
+	}
+	if source == "thread_start" {
+		state.mu.Lock()
+		state.usageTotal = &turnUsage{CacheWriteTokens: new(int64)}
+		state.mu.Unlock()
+	}
+	return state, nil
+}
+
+// newAppServerCleanupContext provides a bounded release context independent of caller cancellation.
 func newAppServerCleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(parent), appServerCleanupTimeout)
 }
 
-// cleanupFailedSubscribedOpen 释放已订阅但后续 read/配置失败的 thread。
+// cleanupFailedSubscribedOpen releases a subscribed but uninstalled open attempt.
 func (a *Agent) cleanupFailedSubscribedOpen(ctx context.Context, sessionID string, generation uint64, cause error) error {
 	if a.sessions.beginStaleCleanup(sessionID, generation) {
 		defer a.sessions.endClose(sessionID)
 		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
 		defer cancelCleanup()
 		if err := a.client.ThreadUnsubscribe(cleanupCtx, sessionID); err != nil {
-			return fmt.Errorf("reading codex thread %q: %w", sessionID, errors.Join(cause, err))
+			return codexOperationFailure("thread_open", cause, err)
 		}
 	}
-	return fmt.Errorf("reading codex thread %q: %w", sessionID, cause)
+	return codexOperationFailure("thread_open", cause, nil)
 }
 
-// closeStaleOpen 仅在旧 open 仍是最新订阅时 unsubscribe，绝不影响新 reopen。
+// closeStaleOpen releases only an obsolete attempt that still owns its subscription.
 func (a *Agent) closeStaleOpen(ctx context.Context, sessionID string, generation uint64) error {
 	if a.sessions.beginStaleCleanup(sessionID, generation) {
 		defer a.sessions.endClose(sessionID)
 		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
 		defer cancelCleanup()
 		if err := a.client.ThreadUnsubscribe(cleanupCtx, sessionID); err != nil {
-			return fmt.Errorf("closing stale session %q: %w", sessionID, errors.Join(ErrSessionClosing, err))
+			return codexOperationFailure("thread_open", ErrSessionClosing, err)
 		}
 	}
 	return fmt.Errorf("opening session %q: %w", sessionID, ErrSessionClosing)
 }
 
-// CloseSession 提升 generation、取消活动 prompt，再 unsubscribe Codex thread。
+// CloseSession fences the native thread, cancels its invocations, and unsubscribes.
 func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	sessionID := string(request.SessionId)
-	_, state := a.sessions.beginClose(sessionID)
+	return acp.CloseSessionResponse{}, a.closeThread(ctx, string(request.SessionId), nil)
+}
+
+// closeThread releases only the identified thread owner.
+func (a *Agent) closeThread(ctx context.Context, sessionID string, expected *sessionState) error {
+	_, state, owned := a.sessions.beginCloseOwned(sessionID, expected)
+	if !owned {
+		return nil
+	}
 	defer a.sessions.endClose(sessionID)
 	a.steering.CloseSession(sessionID, ErrSessionClosing)
 	var cleanupErr error
-	prompts := a.closeSessionPrompts(state)
+	prompts := a.closeSessionTurns(state)
 	for _, prompt := range prompts {
 		turnID := prompt.requestCancel()
 		prompt.markForegroundFinished()
-		a.releaseActivePrompt(state, prompt)
+		a.releaseTurn(state, prompt)
 		if turnID != "" {
 			a.client.MarkTurnStale(sessionID, turnID)
-			a.requestPromptInterrupt(state, prompt, turnID, false)
+			a.requestTurnInterrupt(state, prompt, turnID, false)
 			select {
 			case <-prompt.interruptDone:
 			case <-ctx.Done():
@@ -551,12 +578,64 @@ func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionReques
 		}
 	}
 	if err := a.client.ThreadUnsubscribe(ctx, sessionID); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("unsubscribing codex thread %q: %w", sessionID, err))
+		unsubscribeErr := codexOperationFailure("thread_unsubscribe", err, nil)
+		return codexOperationFailure("thread_close", unsubscribeErr, cleanupErr)
 	}
-	return acp.CloseSessionResponse{}, cleanupErr
+	return cleanupErr
 }
 
-// ListSessions 未在 runtime 子变更实现列表 mapper。
+const (
+	// ThreadArchiveMethod archives an inactive native thread.
+	ThreadArchiveMethod = "_codex/thread/archive"
+	// ThreadUnarchiveMethod restores an archived native thread.
+	ThreadUnarchiveMethod = "_codex/thread/unarchive"
+)
+
+// ThreadArchiveRequest identifies one persisted Codex thread.
+type ThreadArchiveRequest struct {
+	// ThreadID is the native Codex identity to archive or restore.
+	ThreadID string `json:"thread_id"`
+}
+
+// ThreadArchiveResponse confirms the native identity and reported archive operation.
+type ThreadArchiveResponse struct {
+	// ThreadID is the native thread changed by the request.
+	ThreadID string `json:"thread_id"`
+	// Archived reports the state requested and acknowledged by Codex.
+	Archived bool `json:"archived"`
+}
+
+// archiveThread changes persisted archive state while the native thread is inactive.
+func (a *Agent) archiveThread(ctx context.Context, raw json.RawMessage, archive bool) (ThreadArchiveResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return ThreadArchiveResponse{}, err
+	}
+	var request ThreadArchiveRequest
+	if err := json.Unmarshal(raw, &request); err != nil || request.ThreadID == "" {
+		return ThreadArchiveResponse{}, acp.NewInvalidParams("thread_id is required")
+	}
+	generation, err := a.sessions.beginOpen(request.ThreadID)
+	if err != nil {
+		return ThreadArchiveResponse{}, acp.NewInvalidRequest(err.Error())
+	}
+	defer a.sessions.abandonOpen(request.ThreadID, generation)
+	if archive {
+		if err := a.client.ThreadArchive(ctx, request.ThreadID); err != nil {
+			return ThreadArchiveResponse{}, codexRequestFailure("thread_archive", err)
+		}
+	} else {
+		response, err := a.client.ThreadUnarchive(ctx, request.ThreadID)
+		if err != nil {
+			return ThreadArchiveResponse{}, codexRequestFailure("thread_unarchive", err)
+		}
+		if response.Thread.ID != request.ThreadID {
+			return ThreadArchiveResponse{}, codexRequestFailure("thread_unarchive", errors.New("Codex returned a different unarchived thread"))
+		}
+	}
+	return ThreadArchiveResponse{ThreadID: request.ThreadID, Archived: archive}, nil
+}
+
+// ListSessions reports that this adapter has no ACP history-list mapping.
 func (a *Agent) ListSessions(context.Context, acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
 	return acp.ListSessionsResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionList)
 }

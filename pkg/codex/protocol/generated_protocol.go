@@ -65,6 +65,8 @@ type Protocol struct {
 	SkillsListParams                        *SkillsListParams                        `json:"skillsListParams,omitempty"`
 	SkillsListResponse                      *SkillsListResponse                      `json:"skillsListResponse,omitempty"`
 	TerminalInteractionNotification         *TerminalInteractionNotification         `json:"terminalInteractionNotification,omitempty"`
+	ThreadArchiveParams                     *ThreadArchiveParams                     `json:"threadArchiveParams,omitempty"`
+	ThreadArchiveResponse                   map[string]interface{}                   `json:"threadArchiveResponse,omitempty"`
 	ThreadCompactStartParams                *ThreadCompactStartParams                `json:"threadCompactStartParams,omitempty"`
 	ThreadCompactStartResponse              map[string]interface{}                   `json:"threadCompactStartResponse,omitempty"`
 	ThreadForkParams                        *ThreadForkParams                        `json:"threadForkParams,omitempty"`
@@ -73,9 +75,12 @@ type Protocol struct {
 	ThreadReadResponse                      *ThreadReadResponse                      `json:"threadReadResponse,omitempty"`
 	ThreadResumeParams                      *ThreadResumeParams                      `json:"threadResumeParams,omitempty"`
 	ThreadResumeResponse                    *ThreadResumeResponse                    `json:"threadResumeResponse,omitempty"`
+	ThreadSettingsUpdatedNotification       *ThreadSettingsUpdatedNotification       `json:"threadSettingsUpdatedNotification,omitempty"`
 	ThreadStartParams                       *ThreadStartParams                       `json:"threadStartParams,omitempty"`
 	ThreadStartResponse                     *ThreadStartResponse                     `json:"threadStartResponse,omitempty"`
 	ThreadTokenUsageUpdatedNotification     *ThreadTokenUsageUpdatedNotification     `json:"threadTokenUsageUpdatedNotification,omitempty"`
+	ThreadUnarchiveParams                   *ThreadUnarchiveParams                   `json:"threadUnarchiveParams,omitempty"`
+	ThreadUnarchiveResponse                 *ThreadUnarchiveResponse                 `json:"threadUnarchiveResponse,omitempty"`
 	ThreadUnsubscribeParams                 *ThreadUnsubscribeParams                 `json:"threadUnsubscribeParams,omitempty"`
 	ThreadUnsubscribeResponse               *ThreadUnsubscribeResponse               `json:"threadUnsubscribeResponse,omitempty"`
 	ToolRequestUserInputParams              *ToolRequestUserInputParams              `json:"toolRequestUserInputParams,omitempty"`
@@ -435,7 +440,7 @@ type GetAccountRateLimitsResponse struct {
 }
 
 type RateLimitResetCreditsClass struct {
-	AvailableCount int64 `json:"availableCount"`
+	AvailableCount *int64 `json:"availableCount,omitempty"`
 	// Detail rows for available reset credits, when the backend provides them.
 	//
 	// `null` means only `availableCount` is known, while an empty array means details were
@@ -450,7 +455,7 @@ type CreditElement struct {
 	// Unix timestamp in seconds when the credit expires, or `null` if it does not expire.
 	ExpiresAt *int64 `json:"expiresAt,omitempty"`
 	// Unix timestamp in seconds when the credit was granted.
-	GrantedAt int64 `json:"grantedAt"`
+	GrantedAt *int64 `json:"grantedAt,omitempty"`
 	// Opaque backend identifier for this reset credit.
 	ID        string       `json:"id"`
 	ResetType ResetType    `json:"resetType"`
@@ -481,8 +486,8 @@ type CreditsClass struct {
 
 type IndividualLimitClass struct {
 	Limit            string `json:"limit"`
-	RemainingPercent int64  `json:"remainingPercent"`
-	ResetsAt         int64  `json:"resetsAt"`
+	RemainingPercent *int64 `json:"remainingPercent,omitempty"`
+	ResetsAt         *int64 `json:"resetsAt,omitempty"`
 	Used             string `json:"used"`
 }
 
@@ -768,13 +773,13 @@ type MCPServerElicitationRequestParams struct {
 	// identified by the MCP server request id. It may be triggered during a turn, but turn
 	// context is app-server correlation rather than part of the protocol identity of the
 	// elicitation itself.
-	TurnID          *string         `json:"turnId,omitempty"`
-	Meta            json.RawMessage `json:"_meta,omitempty"`
-	Message         string          `json:"message"`
-	Mode            Mode            `json:"mode"`
-	RequestedSchema json.RawMessage `json:"requestedSchema,omitempty"`
-	ElicitationID   *string         `json:"elicitationId,omitempty"`
-	URL             *string         `json:"url,omitempty"`
+	TurnID          *string                               `json:"turnId,omitempty"`
+	Meta            json.RawMessage                       `json:"_meta,omitempty"`
+	Message         string                                `json:"message"`
+	Mode            MCPServerElicitationRequestParamsMode `json:"mode"`
+	RequestedSchema json.RawMessage                       `json:"requestedSchema,omitempty"`
+	ElicitationID   *string                               `json:"elicitationId,omitempty"`
+	URL             *string                               `json:"url,omitempty"`
 }
 
 type MCPServerElicitationRequestResponse struct {
@@ -1035,6 +1040,10 @@ type TerminalInteractionNotification struct {
 	TurnID    string `json:"turnId"`
 }
 
+type ThreadArchiveParams struct {
+	ThreadID string `json:"threadId"`
+}
+
 type ThreadCompactStartParams struct {
 	ThreadID string `json:"threadId"`
 }
@@ -1272,6 +1281,48 @@ type ThreadResumeResponse struct {
 	Thread      Thread                   `json:"thread"`
 }
 
+type ThreadSettingsUpdatedNotification struct {
+	ThreadID       string         `json:"threadId"`
+	ThreadSettings ThreadSettings `json:"threadSettings"`
+}
+
+type ThreadSettings struct {
+	ActivePermissionProfile *ActivePermissionProfileClass `json:"activePermissionProfile,omitempty"`
+	ApprovalPolicy          *ApprovalPolicyUnion          `json:"approvalPolicy"`
+	ApprovalsReviewer       ApprovalsReviewerEnum         `json:"approvalsReviewer"`
+	CollaborationMode       CollaborationMode             `json:"collaborationMode"`
+	Cwd                     string                        `json:"cwd"`
+	Effort                  *string                       `json:"effort,omitempty"`
+	Model                   string                        `json:"model"`
+	ModelProvider           string                        `json:"modelProvider"`
+	Personality             *PersonalityEnum              `json:"personality,omitempty"`
+	SandboxPolicy           SandboxClass                  `json:"sandboxPolicy"`
+	ServiceTier             OptionalNullable[string]      `json:"serviceTier,omitzero"`
+	Summary                 *SummaryEnum                  `json:"summary,omitempty"`
+}
+
+type ActivePermissionProfileClass struct {
+	// Parent profile identifier from the selected permissions profile's `extends` setting, when
+	// present.
+	Extends *string `json:"extends,omitempty"`
+	// Identifier from `default_permissions` or the implicit built-in default, such as
+	// `:workspace` or a user-defined `[permissions.<id>]` profile.
+	ID string `json:"id"`
+}
+
+// Collaboration mode for a Codex session.
+type CollaborationMode struct {
+	Mode     CollaborationModeMode `json:"mode"`
+	Settings Settings              `json:"settings"`
+}
+
+// Settings for a collaboration mode.
+type Settings struct {
+	DeveloperInstructions *string `json:"developer_instructions,omitempty"`
+	Model                 string  `json:"model"`
+	ReasoningEffort       *string `json:"reasoning_effort,omitempty"`
+}
+
 type ThreadStartParams struct {
 	ApprovalPolicy *ApprovalPolicy `json:"approvalPolicy,omitempty"`
 	// Override where approval requests are routed for review on this thread and subsequent
@@ -1329,6 +1380,14 @@ type Last struct {
 	OutputTokens          int64  `json:"outputTokens"`
 	ReasoningOutputTokens int64  `json:"reasoningOutputTokens"`
 	TotalTokens           int64  `json:"totalTokens"`
+}
+
+type ThreadUnarchiveParams struct {
+	ThreadID string `json:"threadId"`
+}
+
+type ThreadUnarchiveResponse struct {
+	Thread Thread `json:"thread"`
 }
 
 type ThreadUnsubscribeParams struct {
@@ -1843,12 +1902,12 @@ const (
 	TypeChatgpt       Type = "chatgpt"
 )
 
-type Mode string
+type MCPServerElicitationRequestParamsMode string
 
 const (
-	Form       Mode = "form"
-	OpenaiForm Mode = "openai/form"
-	URL        Mode = "url"
+	Form       MCPServerElicitationRequestParamsMode = "form"
+	OpenaiForm MCPServerElicitationRequestParamsMode = "openai/form"
+	URL        MCPServerElicitationRequestParamsMode = "url"
 )
 
 type MCPServerElicitationAction string
@@ -2028,6 +2087,14 @@ const (
 	FluffyNone PersonalityEnum = "none"
 	Friendly   PersonalityEnum = "friendly"
 	Pragmatic  PersonalityEnum = "pragmatic"
+)
+
+// Initial collaboration mode to use when the TUI starts.
+type CollaborationModeMode string
+
+const (
+	Default  CollaborationModeMode = "default"
+	ModePlan CollaborationModeMode = "plan"
 )
 
 type SessionStartSourceEnum string

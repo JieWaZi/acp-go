@@ -443,7 +443,7 @@ func TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal(t *testing.T)
 			t.Fatalf("创建首个登录订阅失败: %v", err)
 		}
 		closed.Close()
-		if _, err = closed.Wait(context.Background()); !errors.Is(err, context.Canceled) {
+		if _, err = closed.Wait(context.Background(), ""); !errors.Is(err, context.Canceled) {
 			t.Fatalf("已释放订阅错误为 %v，期望 context.Canceled", err)
 		}
 
@@ -461,7 +461,7 @@ func TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal(t *testing.T)
 			protocol.MethodAccountLoginCompleted,
 			protocol.AccountLoginCompletedNotification{Success: false, LoginID: acp.Ptr("duplicate")},
 		))
-		firstResult, err := first.Wait(context.Background())
+		firstResult, err := first.Wait(context.Background(), "first")
 		first.Close()
 		if err != nil || firstResult.LoginID == nil || *firstResult.LoginID != "first" {
 			t.Fatalf("第一代通知为 %#v, %v", firstResult, err)
@@ -476,7 +476,7 @@ func TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal(t *testing.T)
 			protocol.MethodAccountLoginCompleted,
 			protocol.AccountLoginCompletedNotification{Success: true, LoginID: acp.Ptr("second")},
 		))
-		secondResult, err := second.Wait(context.Background())
+		secondResult, err := second.Wait(context.Background(), "second")
 		second.Close()
 		if err != nil || secondResult.LoginID == nil || *secondResult.LoginID != "second" {
 			t.Fatalf("第二代通知为 %#v, %v", secondResult, err)
@@ -497,7 +497,7 @@ func TestAppServerClientAuthSubscriptionsRespectGenerationAndFatal(t *testing.T)
 		fatalErr := errors.New("fake app-server exited")
 		rpc.err = fatalErr
 		close(rpc.done)
-		if _, err = login.Wait(context.Background()); !errors.Is(err, fatalErr) {
+		if _, err = login.Wait(context.Background(), ""); !errors.Is(err, fatalErr) {
 			t.Fatalf("登录 fatal 错误为 %v", err)
 		}
 		if err = account.Wait(context.Background()); !errors.Is(err, fatalErr) {

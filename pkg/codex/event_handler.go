@@ -454,7 +454,14 @@ func (h *eventHandler) recordTokenUsage(params protocol.ThreadTokenUsageUpdatedN
 	}
 	h.usageMu.Lock()
 	if h.previous == nil {
-		h.usage = &last
+		if h.usage == nil {
+			h.usage = &last
+		} else {
+			current := *h.usage
+			_ = addCodexUsageDelta(&current, &last, turnUsage{CacheWriteTokens: new(int64)})
+			current.LastTokens, current.ContextWindow, current.TotalTokens = last.LastTokens, last.ContextWindow, total.TotalTokens
+			h.usage = &current
+		}
 		h.usage.Complete = false
 	} else {
 		if h.usage == nil {
@@ -485,10 +492,23 @@ func (h *eventHandler) recordTokenUsage(params protocol.ThreadTokenUsageUpdatedN
 	return nil
 }
 
+// breakUsageContinuity preserves observed consumption and discards the preceding counter baseline.
+func (h *eventHandler) breakUsageContinuity() {
+	h.usageMu.Lock()
+	defer h.usageMu.Unlock()
+	h.previous = nil
+	h.invalidateUsageCheckpointLocked()
+}
+
 // invalidateUsageCheckpoint 保留已观测消费，但异常后不能声明覆盖整轮或复用旧基线。
 func (h *eventHandler) invalidateUsageCheckpoint() {
 	h.usageMu.Lock()
 	defer h.usageMu.Unlock()
+	h.invalidateUsageCheckpointLocked()
+}
+
+// invalidateUsageCheckpointLocked invalidates the current baseline and the session checkpoint.
+func (h *eventHandler) invalidateUsageCheckpointLocked() {
 	h.counterInvalid = true
 	h.baselineKnown = false
 	if h.usage != nil {

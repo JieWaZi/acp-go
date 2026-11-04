@@ -406,3 +406,24 @@ func TestStderrSecretsNeverReachLogsOrExitErrors(t *testing.T) {
 		t.Fatalf("stderr log contains raw data: %q", field)
 	}
 }
+
+// TestProcessExitLeavesStdoutReadable verifies Wait does not discard buffered final frames.
+func TestProcessExitLeavesStdoutReadable(t *testing.T) {
+	path := writeExecutableScript(t, "printf '%s\\n' 'final native frame'\n")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	process, err := startAppServer(ctx, path, processOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer process.Close(ctx)
+	select {
+	case <-process.Done():
+	case <-ctx.Done():
+		t.Fatal("process did not exit")
+	}
+	data, err := io.ReadAll(process.Stdout())
+	if err != nil || string(data) != "final native frame\n" {
+		t.Fatalf("stdout after Wait = %q, %v", data, err)
+	}
+}

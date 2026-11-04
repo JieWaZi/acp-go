@@ -86,7 +86,7 @@ func TestUsageFoundationCodexReliableBaselineFinalMetadata(t *testing.T) {
 	if err := h.handleTokenUsage(context.Background(), usageSample(150, 20, 1250, 130)); err != nil {
 		t.Fatal(err)
 	}
-	prompt := newActivePrompt(context.Background(), 1)
+	prompt := newNativeTurn(context.Background(), 1)
 	defer prompt.cancelRun()
 	prompt.setEventRouter(&eventRouter{handler: h})
 	response := codexPromptResponse(prompt, acp.StopReasonEndTurn, nil)
@@ -127,16 +127,16 @@ func TestUsageFoundationCodexHotSessionCheckpoint(t *testing.T) {
 		t.Fatal("install session")
 	}
 	agent := &Agent{sessions: store, sessionUpdater: &recordingSessionUpdater{}}
-	first := newActivePrompt(context.Background(), 1)
+	first := newNativeTurn(context.Background(), 1)
 	defer first.cancelRun()
-	state.activePrompt = first
+	state.activeTurn = first
 	agent.onTurnStarted(state, first, "first")
 	if err = first.currentEventRouter().handler.handleTokenUsage(context.Background(), usageSample(100, 10, 100, 10)); err != nil {
 		t.Fatal(err)
 	}
-	second := newActivePrompt(context.Background(), 2)
+	second := newNativeTurn(context.Background(), 2)
 	defer second.cancelRun()
-	state.activePrompt = second
+	state.activeTurn = second
 	agent.onTurnStarted(state, second, "second")
 	if err = second.currentEventRouter().handler.handleTokenUsage(context.Background(), usageSample(40, 5, 140, 15)); err != nil {
 		t.Fatal(err)
@@ -172,9 +172,9 @@ func TestUnownedUsageInvalidatesTheNextPromptBaseline(t *testing.T) {
 	background := usageSample(30, 0, 130, 0)
 	background.ThreadID, background.TurnID = "thread", "unowned"
 	agent.handleNotification(context.Background(), decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, background))
-	prompt := newActivePrompt(context.Background(), 1)
+	prompt := newNativeTurn(context.Background(), 1)
 	defer prompt.cancelRun()
-	state.activePrompt = prompt
+	state.activeTurn = prompt
 	agent.onTurnStarted(state, prompt, "prompt")
 	if err := prompt.currentEventRouter().handler.recordTokenUsage(usageSample(10, 0, 140, 0)); err != nil {
 		t.Fatal(err)

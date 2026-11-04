@@ -56,48 +56,48 @@ type completionResult struct {
 	err error
 }
 
-// loginCompletionState 表示多个等待方共享的一次登录完成通知。
-// 并发认证订阅复用同一个状态，避免为同一 app-server 通知创建无界 waiter。
+// loginCompletionState owns observations that arrive before account/login/start replies.
 type loginCompletionState struct {
-	// done 在通知到达、transport 失败或最后一个订阅关闭时关闭。
-	done chan struct{}
-	// notification 保存生成协议解码后的登录结果。
-	notification protocol.AccountLoginCompletedNotification
-	// err 保存 transport 或提前关闭错误。
+	// changed signals newly buffered evidence or release.
+	changed chan struct{}
+	// early retains at most eight distinct login notifications.
+	early map[string]protocol.AccountLoginCompletedNotification
+	// err is the connection or subscription release cause.
 	err error
-	// references 是仍拥有该共享状态的订阅数。
-	references int
-	// completed 防止多个终止来源重复关闭 done。
-	completed bool
 }
 
-// clientLoginCompletionSubscription 把共享通知状态适配为 authenticator 消费的小接口。
+// clientLoginCompletionSubscription reads only the native identity owned by the login attempt.
 type clientLoginCompletionSubscription struct {
-	// client 拥有 pendingLogin 的生命周期。
+	// client owns the active login subscription.
 	client *appServerClient
-	// state 是本订阅创建时绑定的精确共享状态。
+	// state is the exact subscription instance, including its early observations.
 	state *loginCompletionState
-	// closeOnce 保证重复 Close 不会重复减少引用。
-	closeOnce sync.Once
 }
 
-// Wait 等待一次 account/login/completed 或调用方取消。
-func (s *clientLoginCompletionSubscription) Wait(
-	ctx context.Context,
-) (protocol.AccountLoginCompletedNotification, error) {
-	select {
-	case <-s.state.done:
-		return s.state.notification, s.state.err
-	case <-ctx.Done():
-		return protocol.AccountLoginCompletedNotification{}, ctx.Err()
+// Wait finds the expected native identity. An empty ID matches only the API key flow.
+func (s *clientLoginCompletionSubscription) Wait(ctx context.Context, loginID string) (protocol.AccountLoginCompletedNotification, error) {
+	for {
+		s.client.authMu.Lock()
+		notice, found := s.state.early[loginID]
+		changed, err := s.state.changed, s.state.err
+		s.client.authMu.Unlock()
+		if found {
+			return notice, nil
+		}
+		if err != nil {
+			return protocol.AccountLoginCompletedNotification{}, err
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return protocol.AccountLoginCompletedNotification{}, ctx.Err()
+		}
 	}
 }
 
-// Close 释放订阅；最后一个订阅会丢弃尚未完成的旧通知身份。
+// Close releases the exact subscription without affecting a later login.
 func (s *clientLoginCompletionSubscription) Close() {
-	s.closeOnce.Do(func() {
-		s.client.releaseLoginSubscription(s.state)
-	})
+	s.client.releaseLoginSubscription(s.state)
 }
 
 // accountUpdateState 表示 logout 前安装的共享 account/updated 信号。
@@ -405,6 +405,23 @@ func (c *appServerClient) Initialize(
 	return c.initializeResponse, c.initializeErr
 }
 
+// ThreadArchive archives one persisted native thread.
+func (c *appServerClient) ThreadArchive(ctx context.Context, threadID string) error {
+	var response map[string]json.RawMessage
+	return c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewThreadArchiveRequest(id, protocol.ThreadArchiveParams{ThreadID: threadID})
+	}, &response)
+}
+
+// ThreadUnarchive restores one persisted native thread without creating an ACP session.
+func (c *appServerClient) ThreadUnarchive(ctx context.Context, threadID string) (protocol.ThreadUnarchiveResponse, error) {
+	var response protocol.ThreadUnarchiveResponse
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewThreadUnarchiveRequest(id, protocol.ThreadUnarchiveParams{ThreadID: threadID})
+	}, &response)
+	return response, err
+}
+
 // ThreadStart 创建一个新 Codex thread。
 func (c *appServerClient) ThreadStart(ctx context.Context, params protocol.ThreadStartParams) (protocol.ThreadStartResponse, error) {
 	var response protocol.ThreadStartResponse
@@ -598,14 +615,14 @@ func (c *appServerClient) AccountLogout(ctx context.Context) error {
 	}, &response)
 }
 
-// SubscribeLoginCompleted 在登录请求前安装共享的单次完成订阅。
+// SubscribeLoginCompleted reserves the early-notification slot before sending login/start.
 func (c *appServerClient) SubscribeLoginCompleted() (loginCompletionSubscription, error) {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	if c.pendingLogin == nil {
-		c.pendingLogin = &loginCompletionState{done: make(chan struct{})}
+	if c.pendingLogin != nil {
+		return nil, errors.New("Codex login already in progress")
 	}
-	c.pendingLogin.references++
+	c.pendingLogin = &loginCompletionState{changed: make(chan struct{}), early: make(map[string]protocol.AccountLoginCompletedNotification)}
 	return &clientLoginCompletionSubscription{client: c, state: c.pendingLogin}, nil
 }
 
@@ -620,36 +637,61 @@ func (c *appServerClient) SubscribeAccountUpdated() *accountUpdateSubscription {
 	return &accountUpdateSubscription{client: c, state: c.pendingAccountUpdate}
 }
 
+// turnStartObservation connects independently observed native identity to an ACK wait.
+type turnStartObservation struct {
+	// confirmedID returns only an identity proved by the operation owner.
+	confirmedID func() string
+	// terminal signals the exact native turn's terminal notification.
+	terminal <-chan struct{}
+}
+
 // RunTurn 在 turn/start 前安装 completion 捕获，并等待精确 thread/turn 完成。
 func (c *appServerClient) RunTurn(
 	ctx context.Context,
 	params protocol.TurnStartParams,
 	onTurnStarted func(turnID string),
+	observed ...turnStartObservation,
 ) (protocol.TurnCompletedNotification, error) {
 	capture, err := c.completions.beginCapture(params.ThreadID)
 	if err != nil {
 		return protocol.TurnCompletedNotification{}, err
 	}
+	observation := turnStartObservation{confirmedID: func() string { return "" }}
+	if len(observed) != 0 {
+		observation = observed[0]
+	}
+	provenID := observation.confirmedID
 	var response protocol.TurnStartResponse
 	buildRequest := func(id protocol.RequestID) protocol.ClientRequest {
 		return protocol.NewTurnStartRequest(id, params)
 	}
 	responseObserved := false
-	if rpc, ok := c.rpc.(observedResponseRPC); ok {
-		err = rpc.CallObserved(ctx, buildRequest, &response, func() error {
-			if response.Turn.ID == "" {
-				return errors.New("codex turn/start response has empty turn id")
-			}
-			if onTurnStarted != nil {
-				onTurnStarted(response.Turn.ID)
-			}
-			responseObserved = true
-			return nil
-		})
-	} else {
-		err = c.rpc.Call(ctx, buildRequest, &response)
-	}
+	err = awaitNativeAcknowledgment(ctx, observation.terminal, func(ackCtx context.Context) error {
+		if rpc, ok := c.rpc.(observedResponseRPC); ok {
+			return rpc.CallObserved(ackCtx, buildRequest, &response, func() error {
+				if response.Turn.ID == "" {
+					return errors.New("codex turn/start response has empty turn id")
+				}
+				if id := provenID(); id != "" && id != response.Turn.ID {
+					return errors.New("Codex turn/start ACK conflicts with the submitted user-message identity")
+				}
+				if onTurnStarted != nil {
+					onTurnStarted(response.Turn.ID)
+				}
+				responseObserved = true
+				return nil
+			})
+		}
+		return c.rpc.Call(ackCtx, buildRequest, &response)
+	})
 	if err != nil {
+		if id := provenID(); id != "" {
+			completion, waitErr := c.completions.waitAfterStart(ctx, params.ThreadID, id, capture)
+			if waitErr == nil {
+				return completion, nil
+			}
+			return protocol.TurnCompletedNotification{}, errors.Join(err, waitErr)
+		}
 		c.completions.releaseCapture(params.ThreadID, capture)
 		return protocol.TurnCompletedNotification{}, err
 	}
@@ -729,7 +771,7 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 
 	threadID, turnID := notificationRouting(notification)
 	if completed, ok := notification.(*protocol.TurnCompletedEnvelope); ok {
-		c.completions.record(completed.Params)
+		defer c.completions.record(completed.Params)
 	}
 
 	c.handlerMu.Lock()
@@ -745,17 +787,26 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 	handler(ctx, notification)
 }
 
-// completeLoginSubscription 完成当前共享登录通知，并为下一次登录释放身份。
+// completeLoginSubscription buffers native identities without satisfying unrelated logins.
 func (c *appServerClient) completeLoginSubscription(notification protocol.AccountLoginCompletedNotification) {
 	c.authMu.Lock()
+	defer c.authMu.Unlock()
 	state := c.pendingLogin
-	c.pendingLogin = nil
-	if state != nil && !state.completed {
-		state.notification = notification
-		state.completed = true
-		close(state.done)
+	if state == nil || state.err != nil {
+		return
 	}
-	c.authMu.Unlock()
+	id := stringValue(notification.LoginID)
+	if _, duplicate := state.early[id]; duplicate {
+		return
+	}
+	if len(state.early) >= 8 {
+		state.err = errors.New("too many early Codex login notifications")
+		close(state.changed)
+		return
+	}
+	state.early[id] = notification
+	close(state.changed)
+	state.changed = make(chan struct{})
 }
 
 // completeAccountUpdateSubscription 完成 logout 前安装的账号更新信号。
@@ -770,21 +821,17 @@ func (c *appServerClient) completeAccountUpdateSubscription() {
 	c.authMu.Unlock()
 }
 
-// releaseLoginSubscription 释放一个引用，并在无人等待时取消旧通知身份。
+// releaseLoginSubscription wakes waiters and releases only this attempt.
 func (c *appServerClient) releaseLoginSubscription(state *loginCompletionState) {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	if state.references > 0 {
-		state.references--
-	}
-	if state.references != 0 || c.pendingLogin != state {
+	if c.pendingLogin != state {
 		return
 	}
 	c.pendingLogin = nil
-	if !state.completed {
+	if state.err == nil {
 		state.err = context.Canceled
-		state.completed = true
-		close(state.done)
+		close(state.changed)
 	}
 }
 
@@ -816,10 +863,9 @@ func (c *appServerClient) failAuthSubscriptions(err error) {
 	account := c.pendingAccountUpdate
 	c.pendingLogin = nil
 	c.pendingAccountUpdate = nil
-	if login != nil && !login.completed {
+	if login != nil && login.err == nil {
 		login.err = err
-		login.completed = true
-		close(login.done)
+		close(login.changed)
 	}
 	if account != nil && !account.completed {
 		account.err = err

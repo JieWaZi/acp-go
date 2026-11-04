@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,76 +12,126 @@ import (
 	"sync"
 )
 
-// activePrompt 保存一个 session 唯一 pending/active turn 的取消身份。
-// 字段同时覆盖 turn/start 前后的 Prompt 身份与等待状态。
-type activePrompt struct {
-	// compact identifies the standalone native compaction lane.
-	compact bool
-	// mu 保护 turnID、cancelRequested 和 finished。
+// turnKind distinguishes native operations with different admission semantics.
+type turnKind uint8
+
+const (
+	promptTurn turnKind = iota
+	steeringTurn
+	compactionTurn
+)
+
+// nativeTurn owns the exact submission, native identity, ordered observations and terminal lifecycle.
+type nativeTurn struct {
+	// kind specifies whether the native turn can accept ordinary input.
+	kind turnKind
+	// mu protects the native identity, cancellation state, and delivery binding.
 	mu sync.Mutex
-	// generation 是 Adapter 为每个 turn 分配的单调 runtime generation。
+	// generation is the Agent-wide monotonic invocation identity.
 	generation uint64
-	// eventRouter 把当前 turn 的 typed 通知映射到 ACP connection。
+	// eventRouter maps frames only after the native identity is proven.
 	eventRouter *eventRouter
-	// runCtx 只约束当前 RunTurn；普通 ACP 取消保留它以观察迟到 start，session close 则显式终止它。
+	// clientMessageID is the unique submitted user-message identity used as pre-ACK evidence.
+	clientMessageID string
+	// eventsMu serializes identity binding, pre-ACK frames, and mapping.
+	eventsMu sync.Mutex
+	// earlyEvents holds frames that cannot be published until the native identity is proven.
+	earlyEvents []protocol.ServerNotification
+	// earlyOverflow means an unknown-identity frame exceeded the bounded buffer.
+	earlyOverflow bool
+	// nativeTerminal rejects replay after the exact native turn has completed.
+	nativeTerminal bool
+	// terminalSignal closes when this exact native turn reaches a terminal notification.
+	terminalSignal chan struct{}
+	// observed collects positive native output, effect and retry evidence.
+	observed turnObservation
+	// eventFailure records mapping/queue failures independently of the native terminal.
+	eventFailure error
+	// delivery joins queued ACP writes before exposing a terminal result.
+	delivery *turnDelivery
+	// runCtx outlives a locally cancelled caller while a late native identity is still possible.
 	runCtx context.Context
-	// runCancel 在 session/Adapter close 时解除 pending turn/start 或 completion waiter。
+	// runCancel releases protocol waiters when the thread or connection closes.
 	runCancel context.CancelFunc
-	// turnID 在 turn/start 响应前为空，迟到响应仍会填入以便 interrupt。
+	// turnID is bound by an ACK or a matching native user-message event.
 	turnID string
-	// cancelRequested 表示 ACP cancel、请求 context 或 close 已到达。
+	// cancelRequested records the first local cancellation signal.
 	cancelRequested bool
-	// finished 表示前台 Prompt 已决定结果；迟到 start 必须视为 stale。
+	// finished fences late identities from a foreground operation that has returned.
 	finished bool
-	// cancelSignal 在首次取消时关闭，解除 turn-start 前的前台等待。
+	// cancelSignal wakes a foreground caller waiting for an unknown turn ID.
 	cancelSignal chan struct{}
-	// cancelOnce 保证 cancelSignal 只关闭一次。
+	// cancelOnce publishes cancellation once.
 	cancelOnce sync.Once
-	// interruptOnce 保证同一 turn 最多发送一次 turn/interrupt。
+	// interruptOnce prevents duplicate native interrupt requests.
 	interruptOnce sync.Once
-	// interruptDone 在 interrupt 请求结束时关闭；尚未触发时保持开放。
+	// interruptDone closes when the native interrupt call returns.
 	interruptDone chan struct{}
-	// turnStarted 在 turn/start 返回身份后关闭，steering 可等待 pending start 而不制造 rival turn。
+	// turnStarted publishes the bound turn identity and initialized event mapping.
 	turnStarted chan struct{}
-	// turnStartedOnce 保证迟到回调或异常重复回调不会重复关闭。
+	// turnStartedOnce protects the identity barrier from duplicate evidence.
 	turnStartedOnce sync.Once
-	// foregroundDone 在 ACP Prompt 或 steering 启动调用完成其前台返回后关闭。
+	// foregroundDone signals that ACP response cleanup finished.
 	foregroundDone chan struct{}
-	// foregroundDoneOnce 保证前台返回信号只关闭一次。
+	// foregroundDoneOnce guards the foreground completion signal.
 	foregroundDoneOnce sync.Once
-	// backgroundDone 在 RunTurn 完整结束、迟到身份已处理后关闭。
+	// backgroundDone signals native waiter cleanup.
 	backgroundDone chan struct{}
-	// backgroundDoneOnce 保证清理路径幂等。
+	// backgroundDoneOnce guards the native cleanup signal.
 	backgroundDoneOnce sync.Once
 }
 
-// newActivePrompt 创建尚未取消、尚无 turn ID 的 prompt 身份与独立 RunTurn 生命周期。
-func newActivePrompt(parent context.Context, generation uint64) *activePrompt {
+// turnObservation contains provider facts scoped to one proven turn.
+type turnObservation struct {
+	// output records positive evidence of generated assistant text.
+	output bool
+	// fileChange records a completed native file change, not an approval or attempt.
+	fileChange bool
+	// lastError retains the last native error notification including willRetry.
+	lastError *protocol.ErrorNotification
+	// reroutes holds a bounded sequence of native model changes for this turn.
+	reroutes []modelReroute
+}
+
+// modelReroute records a provider-reported change without reallocating token counts.
+type modelReroute struct {
+	// From is the native model before the reported change.
+	From string `json:"from"`
+	// To is the native model named by the provider.
+	To string `json:"to"`
+	// Reason preserves the native reroute reason.
+	Reason string `json:"reason"`
+}
+
+// newNativeTurn creates the admission identity before any native submission.
+func newNativeTurn(parent context.Context, generation uint64) *nativeTurn {
 	runCtx, runCancel := context.WithCancel(parent)
-	return &activePrompt{
+	return &nativeTurn{
+		kind:           promptTurn,
 		generation:     generation,
 		runCtx:         runCtx,
 		runCancel:      runCancel,
 		cancelSignal:   make(chan struct{}),
 		interruptDone:  make(chan struct{}),
 		turnStarted:    make(chan struct{}),
+		terminalSignal: make(chan struct{}),
 		foregroundDone: make(chan struct{}),
 		backgroundDone: make(chan struct{}),
 	}
 }
 
-// markForegroundDone 通知 close 路径前台调用已执行完 finally 清理。
-func (p *activePrompt) markForegroundDone() {
+// markForegroundDone signals that the foreground caller released its ownership.
+func (p *nativeTurn) markForegroundDone() {
 	p.foregroundDoneOnce.Do(func() { close(p.foregroundDone) })
 }
 
-// cancelRun 终止底层 pending turn/start 或 completion waiter；普通请求取消不会调用它，以保留迟到观察者。
-func (p *activePrompt) cancelRun() {
+// cancelRun releases this invocation’s native RPC and completion waits.
+func (p *nativeTurn) cancelRun() {
 	p.runCancel()
 }
 
-// requestCancel 幂等记录取消，并返回当前已知 turn ID。
-func (p *activePrompt) requestCancel() string {
+// requestCancel records cancellation and returns the current native identity.
+func (p *nativeTurn) requestCancel() string {
 	p.mu.Lock()
 	p.cancelRequested = true
 	turnID := p.turnID
@@ -89,8 +140,8 @@ func (p *activePrompt) requestCancel() string {
 	return turnID
 }
 
-// setTurn 记录 turn/start 结果，并返回它是否已经属于取消/结束后的迟到 turn。
-func (p *activePrompt) setTurn(turnID string) bool {
+// setTurn binds the native identity and reports whether the foreground caller already left.
+func (p *nativeTurn) setTurn(turnID string) bool {
 	p.mu.Lock()
 	p.turnID = turnID
 	late := p.cancelRequested || p.finished
@@ -98,48 +149,37 @@ func (p *activePrompt) setTurn(turnID string) bool {
 	return late
 }
 
-// claimCompactTurn atomically accepts the first native identity for the held lane.
-func (p *activePrompt) claimCompactTurn(turnID string) (bool, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.turnID != "" {
-		return false, false
-	}
-	p.turnID = turnID
-	return true, p.cancelRequested || p.finished
-}
-
 // signalTurnStarted publishes the initialized native turn identity to waiters.
-func (p *activePrompt) signalTurnStarted() { p.turnStartedOnce.Do(func() { close(p.turnStarted) }) }
+func (p *nativeTurn) signalTurnStarted() { p.turnStartedOnce.Do(func() { close(p.turnStarted) }) }
 
-// markBackgroundDone 通知 steering/close 当前 prompt 已完全释放 session 槽位。
-func (p *activePrompt) markBackgroundDone() {
+// markBackgroundDone signals that no native wait remains.
+func (p *nativeTurn) markBackgroundDone() {
 	p.backgroundDoneOnce.Do(func() { close(p.backgroundDone) })
 }
 
-// currentTurn 返回当前 turn ID 与取消状态快照。
-func (p *activePrompt) currentTurn() (string, bool) {
+// currentTurn returns a synchronized snapshot of the identity and cancellation state.
+func (p *nativeTurn) currentTurn() (string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.turnID, p.cancelRequested
 }
 
-// setEventRouter 安装与已知 turn ID/generation 绑定的事件路由器。
-func (p *activePrompt) setEventRouter(router *eventRouter) {
+// setEventRouter installs the mapper for the proven native identity.
+func (p *nativeTurn) setEventRouter(router *eventRouter) {
 	p.mu.Lock()
 	p.eventRouter = router
 	p.mu.Unlock()
 }
 
-// currentEventRouter 返回当前 prompt 的事件路由器快照。
-func (p *activePrompt) currentEventRouter() *eventRouter {
+// currentEventRouter returns the mapper associated with this turn.
+func (p *nativeTurn) currentEventRouter() *eventRouter {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.eventRouter
 }
 
-// markForegroundFinished 标记 ACP Prompt 已返回；后台只负责 late interrupt/completion 清理。
-func (p *activePrompt) markForegroundFinished() {
+// markForegroundFinished prevents late identity evidence from publishing to a finished caller.
+func (p *nativeTurn) markForegroundFinished() {
 	p.mu.Lock()
 	p.finished = true
 	p.mu.Unlock()
@@ -158,18 +198,18 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 	if !ok {
 		return acpmeta.CompactResponse{}, codexSessionNotFoundError(request.SessionID)
 	}
-	prompt := newActivePrompt(a.runtimeCtx, a.nextTurnGeneration.Add(1))
-	prompt.compact = true
-	if err := a.installActivePrompt(state, prompt); err != nil {
+	prompt := newNativeTurn(a.runtimeCtx, a.nextTurnGeneration.Add(1))
+	prompt.kind = compactionTurn
+	if err := a.installTurn(state, prompt); err != nil {
 		prompt.cancelRun()
 		return acpmeta.CompactResponse{}, err
 	}
 	capture, err := a.client.completions.beginCapture(state.id)
 	if err != nil {
-		a.releaseActivePrompt(state, prompt)
+		a.releaseTurn(state, prompt)
 		prompt.cancelRun()
-		a.finishPromptForeground(prompt)
-		a.finishPromptBackground(prompt)
+		a.finishTurnForeground(prompt)
+		a.finishTurnBackground(prompt)
 		return acpmeta.CompactResponse{}, err
 	}
 	type result struct {
@@ -184,13 +224,15 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 		finish := func() {
 			finished.Do(func() {
 				prompt.markForegroundFinished()
-				a.releaseActivePrompt(state, prompt)
+				a.releaseTurn(state, prompt)
 				prompt.cancelRun()
-				a.finishPromptBackground(prompt)
+				a.finishTurnBackground(prompt)
 			})
 		}
 		defer finish()
-		err := a.client.ThreadCompactStart(prompt.runCtx, protocol.ThreadCompactStartParams{ThreadID: state.id})
+		err := awaitNativeAcknowledgment(prompt.runCtx, prompt.terminalSignal, func(ctx context.Context) error {
+			return a.client.ThreadCompactStart(ctx, protocol.ThreadCompactStartParams{ThreadID: state.id})
+		})
 		reported := false
 		if err != nil {
 			select {
@@ -210,6 +252,22 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 		}
 		select {
 		case <-prompt.turnStarted:
+		case <-a.client.rpc.Done():
+			// Keep an identity/terminal that was already drained before EOF.
+			select {
+			case <-prompt.turnStarted:
+			default:
+				a.client.completions.releaseCapture(state.id, capture)
+				finish()
+				if !reported {
+					err := a.client.rpc.Err()
+					if err == nil {
+						err = ErrAppServerUnavailable
+					}
+					results <- result{err: codexRequestFailure("compact_identity", err)}
+				}
+				return
+			}
 		case <-prompt.runCtx.Done():
 			a.client.completions.releaseCapture(state.id, capture)
 			if !reported {
@@ -246,14 +304,14 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 		}
 		results <- result{response: response}
 	}()
-	defer a.finishPromptForeground(prompt)
+	defer a.finishTurnForeground(prompt)
 	select {
 	case result := <-results:
 		return result.response, result.err
 	case <-ctx.Done():
 		turnID := prompt.requestCancel()
 		if turnID != "" {
-			a.requestPromptInterrupt(state, prompt, turnID, false)
+			a.requestTurnInterrupt(state, prompt, turnID, false)
 		}
 		select {
 		case result := <-results:
@@ -267,7 +325,7 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 	}
 }
 
-// Prompt 提交 turn/start，并按精确 completion 产生 ACP stop reason。
+// Prompt admits one native submission and joins its terminal result with ACP delivery.
 func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response acp.PromptResponse, promptErr error) {
 	if err := a.requireInitialized(); err != nil {
 		return acp.PromptResponse{}, err
@@ -286,8 +344,12 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
-	prompt := newActivePrompt(a.runtimeCtx, a.nextTurnGeneration.Add(1))
-	if err := a.installActivePrompt(state, prompt); err != nil {
+	prompt := newNativeTurn(a.runtimeCtx, a.nextTurnGeneration.Add(1))
+	prompt.clientMessageID = rand.Text()
+	if request.MessageId != nil && *request.MessageId != "" {
+		prompt.clientMessageID = *request.MessageId
+	}
+	if err := a.installTurn(state, prompt); err != nil {
 		prompt.cancelRun()
 		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, err)
 	}
@@ -301,26 +363,34 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 			state.mu.Unlock()
 		}
 		prompt.markForegroundFinished()
-		a.releaseActivePrompt(state, prompt)
-		a.finishPromptForeground(prompt)
+		a.releaseTurn(state, prompt)
+		a.finishTurnForeground(prompt)
 	}()
 
 	// turnResult 在后台 runtime 生命周期与前台 ACP 请求之间传递一次精确 turn 结果。
 	type turnResult struct {
 		// completion 是精确 turn 的完成通知。
 		completion protocol.TurnCompletedNotification
-		// err 是 turn/start、completion 或 process fatal 错误。
+		// err carries native submission and completion failures.
 		err error
+		// deliveryErr carries ACP write failures independently of the native result.
+		deliveryErr error
 	}
 	resultChannel := make(chan turnResult, 1)
-	turnParams := turnParamsForSession(state, input, request.MessageId)
+	turnParams, err := turnParamsForSession(state, input, &prompt.clientMessageID)
+	if err != nil {
+		prompt.cancelRun()
+		a.finishTurnBackground(prompt)
+		return acp.PromptResponse{}, err
+	}
 	go func() {
-		defer a.finishPromptBackground(prompt)
+		defer a.finishTurnBackground(prompt)
 		completion, runErr := a.client.RunTurn(prompt.runCtx, turnParams, func(turnID string) {
 			a.onTurnStarted(state, prompt, turnID)
-		})
+		}, prompt.startObservation())
+		deliveryErr := prompt.waitDelivery()
 		prompt.cancelRun()
-		resultChannel <- turnResult{completion: completion, err: runErr}
+		resultChannel <- turnResult{completion: completion, err: runErr, deliveryErr: deliveryErr}
 	}()
 
 	requestDone := ctx.Done()
@@ -328,6 +398,17 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 	for {
 		select {
 		case result := <-resultChannel:
+			if result.deliveryErr != nil && (result.err != nil || result.completion.Turn.Status != protocol.Failed) {
+				failure := codexRequestFailure("event_delivery", result.deliveryErr)
+				data := failure.Data.(map[string]any)
+				if result.completion.Turn.Status != "" {
+					data["native_status"] = string(result.completion.Turn.Status)
+				}
+				if result.err != nil {
+					data["native_failure"] = codexRequestFailure("turn_completion", result.err).Data
+				}
+				return acp.PromptResponse{}, turnFailureWithUsage(prompt, "event_delivery", failure)
+			}
 			if result.err != nil {
 				if errors.Is(result.err, context.Canceled) {
 					_, cancelled := prompt.currentTurn()
@@ -351,10 +432,15 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 			case protocol.FluffyCompleted:
 				return codexPromptResponse(prompt, acp.StopReasonEndTurn, request.MessageId), nil
 			case protocol.Failed:
+				failure := &acp.RequestError{Code: -32603, Message: fmt.Sprintf("codex turn %q failed", result.completion.Turn.ID)}
 				if turnError := result.completion.Turn.Error; turnError != nil {
-					return acp.PromptResponse{}, turnFailureWithUsage(prompt, "turn_completion", codexTurnRequestError(turnError))
+					failure = codexTurnRequestError(turnError)
 				}
-				return acp.PromptResponse{}, turnFailureWithUsage(prompt, "turn_completion", &acp.RequestError{Code: -32603, Message: fmt.Sprintf("codex turn %q failed", result.completion.Turn.ID)})
+				failure = turnFailureWithUsage(prompt, "turn_completion", failure)
+				if result.deliveryErr != nil {
+					failure.Data.(map[string]any)["event_delivery_error"] = result.deliveryErr.Error()
+				}
+				return acp.PromptResponse{}, failure
 			default:
 				return acp.PromptResponse{}, fmt.Errorf(
 					"codex turn %q completed with unexpected status %q",
@@ -367,7 +453,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 			if turnID == "" {
 				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
 			}
-			a.requestPromptInterrupt(state, prompt, turnID, false)
+			a.requestTurnInterrupt(state, prompt, turnID, false)
 			requestDone = nil
 			cancelSignal = nil
 		case <-cancelSignal:
@@ -375,7 +461,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 			if turnID == "" {
 				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
 			}
-			a.requestPromptInterrupt(state, prompt, turnID, false)
+			a.requestTurnInterrupt(state, prompt, turnID, false)
 			requestDone = nil
 			cancelSignal = nil
 		case <-a.runtimeCtx.Done():
@@ -385,7 +471,7 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 }
 
 // turnFailureWithUsage carries observed consumption across an unsuccessful terminal boundary.
-func turnFailureWithUsage(prompt *activePrompt, phase string, failure *acp.RequestError) *acp.RequestError {
+func turnFailureWithUsage(prompt *nativeTurn, phase string, failure *acp.RequestError) *acp.RequestError {
 	data, _ := failure.Data.(map[string]any)
 	if data == nil {
 		data = map[string]any{}
@@ -404,13 +490,31 @@ func turnFailureWithUsage(prompt *activePrompt, phase string, failure *acp.Reque
 			data = acpmeta.WithTurnUsage(data, usage.Metadata(false))
 		}
 	}
+	prompt.eventsMu.Lock()
+	observation := prompt.observed
+	reroutes := append([]modelReroute(nil), observation.reroutes...)
+	prompt.eventsMu.Unlock()
+	if observation.output {
+		data["output_observed"] = true
+	}
+	if observation.fileChange {
+		data["file_change_observed"] = true
+	}
+	if observation.lastError != nil {
+		data["native_error_observation"] = map[string]any{
+			"source": "error", "will_retry": observation.lastError.WillRetry, "error": observation.lastError.Error,
+		}
+	}
+	if len(reroutes) > 0 {
+		data["native_model_reroutes"] = reroutes
+	}
 	failure.Data = data
 	return failure
 }
 
-// codexPromptResponse 把当前 Turn 的最终 Usage 与消息确认写入终态响应。
+// codexPromptResponse projects the final native counters and user-message confirmation.
 func codexPromptResponse(
-	prompt *activePrompt,
+	prompt *nativeTurn,
 	stopReason acp.StopReason,
 	messageID *string,
 ) acp.PromptResponse {
@@ -420,6 +524,14 @@ func codexPromptResponse(
 	}
 	turnID, _ := prompt.currentTurn()
 	response.Meta = acpmeta.PositionMetadata(turnID)
+	prompt.eventsMu.Lock()
+	if len(prompt.observed.reroutes) > 0 {
+		if response.Meta == nil {
+			response.Meta = make(map[string]any)
+		}
+		response.Meta["native_model_reroutes"] = append([]modelReroute(nil), prompt.observed.reroutes...)
+	}
+	prompt.eventsMu.Unlock()
 	router := prompt.currentEventRouter()
 	if router == nil {
 		return response
@@ -432,47 +544,55 @@ func codexPromptResponse(
 	return response
 }
 
-// installActivePrompt 在统一锁序下同时安装 session 活动槽位与后台 registry 身份。
-func (a *Agent) installActivePrompt(state *sessionState, prompt *activePrompt) error {
-	a.promptMu.Lock()
-	defer a.promptMu.Unlock()
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if a.promptsClosing {
-		return ErrRuntimeUnavailable
-	}
-	if state.promptClosed {
+// installTurn reserves the exact thread and registers the invocation before native I/O.
+func (a *Agent) installTurn(state *sessionState, prompt *nativeTurn) error {
+	a.sessions.mu.Lock()
+	defer a.sessions.mu.Unlock()
+	if a.sessions.sessions[state.id] != state || a.sessions.closing[state.id] > 0 {
 		return ErrSessionClosing
 	}
-	if state.activePrompt != nil {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if a.turnsClosing {
+		return ErrRuntimeUnavailable
+	}
+	if state.turnAdmissionClosed {
+		return ErrSessionClosing
+	}
+	if state.replayingHistory {
+		return ErrSessionOpening
+	}
+	if state.activeTurn != nil {
 		return ErrPromptActive
 	}
-	if prompt.compact {
+	if prompt.kind == compactionTurn {
 		// Compact has no turn ID in its ACK. Do not let an unresolved start from a
 		// prior foreground request provide a candidate identity for this lane.
-		for _, owner := range a.prompts {
+		for _, owner := range a.turns {
 			if owner.id == state.id {
 				return ErrPromptActive
 			}
 		}
 	}
-	state.activePrompt = prompt
-	a.prompts[prompt] = state
+	state.activeTurn = prompt
+	a.turns[prompt] = state
 	return nil
 }
 
-// closeSessionPrompts 原子关闭旧 session state 的 prompt 安装入口，并返回其所有前台/后台身份。
-func (a *Agent) closeSessionPrompts(state *sessionState) []*activePrompt {
+// closeSessionTurns fences admission and returns every invocation owned by the retiring thread.
+func (a *Agent) closeSessionTurns(state *sessionState) []*nativeTurn {
 	if state == nil {
 		return nil
 	}
-	a.promptMu.Lock()
-	defer a.promptMu.Unlock()
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
 	state.mu.Lock()
-	state.promptClosed = true
+	state.turnAdmissionClosed = true
 	state.mu.Unlock()
-	prompts := make([]*activePrompt, 0)
-	for prompt, owner := range a.prompts {
+	prompts := make([]*nativeTurn, 0)
+	for prompt, owner := range a.turns {
 		if owner == state {
 			prompts = append(prompts, prompt)
 		}
@@ -480,32 +600,32 @@ func (a *Agent) closeSessionPrompts(state *sessionState) []*activePrompt {
 	return prompts
 }
 
-// closeAllPrompts 关闭 Adapter 级安装入口，并返回所有尚未完全结束的 prompt。
-func (a *Agent) closeAllPrompts() []*activePrompt {
-	a.promptMu.Lock()
-	defer a.promptMu.Unlock()
-	a.promptsClosing = true
-	prompts := make([]*activePrompt, 0, len(a.prompts))
-	for prompt := range a.prompts {
+// closeAllTurns fences Agent-wide admission and snapshots unfinished invocations.
+func (a *Agent) closeAllTurns() []*nativeTurn {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+	a.turnsClosing = true
+	prompts := make([]*nativeTurn, 0, len(a.turns))
+	for prompt := range a.turns {
 		prompts = append(prompts, prompt)
 	}
 	return prompts
 }
 
-// finishPromptForeground 标记前台 finally 完成，并在后台也结束后移除 registry 身份。
-func (a *Agent) finishPromptForeground(prompt *activePrompt) {
+// finishTurnForeground releases the foreground half of the invocation.
+func (a *Agent) finishTurnForeground(prompt *nativeTurn) {
 	prompt.markForegroundDone()
-	a.untrackPromptIfDone(prompt)
+	a.untrackTurnIfDone(prompt)
 }
 
-// finishPromptBackground 标记 RunTurn goroutine 完成，并在前台也结束后移除 registry 身份。
-func (a *Agent) finishPromptBackground(prompt *activePrompt) {
+// finishTurnBackground releases the native waiter half of the invocation.
+func (a *Agent) finishTurnBackground(prompt *nativeTurn) {
 	prompt.markBackgroundDone()
-	a.untrackPromptIfDone(prompt)
+	a.untrackTurnIfDone(prompt)
 }
 
-// untrackPromptIfDone 仅在前台与后台信号都关闭后删除精确 prompt 身份。
-func (a *Agent) untrackPromptIfDone(prompt *activePrompt) {
+// untrackTurnIfDone removes the invocation after both ownership halves have ended.
+func (a *Agent) untrackTurnIfDone(prompt *nativeTurn) {
 	select {
 	case <-prompt.foregroundDone:
 	default:
@@ -516,24 +636,108 @@ func (a *Agent) untrackPromptIfDone(prompt *activePrompt) {
 	default:
 		return
 	}
-	a.promptMu.Lock()
-	delete(a.prompts, prompt)
-	a.promptMu.Unlock()
+	a.turnMu.Lock()
+	delete(a.turns, prompt)
+	a.turnMu.Unlock()
 }
 
-// onTurnStarted 处理正常或取消后迟到的 turn identity，并触发一次 interrupt。
-func (a *Agent) onTurnStarted(state *sessionState, prompt *activePrompt, turnID string) {
-	defer prompt.signalTurnStarted()
-	late := prompt.setTurn(turnID) || !a.sessions.isCurrent(state)
-	if late {
-		a.requestPromptInterrupt(state, prompt, turnID, true)
+// onTurnStarted binds the identity in the ACK and drains previously isolated frames.
+func (a *Agent) onTurnStarted(state *sessionState, prompt *nativeTurn, turnID string) {
+	prompt.eventsMu.Lock()
+	defer prompt.eventsMu.Unlock()
+	a.bindTurnLocked(state, prompt, turnID)
+}
+
+// bindTurnLocked publishes an identity proved by an ACK or the submitted user-message ID.
+func (a *Agent) bindTurnLocked(state *sessionState, prompt *nativeTurn, turnID string) {
+	if id := prompt.confirmedTurnID(); id != "" {
 		return
 	}
-	a.attachTurnEvents(state, prompt, turnID, a.currentSessionUpdater())
+	late := prompt.setTurn(turnID) || !a.sessions.isCurrent(state)
+	if late && prompt.kind != compactionTurn {
+		a.requestTurnInterrupt(state, prompt, turnID, true)
+		prompt.signalTurnStarted()
+		return
+	}
+	var updater sessionUpdater
+	if prompt.kind != compactionTurn {
+		updater = a.currentSessionUpdater()
+	}
+	a.attachTurnEvents(state, prompt, turnID, updater)
+	if prompt.earlyOverflow {
+		prompt.eventFailure = errEventDeliveryBackpressure
+		prompt.currentEventRouter().handler.breakUsageContinuity()
+	}
+	for _, notification := range prompt.earlyEvents {
+		_, id := notificationRouting(notification)
+		a.routeBoundTurnLocked(prompt.runCtx, state, prompt, turnID, id, notification)
+	}
+	prompt.earlyEvents = nil
+	prompt.signalTurnStarted()
+	if late {
+		a.requestTurnInterrupt(state, prompt, turnID, false)
+	}
+}
+
+// startObservation connects protocol ACK waiting to this turn's native evidence.
+func (p *nativeTurn) startObservation() turnStartObservation {
+	return turnStartObservation{confirmedID: p.confirmedTurnID, terminal: p.terminalSignal}
+}
+
+var errNativeTerminalObserved = errors.New("native terminal observed before acknowledgment")
+
+// awaitNativeAcknowledgment lets independently proven completion end the ACK wait.
+// The transport keeps its bounded, one-shot response observer after local cancellation.
+func awaitNativeAcknowledgment(ctx context.Context, terminal <-chan struct{}, call func(context.Context) error) error {
+	if terminal == nil {
+		return call(ctx)
+	}
+	ackCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ack := make(chan error, 1)
+	go func() { ack <- call(ackCtx) }()
+	select {
+	case err := <-ack:
+		return err
+	case <-terminal:
+		cancel()
+		<-ack
+		return errNativeTerminalObserved
+	case <-ctx.Done():
+		// Join the locally cancelled request. The protocol transport retains any
+		// detached observer, but the invocation must not leave a waiter behind.
+		err := <-ack
+		select {
+		case <-terminal:
+			return errNativeTerminalObserved
+		default:
+			if err != nil {
+				return err
+			}
+			return ctx.Err()
+		}
+	}
+}
+
+// confirmedTurnID returns a native ID bound to this submission.
+func (p *nativeTurn) confirmedTurnID() string {
+	id, _ := p.currentTurn()
+	return id
 }
 
 // attachTurnEvents binds accounting and event delivery to the admitted native identity.
-func (a *Agent) attachTurnEvents(state *sessionState, prompt *activePrompt, turnID string, updater sessionUpdater) {
+func (a *Agent) attachTurnEvents(state *sessionState, prompt *nativeTurn, turnID string, updater sessionUpdater) {
+	if a.delivery != nil && updater != nil {
+		prompt.mu.Lock()
+		prompt.delivery = &turnDelivery{
+			owner: a.delivery, updater: updater, ctx: prompt.runCtx,
+			stillOwned: func() bool {
+				return prompt.runCtx.Err() == nil && a.sessions.isCurrent(state) && sessionActiveTurn(state) == prompt
+			},
+		}
+		updater = prompt.delivery
+		prompt.mu.Unlock()
+	}
 	router := newEventRouter(updater, turnGeneration{
 		SessionID:  acp.SessionId(state.id),
 		ThreadID:   state.id,
@@ -550,18 +754,31 @@ func (a *Agent) attachTurnEvents(state *sessionState, prompt *activePrompt, turn
 	router.handler.checkpoint = func(total *turnUsage) {
 		state.mu.Lock()
 		defer state.mu.Unlock()
-		if state.activePrompt == prompt {
+		if state.activeTurn == prompt {
 			state.usageTotal = total
 		}
 	}
 	prompt.setEventRouter(router)
 }
 
-// requestPromptInterrupt 使用 activePrompt 的 Once 保证所有取消来源合计只请求一次。
-// resolveInterrupted 为没有前台等待方的迟到 Turn 合成 interrupted 结果。
-func (a *Agent) requestPromptInterrupt(
+// waitDelivery waits for the ACP updates already mapped from this native turn.
+func (p *nativeTurn) waitDelivery() error {
+	p.eventsMu.Lock()
+	err := p.eventFailure
+	p.eventsMu.Unlock()
+	p.mu.Lock()
+	delivery := p.delivery
+	p.mu.Unlock()
+	if delivery != nil {
+		err = errors.Join(err, delivery.wait(p.runCtx))
+	}
+	return err
+}
+
+// requestTurnInterrupt sends at most one interrupt for a proven native identity.
+func (a *Agent) requestTurnInterrupt(
 	state *sessionState,
-	prompt *activePrompt,
+	prompt *nativeTurn,
 	turnID string,
 	resolveInterrupted bool,
 ) {
@@ -581,35 +798,30 @@ func (a *Agent) requestPromptInterrupt(
 	})
 }
 
-// releaseActivePrompt 只清理仍指向当前身份的前台活动槽位，绝不影响已安装的后继 prompt。
-func (a *Agent) releaseActivePrompt(state *sessionState, prompt *activePrompt) {
+// releaseTurn clears the lane only if the exact invocation still owns it.
+func (a *Agent) releaseTurn(state *sessionState, prompt *nativeTurn) {
 	state.mu.Lock()
-	if state.activePrompt == prompt {
-		state.activePrompt = nil
+	if state.activeTurn == prompt {
+		state.activeTurn = nil
 	}
 	state.mu.Unlock()
 }
 
-// clearActivePrompt 释放无独立 ACP Prompt 所有者的 steering 活动槽位；后台 registry 由 defer 回收。
-func (a *Agent) clearActivePrompt(state *sessionState, prompt *activePrompt) {
-	a.releaseActivePrompt(state, prompt)
-}
-
-// Cancel 幂等取消 session 的 pending/active prompt；turn 未知时不发送 interrupt。
+// Cancel asks the native turn owner to interrupt the current ACP session.
 func (a *Agent) Cancel(_ context.Context, notification acp.CancelNotification) error {
 	state, ok := a.sessions.get(string(notification.SessionId))
 	if !ok {
 		return nil
 	}
 	state.mu.Lock()
-	prompt := state.activePrompt
+	prompt := state.activeTurn
 	state.mu.Unlock()
 	if prompt == nil {
 		return nil
 	}
 	turnID := prompt.requestCancel()
 	if turnID != "" {
-		a.requestPromptInterrupt(state, prompt, turnID, false)
+		a.requestTurnInterrupt(state, prompt, turnID, false)
 	}
 	return nil
 }

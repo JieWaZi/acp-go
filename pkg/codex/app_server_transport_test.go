@@ -448,7 +448,7 @@ func TestAppServerTransportFansOutStableFatalError(t *testing.T) {
 	if !errors.Is(first, ErrAppServerUnavailable) || !errors.Is(second, ErrAppServerUnavailable) {
 		t.Fatalf("pending 错误为 %v / %v", first, second)
 	}
-	if first != second {
+	if !errors.Is(first, harness.transport.Err()) || !errors.Is(second, harness.transport.Err()) {
 		t.Fatalf("fatal fan-out 应共享同一稳定错误实例: %p / %p", first, second)
 	}
 }
@@ -498,7 +498,7 @@ func TestAppServerTransportPrefersConfirmedProcessExitToClosedPipe(t *testing.T)
 	if !strings.Contains(first.Error(), "code 7") || !strings.Contains(first.Error(), "fatal app-server fixture") {
 		t.Fatalf("进程退出诊断不完整: %v", first)
 	}
-	if first != second {
+	if !errors.Is(first, transport.Err()) || !errors.Is(second, transport.Err()) {
 		t.Fatalf("process fatal fan-out 应共享同一稳定错误实例: %p / %p", first, second)
 	}
 }
@@ -635,4 +635,26 @@ func TestAppServerTransportRejectsOversizedLine(t *testing.T) {
 	}
 	_ = harness.responses.Close()
 	<-writeResult
+}
+
+// shortFrameWriter simulates a pipe that accepts only a prefix without returning an error.
+type shortFrameWriter struct{}
+
+// Write returns a prefix count so the transport detects a short frame.
+func (shortFrameWriter) Write(data []byte) (int, error) { return len(data) / 2, nil }
+
+// TestTransportFailsOnShortFrame verifies a truncated NDJSON frame cannot leave the stream usable.
+func TestTransportFailsOnShortFrame(t *testing.T) {
+	stdout, child := io.Pipe()
+	defer child.Close()
+	transport := newAppServerTransport(context.Background(), stdout, shortFrameWriter{}, stdout, transportOptions{})
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := transport.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewThreadUnsubscribeRequest(id, protocol.ThreadUnsubscribeParams{ThreadID: "example"})
+	}, nil)
+	if !errors.Is(err, io.ErrShortWrite) || !errors.Is(transport.Err(), ErrAppServerUnavailable) {
+		t.Fatalf("short frame did not fail transport: call=%v, transport=%v", err, transport.Err())
+	}
 }

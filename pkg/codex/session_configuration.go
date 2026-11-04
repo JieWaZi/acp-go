@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -38,13 +39,13 @@ type agentModeDefinition struct {
 	SandboxMode protocol.SandboxEnum
 }
 
-// modelSelection 保存当前模型与推理强度，供 turn/start 消费方读取。
+// modelSelection holds the next-submission projection and explicit intent markers.
 type modelSelection struct {
-	// Model 是不包含 effort 后缀的 app-server 模型标识。
+	// Model is the native model routing ID.
 	Model string
-	// Effort 是当前模型选定的推理强度。
+	// Effort is the requested or inherited native reasoning effort.
 	Effort string
-	// Mode 是当前审批与沙箱模式标识。
+	// Mode selects the local approval and sandbox preset.
 	Mode acp.SessionModeId
 	// ServiceTier is the requested native override, independent of observed state.
 	ServiceTier protocol.OptionalNullable[string]
@@ -54,16 +55,172 @@ type modelSelection struct {
 	EffortRequested bool
 }
 
-// sessionConfiguration 只维护单个 session 的配置选择，不持有 runtime 生命周期状态。
+// sessionConfiguration owns the catalog, explicit overrides, and independent native receipts.
 type sessionConfiguration struct {
-	// models 是 app-server 返回的模型目录快照。
+	// models is the catalog returned by the native model/list request.
 	models []protocol.ModelListResponseDatum
-	// current 是当前模型、effort 与模式选择。
+	// current is the next-submission projection derived from intent and receipts.
 	current modelSelection
-	// effortExplicit records an explicit selection that must not be silently replaced.
-	effortExplicit bool
-	// observedServiceTier is the latest explicit native thread response, not an ACK.
-	observedServiceTier protocol.OptionalNullable[string]
+	// observed is independent of local selections and only changes on native evidence.
+	observed ObservedSettings
+}
+
+const (
+	openSettingsKey    = "codex/open-settings"
+	sessionSettingsKey = "codex/settings"
+	fastServiceTierKey = "codex/fast-service-tier"
+	// SessionSettingsMethod reads the current Codex settings and their evidence.
+	SessionSettingsMethod = "_codex/session/settings"
+)
+
+// OpenSettings specifies optional native overrides for a Codex thread.
+type OpenSettings struct {
+	// Model is an exact native model ID. Nil inherits the thread's setting.
+	Model *string `json:"model,omitempty"`
+	// ReasoningEffort is an exact native effort override.
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	// ServiceTier is omitted to inherit, null to turn off, or a native tier ID.
+	ServiceTier protocol.OptionalNullable[string] `json:"service_tier,omitzero"`
+}
+
+// ObservedSettings contains the settings confirmed by one native receipt.
+type ObservedSettings struct {
+	// OpenSettings contains the settings values reported by the provider.
+	OpenSettings
+	// Source identifies the native response or notification that supplied the observation.
+	Source string `json:"source"`
+}
+
+// SessionSettings exposes requested and observed Codex settings separately.
+type SessionSettings struct {
+	// Requested is the local intent applied to native submissions.
+	Requested OpenSettings `json:"requested"`
+	// Observed is the latest native settings receipt.
+	Observed ObservedSettings `json:"observed"`
+}
+
+// OpenSettingsMetadata constructs metadata for new, load, resume, or fork.
+func OpenSettingsMetadata(settings OpenSettings) map[string]any {
+	return map[string]any{openSettingsKey: settings}
+}
+
+// ReadSessionSettingsMetadata reads a settings snapshot from a session operation response.
+func ReadSessionSettingsMetadata(meta map[string]any) (SessionSettings, bool) {
+	var settings SessionSettings
+	raw, ok := meta[sessionSettingsKey]
+	if !ok {
+		return settings, false
+	}
+	data, err := json.Marshal(raw)
+	if err != nil || json.Unmarshal(data, &settings) != nil {
+		return SessionSettings{}, false
+	}
+	return settings, true
+}
+
+// FastServiceTier reads the native ID whose catalog identifies it as Fast.
+func FastServiceTier(modelMetadata map[string]any) (string, bool) {
+	id, ok := modelMetadata[fastServiceTierKey].(string)
+	return id, ok && id != ""
+}
+
+// parseOpenSettings validates typed overrides before submitting a native open request.
+func parseOpenSettings(meta map[string]any) (OpenSettings, error) {
+	var settings OpenSettings
+	raw, ok := meta[openSettingsKey]
+	if !ok {
+		return settings, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil || string(data) == "null" || json.Unmarshal(data, &settings) != nil {
+		return OpenSettings{}, acp.NewInvalidParams("invalid Codex open settings")
+	}
+	if settings.Model != nil && *settings.Model == "" || settings.ReasoningEffort != nil && *settings.ReasoningEffort == "" {
+		return OpenSettings{}, acp.NewInvalidParams("Codex model and reasoning effort overrides must be nonempty")
+	}
+	if tier, ok := settings.ServiceTier.Value(); ok && (tier == "" || tier == "off" || tier == "inherit") {
+		return OpenSettings{}, acp.NewInvalidParams("Codex service tier override must be a native ID or null")
+	}
+	return settings, nil
+}
+
+// applyOpenEffort uses the native config override declared in the pinned Codex schema.
+func (s OpenSettings) applyOpenEffort(config map[string]json.RawMessage) {
+	if s.ReasoningEffort != nil {
+		encoded, _ := json.Marshal(*s.ReasoningEffort)
+		config["model_reasoning_effort"] = encoded
+	}
+}
+
+// observe records receipt values and updates only inherited selectors.
+func (c *sessionConfiguration) observe(source, model string, effort *string, tier protocol.OptionalNullable[string]) {
+	c.observed = ObservedSettings{OpenSettings: OpenSettings{ReasoningEffort: effort, ServiceTier: tier}, Source: source}
+	if model != "" {
+		c.observed.Model = &model
+		if !c.current.ModelRequested {
+			c.current.Model = model
+		}
+	}
+	if !c.current.EffortRequested {
+		c.current.Effort = stringValue(effort)
+	}
+}
+
+// applyOpenIntent retains request values independently of the native receipt.
+func (c *sessionConfiguration) applyOpenIntent(settings OpenSettings) {
+	if settings.Model != nil {
+		c.current.Model = *settings.Model
+		c.current.ModelRequested = true
+	}
+	if settings.ReasoningEffort != nil {
+		c.current.Effort = *settings.ReasoningEffort
+		c.current.EffortRequested = true
+	}
+	c.current.ServiceTier = settings.ServiceTier
+}
+
+// settings returns the independent intent and receipt snapshots.
+func (c *sessionConfiguration) settings() SessionSettings {
+	intent := OpenSettings{ServiceTier: c.current.ServiceTier}
+	if c.current.ModelRequested {
+		intent.Model = new(string)
+		*intent.Model = c.current.Model
+	}
+	if c.current.EffortRequested {
+		intent.ReasoningEffort = new(string)
+		*intent.ReasoningEffort = c.current.Effort
+	}
+	return SessionSettings{Requested: intent, Observed: c.observed}
+}
+
+// sessionSettingsMetadata projects the snapshot independently of catalog availability.
+func sessionSettingsMetadata(state *sessionState) map[string]any {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return map[string]any{sessionSettingsKey: state.configuration.settings()}
+}
+
+// readSessionSettings returns the latest confirmed settings of an installed session.
+func (a *Agent) readSessionSettings(raw json.RawMessage) (SessionSettings, error) {
+	var request struct {
+		// SessionID identifies the installed Codex session.
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil || request.SessionID == "" {
+		return SessionSettings{}, acp.NewInvalidParams("session_id is required")
+	}
+	var settings SessionSettings
+	err := a.sessions.withCurrent(request.SessionID, func(state *sessionState) error {
+		if state.configuration == nil {
+			return acp.NewInvalidRequest("Codex session settings are unavailable")
+		}
+		settings = state.configuration.settings()
+		return nil
+	})
+	if errors.Is(err, ErrSessionNotFound) {
+		return SessionSettings{}, codexSessionNotFoundError(request.SessionID)
+	}
+	return settings, err
 }
 
 // agentModes 返回顺序稳定的三个 V1 权限模式。
@@ -179,7 +336,7 @@ func (c *sessionConfiguration) Options() []acp.SessionConfigOption {
 	return options
 }
 
-// Select 校验并应用一个 ACP 配置选择；未知值保持原状态并返回错误。
+// Select records one valid local override without mutating native observations.
 func (c *sessionConfiguration) Select(id acp.SessionConfigId, value string) error {
 	switch id {
 	case modeConfigID:
@@ -200,7 +357,7 @@ func (c *sessionConfiguration) Select(id acp.SessionConfigId, value string) erro
 	}
 }
 
-// selectModel 应用模型选择，并保留有效 effort；无效时使用模型默认值。
+// selectModel validates all explicit settings against the new model.
 func (c *sessionConfiguration) selectModel(id string) error {
 	model, ok := c.findModel(id)
 	if !ok {
@@ -212,7 +369,7 @@ func (c *sessionConfiguration) selectModel(id string) error {
 	}
 	effort := c.current.Effort
 	if _, ok := findSupportedEffort(model.SupportedReasoningEfforts, effort); !ok {
-		if c.effortExplicit {
+		if c.current.EffortRequested {
 			return fmt.Errorf("model %q does not support selected reasoning effort %q", id, effort)
 		}
 		effort = model.DefaultReasoningEffort
@@ -226,7 +383,7 @@ func (c *sessionConfiguration) selectModel(id string) error {
 	return nil
 }
 
-// selectEffort 只允许当前已编目模型声明支持的 reasoning effort。
+// selectEffort selects a reasoning level explicitly offered by the current model.
 func (c *sessionConfiguration) selectEffort(effort string) error {
 	model, ok := c.findModel(c.current.Model)
 	if !ok {
@@ -236,7 +393,6 @@ func (c *sessionConfiguration) selectEffort(effort string) error {
 	if !ok {
 		return fmt.Errorf("model %q does not support reasoning effort %q", c.current.Model, effort)
 	}
-	c.effortExplicit = true
 	c.current.EffortRequested = true
 	c.current.Effort = selected.ReasoningEffort
 	return nil
@@ -283,7 +439,7 @@ func (c *sessionConfiguration) modeOption() acp.SessionConfigOption {
 	}}
 }
 
-// modelOption 将 app-server 模型目录直接转换为 ACP model select 配置。
+// modelOption reports per-model options with known and unknown fields.
 func (c *sessionConfiguration) modelOption() acp.SessionConfigOption {
 	category := acp.SessionConfigOptionCategoryModel
 	options := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(c.models)+1)
@@ -307,6 +463,12 @@ func (c *sessionConfiguration) modelOption() acp.SessionConfigOption {
 			catalog.Options = append(catalog.Options, tier)
 		}
 		meta := acpmeta.WithModelConfigCatalog(nil, catalog)
+		for _, tier := range nativeTiers(model) {
+			if tier.ID != "" && strings.EqualFold(strings.TrimSpace(tier.Name), "fast") {
+				meta[fastServiceTierKey] = tier.ID
+				break
+			}
+		}
 		options = append(options, acp.SessionConfigSelectOption{
 			Value: acp.SessionConfigValueId(model.ID), Name: model.DisplayName, Description: &description, Meta: meta,
 		})
@@ -416,17 +578,16 @@ func (c *sessionConfiguration) tierOption(model protocol.ModelListResponseDatum)
 		current = value
 	}
 	var meta map[string]any
-	if model.ID == c.current.Model && c.observedServiceTier.IsPresent() {
+	if model.ID == c.current.Model && c.observed.ServiceTier.IsPresent() {
 		meta = map[string]any{"observed_service_tier": nil}
-		if value, ok := c.observedServiceTier.Value(); ok {
+		if value, ok := c.observed.ServiceTier.Value(); ok {
 			meta["observed_service_tier"] = value
 		}
 	}
 	return acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{Meta: meta, Id: serviceTierConfigID, Name: "Service tier", CurrentValue: acp.SessionConfigValueId(current), Options: acp.SessionConfigSelectOptions{Ungrouped: &options}, Type: "select"}}, true
 }
 
-// configurationForSession 复用 model/list 与 sessionConfiguration 组装真实 session 配置。
-// app-server 响应缺失 schema-required model 时显式失败，避免向 ACP 客户端静默降级能力。
+// configurationForSession reads the catalog and constructs the initial configuration.
 func (a *Agent) configurationForSession(
 	ctx context.Context,
 	model string,
@@ -437,11 +598,16 @@ func (a *Agent) configurationForSession(
 	}
 	models, err := a.client.ListModels(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing Codex models: %w", err)
+		return nil, codexOperationFailure("model_list", err, nil)
 	}
 	currentEffort := ""
 	if effort != nil {
 		currentEffort = *effort
+	}
+	for i := range models {
+		if models[i].Model != "" {
+			models[i].ID = models[i].Model
+		}
 	}
 	configuration, err := newSessionConfiguration(models, model, currentEffort, "agent")
 	if err != nil {
@@ -450,7 +616,7 @@ func (a *Agent) configurationForSession(
 	return configuration, nil
 }
 
-// sessionConfigurationResponse 在 session 锁内生成 ACP mode/config 快照。
+// sessionConfigurationResponse snapshots ACP configuration under the thread lock.
 func sessionConfigurationResponse(
 	state *sessionState,
 ) (*acp.SessionModeState, []acp.SessionConfigOption) {
@@ -466,13 +632,12 @@ func sessionConfigurationResponse(
 	return &modes, state.configuration.Options()
 }
 
-// turnParamsForSession 在 session 锁内快照 cwd 与当前配置，供普通 Prompt 和 steering fallback 共用。
-// 返回值不持有 session 内部指针，后续配置更新不会改写已发送的 turn/start。
+// turnParamsForSession freezes and validates the effective overrides for one native submission.
 func turnParamsForSession(
 	state *sessionState,
 	input []protocol.InputElement,
 	messageID *string,
-) protocol.TurnStartParams {
+) (protocol.TurnStartParams, error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	cwd := state.cwd
@@ -483,9 +648,20 @@ func turnParamsForSession(
 		Cwd:                 &cwd,
 	}
 	if state.configuration == nil {
-		return params
+		return params, nil
 	}
 	selection := state.configuration.Selection()
+	if model, known := state.configuration.findModel(selection.Model); known {
+		if tier, explicit := selection.ServiceTier.Value(); explicit &&
+			(model.ServiceTiers != nil || model.AdditionalSpeedTiers != nil) && !supportsTier(model, tier) {
+			return protocol.TurnStartParams{}, acp.NewInvalidParams(fmt.Sprintf("model %q does not support selected service tier %q", selection.Model, tier))
+		}
+		if selection.EffortRequested && model.SupportedReasoningEfforts != nil {
+			if _, supported := findSupportedEffort(model.SupportedReasoningEfforts, selection.Effort); !supported {
+				return protocol.TurnStartParams{}, acp.NewInvalidParams(fmt.Sprintf("model %q does not support selected reasoning effort %q", selection.Model, selection.Effort))
+			}
+		}
+	}
 	mode := state.configuration.ModeDefinition()
 	if selection.ModelRequested {
 		params.Model = &selection.Model
@@ -500,10 +676,10 @@ func turnParamsForSession(
 		state.additionalDirectories,
 	)
 	params.SandboxPolicy = &sandbox
-	return params
+	return params, nil
 }
 
-// SetSessionConfigOption 校验 SDK union，并把选择写入精确当前 session 的现有配置组件。
+// SetSessionConfigOption applies local intent and retains the independent native receipt.
 func (a *Agent) SetSessionConfigOption(
 	_ context.Context,
 	request acp.SetSessionConfigOptionRequest,
@@ -515,6 +691,7 @@ func (a *Agent) SetSessionConfigOption(
 	}
 	value := request.ValueId
 	var options []acp.SessionConfigOption
+	var settings SessionSettings
 	err := a.sessions.withCurrent(string(value.SessionId), func(state *sessionState) error {
 		if state.configuration == nil {
 			return acp.NewInvalidParams(map[string]any{
@@ -525,6 +702,7 @@ func (a *Agent) SetSessionConfigOption(
 			return acp.NewInvalidParams(map[string]any{"error": selectErr.Error()})
 		}
 		options = state.configuration.Options()
+		settings = state.configuration.settings()
 		return nil
 	})
 	if errors.Is(err, ErrSessionNotFound) {
@@ -533,10 +711,10 @@ func (a *Agent) SetSessionConfigOption(
 	if err != nil {
 		return acp.SetSessionConfigOptionResponse{}, err
 	}
-	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: options, Meta: map[string]any{sessionSettingsKey: settings}}, nil
 }
 
-// SetSessionMode 复用 mode 配置选择；未知模式绝不回退到更宽松权限。
+// SetSessionMode updates the local approval and sandbox selection.
 func (a *Agent) SetSessionMode(
 	_ context.Context,
 	request acp.SetSessionModeRequest,

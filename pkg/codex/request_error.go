@@ -131,6 +131,13 @@ func codexErrorKind(info *protocol.CodexErrorInfoUnion) string {
 // codexRequestFailure preserves native rejection facts at the ACP boundary.
 func codexRequestFailure(phase string, err error) *acp.RequestError {
 	data := map[string]any{"phase": phase, "submission": "unknown"}
+	var delivery *transportCallError
+	if errors.As(err, &delivery) {
+		data["delivery"] = string(delivery.delivery)
+		if delivery.delivery == frameNotWritten {
+			data["submission"] = "not_submitted"
+		}
+	}
 	var native *rpcError
 	if errors.As(err, &native) {
 		data["submission"] = "rejected"
@@ -145,4 +152,35 @@ func codexRequestFailure(phase string, err error) *acp.RequestError {
 		code = -32601
 	}
 	return &acp.RequestError{Code: code, Message: err.Error(), Data: data}
+}
+
+// codexOperationFailure keeps the primary native phase and attaches secondary cleanup failure.
+func codexOperationFailure(phase string, cause error, cleanup error) error {
+	if cause == nil {
+		return cleanup
+	}
+	var failure *acp.RequestError
+	if !errors.As(cause, &failure) {
+		var native *rpcError
+		var transport *transportCallError
+		if cleanup == nil && !errors.As(cause, &native) && !errors.As(cause, &transport) {
+			return cause
+		}
+		failure = codexRequestFailure(phase, cause)
+	}
+	if cleanup == nil {
+		return failure
+	}
+	data := make(map[string]any)
+	if original, ok := failure.Data.(map[string]any); ok {
+		for key, value := range original {
+			data[key] = value
+		}
+	}
+	if existing, ok := cleanup.(*acp.RequestError); ok {
+		data["cleanup"] = existing
+	} else {
+		data["cleanup"] = codexRequestFailure("thread_unsubscribe", cleanup)
+	}
+	return &acp.RequestError{Code: failure.Code, Message: failure.Message, Data: data}
 }

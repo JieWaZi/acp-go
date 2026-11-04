@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -286,7 +288,7 @@ func TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce(t *testing.T) {
 	if !ok {
 		t.Fatal("取消前 session 状态不存在")
 	}
-	backgroundPrompt := sessionActivePrompt(state)
+	backgroundPrompt := sessionActiveTurn(state)
 	if backgroundPrompt == nil {
 		t.Fatal("turn/start pending 时应存在活动 prompt")
 	}
@@ -317,7 +319,7 @@ func TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce(t *testing.T) {
 		t.Fatal("turn/start 返回前不应发送 interrupt")
 	default:
 	}
-	if active := sessionActivePrompt(state); active != nil {
+	if active := sessionActiveTurn(state); active != nil {
 		t.Fatal("取消 turn/start pending prompt 后未立即释放前台活动槽位")
 	}
 
@@ -411,7 +413,7 @@ func TestAgentCloseSessionCancelsPendingTurnStartAndReapsBackground(t *testing.T
 	if !ok {
 		t.Fatal("关闭前 session 状态不存在")
 	}
-	backgroundPrompt := sessionActivePrompt(state)
+	backgroundPrompt := sessionActiveTurn(state)
 	if backgroundPrompt == nil {
 		t.Fatal("关闭前 pending prompt 不存在")
 	}
@@ -491,7 +493,7 @@ func TestAgentCloseSessionObservesLateTurnStartOverRealTransport(t *testing.T) {
 	if turnStart.Method != protocol.MethodTurnStart {
 		t.Fatalf("首个 wire 请求为 %q，期望 turn/start", turnStart.Method)
 	}
-	prompt := sessionActivePrompt(state)
+	prompt := sessionActiveTurn(state)
 	if prompt == nil {
 		t.Fatal("turn/start pending 时没有活动 prompt")
 	}
@@ -619,7 +621,7 @@ func TestAgentCloseSessionReapsReleasedPendingObserver(t *testing.T) {
 		t.Fatalf("取消 pending prompt 失败: %v", err)
 	}
 	state, ok := agent.sessions.get("thread-orphan")
-	if !ok || sessionActivePrompt(state) != nil {
+	if !ok || sessionActiveTurn(state) != nil {
 		t.Fatal("普通取消后前台活动槽位未释放")
 	}
 
@@ -970,7 +972,7 @@ func TestAgentNotificationUsesVerifiedEventRouter(t *testing.T) {
 	if !ok {
 		t.Fatal("事件测试 session 不存在")
 	}
-	prompt := sessionActivePrompt(state)
+	prompt := sessionActiveTurn(state)
 	if prompt == nil {
 		t.Fatal("事件测试活动 Prompt 不存在")
 	}
@@ -1087,9 +1089,9 @@ func TestAgentSnapshotsAdvertisedTerminalOutputModeIntoLiveEvents(t *testing.T) 
 	if !ok {
 		t.Fatal("terminal_output session 未安装")
 	}
-	prompt := newActivePrompt(agent.runtimeCtx, agent.nextTurnGeneration.Add(1))
+	prompt := newNativeTurn(agent.runtimeCtx, agent.nextTurnGeneration.Add(1))
 	t.Cleanup(prompt.cancelRun)
-	if err = agent.installActivePrompt(state, prompt); err != nil {
+	if err = agent.installTurn(state, prompt); err != nil {
 		t.Fatalf("安装 terminal_output prompt 失败: %v", err)
 	}
 	agent.onTurnStarted(state, prompt, "terminal-mode-turn")
@@ -1111,6 +1113,9 @@ func TestAgentSnapshotsAdvertisedTerminalOutputModeIntoLiveEvents(t *testing.T) 
 		if err = router.HandleJSON(context.Background(), []byte(raw)); err != nil {
 			t.Fatalf("处理 terminal_output fixture 失败: %v", err)
 		}
+	}
+	if err := prompt.waitDelivery(); err != nil {
+		t.Fatalf("draining terminal updates: %v", err)
 	}
 	if got, want := len(updater.notifications), 8; got != want {
 		t.Fatalf("terminal_output update 数 = %d，期望 %d", got, want)
@@ -1445,6 +1450,11 @@ func TestCompactHoldsSessionUntilNativeCompletion(t *testing.T) {
 		t.Fatalf("rival prompt: %v", err)
 	}
 	agent.client.HandleNotification(context.Background(), decodeTestNotification(t, "turn/started", map[string]any{"threadId": "thread", "turn": map[string]any{"id": "compact-turn", "status": "inProgress", "items": []any{}}}))
+	_, steerErr := agent.HandleExtensionMethod(context.Background(), steeringExtensionMethod, steeringRawParams(t, "thread", "do not submit"))
+	var rejected *acp.RequestError
+	if !errors.As(steerErr, &rejected) || rejected.Code != acp.NewInvalidRequest(nil).Code {
+		t.Fatalf("steering did not reject the compaction lane: %v", steerErr)
+	}
 	agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "compact-turn", protocol.FluffyCompleted))
 	select {
 	case err := <-done:
@@ -1779,7 +1789,7 @@ func TestCompactMethodNotFoundReleasesLaneAndReportsUnsupported(t *testing.T) {
 	}
 	state, _ := agent.sessions.get("thread")
 	state.mu.Lock()
-	active := state.activePrompt
+	active := state.activeTurn
 	state.mu.Unlock()
 	if active != nil {
 		t.Fatal("explicit rejection retained the session lane")
@@ -1818,7 +1828,7 @@ func TestFailedTurnPreservesObservedUsageInFinalError(t *testing.T) {
 	<-started
 	state, _ := agent.sessions.get("thread")
 	state.mu.Lock()
-	prompt := state.activePrompt
+	prompt := state.activeTurn
 	state.mu.Unlock()
 	<-prompt.turnStarted
 	usage := usageSample(12, 3, 12, 3)
@@ -1953,5 +1963,569 @@ func TestCompactFailureRetainsItsOwnUsage(t *testing.T) {
 	if !ok || usage.InputTokens == nil || *usage.InputTokens != 8 || usage.Complete ||
 		data["turn_id"] != "compact" || data["phase"] != "compact_completion" || data["submission"] != "accepted" {
 		t.Fatalf("compact failure facts = %#v", data)
+	}
+}
+
+// TestCompactReleasesLaneWhenServerExitsBeforeIdentity exercises an ACK without a started notification.
+func TestCompactReleasesLaneWhenServerExitsBeforeIdentity(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	ack := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodThreadCompactStart:
+			close(ack)
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := agent.HandleExtensionMethod(context.Background(), acpmeta.CompactMethod, json.RawMessage(`{"session_id":"thread"}`))
+		done <- err
+	}()
+	<-ack
+	close(rpc.done)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("process exit returned successful compact")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("compact did not return after process exit")
+	}
+	state, _ := agent.sessions.get("thread")
+	if sessionActiveTurn(state) != nil {
+		t.Fatal("compact still owns the session lane after process exit")
+	}
+}
+
+// TestPromptDrainsNativeEventsAcrossStartAck checks that the terminal retains early output and usage.
+func TestPromptDrainsNativeEventsAcrossStartAck(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodTurnStart:
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodAgentMessageDelta, map[string]any{
+				"threadId": "thread", "turnId": "native", "itemId": "reply", "delta": "early",
+			}))
+			usage := usageSample(12, 4, 12, 4)
+			usage.ThreadID, usage.TurnID = "thread", "native"
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, usage))
+			agent.client.HandleNotification(ctx, completeNotification(t, "thread", "native", protocol.FluffyCompleted))
+			result.(*protocol.TurnStartResponse).Turn.ID = "native"
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	updater := &recordingSessionUpdater{}
+	agent.sessionUpdater = updater
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Usage == nil || response.Usage.InputTokens != 12 || len(updater.notifications) != 2 {
+		t.Fatalf("early frames lost: usage=%#v updates=%d", response.Usage, len(updater.notifications))
+	}
+}
+
+// TestPromptDeliveryFailureOutranksNativeSuccess checks separate native and ACP terminal facts.
+func TestPromptDeliveryFailureOutranksNativeSuccess(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn.ID = "native"
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	agent.sessionUpdater = &recordingHistoryUpdater{err: errors.New("ACP pipe closed")}
+	rpc.afterObserved = func() {
+		agent.client.HandleNotification(context.Background(), decodeTestNotification(t, protocol.MethodAgentMessageDelta, map[string]any{
+			"threadId": "thread", "turnId": "native", "itemId": "reply", "delta": "not delivered",
+		}))
+		agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "native", protocol.FluffyCompleted))
+	}
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("failed update reported as normal completion: %+v / %v", response, err)
+	}
+	facts, _ := failure.Data.(map[string]any)
+	if facts["phase"] != "event_delivery" || facts["native_status"] != "completed" {
+		t.Fatalf("delivery failure erased native terminal facts: %#v", facts)
+	}
+}
+
+// TestQuotaReadRetainsIndividualWindowAndResetCredits preserves known zero, false, and empty details.
+func TestQuotaReadRetainsIndividualWindowAndResetCredits(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.accountResponse = &protocol.GetAccountResponse{Account: &protocol.Account{Type: protocol.AccountTypeChatgpt}}
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodAccountRateLimitsRead:
+			*result.(*json.RawMessage) = json.RawMessage(`{"rateLimits":{"individualLimit":{"remainingPercent":0,"resetsAt":1700},"rateLimitReachedType":"workspace_member_usage_limit_reached","spendControlReached":false},"rateLimitResetCredits":{"availableCount":0,"credits":[]}}`)
+			return nil
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	result, err := agent.HandleExtensionMethod(context.Background(), acpmeta.AccountUsageMethod, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"kind":"individual"`, `"remaining_percent":0`, `"reset_at_unix_seconds":1700`, `"reached_type":"workspace_member_usage_limit_reached"`, `"spend_control_reached":false`, `"reset_credits":{"available_count":0,"details":[]}`} {
+		if !strings.Contains(string(wire), want) {
+			t.Fatalf("quota missing %s: %s", want, wire)
+		}
+	}
+}
+
+// TestNativeThreadArchiveOperationsUseExactIdentity checks both explicit management operations.
+func TestNativeThreadArchiveOperationsUseExactIdentity(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var called []string
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if request.Method() == protocol.MethodInitialize {
+			return nil
+		}
+		frame, err := json.Marshal(request)
+		if err != nil || !strings.Contains(string(frame), `"threadId":"saved"`) {
+			return fmt.Errorf("wrong management request: %s, %v", frame, err)
+		}
+		called = append(called, request.Method())
+		if request.Method() == "thread/unarchive" {
+			return json.Unmarshal([]byte(`{"thread":{"id":"saved"}}`), result)
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	for _, method := range []string{"_codex/thread/archive", "_codex/thread/unarchive"} {
+		if _, err := agent.HandleExtensionMethod(context.Background(), method, json.RawMessage(`{"thread_id":"saved"}`)); err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+	}
+	if !slices.Equal(called, []string{"thread/archive", "thread/unarchive"}) {
+		t.Fatalf("native management requests: %v", called)
+	}
+}
+
+// TestNativeSettingsCarryOpenIntentAndIndependentObservations checks the real open and late receipt path.
+func TestNativeSettingsCarryOpenIntentAndIndependentObservations(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var wire []byte
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize, protocol.MethodModelList:
+			return nil
+		case protocol.MethodThreadStart:
+			wire, _ = json.Marshal(request)
+			return json.Unmarshal([]byte(`{"thread":{"id":"settings"},"model":"observed","reasoningEffort":"low","serviceTier":"standard"}`), result)
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	agent := newAgentWithClient(slog.Default(), ctx, cancel, newAppServerClient(ctx, rpc))
+	initializeTestAgent(t, agent)
+	response, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir(), Meta: map[string]any{
+		"codex/open-settings": map[string]any{"model": "requested", "reasoning_effort": "high", "service_tier": nil},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"model":"requested"`, `"model_reasoning_effort":"high"`, `"serviceTier":null`} {
+		if !strings.Contains(string(wire), want) {
+			t.Fatalf("open did not submit %s: %s", want, wire)
+		}
+	}
+	encoded, _ := json.Marshal(response.Meta)
+	for _, want := range []string{`"requested":{"model":"requested"`, `"observed":{"model":"observed"`, `"service_tier":"standard"`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("open result did not retain %s: %s", want, encoded)
+		}
+	}
+	agent.client.HandleNotification(ctx, decodeTestNotification(t, "thread/settings/updated", map[string]any{
+		"threadId": "settings", "threadSettings": map[string]any{"model": "rerouted", "effort": "medium", "serviceTier": nil},
+	}))
+	result, err := agent.HandleExtensionMethod(ctx, "_codex/session/settings", json.RawMessage(`{"session_id":"settings"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ = json.Marshal(result)
+	for _, want := range []string{`"model":"requested"`, `"model":"rerouted"`, `"service_tier":null`, `"source":"thread_settings_updated"`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("late receipt did not retain %s: %s", want, encoded)
+		}
+	}
+}
+
+// TestFailedTurnPreservesObservedOutputAndRetry verifies positive evidence survives an empty failure.
+func TestFailedTurnPreservesObservedOutputAndRetry(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn.ID = "turn"
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	rpc.afterObserved = func() {
+		ctx := context.Background()
+		agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodAgentMessageDelta, map[string]any{
+			"threadId": "thread", "turnId": "turn", "itemId": "output", "delta": "partial",
+		}))
+		agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemCompleted, map[string]any{
+			"threadId": "thread", "turnId": "turn", "item": map[string]any{"type": "fileChange", "id": "write", "status": "completed", "changes": []any{map[string]any{"path": "/workspace/result", "kind": map[string]any{"type": "add"}, "diff": "+result"}}},
+		}))
+		agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodError, map[string]any{
+			"threadId": "thread", "turnId": "turn", "willRetry": true, "error": map[string]any{"message": "temporary native connection loss"},
+		}))
+		agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodModelRerouted, map[string]any{
+			"threadId": "thread", "turnId": "turn", "fromModel": "original", "toModel": "new-model", "reason": "provider",
+		}))
+		agent.client.HandleNotification(ctx, completeNotification(t, "thread", "turn", protocol.Failed))
+	}
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("failed native turn: %v", err)
+	}
+	data, _ := failure.Data.(map[string]any)
+	wire, _ := json.Marshal(data)
+	for _, want := range []string{`"output_observed":true`, `"file_change_observed":true`, `"will_retry":true`, `"temporary native connection loss"`, `"to":"new-model"`} {
+		if !strings.Contains(string(wire), want) {
+			t.Fatalf("failure lost %s: %s", want, wire)
+		}
+	}
+}
+
+// TestResumePreservesUnrelatedNativeFault verifies a non-missing rejection survives the ACP boundary.
+func TestResumePreservesUnrelatedNativeFault(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodThreadResume:
+			return &rpcError{Code: -32099, Message: "model quota", Data: json.RawMessage(`{"resetsAt":9000}`)}
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	_, err := agent.ResumeSession(context.Background(), acp.ResumeSessionRequest{SessionId: "thread", Cwd: t.TempDir()})
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("native error not exposed as ACP request error: %v", err)
+	}
+	wire, _ := json.Marshal(failure.Data)
+	for _, want := range []string{`"phase":"thread_resume"`, `"code":-32099`, `"resetsAt":9000`} {
+		if !strings.Contains(string(wire), want) {
+			t.Fatalf("resume error lost %s: %s", want, wire)
+		}
+	}
+}
+
+// TestPromptUsesMessageIdentityWhenStartAckIsLost verifies a proven terminal remains authoritative.
+func TestPromptUsesMessageIdentityWhenStartAckIsLost(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch value := request.(type) {
+		case protocol.InitializeRequest:
+		case protocol.ThreadStartRequest:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.TurnStartRequest:
+			messageID := stringValue(value.Params.ClientUserMessageID)
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemStarted, map[string]any{
+				"threadId": "thread", "turnId": "native", "item": map[string]any{"type": "userMessage", "id": "user", "clientId": messageID},
+			}))
+			agent.client.HandleNotification(ctx, completeNotification(t, "thread", "native", protocol.FluffyCompleted))
+			return context.DeadlineExceeded
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+	if err != nil || got.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("proven native terminal was lost: %+v / %v", got, err)
+	}
+}
+
+// TestForeignUsageCannotInflateAnActivePrompt checks both pending and acknowledged identities.
+func TestForeignUsageCannotInflateAnActivePrompt(t *testing.T) {
+	for _, beforeAck := range []bool{true, false} {
+		t.Run(fmt.Sprint(beforeAck), func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			var agent *Agent
+			sendUsage := func(threadID, turnID string, own, total int64) {
+				usage := usageSample(own, 0, total, 0)
+				usage.ThreadID, usage.TurnID = threadID, turnID
+				agent.client.HandleNotification(context.Background(), decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, usage))
+			}
+			rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+				switch request.Method() {
+				case protocol.MethodInitialize:
+				case protocol.MethodThreadStart:
+					result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+				case protocol.MethodTurnStart:
+					if beforeAck {
+						sendUsage("thread", "foreign", 30, 30)
+					}
+					result.(*protocol.TurnStartResponse).Turn.ID = "owned"
+				default:
+					return fmt.Errorf("unexpected call %s", request.Method())
+				}
+				return nil
+			}
+			agent = newRuntimeTestAgent(t, rpc)
+			rpc.afterObserved = func() {
+				if !beforeAck {
+					sendUsage("thread", "foreign", 30, 30)
+				}
+				sendUsage("thread", "owned", 10, 40)
+				agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "owned", protocol.FluffyCompleted))
+			}
+			if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+				t.Fatal(err)
+			}
+			response, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+			report, reported := acpmeta.ReadTurnUsage(response.Meta)
+			if err != nil || !reported || report.Complete || report.InputTokens == nil || *report.InputTokens != 10 {
+				t.Fatalf("foreign usage polluted the result: %+v / %v", response, err)
+			}
+		})
+	}
+}
+
+// TestProvenNativeTerminalDoesNotWaitForMissingAck checks independently observed completion.
+func TestProvenNativeTerminalDoesNotWaitForMissingAck(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch value := request.(type) {
+		case protocol.InitializeRequest:
+		case protocol.ThreadStartRequest:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.TurnStartRequest:
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemStarted, map[string]any{
+				"threadId": "thread", "turnId": "turn", "item": map[string]any{
+					"type": "userMessage", "id": "user", "clientId": stringValue(value.Params.ClientUserMessageID),
+				},
+			}))
+			agent.client.HandleNotification(ctx, completeNotification(t, "thread", "turn", protocol.FluffyCompleted))
+			<-ctx.Done()
+			return ctx.Err()
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		result, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+		if err == nil && result.StopReason != acp.StopReasonEndTurn {
+			err = fmt.Errorf("expected successful native terminal, got %s", result.StopReason)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prompt still waiting for ACK after proven native terminal")
+	}
+}
+
+// TestApprovalBeforeStartAckUsesProvenUserMessage checks that an early native request can reach ACP.
+func TestApprovalBeforeStartAckUsesProvenUserMessage(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	requester := &recordingPermissionRequester{response: selectedPermission("allow_once")}
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch value := request.(type) {
+		case protocol.InitializeRequest:
+		case protocol.ThreadStartRequest:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.TurnStartRequest:
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemStarted, map[string]any{
+				"threadId": "thread", "turnId": "turn", "item": map[string]any{
+					"type": "userMessage", "id": "user", "clientId": stringValue(value.Params.ClientUserMessageID),
+				},
+			}))
+			approval, err := protocol.DecodeServerRequest([]byte(`{"id":"approval","method":"item/commandExecution/requestApproval","params":{"command":"pwd","cwd":"/tmp","itemId":"item","startedAtMs":1,"threadId":"thread","turnId":"turn"}}`))
+			if err != nil {
+				return err
+			}
+			response, err := agent.handleServerRequest(ctx, approval)
+			if err != nil {
+				return err
+			}
+			decision := response.(protocol.CommandExecutionRequestApprovalResponse).Decision
+			if decision == nil || decision.Enum == nil || *decision.Enum != protocol.Accept {
+				return fmt.Errorf("approval denied before ACK: %+v", response)
+			}
+			result.(*protocol.TurnStartResponse).Turn.ID = "turn"
+			agent.client.HandleNotification(ctx, completeNotification(t, "thread", "turn", protocol.FluffyCompleted))
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	agent.approvalRequester = requester
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requester.requests) != 1 {
+		t.Fatalf("approval requests: %d", len(requester.requests))
+	}
+}
+
+// blockingSessionUpdater holds an ACP write while the fake app server sends other frames.
+type blockingSessionUpdater struct {
+	// entered signals the ACP write is blocked.
+	entered chan struct{}
+	// release lets the test finish the write.
+	release chan struct{}
+}
+
+// SessionUpdate simulates a slow ACP peer.
+func (u *blockingSessionUpdater) SessionUpdate(context.Context, acp.SessionNotification) error {
+	close(u.entered)
+	<-u.release
+	return nil
+}
+
+// TestNativeReadRemainsResponsiveDuringBlockedACPWrite verifies real NDJSON ordering and drain.
+func TestNativeReadRemainsResponsiveDuringBlockedACPWrite(t *testing.T) {
+	var client *appServerClient
+	harness := newTransportHarness(t, 4096, func(ctx context.Context, n protocol.ServerNotification) {
+		client.HandleNotification(ctx, n)
+	}, nil)
+	runtime, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client = newAppServerClient(runtime, harness.transport)
+	agent := newAgentWithClient(slog.Default(), runtime, cancel, client)
+	agent.initialized = true
+	agent.markConnectionReady()
+	updater := &blockingSessionUpdater{entered: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-updater.release:
+		default:
+			close(updater.release)
+		}
+	}()
+	agent.sessionUpdater = updater
+	generation, err := agent.sessions.beginOpen("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := agent.sessions.install("thread", t.TempDir(), generation, nil, terminalOutputModeDelta); !ok {
+		t.Fatal("failed to install thread fixture")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+		done <- err
+	}()
+	turn := readRuntimeWireRequest(t, harness)
+	writeRuntimeWireResult(t, harness, turn.ID, json.RawMessage(`{"turn":{"id":"turn","status":"inProgress","items":[]}}`))
+	if _, err := io.WriteString(harness.responses, `{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"output","delta":"hello"}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-updater.entered:
+	case <-time.After(time.Second):
+		t.Fatal("ACP notification was never attempted")
+	}
+	sentinelDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, err := client.ThreadRead(ctx, protocol.ThreadReadParams{ThreadID: "thread"})
+		sentinelDone <- err
+	}()
+	sentinel := readRuntimeWireRequest(t, harness)
+	go writeRuntimeWireResult(t, harness, sentinel.ID, json.RawMessage(`{"thread":{"id":"thread"}}`))
+	if err := <-sentinelDone; err != nil {
+		t.Fatalf("blocked ACP event delayed unrelated native RPC: %v", err)
+	}
+	if _, err := io.WriteString(harness.responses, `{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+		t.Fatal("terminal crossed an undrained ACP update")
+	default:
+	}
+	close(updater.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal did not follow the drained ACP update")
 	}
 }

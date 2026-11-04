@@ -26,29 +26,43 @@ func failClosedServerRequest(request protocol.ServerRequest) (any, error) {
 	}
 }
 
-// handleServerRequest 把 transport 解码的三类审批请求接到已验证 approvalHandler。
-// 连接或当前 Turn 身份缺失时，审批请求统一按拒绝安全值返回。
+// handleServerRequest dispatches only requests bound to a proven native turn.
 func (a *Agent) handleServerRequest(ctx context.Context, request protocol.ServerRequest) (any, error) {
 	requester := a.currentApprovalRequester()
 	switch value := request.(type) {
 	case *protocol.CommandExecutionApprovalRequest:
-		generation, current := a.currentTurnGeneration(value.Params.ThreadID, value.Params.TurnID)
+		generation, current := a.waitForTurnGeneration(ctx, value.Params.ThreadID, value.Params.TurnID)
 		if requester == nil || !current {
 			return failClosedCommandApproval(), nil
 		}
-		return newApprovalHandler(requester, generation, a, a.logger).HandleCommand(ctx, value.Params), nil
+		turnCtx, cancel, owned := a.turnElicitationContext(ctx, generation)
+		if !owned {
+			return failClosedCommandApproval(), nil
+		}
+		defer cancel()
+		return newApprovalHandler(requester, generation, a, a.logger).HandleCommand(turnCtx, value.Params), nil
 	case *protocol.FileChangeApprovalRequest:
-		generation, current := a.currentTurnGeneration(value.Params.ThreadID, value.Params.TurnID)
+		generation, current := a.waitForTurnGeneration(ctx, value.Params.ThreadID, value.Params.TurnID)
 		if requester == nil || !current {
 			return failClosedFileApproval(), nil
 		}
-		return newApprovalHandler(requester, generation, a, a.logger).HandleFile(ctx, value.Params), nil
+		turnCtx, cancel, owned := a.turnElicitationContext(ctx, generation)
+		if !owned {
+			return failClosedFileApproval(), nil
+		}
+		defer cancel()
+		return newApprovalHandler(requester, generation, a, a.logger).HandleFile(turnCtx, value.Params), nil
 	case *protocol.PermissionsApprovalRequest:
-		generation, current := a.currentTurnGeneration(value.Params.ThreadID, value.Params.TurnID)
+		generation, current := a.waitForTurnGeneration(ctx, value.Params.ThreadID, value.Params.TurnID)
 		if requester == nil || !current {
 			return failClosedPermissionsApproval(), nil
 		}
-		return newApprovalHandler(requester, generation, a, a.logger).HandlePermissions(ctx, value.Params), nil
+		turnCtx, cancel, owned := a.turnElicitationContext(ctx, generation)
+		if !owned {
+			return failClosedPermissionsApproval(), nil
+		}
+		defer cancel()
+		return newApprovalHandler(requester, generation, a, a.logger).HandlePermissions(turnCtx, value.Params), nil
 	case *protocol.MCPServerElicitationRequest:
 		return a.handleMCPServerElicitation(ctx, value.Params), nil
 	case *protocol.ToolRequestUserInputRequest:
@@ -79,6 +93,32 @@ func (a *Agent) currentSessionUpdater() sessionUpdater {
 	return a.sessionUpdater
 }
 
+// waitForTurnGeneration parks an early server request outside the native reader.
+// It can proceed after the ACK or verified user-message event binds the exact ID.
+func (a *Agent) waitForTurnGeneration(ctx context.Context, threadID, turnID string) (turnGeneration, bool) {
+	state, ok := a.sessions.get(threadID)
+	if !ok {
+		return turnGeneration{}, false
+	}
+	turn := sessionActiveTurn(state)
+	if turn == nil || turn.kind == compactionTurn {
+		return turnGeneration{}, false
+	}
+	if id := turn.confirmedTurnID(); id != "" && id != turnID {
+		return turnGeneration{}, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, appServerCleanupTimeout)
+	defer cancel()
+	select {
+	case <-turn.turnStarted:
+		generation, valid := a.currentTurnGeneration(threadID, turnID)
+		return generation, valid && generation.Generation == turn.generation
+	case <-turn.runCtx.Done():
+	case <-ctx.Done():
+	}
+	return turnGeneration{}, false
+}
+
 // currentTurnGeneration 在 session、活动槽位、turn ID 与取消状态都匹配时构造不可变身份。
 func (a *Agent) currentTurnGeneration(threadID, turnID string) (turnGeneration, bool) {
 	state, ok := a.sessions.get(threadID)
@@ -86,9 +126,9 @@ func (a *Agent) currentTurnGeneration(threadID, turnID string) (turnGeneration, 
 		return turnGeneration{}, false
 	}
 	state.mu.Lock()
-	prompt := state.activePrompt
+	prompt := state.activeTurn
 	state.mu.Unlock()
-	if prompt == nil {
+	if prompt == nil || prompt.kind == compactionTurn {
 		return turnGeneration{}, false
 	}
 	activeTurnID, cancelled := prompt.currentTurn()

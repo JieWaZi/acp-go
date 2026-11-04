@@ -93,3 +93,22 @@ func TestSessionStoreRejectsConcurrentOpen(t *testing.T) {
 		t.Fatal("concurrent open invalidated the first subscription")
 	}
 }
+
+// TestSessionStoreRejectsOpeningInstalledThread protects its active lane and history owner.
+func TestSessionStoreRejectsOpeningInstalledThread(t *testing.T) {
+	store := newSessionStore()
+	generation, err := store.beginOpen("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, ok := store.install("thread", "/tmp", generation, nil, terminalOutputModeDelta)
+	if !ok {
+		t.Fatal("failed to install session")
+	}
+	if _, err := store.beginOpen("thread"); err == nil {
+		t.Fatal("installed native thread can be replaced")
+	}
+	if !store.isCurrent(state) {
+		t.Fatal("existing thread owner changed")
+	}
+}

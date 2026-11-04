@@ -36,7 +36,7 @@
 
 不支持的主要能力：
 
-- `session/list`、archive、delete、rename 和 rollback。
+- `session/list`、delete、rename 和 rollback。
 - Audio、Review、Goal、Realtime、动态客户端工具及生态管理接口。
 - SSE 与 MCP-over-ACP transport。
 
@@ -44,7 +44,9 @@
 
 - `acpmeta.DeveloperInstructionsMetadata` 用于 new、load、resume 和支持的 fork：nil 保持原配置，空字符串显式清除；初始化元数据说明实际支持的入口。该内容只在打开会话时设置，不在每轮重复。
 - 模型参数通过 `acpmeta.ReadModelConfigCatalog` 读取。逐项未知的参数列在 `unknown_config_ids`，与其他已知选项并存。只有全部参数已知时，旧入口 `acpmeta.ModelConfigOptions` 才返回目录。service tier 使用原生 ID，`inherit` 省略字段，`off` 发送 null。原生 thread 回执报告的 tier 与本地请求分别保存。显式空的新版档位列表优先于旧格式。
-- `_account/read` 不启动 Prompt，返回 `acpmeta.AccountInfo`；API key 不推导套餐或账号标识。`_account/usage` 返回 `acpmeta.AccountUsage`，各桶窗口使用浮点百分比、持续时间秒与 Unix 重置秒；nil 表示未知，空列表表示已知空。
+- `_account/read` 不启动 Prompt，返回 `acpmeta.AccountInfo`；API key 不推导套餐或账号标识。`_account/usage` 返回 `acpmeta.AccountUsage`，各桶窗口使用浮点百分比、持续时间秒与 Unix 重置秒，并保留个人额度窗口、限制状态和只读重置积分。nil 列表表示未知，空列表表示已知空。
+- `codex.OpenSettingsMetadata` 向 new、load、resume、fork 写入 Codex 原生模型、推理强度及三态档位请求。`codex.ReadSessionSettingsMetadata` 读取会话回执。`_codex/session/settings` 读取同一会话的请求与观察状态，观察来自 thread 响应或 `thread/settings/updated`。`codex.FastServiceTier` 从目录元数据读取实际 Fast ID。
+- `_codex/thread/archive` 和 `_codex/thread/unarchive` 接受 `{"thread_id":"..."}`，使用原生管理请求变更非活动线程的归档状态。
 - `_session/compact` 接受 `{"session_id":"..."}`，响应包含原生 `turn_id` 和 `status`。原生 ACK 不包含 turn 身份；Adapter 等待 turn started 和相同 turn 的完成通知，并在此期间占用该 session 的活动槽位。已完成的近期 turn ID 在同一连接内去重。已观察到的压缩消费附在压缩结果或错误中。不确定结果不会自动重试。
 
 上述合同基于已提交的 app-server schema 和合成 RPC 回归；真实 CLI、账号与模型验收另行执行。公开 stderr 日志与退出错误只提供固定脱敏标记、存在性、截断和退出状态，不回显进程原文。
@@ -63,7 +65,7 @@ flowchart LR
     Agent --> ACP
 ```
 
-一个 Adapter 实例只启动一个 app-server。各 Session 共享 transport，但 Session generation、活动 Prompt、审批和 steering 队列相互隔离。
+一个 Adapter 实例持有一个 app-server。传输管理 NDJSON 帧、待响应请求和进程结束。每个原生线程持有一个活动回合。Prompt、steering 与 compact 各自按原生提交证据接纳。ACK 前的帧先隔离，收到匹配 ACK 或客户端消息 ID 证据后按顺序处理。ACP 更新经有界队列发送，Prompt 在已映射更新交付或明确交付失败后返回。
 
 ## 消息阶段与完成边界
 

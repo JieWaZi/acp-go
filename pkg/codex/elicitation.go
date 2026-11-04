@@ -72,7 +72,7 @@ func (a *Agent) handleToolUserInput(
 	if !formSupported || requester == nil {
 		return failClosedToolUserInput()
 	}
-	generation, current := a.currentTurnGeneration(params.ThreadID, params.TurnID)
+	generation, current := a.waitForTurnGeneration(ctx, params.ThreadID, params.TurnID)
 	if !current {
 		return failClosedToolUserInput()
 	}
@@ -212,7 +212,7 @@ func (a *Agent) handleMCPServerElicitation(
 	var generation turnGeneration
 	if params.TurnID != nil {
 		var current bool
-		generation, current = a.currentTurnGeneration(params.ThreadID, *params.TurnID)
+		generation, current = a.waitForTurnGeneration(ctx, params.ThreadID, *params.TurnID)
 		if !current {
 			return failClosedMCPServerElicitation()
 		}
@@ -258,7 +258,7 @@ func (a *Agent) turnElicitationContext(
 		return nil, func() {}, false
 	}
 	state.mu.Lock()
-	prompt := state.activePrompt
+	prompt := state.activeTurn
 	state.mu.Unlock()
 	if prompt == nil || !a.IsCurrent(generation) {
 		return nil, func() {}, false
@@ -415,10 +415,21 @@ func (a *Agent) completePendingURLElicitations(ctx context.Context, threadID str
 	if requester == nil {
 		return
 	}
-	for elicitationID := range pending {
-		if err := requester.UnstableCompleteElicitation(ctx, acp.UnstableCompleteElicitationNotification{ElicitationId: elicitationID}); err != nil {
-			a.logger.Debug("Failed to complete ACP URL elicitation", "thread_id", threadID, "error", err)
+	state, _ := a.sessions.get(threadID)
+	send := func() {
+		if !a.sessions.isCurrent(state) {
+			return
 		}
+		for elicitationID := range pending {
+			if err := requester.UnstableCompleteElicitation(ctx, acp.UnstableCompleteElicitationNotification{ElicitationId: elicitationID}); err != nil {
+				a.logger.Debug("Failed to complete ACP URL elicitation", "thread_id", threadID, "error", err)
+			}
+		}
+	}
+	if a.delivery == nil {
+		send()
+	} else if err := a.delivery.enqueue(send); err != nil {
+		a.logger.Warn("Could not queue Codex elicitation resolution", "error", err)
 	}
 }
 

@@ -2,10 +2,10 @@ package codex
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
@@ -22,8 +22,6 @@ const (
 	steeringInjected = "injected"
 	// steeringStartedNewTurn 表示无活动 turn 时新 turn 已被 app-server 接受。
 	steeringStartedNewTurn = "startedNewTurn"
-	// steeringFailed 表示当前单项遇到非协议性失败，队列仍继续。
-	steeringFailed = "failed"
 )
 
 // steeringParams 是 `_session/steering` 扩展的参数。
@@ -188,7 +186,7 @@ func (q *steeringQueue) isIdle() bool {
 	return !q.processing && len(q.pending) == 0
 }
 
-// steeringManager 保存 session→FIFO queue 映射，并实现固定 fallback 语义。
+// steeringManager owns the bounded FIFO of ACP input requests for each native thread.
 type steeringManager struct {
 	// agent 提供 session identity、typed client 与 prompt 生命周期。
 	agent *Agent
@@ -204,12 +202,12 @@ type steeringManager struct {
 	closeErr error
 }
 
-// newSteeringManager 创建空的 per-session queue registry。
+// newSteeringManager creates the queue registry for the Agent.
 func newSteeringManager(agent *Agent, capacity int) *steeringManager {
 	return &steeringManager{agent: agent, capacity: capacity, queues: make(map[string]*steeringQueue)}
 }
 
-// Handle 校验 extension params、捕获 generation 并等待 FIFO 接受结果。
+// Handle validates and enqueues input against the current native thread generation.
 func (m *steeringManager) Handle(ctx context.Context, raw json.RawMessage) (steeringResponse, error) {
 	var params steeringParams
 	if err := json.Unmarshal(raw, &params); err != nil {
@@ -233,14 +231,13 @@ func (m *steeringManager) Handle(ctx context.Context, raw json.RawMessage) (stee
 		return response, nil
 	}
 	var requestErr *acp.RequestError
-	if errors.As(err, &requestErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return steeringResponse{}, err
+	if errors.As(err, &requestErr) {
+		return steeringResponse{}, requestErr
 	}
-	m.agent.logger.Warn("Codex steering item failed", "session_id", params.SessionID, "error", err)
-	return steeringResponse{Outcome: steeringFailed}, nil
+	return steeringResponse{}, err
 }
 
-// getQueue 返回现有 session 队列或在锁内创建唯一实例。
+// getQueue returns the existing FIFO or registers a new queue for the thread.
 func (m *steeringManager) getQueue(sessionID string) (*steeringQueue, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -255,7 +252,7 @@ func (m *steeringManager) getQueue(sessionID string) (*steeringQueue, error) {
 	return queue, nil
 }
 
-// removeIfIdle 仅在 map 仍指向同一空闲实例时删除，防止误删复用队列。
+// removeIfIdle releases only the exact queue instance when it is idle.
 func (m *steeringManager) removeIfIdle(sessionID string, queue *steeringQueue) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -264,7 +261,7 @@ func (m *steeringManager) removeIfIdle(sessionID string, queue *steeringQueue) {
 	}
 }
 
-// perform 尝试注入活动 turn；无活动或明确竞态时启动新 turn。
+// perform steers an active input turn or starts one when no input was submitted.
 func (m *steeringManager) perform(
 	ctx context.Context,
 	params steeringParams,
@@ -279,8 +276,11 @@ func (m *steeringManager) perform(
 		return steeringResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
 	}
 
-	prompt := sessionActivePrompt(state)
+	prompt := sessionActiveTurn(state)
 	if prompt != nil {
+		if prompt.kind == compactionTurn {
+			return steeringResponse{}, acp.NewInvalidRequest("native compaction owns the session")
+		}
 		turnID, _ := prompt.currentTurn()
 		if turnID == "" {
 			select {
@@ -293,59 +293,71 @@ func (m *steeringManager) perform(
 			}
 		}
 		if turnID != "" {
-			_, steerErr := m.agent.client.TurnSteer(ctx, protocol.TurnSteerParams{
+			if err := ctx.Err(); err != nil {
+				return steeringResponse{}, err
+			}
+			response, err := m.agent.client.TurnSteer(ctx, protocol.TurnSteerParams{
 				ThreadID: params.SessionID, ExpectedTurnID: turnID, Input: input,
 			})
-			if steerErr == nil {
-				return steeringResponse{Outcome: steeringInjected}, nil
+			if err != nil {
+				// A changed turn identity does not prove the provider refused the input.
+				return steeringResponse{}, codexRequestFailure("turn_steer", err)
 			}
-			currentPrompt := sessionActivePrompt(state)
-			currentTurnID := ""
-			if currentPrompt != nil {
-				currentTurnID, _ = currentPrompt.currentTurn()
+			if response.TurnID != turnID {
+				return steeringResponse{}, codexRequestFailure("turn_steer", errors.New("Codex steer response did not identify the expected turn"))
 			}
-			if currentTurnID == turnID && !isNoActiveTurnToSteerError(steerErr) {
-				return steeringResponse{}, steerErr
-			}
+			return steeringResponse{Outcome: steeringInjected}, nil
 		}
 	}
 
 	return m.startNewTurn(ctx, state, input, generation)
 }
 
-// startNewTurn 等待旧 prompt 完整释放后启动控制 turn，并在 onTurnStarted 时立即接受 steering。
+// startNewTurn admits input only if no previous native submission consumed it.
 func (m *steeringManager) startNewTurn(
 	ctx context.Context,
 	state *sessionState,
 	input []protocol.InputElement,
 	generation uint64,
 ) (steeringResponse, error) {
-	if previous := sessionActivePrompt(state); previous != nil {
+	if previous := sessionActiveTurn(state); previous != nil {
 		select {
 		case <-previous.backgroundDone:
 		case <-ctx.Done():
 			return steeringResponse{}, ctx.Err()
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return steeringResponse{}, err
+	}
 	if !m.agent.sessions.isCurrent(state) || state.generation != generation {
 		return steeringResponse{}, acp.NewInvalidRequest("session is closing")
 	}
-	prompt := newActivePrompt(m.agent.runtimeCtx, m.agent.nextTurnGeneration.Add(1))
-	if err := m.agent.installActivePrompt(state, prompt); err != nil {
+	prompt := newNativeTurn(m.agent.runtimeCtx, m.agent.nextTurnGeneration.Add(1))
+	prompt.kind = steeringTurn
+	prompt.clientMessageID = rand.Text()
+	if err := m.agent.installTurn(state, prompt); err != nil {
 		prompt.cancelRun()
 		return steeringResponse{}, err
 	}
-	defer m.agent.finishPromptForeground(prompt)
+	defer m.agent.finishTurnForeground(prompt)
 
 	result := make(chan error, 1)
-	turnParams := turnParamsForSession(state, input, nil)
+	turnParams, err := turnParamsForSession(state, input, &prompt.clientMessageID)
+	if err != nil {
+		prompt.cancelRun()
+		m.agent.releaseTurn(state, prompt)
+		m.agent.finishTurnBackground(prompt)
+		return steeringResponse{}, err
+	}
 	go func() {
-		defer m.agent.finishPromptBackground(prompt)
+		defer m.agent.finishTurnBackground(prompt)
 		_, runErr := m.agent.client.RunTurn(prompt.runCtx, turnParams, func(turnID string) {
 			m.agent.onTurnStarted(state, prompt, turnID)
-		})
+		}, prompt.startObservation())
+		runErr = errors.Join(runErr, prompt.waitDelivery())
 		prompt.cancelRun()
-		m.agent.clearActivePrompt(state, prompt)
+		m.agent.releaseTurn(state, prompt)
 		result <- runErr
 	}()
 
@@ -356,52 +368,23 @@ func (m *steeringManager) startNewTurn(
 		if err == nil {
 			return steeringResponse{Outcome: steeringStartedNewTurn}, nil
 		}
-		return steeringResponse{}, err
+		return steeringResponse{}, codexRequestFailure("turn_start", err)
 	case <-ctx.Done():
 		prompt.requestCancel()
 		prompt.markForegroundFinished()
-		m.agent.releaseActivePrompt(state, prompt)
+		m.agent.releaseTurn(state, prompt)
 		return steeringResponse{}, ctx.Err()
 	}
 }
 
-// sessionActivePrompt 返回 session 当前 prompt 指针快照。
-func sessionActivePrompt(state *sessionState) *activePrompt {
+// sessionActiveTurn returns the current native lane owner.
+func sessionActiveTurn(state *sessionState) *nativeTurn {
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	return state.activePrompt
+	return state.activeTurn
 }
 
-// isNoActiveTurnToSteerError 同时检查 message、字符串 data 与 data.details。
-func isNoActiveTurnToSteerError(err error) bool {
-	messages := []string{err.Error()}
-	var rpcErr *rpcError
-	if errors.As(err, &rpcErr) && len(rpcErr.Data) > 0 {
-		if rpcErr.Data[0] == '"' {
-			// 兼容 data 直接使用错误文本的 app-server 响应形状。
-			var details string
-			if json.Unmarshal(rpcErr.Data, &details) == nil {
-				messages = append(messages, details)
-			}
-		} else {
-			var data struct {
-				// Details 是 app-server 对无活动 turn 竞态的附加文本。
-				Details string `json:"details"`
-			}
-			if json.Unmarshal(rpcErr.Data, &data) == nil {
-				messages = append(messages, data.Details)
-			}
-		}
-	}
-	for _, message := range messages {
-		if strings.Contains(strings.ToLower(message), "no active turn to steer") {
-			return true
-		}
-	}
-	return false
-}
-
-// CloseSession 关闭并移除精确 session 队列。
+// CloseSession closes and removes the identified thread queue.
 func (m *steeringManager) CloseSession(sessionID string, err error) {
 	m.mu.Lock()
 	queue := m.queues[sessionID]

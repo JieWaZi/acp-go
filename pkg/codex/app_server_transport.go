@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 )
@@ -21,6 +22,7 @@ const (
 	defaultMaxAppServerLineBytes = 8 << 20
 	// defaultMaxServerRequests 限制同时执行的 app-server→ACP 回调数。
 	defaultMaxServerRequests = 16
+	defaultMaxPendingCalls   = 256
 )
 
 var (
@@ -31,6 +33,29 @@ var (
 	// ErrAppServerFrameTooLarge 表示 app-server 输出了超过配置上限的 NDJSON 帧。
 	ErrAppServerFrameTooLarge = errors.New("codex app-server frame too large")
 )
+
+// frameDelivery describes how many bytes of one outbound NDJSON frame reached the writer.
+type frameDelivery string
+
+const (
+	frameNotWritten frameDelivery = "not_written"
+	framePartial    frameDelivery = "partial"
+	frameWritten    frameDelivery = "written"
+)
+
+// transportCallError keeps frame delivery evidence separate from native admission.
+type transportCallError struct {
+	// delivery describes the outbound frame independently of the reply.
+	delivery frameDelivery
+	// cause is the original transport, context, or decode error.
+	cause error
+}
+
+// Error returns the underlying diagnostic.
+func (e *transportCallError) Error() string { return e.cause.Error() }
+
+// Unwrap retains errors.Is and errors.As for the original cause.
+func (e *transportCallError) Unwrap() error { return e.cause }
 
 // notificationHandler 消费已按 method discriminator 解码的 app-server 通知。
 type notificationHandler func(ctx context.Context, notification protocol.ServerNotification)
@@ -44,6 +69,8 @@ type transportOptions struct {
 	Logger *slog.Logger
 	// MaxLineBytes 是单条 NDJSON 消息的最大字节数。
 	MaxLineBytes int
+	// MaxPendingCalls bounds response waiters, including detached turn observers.
+	MaxPendingCalls int
 	// MaxServerRequests 是并行 server request 的硬上限。
 	MaxServerRequests int
 	// NotificationHandler 接收服务端通知；nil 表示忽略通知。
@@ -54,7 +81,7 @@ type transportOptions struct {
 	EOFError func() error
 }
 
-// pendingResponse 保存一个等待 app-server 响应的调用。
+// pendingResponse carries the exact matching native response or failure.
 type pendingResponse struct {
 	// result 是响应成功时的原始 JSON result。
 	result json.RawMessage
@@ -62,8 +89,7 @@ type pendingResponse struct {
 	err error
 }
 
-// pendingCall 保存等待通道和可选的同步 response observer。
-// observer 只用于 turn/start 激活屏障，必须在 readLoop 继续读取下一帧前返回。
+// pendingCall owns the response waiter and optional pre-notification observer.
 type pendingCall struct {
 	// waiter 接收唯一一次响应或 transport fatal；调用方取消后可置空而不丢 observer。
 	waiter chan pendingResponse
@@ -96,8 +122,7 @@ func (e *rpcError) Error() string {
 	return fmt.Sprintf("codex app-server error %d: %s", e.Code, e.Message)
 }
 
-// appServerTransport 实现无 jsonrpc 的 NDJSON 边界。
-// transport 显式限制帧大小、待处理请求数量和反向请求并发。
+// appServerTransport owns native frame order, request pairing and fatal state.
 type appServerTransport struct {
 	// ctx 由 transport 关闭或父进程取消时结束。
 	ctx context.Context
@@ -105,7 +130,7 @@ type appServerTransport struct {
 	cancel context.CancelFunc
 	// reader 只由 readLoop goroutine 读取。
 	reader io.Reader
-	// writer 写入由 writeMu 串行化，保持每帧原子顺序。
+	// writer is owned by the caller holding writeSlot.
 	writer io.Writer
 	// closer 释放拥有 reader/writer 的底层进程或连接。
 	closer io.Closer
@@ -119,17 +144,19 @@ type appServerTransport struct {
 	pending map[string]pendingCall
 	// fatalErr 是首次致命失败创建的共享稳定错误实例。
 	fatalErr error
-	// writeMu 防止并发请求或服务端回复交叉写入同一 NDJSON 行。
-	writeMu sync.Mutex
+	// writeSlot serializes complete frames and permits cancellation while queued.
+	writeSlot chan struct{}
 	// serverSlots 限制服务端请求的并行回调数。
 	serverSlots chan struct{}
-	// done 在首次 fatal/close 时关闭。
+	// overloadSlot permits a bounded failure reply without blocking the native reader.
+	overloadSlot chan struct{}
+	// done closes on the first fatal error or explicit shutdown.
 	done chan struct{}
 	// closeOnce 保证底层资源只释放一次。
 	closeOnce sync.Once
 }
 
-// newAppServerTransport 创建 transport 并立即启动唯一读取循环。
+// newAppServerTransport starts the sole native protocol reader.
 func newAppServerTransport(
 	parent context.Context,
 	reader io.Reader,
@@ -146,23 +173,28 @@ func newAppServerTransport(
 	if options.MaxServerRequests <= 0 {
 		options.MaxServerRequests = defaultMaxServerRequests
 	}
+	if options.MaxPendingCalls <= 0 {
+		options.MaxPendingCalls = defaultMaxPendingCalls
+	}
 	ctx, cancel := context.WithCancel(parent)
 	transport := &appServerTransport{
-		ctx:         ctx,
-		cancel:      cancel,
-		reader:      reader,
-		writer:      writer,
-		closer:      closer,
-		options:     options,
-		pending:     make(map[string]pendingCall),
-		serverSlots: make(chan struct{}, options.MaxServerRequests),
-		done:        make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		reader:       reader,
+		writer:       writer,
+		closer:       closer,
+		options:      options,
+		pending:      make(map[string]pendingCall),
+		writeSlot:    make(chan struct{}, 1),
+		serverSlots:  make(chan struct{}, options.MaxServerRequests),
+		overloadSlot: make(chan struct{}, 1),
+		done:         make(chan struct{}),
 	}
 	go transport.readLoop()
 	return transport
 }
 
-// Call 先安装 pending，再发送由强类型构造器绑定 method/params 的请求并等待响应。
+// Call writes a generated native request and joins its matching response.
 func (t *appServerTransport) Call(
 	ctx context.Context,
 	build func(id protocol.RequestID) protocol.ClientRequest,
@@ -171,8 +203,7 @@ func (t *appServerTransport) Call(
 	return t.call(ctx, build, result, nil)
 }
 
-// CallObserved 在 result 解码后、readLoop 继续下一帧前同步执行 observer。
-// observer 用于在后续通知可见前安装 Turn identity。
+// CallObserved installs response identity before the reader accepts another frame.
 func (t *appServerTransport) CallObserved(
 	ctx context.Context,
 	build func(id protocol.RequestID) protocol.ClientRequest,
@@ -192,7 +223,7 @@ func (t *appServerTransport) CallObserved(
 	})
 }
 
-// call 实现普通响应交付与可选同步 observer 共用的 pending 生命周期。
+// call owns one bounded native request from admission through response or cancellation.
 func (t *appServerTransport) call(
 	ctx context.Context,
 	build func(id protocol.RequestID) protocol.ClientRequest,
@@ -204,50 +235,58 @@ func (t *appServerTransport) call(
 	key := strconv.FormatInt(idNumber, 10)
 	responseChannel := make(chan pendingResponse, 1)
 
+	request := build(id)
+	if request == nil {
+		return &transportCallError{frameNotWritten, errors.New("codex app-server request builder returned nil")}
+	}
 	t.pendingMu.Lock()
 	if t.fatalErr != nil {
 		err := t.fatalErr
 		t.pendingMu.Unlock()
-		return err
+		return &transportCallError{frameNotWritten, err}
+	}
+	if len(t.pending) >= t.options.MaxPendingCalls {
+		t.pendingMu.Unlock()
+		return &transportCallError{frameNotWritten, errors.New("too many pending Codex app-server requests")}
 	}
 	t.pending[key] = pendingCall{waiter: responseChannel, observe: observer}
 	t.pendingMu.Unlock()
 
-	request := build(id)
-	if request == nil {
-		t.removePending(key)
-		return errors.New("codex app-server request builder returned nil")
-	}
 	if err := t.writeJSON(ctx, request); err != nil {
 		t.removePending(key)
 		return err
 	}
 
+	var response pendingResponse
 	select {
-	case response := <-responseChannel:
-		if response.err != nil {
+	case response = <-responseChannel:
+	case <-ctx.Done():
+		select {
+		case response = <-responseChannel:
+		default:
+			t.detachPendingWaiter(key, responseChannel)
+			return &transportCallError{frameWritten, ctx.Err()}
+		}
+	case <-t.done:
+		select {
+		case response = <-responseChannel:
+		default:
+			return &transportCallError{frameWritten, t.Err()}
+		}
+	}
+	if response.err != nil {
+		var native *rpcError
+		if errors.As(response.err, &native) {
 			return response.err
 		}
-		if result == nil {
-			return nil
-		}
-		if err := json.Unmarshal(response.result, result); err != nil {
-			return fmt.Errorf("decoding %s response: %w", request.Method(), err)
-		}
-		return nil
-	case <-ctx.Done():
-		// 普通调用可直接删除；turn/start 必须仅分离本地 waiter，保留 server 迟到响应的一次 observer。
-		t.detachPendingWaiter(key, responseChannel)
-		return ctx.Err()
-	case <-t.done:
-		t.pendingMu.Lock()
-		err := t.fatalErr
-		t.pendingMu.Unlock()
-		if err == nil {
-			return ErrAppServerUnavailable
-		}
-		return err
+		return &transportCallError{frameWritten, response.err}
 	}
+	if result != nil {
+		if err := json.Unmarshal(response.result, result); err != nil {
+			return &transportCallError{frameWritten, fmt.Errorf("decoding %s response: %w", request.Method(), err)}
+		}
+	}
+	return nil
 }
 
 // Notify 写入由 protocol 包封闭的客户端通知变体。
@@ -282,12 +321,15 @@ func (t *appServerTransport) Close() error {
 	return closeErr
 }
 
-// readLoop 按 newline 拆分并分发 app-server 帧。
+// readLoop drains native NDJSON frames until EOF or an unrecoverable read failure.
 func (t *appServerTransport) readLoop() {
 	scanner := bufio.NewScanner(t.reader)
 	initialBuffer := min(64<<10, t.options.MaxLineBytes)
 	scanner.Buffer(make([]byte, initialBuffer), t.options.MaxLineBytes)
 	for scanner.Scan() {
+		if t.ctx.Err() != nil {
+			return
+		}
 		line := append([]byte(nil), scanner.Bytes()...)
 		if len(line) == 0 {
 			continue
@@ -300,7 +342,7 @@ func (t *appServerTransport) readLoop() {
 			t.fail(ErrAppServerFrameTooLarge)
 			return
 		}
-		if errors.Is(err, os.ErrClosed) && t.options.EOFError != nil {
+		if (errors.Is(err, os.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded)) && t.options.EOFError != nil {
 			// Go exec.Cmd.Wait 会在返回前关闭 StdoutPipe，scanner 可能先观察到 os.ErrClosed；
 			// 仅当唯一 Wait owner 随后确认异常退出时，才用 exit code/stderr
 			// 覆盖这个运行时竞态；普通 reader I/O 错误仍保持原因。
@@ -392,7 +434,7 @@ func (t *appServerTransport) handleNotification(line []byte) {
 	}
 }
 
-// handleServerRequest 在有界槽位中解码服务端请求并写回原始 ID。
+// handleServerRequest handles native callbacks within bounded reverse-request slots.
 func (t *appServerTransport) handleServerRequest(line, id json.RawMessage) {
 	select {
 	case t.serverSlots <- struct{}{}:
@@ -420,7 +462,15 @@ func (t *appServerTransport) handleServerRequest(line, id json.RawMessage) {
 			}{ID: id, Result: result})
 		}()
 	default:
-		t.writeServerError(id, -32000, "too many concurrent server requests")
+		select {
+		case t.overloadSlot <- struct{}{}:
+			go func() {
+				defer func() { <-t.overloadSlot }()
+				t.writeServerError(id, -32000, "too many concurrent server requests")
+			}()
+		default:
+			t.fail(errors.New("Codex server requests exceeded callback and overload reply capacity"))
+		}
 	}
 }
 
@@ -434,27 +484,70 @@ func (t *appServerTransport) writeServerError(id json.RawMessage, code int, mess
 	}{ID: id, Error: &rpcError{Code: code, Message: message}})
 }
 
-// writeJSON 在单一锁内完成 marshal 和一行写入，禁止帧交叉。
+// writeJSON acquires a cancellable writer slot and emits exactly one complete frame.
 func (t *appServerTransport) writeJSON(ctx context.Context, message any) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.done:
-		return t.Err()
-	default:
-	}
 	data, err := json.Marshal(message)
 	if err != nil {
-		return fmt.Errorf("encoding codex app-server message: %w", err)
+		return &transportCallError{frameNotWritten, fmt.Errorf("encoding codex app-server message: %w", err)}
 	}
 	data = append(data, '\n')
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	if _, err = t.writer.Write(data); err != nil {
+	select {
+	case <-ctx.Done():
+		return &transportCallError{frameNotWritten, ctx.Err()}
+	case <-t.done:
+		return &transportCallError{frameNotWritten, t.Err()}
+	case t.writeSlot <- struct{}{}:
+	}
+	defer func() { <-t.writeSlot }()
+	if err := ctx.Err(); err != nil {
+		return &transportCallError{frameNotWritten, err}
+	}
+	if err := t.Err(); err != nil {
+		return &transportCallError{frameNotWritten, err}
+	}
+	n, err := t.writeFrame(ctx, data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		delivery := framePartial
+		switch {
+		case n <= 0:
+			delivery = frameNotWritten
+		case n == len(data):
+			delivery = frameWritten
+		}
+		if ctx.Err() != nil && delivery == frameNotWritten {
+			return &transportCallError{frameNotWritten, ctx.Err()}
+		}
 		t.fail(fmt.Errorf("writing codex app-server stdin: %w", err))
-		return t.Err()
+		return &transportCallError{delivery, t.Err()}
 	}
 	return nil
+}
+
+// writeFrame interrupts an in-progress write when the writer supports deadlines.
+// The write slot stays held until the callback is stopped and the deadline cleared.
+func (t *appServerTransport) writeFrame(ctx context.Context, data []byte) (int, error) {
+	if writer, ok := t.writer.(interface {
+		// SetWriteDeadline sets or clears the current write deadline.
+		SetWriteDeadline(time.Time) error
+	}); ok {
+		if err := writer.SetWriteDeadline(time.Time{}); err == nil {
+			stopped := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				_ = writer.SetWriteDeadline(time.Now())
+				close(stopped)
+			})
+			defer func() {
+				if !stop() {
+					<-stopped
+				}
+				_ = writer.SetWriteDeadline(time.Time{})
+			}()
+		}
+	}
+	return t.writer.Write(data)
 }
 
 // removePending 仅在调用方取消或写失败时删除仍属于它的 pending。
@@ -481,7 +574,7 @@ func (t *appServerTransport) detachPendingWaiter(key string, waiter chan pending
 	t.pending[key] = call
 }
 
-// fail 只接受首次 fatal，并把同一错误实例广播给全部 pending。
+// fail publishes one immutable fatal cause and releases pending request waiters.
 func (t *appServerTransport) fail(cause error) {
 	t.pendingMu.Lock()
 	if t.fatalErr != nil {

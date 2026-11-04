@@ -3,7 +3,6 @@ package codex
 import (
 	"context"
 	"errors"
-	"fmt"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
@@ -41,6 +40,11 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
+	settings, err := parseOpenSettings(request.Meta)
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, err
+	}
+	settings.applyOpenEffort(config)
 	if err = acpmeta.BeginForkReceipt(request); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -49,53 +53,34 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 		ThreadID:              string(request.SessionId),
 		LastTurnID:            optionalForkPosition(request.Meta),
 		DeveloperInstructions: instructions,
+		Model:                 settings.Model,
+		ServiceTier:           settings.ServiceTier,
 		Cwd:                   &workspace.CWD,
 		Config:                config,
 	})
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, fmt.Errorf("starting codex thread: %w", err)
+		return acp.UnstableForkSessionResponse{}, codexOperationFailure("thread_fork", err, nil)
 	}
 	if response.Thread.ID == "" || response.Thread.ID == string(request.SessionId) {
 		return acp.UnstableForkSessionResponse{}, errors.New("starting codex thread: empty thread id")
 	}
-	if err = acpmeta.WriteForkReceipt(request, acp.SessionId(response.Thread.ID)); err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-	configuration, err := a.configurationForSession(ctx, response.Model, response.ReasoningEffort)
-	if err != nil {
-		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
-		defer cancelCleanup()
-		unsubscribeErr := a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID)
-		return acp.UnstableForkSessionResponse{}, fmt.Errorf(
-			"configuring new codex thread %q: %w",
-			response.Thread.ID,
-			errors.Join(err, unsubscribeErr),
-		)
-	}
-	configuration.observedServiceTier = response.ServiceTier
 	generation, err := a.sessions.beginOpen(response.Thread.ID)
 	if err != nil {
-		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
-		defer cancelCleanup()
-		return acp.UnstableForkSessionResponse{}, errors.Join(err, a.client.ThreadUnsubscribe(cleanupCtx, response.Thread.ID))
+		return acp.UnstableForkSessionResponse{}, err
 	}
-	state, installed := a.sessions.installWorkspace(
-		response.Thread.ID,
-		workspace,
-		generation,
-		configuration,
-		a.currentTerminalOutputMode(),
-	)
-	if !installed {
-		return acp.UnstableForkSessionResponse{}, a.closeStaleOpen(ctx, response.Thread.ID, generation)
+	if err = acpmeta.WriteForkReceipt(request, acp.SessionId(response.Thread.ID)); err != nil {
+		return acp.UnstableForkSessionResponse{}, a.cleanupFailedSubscribedOpen(ctx, response.Thread.ID, generation, err)
+	}
+	state, err := a.installOpenedSession(ctx, response.Thread.ID, generation, workspace, settings,
+		"thread_fork", response.Model, response.ReasoningEffort, response.ServiceTier, false)
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, err
 	}
 	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
 	modes, options := sessionConfigurationResponse(state)
-	if err = acpmeta.WriteForkReceipt(request, acp.SessionId(response.Thread.ID)); err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
 	return acpmeta.ForkResponse(request.SessionId, acp.NewSessionResponse{
 		SessionId:     acp.SessionId(response.Thread.ID),
+		Meta:          sessionSettingsMetadata(state),
 		Modes:         modes,
 		ConfigOptions: options,
 	})

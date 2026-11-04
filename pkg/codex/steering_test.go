@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
@@ -176,7 +179,7 @@ func TestSteeringFallbackInheritsSessionConfiguration(t *testing.T) {
 	))
 }
 
-// TestSteeringFailureDoesNotStallNextRequest 验证单项 unexpected steer 失败返回 failed，FIFO 继续下一项。
+// TestSteeringFailureDoesNotStallNextRequest verifies error delivery without blocking the next item.
 func TestSteeringFailureDoesNotStallNextRequest(t *testing.T) {
 	t.Parallel()
 	rpc := newFakeAppServerRPC()
@@ -228,12 +231,12 @@ func TestSteeringFailureDoesNotStallNextRequest(t *testing.T) {
 	}()
 	<-turnStarted
 
-	firstResult := make(chan any, 1)
+	firstResult := make(chan error, 1)
 	go func() {
-		result, _ := agent.HandleExtensionMethod(
+		_, err := agent.HandleExtensionMethod(
 			context.Background(), steeringExtensionMethod, steeringRawParams(t, "thread-1", "first"),
 		)
-		firstResult <- result
+		firstResult <- err
 	}()
 	<-firstSteerCalled
 	secondResult := make(chan any, 1)
@@ -244,8 +247,9 @@ func TestSteeringFailureDoesNotStallNextRequest(t *testing.T) {
 		secondResult <- result
 	}()
 	close(releaseFirstSteer)
-	if result := <-firstResult; result != (steeringResponse{Outcome: steeringFailed}) {
-		t.Fatalf("失败 steering 结果为 %#v", result)
+	var failure *acp.RequestError
+	if err := <-firstResult; !errors.As(err, &failure) {
+		t.Fatalf("steering failure = %v, want ACP request error", err)
 	}
 	if result := <-secondResult; result != (steeringResponse{Outcome: steeringInjected}) {
 		t.Fatalf("后继 steering 结果为 %#v", result)
@@ -255,29 +259,6 @@ func TestSteeringFailureDoesNotStallNextRequest(t *testing.T) {
 	))
 	if err := <-promptResult; err != nil {
 		t.Fatalf("活动 prompt 错误: %v", err)
-	}
-}
-
-// TestNoActiveTurnToSteerErrorAcceptsSupportedDataShapes 验证同时识别 string data 与 object.details。
-func TestNoActiveTurnToSteerErrorAcceptsSupportedDataShapes(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		// name 描述 app-server 返回的 data 形状。
-		name string
-		// data 是 rpc error 的原始 JSON data。
-		data json.RawMessage
-	}{
-		{name: "字符串", data: json.RawMessage(`"No active turn to steer"`)},
-		{name: "对象 details", data: json.RawMessage(`{"details":"No active turn to steer"}`)},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			err := &rpcError{Code: -32000, Message: "turn changed", Data: tt.data}
-			if !isNoActiveTurnToSteerError(err) {
-				t.Fatalf("未识别 no-active-turn data: %s", tt.data)
-			}
-		})
 	}
 }
 
@@ -392,5 +373,75 @@ func TestSteeringQueueIsBoundedAndCloseRejectsPending(t *testing.T) {
 	))
 	if err := <-promptResult; err != nil {
 		t.Fatalf("活动 prompt 错误: %v", err)
+	}
+}
+
+// TestSteeringLostAckDoesNotResubmit protects the native admission boundary.
+func TestSteeringLostAckDoesNotResubmit(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	started, allowSteerFailure := make(chan struct{}), make(chan struct{})
+	promptDone := make(chan error, 1)
+	var starts atomic.Int32
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodTurnStart:
+			id := "original"
+			if starts.Add(1) > 1 {
+				id = "duplicate"
+			}
+			result.(*protocol.TurnStartResponse).Turn.ID = id
+		case protocol.MethodTurnSteer:
+			agent.client.HandleNotification(ctx, completeNotification(t, "thread", "original", protocol.FluffyCompleted))
+			<-allowSteerFailure
+			return context.DeadlineExceeded
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	rpc.afterObserved = func() {
+		if starts.Load() == 1 {
+			close(started)
+		}
+	}
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+		promptDone <- err
+	}()
+	select {
+	case <-started:
+	case err := <-promptDone:
+		t.Fatalf("prompt stopped before native identity: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("native prompt did not start")
+	}
+	steerDone := make(chan error, 1)
+	params := steeringRawParams(t, "thread", "do it once")
+	go func() {
+		_, err := agent.HandleExtensionMethod(context.Background(), steeringExtensionMethod, params)
+		steerDone <- err
+	}()
+	if err := <-promptDone; err != nil {
+		t.Fatal(err)
+	}
+	close(allowSteerFailure)
+	select {
+	case err := <-steerDone:
+		if starts.Load() != 1 {
+			t.Fatalf("steering resubmitted after losing ACK: %d turn/start calls", starts.Load())
+		}
+		if err == nil {
+			t.Fatal("lost ACK reported as successful steering")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("steering did not return")
 	}
 }

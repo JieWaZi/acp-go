@@ -138,6 +138,8 @@ type Agent struct {
 	connection *acp.AgentSideConnection
 	// approvalRequester 是 approval 组件消费的窄接口；生产值始终与 connection 相同，测试可独立注入。
 	approvalRequester permissionRequester
+	// delivery sends ordered turn notifications without blocking the native reader.
+	delivery *eventDelivery
 	// sessionUpdater 是 event/history 组件消费的 SDK 原生 session/update 窄接口。
 	sessionUpdater sessionUpdater
 	// elicitationRequester 是 MCP 与 request_user_input 使用的 ACP 交互窄接口。
@@ -146,13 +148,13 @@ type Agent struct {
 	connectionReady chan struct{}
 	// connectionReadyOnce 保证 binder 重复调用不会 panic。
 	connectionReadyOnce sync.Once
-	// promptMu 保护所有前台已结束但仍在观察迟到 start 的 prompt 身份。
-	promptMu sync.Mutex
-	// prompts 把每个尚未完全结束的 prompt 关联到精确 session generation 状态。
-	prompts map[*activePrompt]*sessionState
-	// promptsClosing 阻止 Adapter Close 开始后安装新的 prompt 后台任务。
-	promptsClosing bool
-	// nextTurnGeneration 为每个 prompt/steering turn 分配 Adapter 内单调身份。
+	// turnMu protects invocations that still own a foreground or native waiter.
+	turnMu sync.Mutex
+	// turns maps each unfinished native invocation to its exact thread owner.
+	turns map[*nativeTurn]*sessionState
+	// turnsClosing fences new invocations once Agent shutdown starts.
+	turnsClosing bool
+	// nextTurnGeneration allocates unique local invocation identities.
 	nextTurnGeneration atomic.Uint64
 	// mcpMu 保护启动状态快照与已接受 URL elicitation。
 	mcpMu sync.Mutex
@@ -242,10 +244,11 @@ func newAgentWithClient(
 		getenv:                 os.Getenv,
 		runtimeCtx:             runtimeCtx,
 		runtimeCancel:          runtimeCancel,
+		delivery:               startEventDelivery(runtimeCtx),
 		client:                 client,
 		sessions:               newSessionStore(),
 		connectionReady:        make(chan struct{}),
-		prompts:                make(map[*activePrompt]*sessionState),
+		turns:                  make(map[*nativeTurn]*sessionState),
 		mcpStatuses:            make(map[string]mcpStatusSnapshot),
 		pendingURLElicitations: make(map[string]map[acp.UnstableElicitationId]struct{}),
 	}
@@ -340,7 +343,7 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 		Meta: map[string]any{
 			"developerInstructions": acpmeta.DeveloperInstructionsCapability(acpmeta.VerifiedForkMode(a.executable.Version, "0.155.1", acpmeta.ForkTurn) != acpmeta.ForkUnsupported),
 			"steering":              map[string]any{"supported": true},
-			"native_management":     map[string]any{"account_read": true, "account_usage": true, "compact": true, "schema_version": "0.148.0", "provider_support": "unknown"},
+			"native_management":     map[string]any{"account_read": true, "account_usage": true, "compact": true, "codex_thread_archive": ThreadArchiveMethod, "codex_session_settings": SessionSettingsMethod, "codex_thread_unarchive": ThreadUnarchiveMethod, "schema_version": "0.148.0", "provider_support": "unknown"},
 			"fork":                  map[string]any{"mode": acpmeta.VerifiedForkMode(a.executable.Version, "0.155.1", acpmeta.ForkTurn)},
 		},
 	}, nil
@@ -356,7 +359,10 @@ func (a *Agent) currentTerminalOutputMode() terminalOutputMode {
 	return terminalOutputModeDelta
 }
 
-// HandleExtensionMethod 把唯一 V1 steering extension 交给有界 FIFO manager；其余使用 SDK 标准错误。
+// ManagesSessionLifecycle lets the native turn owner handle ACP session cancellation.
+func (*Agent) ManagesSessionLifecycle() bool { return true }
+
+// HandleExtensionMethod dispatches the supported ACP technical operations.
 func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
 	case steeringExtensionMethod:
@@ -367,6 +373,10 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		return a.AccountUsage(ctx)
 	case acpmeta.CompactMethod:
 		return a.compact(ctx, params)
+	case SessionSettingsMethod:
+		return a.readSessionSettings(params)
+	case ThreadArchiveMethod, ThreadUnarchiveMethod:
+		return a.archiveThread(ctx, params, method == ThreadArchiveMethod)
 	default:
 		return nil, acp.NewMethodNotFound(method)
 	}
@@ -376,7 +386,7 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 func (a *Agent) Close(ctx context.Context) error {
 	a.closeOnce.Do(func() {
 		a.steering.Close(ErrRuntimeUnavailable)
-		prompts := a.closeAllPrompts()
+		prompts := a.closeAllTurns()
 		a.sessions.closeAll()
 		for _, prompt := range prompts {
 			prompt.requestCancel()

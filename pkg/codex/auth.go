@@ -33,8 +33,8 @@ type authServer interface {
 
 // loginCompletionSubscription 表示在 account/login/start 前安装的单次完成订阅。
 type loginCompletionSubscription interface {
-	// Wait 等待 typed account/login/completed 通知。
-	Wait(context.Context) (protocol.AccountLoginCompletedNotification, error)
+	// Wait accepts only the exact expected native login ID, or empty for the API key flow.
+	Wait(context.Context, string) (protocol.AccountLoginCompletedNotification, error)
 	// Close 释放订阅，避免登录失败后遗留监听器。
 	Close()
 }
@@ -151,65 +151,75 @@ func (a *authenticator) authenticateAPIKey(ctx context.Context, request acp.Auth
 	}); err != nil {
 		// 不包装服务端错误：其文本可能包含服务端回显的 secret。
 		a.logger.Error("Failed to start API key login")
-		return errAuthenticationFailed
+		return codexAuthenticationFailure("account_login_start", err)
 	}
 	return waitForLoginCompletion(ctx, subscription)
 }
 
-// authenticateChatGPT 先刷新账号；需要登录时严格执行 subscribe、start、open、wait 顺序。
+// authenticateChatGPT joins the completion for this exact browser login attempt.
 func (a *authenticator) authenticateChatGPT(ctx context.Context) error {
 	refresh := true
 	account, err := a.server.AccountRead(ctx, protocol.GetAccountParams{RefreshToken: &refresh})
 	if err != nil {
-		a.logger.Error("Failed to read ChatGPT account")
-		return errAuthenticationFailed
+		return codexAuthenticationFailure("account_read", err)
 	}
 	if account.Account != nil && account.Account.Type == protocol.AccountTypeChatgpt {
 		return nil
 	}
-
 	subscription, err := a.subscriber.SubscribeLoginCompleted()
 	if err != nil {
-		a.logger.Error("Failed to subscribe to login completion notifications")
-		return errAuthenticationFailed
+		return codexAuthenticationFailure("account_login_subscribe", err)
 	}
 	defer subscription.Close()
 	login, err := a.server.AccountLogin(ctx, protocol.LoginAccountParams{Type: protocol.TypeChatgpt})
 	if err != nil {
-		a.logger.Error("Failed to start ChatGPT login")
-		return errAuthenticationFailed
+		return codexAuthenticationFailure("account_login_start", err)
 	}
-	if login.Type != protocol.TypeChatgpt || login.AuthURL == nil || *login.AuthURL == "" || a.browser == nil {
-		return errAuthenticationFailed
-	}
-	if err := a.browser.Open(ctx, *login.AuthURL); err != nil {
-		a.logger.Error("Failed to open ChatGPT login page")
-		return errAuthenticationFailed
-	}
-	completion, waitErr := subscription.Wait(ctx)
-	if waitErr != nil {
-		if (errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded)) && login.LoginID != nil {
-			// 取消请求不能复用已取消的 ctx，且独立清理必须有界。
+	loginID := stringValue(login.LoginID)
+	finished := false
+	if loginID != "" {
+		defer func() {
+			if finished {
+				return
+			}
 			cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)
 			defer cancelCleanup()
-			if _, cancelErr := a.server.AccountLoginCancel(
-				cleanupCtx,
-				protocol.CancelLoginAccountParams{LoginID: *login.LoginID},
-			); cancelErr != nil {
+			if _, err := a.server.AccountLoginCancel(cleanupCtx, protocol.CancelLoginAccountParams{LoginID: loginID}); err != nil {
 				a.logger.Error("Failed to cancel ChatGPT login")
 			}
-		}
-		return errAuthenticationFailed
+		}()
 	}
+	if login.Type != protocol.TypeChatgpt || loginID == "" || stringValue(login.AuthURL) == "" || a.browser == nil {
+		return codexAuthenticationFailure("account_login_start", errAuthenticationFailed)
+	}
+	if err := a.browser.Open(ctx, *login.AuthURL); err != nil {
+		return codexAuthenticationFailure("account_login_browser", err)
+	}
+	completion, err := subscription.Wait(ctx, loginID)
+	if err != nil {
+		return codexAuthenticationFailure("account_login_completion", err)
+	}
+	finished = true
 	if !completion.Success {
-		return errAuthenticationFailed
+		return codexAuthenticationFailure("account_login_completion", errAuthenticationFailed)
 	}
 	return nil
 }
 
+// codexAuthenticationFailure retains phase and native code without echoing credentials.
+func codexAuthenticationFailure(phase string, err error) *acp.RequestError {
+	failure := codexRequestFailure(phase, err)
+	data := failure.Data.(map[string]any)
+	if native, ok := data["native"].(map[string]any); ok {
+		data["native"] = map[string]any{"code": native["code"]}
+	}
+	failure.Message = errAuthenticationFailed.Error()
+	return failure
+}
+
 // waitForLoginCompletion 等待 typed 通知并返回不包含服务端错误文本的稳定错误。
 func waitForLoginCompletion(ctx context.Context, subscription loginCompletionSubscription) error {
-	completion, err := subscription.Wait(ctx)
+	completion, err := subscription.Wait(ctx, "")
 	if err != nil || !completion.Success {
 		return errAuthenticationFailed
 	}
@@ -246,12 +256,43 @@ func (a *Agent) AccountUsage(ctx context.Context) (acpmeta.AccountUsage, error) 
 		return acpmeta.AccountUsage{}, codexRequestFailure("account_usage", err)
 	}
 	result := acpmeta.AccountUsage{}
+	if credits := response.RateLimitResetCredits; credits != nil {
+		result.ResetCredits = &acpmeta.AccountUsageResetCredits{AvailableCount: credits.AvailableCount}
+		if credits.Credits != nil {
+			result.ResetCredits.Details = make([]acpmeta.AccountUsageResetCredit, 0, len(credits.Credits))
+			for _, credit := range credits.Credits {
+				if credit.ID == "" {
+					return acpmeta.AccountUsage{}, codexRequestFailure("account_usage_decode", errors.New("Codex reset credit has no native identity"))
+				}
+				result.ResetCredits.Details = append(result.ResetCredits.Details, acpmeta.AccountUsageResetCredit{
+					ID: credit.ID, Status: string(credit.Status), ResetType: string(credit.ResetType),
+					Title: credit.Title, Description: credit.Description, GrantedAtUnixSeconds: credit.GrantedAt, ExpiresAtUnixSeconds: credit.ExpiresAt,
+				})
+			}
+		}
+	}
 	if !known {
 		return result, nil
 	}
 	result.Buckets = []acpmeta.AccountUsageBucket{}
 	appendBucket := func(id string, native protocol.RateLimits) error {
-		bucket := acpmeta.AccountUsageBucket{ID: id, Name: native.LimitName}
+		bucket := acpmeta.AccountUsageBucket{ID: id, Name: native.LimitName, SpendControlReached: native.SpendControlReached}
+		if native.RateLimitReachedType != nil {
+			reached := string(*native.RateLimitReachedType)
+			bucket.ReachedType = &reached
+		}
+		if individual := native.IndividualLimit; individual != nil {
+			item := acpmeta.AccountUsageWindow{Kind: "individual", ResetAtUnixSeconds: individual.ResetsAt}
+			if individual.RemainingPercent != nil {
+				value := *individual.RemainingPercent
+				if value > 1<<53 || value < -(1<<53) {
+					return errors.New("native quota percentage exceeds exact numeric range")
+				}
+				percentage := float64(value)
+				item.RemainingPercent = &percentage
+			}
+			bucket.Windows = append(bucket.Windows, item)
+		}
 		if native.Credits != nil {
 			bucket.HasCredits = &native.Credits.HasCredits
 			bucket.Unlimited = &native.Credits.Unlimited
@@ -333,7 +374,7 @@ func (a *Agent) checkAuthorization(ctx context.Context) error {
 	refresh := false
 	account, err := a.client.AccountRead(ctx, protocol.GetAccountParams{RefreshToken: &refresh})
 	if err != nil {
-		return fmt.Errorf("checking Codex authentication: %w", err)
+		return codexAuthenticationFailure("account_read", err)
 	}
 	if account.RequiresOpenaiAuth && account.Account == nil {
 		return acp.NewAuthRequired(nil)
@@ -349,10 +390,10 @@ func (a *Agent) Logout(ctx context.Context, _ acp.LogoutRequest) (acp.LogoutResp
 	subscription := a.client.SubscribeAccountUpdated()
 	defer subscription.Close()
 	if err := a.client.AccountLogout(ctx); err != nil {
-		return acp.LogoutResponse{}, fmt.Errorf("logging out Codex account: %w", err)
+		return acp.LogoutResponse{}, codexAuthenticationFailure("account_logout", err)
 	}
 	if err := subscription.Wait(ctx); err != nil {
-		return acp.LogoutResponse{}, fmt.Errorf("waiting for Codex account update: %w", err)
+		return acp.LogoutResponse{}, codexAuthenticationFailure("account_logout_update", err)
 	}
 	return acp.LogoutResponse{}, nil
 }

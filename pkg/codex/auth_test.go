@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -87,7 +88,7 @@ type recordingLoginSubscription struct {
 }
 
 // Wait 返回预置的 typed 登录完成通知。
-func (s *recordingLoginSubscription) Wait(_ context.Context) (protocol.AccountLoginCompletedNotification, error) {
+func (s *recordingLoginSubscription) Wait(_ context.Context, _ string) (protocol.AccountLoginCompletedNotification, error) {
 	*s.events = append(*s.events, "wait")
 	return s.completion, s.err
 }
@@ -187,7 +188,7 @@ func TestAuthenticatorChatGPTSubscribesBeforeLoginAndOpensBrowser(t *testing.T) 
 	server := &recordingAuthServer{
 		events:  &events,
 		account: protocol.GetAccountResponse{RequiresOpenaiAuth: true},
-		login:   protocol.LoginAccountResponse{Type: protocol.TypeChatgpt, AuthURL: &authURL},
+		login:   protocol.LoginAccountResponse{Type: protocol.TypeChatgpt, AuthURL: &authURL, LoginID: acp.Ptr("login-1")},
 	}
 	subscriber := &recordingLoginSubscriber{
 		events: &events, completion: protocol.AccountLoginCompletedNotification{Success: true},
@@ -285,5 +286,37 @@ func TestAuthenticatorNeverLeaksAPIKey(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) || strings.Contains(logs.String(), secret) {
 		t.Fatalf("secret 泄漏：error=%q logs=%q", err, logs.String())
+	}
+}
+
+// TestChatGPTLoginIgnoresPreviousLoginCompletion checks early notifications by native ID.
+func TestChatGPTLoginIgnoresPreviousLoginCompletion(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.accountResponse = &protocol.GetAccountResponse{RequiresOpenaiAuth: true}
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodAccountLoginStart:
+			*result.(*protocol.LoginAccountResponse) = protocol.LoginAccountResponse{
+				Type: protocol.TypeChatgpt, LoginID: acp.Ptr("current"), AuthURL: acp.Ptr("https://example.invalid"),
+			}
+			for _, notice := range []protocol.AccountLoginCompletedNotification{
+				{LoginID: acp.Ptr("previous"), Success: true},
+				{LoginID: acp.Ptr("current"), Success: false},
+			} {
+				agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodAccountLoginCompleted, notice))
+			}
+		default:
+			return fmt.Errorf("unexpected call %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	var events []string
+	agent.auth.browser = &recordingBrowserOpener{events: &events}
+	_, err := agent.Authenticate(context.Background(), acp.AuthenticateRequest{MethodId: "chat-gpt"})
+	if err == nil {
+		t.Fatal("previous login success satisfied current login")
 	}
 }

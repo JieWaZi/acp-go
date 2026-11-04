@@ -13,6 +13,9 @@ var ErrInvalidEnvelope = errors.New("invalid Codex protocol envelope")
 const (
 	MethodInitialize                      = "initialize"
 	MethodThreadStart                     = "thread/start"
+	MethodThreadArchive                   = "thread/archive"
+	MethodThreadUnarchive                 = "thread/unarchive"
+	MethodThreadSettingsUpdated           = "thread/settings/updated"
 	MethodThreadCompactStart              = "thread/compact/start"
 	MethodThreadResume                    = "thread/resume"
 	MethodThreadFork                      = "thread/fork"
@@ -145,6 +148,34 @@ type ThreadCompactStartRequest struct {
 // NewThreadCompactStartRequest constructs the native compact request.
 func NewThreadCompactStartRequest(id RequestID, params ThreadCompactStartParams) ThreadCompactStartRequest {
 	return ThreadCompactStartRequest{newClientRequest(id, MethodThreadCompactStart, params)}
+}
+
+// ThreadArchiveRequest carries the exact native thread to archive.
+type ThreadArchiveRequest struct {
+	// clientRequestEnvelope couples the archive method and typed parameters.
+	clientRequestEnvelope[ThreadArchiveParams]
+}
+
+// NewThreadArchiveRequest constructs a thread/archive request.
+func NewThreadArchiveRequest(id RequestID, params ThreadArchiveParams) ThreadArchiveRequest {
+	return ThreadArchiveRequest{newClientRequest(id, MethodThreadArchive, params)}
+}
+
+// ThreadUnarchiveRequest carries the exact native thread to unarchive.
+type ThreadUnarchiveRequest struct {
+	// clientRequestEnvelope couples the unarchive method and typed parameters.
+	clientRequestEnvelope[ThreadUnarchiveParams]
+}
+
+// NewThreadUnarchiveRequest constructs a thread/unarchive request.
+func NewThreadUnarchiveRequest(id RequestID, params ThreadUnarchiveParams) ThreadUnarchiveRequest {
+	return ThreadUnarchiveRequest{newClientRequest(id, MethodThreadUnarchive, params)}
+}
+
+// ThreadSettingsUpdatedEnvelope carries an observed native settings snapshot.
+type ThreadSettingsUpdatedEnvelope struct {
+	// notificationEnvelope binds the method and generated parameters.
+	notificationEnvelope[ThreadSettingsUpdatedNotification]
 }
 
 // ThreadStartRequest 表示固定 method 为 thread/start 的请求。
@@ -832,6 +863,9 @@ func DecodeServerNotification(data []byte) (ServerNotification, error) {
 	case MethodError:
 		envelope, err := decodeNotification[ErrorNotification](wire)
 		return serverNotificationResult(&ErrorEnvelope{envelope}, err)
+	case MethodThreadSettingsUpdated:
+		envelope, err := decodeNotification[ThreadSettingsUpdatedNotification](wire)
+		return serverNotificationResult(&ThreadSettingsUpdatedEnvelope{envelope}, err)
 	case MethodTurnStarted:
 		envelope, err := decodeNotification[TurnStartedNotification](wire)
 		return serverNotificationResult(&TurnStartedEnvelope{envelope}, err)

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 const defaultMaxStderrBytes = 256 << 10
@@ -73,11 +75,16 @@ func startAppServer(ctx context.Context, path string, options processOptions) (*
 	if err != nil {
 		return nil, fmt.Errorf("creating codex app-server stdin: %w", err)
 	}
-	stdout, err := command.StdoutPipe()
+	// The parent owns the read end. Cmd.Wait must not close it before the scanner
+	// consumes the child's final frames.
+	stdout, childOutput, err := os.Pipe()
 	if err != nil {
 		_ = stdin.Close()
 		return nil, fmt.Errorf("creating codex app-server stdout: %w", err)
 	}
+	defer childOutput.Close()
+	command.Stdout = childOutput
+	command.WaitDelay = time.Second
 	stderr := &tailBuffer{limit: options.MaxStderrBytes, logger: options.Logger}
 	command.Stderr = stderr
 	if err = command.Start(); err != nil {
@@ -119,16 +126,22 @@ func (p *appServerProcess) Err() error {
 	return p.waitErr
 }
 
-// FinalError 等待唯一 Wait owner，并返回包含 exit/stderr 的最终结果。
-// transport 用它仲裁 clean EOF 及 Wait 提前关闭 StdoutPipe 产生的 os.ErrClosed；调用方不得自行 Wait。
+// FinalError joins the sole process waiter after transport drains stdout.
 func (p *appServerProcess) FinalError() error {
-	<-p.done
-	return p.Err()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+		return p.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // Close 先关闭 stdin 请求自然退出，超出调用方期限时强制 Kill，并始终等待唯一 Wait owner。
 func (p *appServerProcess) Close(ctx context.Context) error {
 	p.closeOnce.Do(func() {
+		defer p.stdout.Close()
 		_ = p.stdin.Close()
 		select {
 		case <-p.done:
@@ -146,6 +159,10 @@ func (p *appServerProcess) Close(ctx context.Context) error {
 // wait 是进程唯一的 Wait 调用点，并在 stderr 已刷新后构造稳定错误。
 func (p *appServerProcess) wait() {
 	err := p.command.Wait()
+	if stdout, ok := p.stdout.(*os.File); ok {
+		// A child can inherit stdout and delay EOF after the owned process exited.
+		_ = stdout.SetReadDeadline(time.Now().Add(2 * time.Second))
+	}
 	p.waitMu.Lock()
 	if err != nil {
 		exitDetail := err.Error()
