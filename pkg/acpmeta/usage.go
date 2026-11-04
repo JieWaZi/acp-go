@@ -9,31 +9,31 @@ const turnUsageKey = "acp-go/turn-usage"
 
 // TurnUsage is a replaceable invocation snapshot with independent token and valuation evidence.
 type TurnUsage struct {
-	// InputTokens 是不含缓存读写的输入 token 数。
+	// InputTokens counts input excluding cache reads and writes.
 	InputTokens *int64 `json:"inputTokens,omitempty"`
-	// CacheReadTokens 是缓存读取 token 数。
+	// CacheReadTokens counts input read from cache.
 	CacheReadTokens *int64 `json:"cacheReadTokens,omitempty"`
-	// CacheWriteTokens 是缓存写入 token 数。
+	// CacheWriteTokens counts input written to cache.
 	CacheWriteTokens *int64 `json:"cacheWriteTokens,omitempty"`
-	// OutputTokens 是输出 token 数，包含已单列的推理子集。
+	// OutputTokens includes reasoning tokens when those are also reported separately.
 	OutputTokens *int64 `json:"outputTokens,omitempty"`
-	// ReasoningTokens 是输出中的推理 token 子集。
+	// ReasoningTokens is a separately observed subset of output.
 	ReasoningTokens *int64 `json:"reasoningTokens,omitempty"`
-	// Source 是原生计数来源。
+	// Source identifies the native token observation.
 	Source string `json:"source"`
-	// Coverage 声明原生报告覆盖的调用范围，例如 main_loop 或 native_turn。
+	// Coverage describes which native calls the token snapshot covers.
 	Coverage string `json:"coverage,omitempty"`
-	// Complete 表示快照覆盖产品整轮消费，不代表所有分量均已报告。
+	// Complete means the snapshot covers the stated invocation; individual components can still be unknown.
 	Complete bool `json:"complete"`
-	// ContextKnown 表示同一通知的 Used 和 Size 有真实上下文证据。
+	// ContextKnown means the same notification has evidence for context used and size.
 	ContextKnown bool `json:"contextKnown"`
-	// Model 仅在原生明确报告时填写。
+	// Model is present only when the native report identifies one model for these totals.
 	Model string `json:"model,omitempty"`
 	// Cost is independent of token coverage and is absent without a reliable valuation.
 	Cost *UsageCost `json:"cost,omitempty"`
 	// Models attributes the same totals to models. It is not additional usage.
 	// Nil is unknown; an empty map is a known empty attribution.
-	Models map[string]ModelUsage `json:"models,omitempty"`
+	Models map[string]ModelUsage `json:"models"`
 }
 
 // ModelUsage attributes known counters and cost to one native model.

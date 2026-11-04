@@ -84,9 +84,18 @@ func TestTurnUsageCostKeepsDecimalAndRejectsInvalidAmounts(t *testing.T) {
 // TestTurnUsageDistinguishesUnknownAndEmptyModelAttribution checks metadata field presence.
 func TestTurnUsageDistinguishesUnknownAndEmptyModelAttribution(t *testing.T) {
 	for _, models := range []map[string]ModelUsage{nil, {}} {
-		got, ok := ReadTurnUsage(WithTurnUsage(nil, TurnUsage{Source: "synthetic", Models: models}))
+		snapshot := TurnUsage{Source: "synthetic", Models: models}
+		got, ok := ReadTurnUsage(WithTurnUsage(nil, snapshot))
 		if !ok || (got.Models == nil) != (models == nil) {
 			t.Fatalf("models = %#v, known = %v, want %#v", got.Models, ok, models)
+		}
+		wire, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded TurnUsage
+		if err := json.Unmarshal(wire, &decoded); err != nil || (decoded.Models == nil) != (models == nil) {
+			t.Fatalf("typed model presence lost: %s / %v", wire, err)
 		}
 	}
 }
