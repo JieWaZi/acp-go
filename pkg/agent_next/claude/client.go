@@ -40,7 +40,7 @@ const (
 type Options struct {
 	// Executable selects Claude Code, defaulting to claude on the frozen PATH.
 	Executable string
-	// PrefixArgs contains executable arguments before the Claude arguments.
+	// PrefixArgs precedes the Claude arguments. Native launch controls are reserved.
 	PrefixArgs []string
 	// Environment is the full child environment; nil snapshots the current environment.
 	Environment []string
@@ -104,6 +104,9 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	}
 	options.Environment = slices.Clone(options.Environment)
 	options.PrefixArgs = slices.Clone(options.PrefixArgs)
+	if err := validateLaunchPrefix(options.PrefixArgs); err != nil {
+		return nil, err
+	}
 	dir, err := filepath.Abs(options.WorkingDirectory)
 	if err != nil {
 		return nil, err

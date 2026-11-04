@@ -179,9 +179,7 @@ func (s sessionSettings) currentModel() (protocol.ModelInfo, bool) {
 // initialModelAlias describes a fresh launch with no previous native model
 // selection. Legacy CLI readback expands aliases while its catalog does not.
 func (c *Client) initialModelAlias(effective *protocol.EffectiveSettings) string {
-	if effective == nil || slices.ContainsFunc(c.options.PrefixArgs, func(arg string) bool {
-		return arg == "--model" || strings.HasPrefix(arg, "--model=")
-	}) {
+	if effective == nil {
 		return ""
 	}
 	return firstString(effective.Environment.Model, c.environment("ANTHROPIC_MODEL"), effective.Model, "default")

@@ -43,6 +43,63 @@ type launchPlan struct {
 	workspace         *workspacePolicy
 }
 
+func validateLaunchPrefix(args []string) error {
+	for _, arg := range args {
+		// A wrapper can consume its own -- and forward the remaining flags.
+		// The executable itself remains trusted, but its prefix cannot carry
+		// native flags that compete with the adapter's launch inputs.
+		if claudeLaunchOverride(arg) {
+			return errors.New("Claude startup arguments cannot override managed launch settings")
+		}
+	}
+	return nil
+}
+
+func claudeLaunchOverride(arg string) bool {
+	flag, _, _ := strings.Cut(arg, "=")
+	switch flag {
+	case "--settings", "--managed-settings", "--setting-sources", "--client-data-url", "--host-auth-is-org-sign-in",
+		"--bare", "--safe-mode":
+		return true
+	case "--permission-mode", "--inherit-permission-mode", "--permission-prompt-tool", "--permission-prompts",
+		"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode", "--restricted",
+		"--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools":
+		return true
+	case "--cwd", "--add-dir", "--project-config-root", "--worktree", "--tmux", "--file", "--deep-link-cwd-b64",
+		"--mcp-config", "--strict-mcp-config", "--plugin-dir", "--plugin-dir-no-mcp", "--plugin-url",
+		"--channels", "--dangerously-load-development-channels", "--chrome", "--ide":
+		return true
+	case "--model", "--fallback-model", "--allow-other-models", "--include-unsupported-models", "--effort", "--fast-mode",
+		"--agent", "--agents", "--system-prompt", "--system-prompt-file", "--append-system-prompt",
+		"--append-system-prompt-file", "--system-prompt-snapshot":
+		return true
+	case "--continue", "--resume", "--fork-session", "--session-id", "--no-session-persistence", "--from-pr",
+		"--resume-session-at", "--resume-drops-turn", "--reply-on-resume", "--rewind-files",
+		"--bg", "--background", "--remote", "--cloud", "--teleport", "--remote-control", "--rc", "--attach-serve", "--desktop":
+		return true
+	case "--print", "--input-format", "--output-format", "--sdk-url", "--await-initialize", "--await-claim",
+		"--verbose", "--include-partial-messages", "--replay-user-messages", "--init", "--init-only", "--maintenance":
+		return true
+	}
+	if len(flag) < 2 || flag[0] != '-' || flag[1] == '-' {
+		return false
+	}
+	// Commander accepts attached values for -r and -w and splits boolean
+	// short options. Unknown prefixes and value-taking diagnostic options
+	// are not clusters of native flags (for example, -test.run or -dworktree).
+	for _, option := range flag[1:] {
+		switch option {
+		case 'p', 'c', 'r', 'w':
+			return true
+		case 'h', 'v':
+			continue
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func freezeLaunch(o LaunchOptions) (LaunchOptions, error) {
 	o.SettingSources = slices.Clone(o.SettingSources)
 	o.Tools = slices.Clone(o.Tools)
