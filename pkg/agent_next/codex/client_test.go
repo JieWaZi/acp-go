@@ -9,7 +9,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,7 +33,11 @@ func TestAppServerFixture(t *testing.T) {
 	}
 	input := bufio.NewScanner(os.Stdin)
 	out := json.NewEncoder(os.Stdout)
+	if mode == "malformed_live" {
+		_ = os.WriteFile(os.Getenv("CODEX_NEXT_TRACE")+".pid", []byte(strconv.Itoa(os.Getpid())), 0600)
+	}
 	turnNumber := 0
+	archived := true
 	nativeTurn := "turn-0"
 	for input.Scan() {
 		var call struct {
@@ -62,6 +69,14 @@ func TestAppServerFixture(t *testing.T) {
 				ack(map[string]any{"account": nil, "requiresOpenaiAuth": false})
 			}
 		case "account/rateLimits/read":
+			if mode == "autonomous" || mode == "autonomous_after_terminal" {
+				nativeTurn = "native-autonomous"
+				emit("turn/started", turn("inProgress"))
+				emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, 19))
+				emit("item/completed", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "item": map[string]any{"id": "autonomous-answer", "type": "agentMessage", "phase": "final_answer", "text": "detached body"}})
+				emit("turn/completed", turn("completed"))
+				emit("turn/completed", turn("completed"))
+			}
 			ack(map[string]any{"rateLimitsByLimitId": map[string]any{"codex": map[string]any{"primary": map[string]any{"usedPercent": 5, "windowDurationMins": 300}}}})
 		case "account/logout":
 			emit("account/updated", map[string]any{})
@@ -88,8 +103,31 @@ func TestAppServerFixture(t *testing.T) {
 		case "thread/items/list":
 			ack(map[string]any{"data": []any{map[string]any{"turnId": "history-turn", "item": map[string]any{"id": "history-user", "type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "past input"}}}}}})
 		case "thread/archive", "thread/unarchive":
+			archived = call.Method == "thread/archive"
+			ack(map[string]any{})
+		case "skills/extraRoots/set", "skills/list":
 			ack(map[string]any{})
 		case "thread/start", "thread/resume":
+			if mode == "skills_during_gate" && filepath.Base(call.Params["cwd"].(string)) == "secondary-workspace" {
+				ack(map[string]any{"thread": map[string]any{"id": "thread-2"}, "model": "actual-model"})
+				continue
+			}
+			if mode == "archived_identity" && call.Method == "thread/resume" {
+				const id = "a560d6d5-8080-4acd-b659-fad0b0c86cde"
+				if archived {
+					text := fmt.Sprintf("session %s is archived. Run `codex unarchive %s` to unarchive it first.", id, id)
+					_ = out.Encode(map[string]any{"id": call.ID, "error": map[string]any{"code": -32600, "message": text}})
+				} else {
+					ack(map[string]any{"thread": map[string]any{"id": id}, "model": "actual-model"})
+				}
+				continue
+			}
+			if mode == "unrelated_archived_error" && call.Method == "thread/resume" {
+				_ = out.Encode(map[string]any{"id": call.ID, "error": map[string]any{
+					"code": -32000, "message": "failed to read archived workspace template", "data": map[string]any{"resource": "workspace-template"},
+				}})
+				continue
+			}
 			ack(map[string]any{"thread": map[string]any{"id": "thread-1"}, "model": "actual-model"})
 		case "thread/unsubscribe":
 			if mode == "retry_close" && turnNumber == 0 {
@@ -101,6 +139,33 @@ func TestAppServerFixture(t *testing.T) {
 		case "turn/start":
 			turnNumber++
 			nativeTurn = fmt.Sprintf("turn-%d", turnNumber)
+			if mode == "malformed_live" {
+				ack(turn("inProgress"))
+				fmt.Fprintln(os.Stdout, "this is not a native frame")
+				continue
+			}
+			if mode == "late_steer_ack" {
+				ack(turn("inProgress"))
+				emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": "message-1", "delta": "hold"})
+				continue
+			}
+			if mode == "usage_reset" {
+				ack(turn("inProgress"))
+				n := 19
+				if turnNumber == 2 {
+					n = 9
+				}
+				emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, n))
+				emit("turn/completed", turn("completed"))
+				continue
+			}
+			if mode == "usage_tail" {
+				ack(turn("inProgress"))
+				emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": "message-1", "delta": "hold"})
+				emit("turn/completed", turn("completed"))
+				emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, 19))
+				continue
+			}
 			if mode == "approval" {
 				ack(turn("inProgress"))
 				_ = out.Encode(map[string]any{"id": "foreign-approval", "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread-1", "turnId": "foreign-turn", "itemId": "foreign", "command": "foreign command"}})
@@ -151,6 +216,9 @@ func TestAppServerFixture(t *testing.T) {
 			if string(call.ID) == `"owned-approval"` {
 				emit("turn/completed", turn("completed"))
 			}
+		case "turn/steer":
+			emit("turn/completed", turn("completed"))
+			ack(map[string]any{"turnId": nativeTurn})
 		case "turn/interrupt":
 			ack(map[string]any{})
 			emit("turn/completed", turn("interrupted"))
@@ -192,7 +260,11 @@ func newFixture(t *testing.T, mode string, host agentclient.HostCallbacks) (*cod
 			t.Error(err)
 		}
 	})
-	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+	initialize := acp.InitializeRequest{ProtocolVersion: 1}
+	if mode == "receipts" || mode == "autonomous_after_terminal" {
+		initialize.ClientCapabilities.Meta = map[string]any{acpmeta.NativeTurnReceiptsCapability: true}
+	}
+	if _, err := client.Initialize(ctx, initialize); err != nil {
 		t.Fatal(err)
 	}
 	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir, McpServers: []acp.McpServer{}})
@@ -669,4 +741,407 @@ func TestIdleSteeringAcknowledgesNativeAdmissionBeforeTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitTrace(t, ctx, trace, `"method":"turn/interrupt"`)
+}
+
+func TestReviewDetachedNativeOutcomeOnWire(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	trace := filepath.Join(dir, "trace.ndjson")
+	a, err := agentclient.NewACPAgent(func(host agentclient.HostCallbacks) (agentclient.Client, error) {
+		return codex.NewClient(ctx, codex.Options{
+			Executable: os.Args[0], PrefixArgs: []string{"-test.run=^TestAppServerFixture$", "--"},
+			Environment: append(os.Environ(), "CODEX_NEXT_FIXTURE=normal", "CODEX_NEXT_TRACE="+trace), WorkingDirectory: dir,
+		}, host)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	toAgent, fromClient := io.Pipe()
+	toClient, fromAgent := io.Pipe()
+	t.Cleanup(func() {
+		_ = toAgent.Close()
+		_ = fromClient.Close()
+		_ = toClient.Close()
+		_ = fromAgent.Close()
+		c, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		if err := a.Close(c); err != nil {
+			t.Error(err)
+		}
+	})
+	acp.NewAgentSideConnectionWithBinder(a, fromAgent, toAgent, a.SetAgentConnection)
+	peer := acp.NewClientSideConnection(fixtureWireClient{}, fromClient, toClient)
+	if _, err = peer.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := peer.NewSession(ctx, acp.NewSessionRequest{Cwd: dir, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := peer.CallExtension(ctx, "_session/steering", agentclient.SteerRequest{
+		SessionID: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("run detached")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "startedNewTurn") {
+		t.Fatalf("steering not admitted: %s", raw)
+	}
+	t.Logf("steering ACK: %s", raw)
+	for {
+		raw, err := peer.CallExtension(ctx, acpmeta.NativeTurnReceiptsMethod, acpmeta.NativeTurnReceiptsRequest{SessionID: string(session.SessionId)})
+		if err != nil {
+			t.Fatalf("admitted detached execution has no public result: %v", err)
+		}
+		var page acpmeta.NativeTurnReceiptsResponse
+		if err := json.Unmarshal(raw, &page); err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Receipts) > 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("no receipt before deadline: %s", raw)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func TestReviewLateSteeringACKReportsConsumedInput(t *testing.T) {
+	active, release := make(chan struct{}), make(chan struct{})
+	c, ctx, session, trace := newFixture(t, "late_steer_ack", agentclient.HostCallbacks{
+		Observe: func(ctx context.Context, _ agentclient.Scope, n acp.SessionNotification) error {
+			if n.Update.AgentMessageChunk == nil {
+				return nil
+			}
+			close(active)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	run := reserve(t, c, ctx, session, agentclient.PromptOptions{})
+	defer close(release)
+	done := make(chan agentclient.PromptResult, 1)
+	go func() { done <- run() }()
+	select {
+	case <-active:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	steer, err := c.Steer(ctx, agentclient.SteerRequest{
+		SessionID: session, PromptRequired: true, Prompt: []acp.ContentBlock{acp.TextBlock("inject into current turn")},
+	})
+	if err != nil || steer.Outcome != "injected" {
+		t.Fatalf("steering ACK: %+v %v", steer, err)
+	}
+	result := func() agentclient.PromptResult {
+		select {
+		case <-done:
+			t.Fatal("observer released unexpectedly")
+		default:
+		}
+		// Replace the deferred close above with releasing an observation through one buffered send.
+		release <- struct{}{}
+		return <-done
+	}()
+	b, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frame := range strings.Split(string(b), "\n") {
+		var r struct {
+			Method string
+			Params map[string]any
+		}
+		if json.Unmarshal([]byte(frame), &r) == nil && r.Method == "turn/steer" {
+			id, _ := r.Params["clientUserMessageId"].(string)
+			if result.Outcome == nil || id == "" {
+				t.Fatalf("missing result/input: %+v %q", result, id)
+			}
+			for _, consumed := range result.Outcome.Turn.ConsumedInputIDs {
+				if consumed == id {
+					return
+				}
+			}
+			t.Fatalf("native injected ACK for %s absent from terminal receipt %v", id, result.Outcome.Turn.ConsumedInputIDs)
+		}
+	}
+	t.Fatal("fixture did not see turn/steer")
+}
+
+func TestReviewArchivedSubstringMutatesWrongRecovery(t *testing.T) {
+	c, ctx, session, trace := newFixture(t, "unrelated_archived_error", agentclient.HostCallbacks{})
+	if _, err := c.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: session, Cwd: filepath.Dir(trace)})
+	if err == nil {
+		t.Fatal("unexpected resume")
+	}
+	b, _ := os.ReadFile(trace)
+	var rpc *acp.RequestError
+	if !errors.As(err, &rpc) {
+		t.Fatalf("missing RPC error: %v", err)
+	}
+	if strings.Contains(string(b), `"method":"thread/unarchive"`) || rpc.Data == nil {
+		t.Fatalf("foreign archived error triggered unarchive=%t and returned data=%v: %v", strings.Contains(string(b), `"method":"thread/unarchive"`), rpc.Data, err)
+	}
+}
+
+func TestReviewResetUsageLastRequestStillObservable(t *testing.T) {
+	c, ctx, session, _ := newFixture(t, "usage_reset", agentclient.HostCallbacks{})
+	first := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	second := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	if first.Outcome == nil || first.Outcome.Turn.Usage == nil {
+		t.Fatal("fixture did not get first usage")
+	}
+	if second.Outcome == nil || second.Outcome.Turn.Usage == nil {
+		t.Fatalf("missing second usage: %+v", second)
+	}
+	usage := second.Outcome.Turn.Usage
+	if usage.InputTokens == nil || *usage.InputTokens != 5 || usage.OutputTokens == nil || *usage.OutputTokens != 7 {
+		t.Fatalf("native last={input:9, cached:4, output:7} after total reset returned input=%v output=%v complete=%t",
+			printableReviewCount(usage.InputTokens), printableReviewCount(usage.OutputTokens), usage.Complete)
+	}
+}
+
+func printableReviewCount(n *int64) any {
+	if n == nil {
+		return nil
+	}
+	return *n
+}
+
+func TestReviewProcessSkillRootsCanChangeAfterGate(t *testing.T) {
+	c, ctx, session, trace := newFixture(t, "skills_during_gate", agentclient.HostCallbacks{})
+	root := filepath.Join(filepath.Dir(trace), "secondary-workspace")
+	extra := t.TempDir()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(extra, ".agents", "skills"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	result := reserve(t, c, ctx, session, agentclient.PromptOptions{
+		BeforeSubmit: func(ctx context.Context, _ agentclient.PromptSubmission) error {
+			_, err := c.NewSession(ctx, acp.NewSessionRequest{Cwd: root, AdditionalDirectories: []string{extra}, McpServers: []acp.McpServer{}})
+			return err
+		},
+	})()
+	if result.Outcome == nil {
+		t.Fatalf("prompt did not execute: %+v", result)
+	}
+	b, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var extraRoots []string
+	for _, frame := range strings.Split(string(b), "\n") {
+		var r struct {
+			Method string
+			Params struct{ ExtraRoots []string }
+		}
+		if json.Unmarshal([]byte(frame), &r) != nil {
+			continue
+		}
+		if r.Method == "skills/extraRoots/set" {
+			extraRoots = r.Params.ExtraRoots
+		}
+		if r.Method == "turn/start" {
+			if len(extraRoots) != 0 {
+				t.Fatalf("primary workspace turn/start inherited the other session's process skill roots: %v", extraRoots)
+			}
+			return
+		}
+	}
+	t.Fatal("fixture saw no turn/start")
+}
+
+func TestReviewMalformedNativeStreamLeavesProcessRunning(t *testing.T) {
+	c, ctx, session, trace := newFixture(t, "malformed_live", agentclient.HostCallbacks{})
+	outcome := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	if outcome.Outcome == nil || outcome.Outcome.OperationError == nil ||
+		!strings.Contains(outcome.Outcome.OperationError.Error(), "invalid Codex native frame") {
+		t.Fatalf("malformed stream was not reported: %+v", outcome)
+	}
+	raw, err := os.ReadFile(trace + ".pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	defer p.Release()
+	deadline := time.After(350 * time.Millisecond)
+	for p.Signal(syscall.Signal(0)) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("the original live app-server still owns resources after the reader failed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestAutonomousReceiptRetainsIndependentOutcomeUntilScopedACK(t *testing.T) {
+	observeErr := errors.New("detached observer failed")
+	c, ctx, session, _ := newFixture(t, "autonomous", agentclient.HostCallbacks{Observe: func(_ context.Context, scope agentclient.Scope, _ acp.SessionNotification) error {
+		if scope.HostInvocationID != "" || scope.NativeInvocationID == "" {
+			t.Errorf("autonomous observation claimed host input: %+v", scope)
+		}
+		return observeErr
+	}})
+	request := acpmeta.NativeTurnReceiptsRequest{SessionID: string(session)}
+	if _, err := c.ReadAccountUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	page, err := c.ReadNativeOutcomes(ctx, request, true)
+	if err != nil || len(page.Outcomes) != 1 || page.More {
+		t.Fatalf("autonomous receipt: %+v %v", page, err)
+	}
+	o := page.Outcomes[0]
+	if o.Turn.Origin != acpmeta.NativeTurnOriginUnknown || o.Turn.Status != acpmeta.NativeTurnCompleted ||
+		len(o.Turn.ConsumedInputIDs) != 0 || o.Turn.Usage == nil || !errors.Is(o.DeliveryError, observeErr) ||
+		o.FinalMessage == nil || o.FinalMessage.Text != "detached body" {
+		t.Fatalf("autonomous execution was lost or attributed to host: %+v", o)
+	}
+	*o.Turn.Usage.InputTokens = 999
+	o.FinalMessage.Text = "mutated"
+	if _, err := c.ReadNativeOutcomes(ctx, acpmeta.NativeTurnReceiptsRequest{
+		SessionID: "different-thread", AckInvocationIDs: []string{o.Turn.InvocationID},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session}); err != nil {
+		t.Fatal(err)
+	}
+	page, err = c.ReadNativeOutcomes(ctx, request, false)
+	if err != nil || len(page.Outcomes) != 1 || *page.Outcomes[0].Turn.Usage.InputTokens != 15 || page.Outcomes[0].FinalMessage.Text != "detached body" {
+		t.Fatalf("receipt mutated or lost on close: %+v %v", page, err)
+	}
+	request.AckInvocationIDs = []string{o.Turn.InvocationID}
+	for range 2 {
+		page, err = c.ReadNativeOutcomes(ctx, request, true)
+		if err != nil || len(page.Outcomes) != 0 {
+			t.Fatalf("ACK was not idempotent: %+v %v", page, err)
+		}
+	}
+}
+
+func TestResumeRecoversOnlyNativeArchivedThreadIdentity(t *testing.T) {
+	c, ctx, _, trace := newFixture(t, "archived_identity", agentclient.HostCallbacks{})
+	const id = "a560d6d5-8080-4acd-b659-fad0b0c86cde"
+	request := acp.ResumeSessionRequest{SessionId: "b560d6d5-8080-4acd-b659-fad0b0c86cde", Cwd: filepath.Dir(trace)}
+	if _, err := c.ResumeSession(ctx, request); err == nil {
+		t.Fatal("resume accepted evidence for a different archived thread")
+	}
+	request.SessionId = id
+	if _, err := c.ResumeSession(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(trace)
+	if err != nil || strings.Count(string(raw), `"method":"thread/unarchive"`) != 1 || !strings.Contains(string(raw), `"method":"thread/unarchive","params":{"threadId":"`+id+`"}`) {
+		t.Fatalf("incorrect native archive transition: %v %s", err, raw)
+	}
+}
+
+func TestAutonomousAfterTerminalSurvivesPreviousObserverDrain(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first sync.Once
+	c, ctx, session, _ := newFixture(t, "autonomous_after_terminal", agentclient.HostCallbacks{Observe: func(ctx context.Context, scope agentclient.Scope, _ acp.SessionNotification) error {
+		if scope.HostInvocationID != "" {
+			first.Do(func() { close(entered) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	run := reserve(t, c, ctx, session, agentclient.PromptOptions{})
+	prompt := make(chan agentclient.PromptResult, 1)
+	go func() { prompt <- run() }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if _, err := c.ReadAccountUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	request := acpmeta.NativeTurnReceiptsRequest{SessionID: string(session)}
+	if page, err := c.ReadNativeOutcomes(ctx, request, false); err != nil || len(page.Outcomes) != 0 {
+		t.Fatalf("unsettled native prefix was skipped: %+v %v", page, err)
+	}
+	close(release)
+	select {
+	case result := <-prompt:
+		if result.Outcome == nil || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+			t.Fatalf("first terminal lost: %+v", result)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	wait, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	page, err := c.ReadNativeOutcomes(wait, request, true)
+	if err != nil || len(page.Outcomes) == 0 || page.Outcomes[0].Turn.NativeTurnID == nil ||
+		*page.Outcomes[0].Turn.NativeTurnID != "turn-1" {
+		t.Fatalf("first native terminal did not retain its receipt order: %+v %v", page, err)
+	}
+	request.AckInvocationIDs = []string{page.Outcomes[0].Turn.InvocationID}
+	page, err = c.ReadNativeOutcomes(wait, request, true)
+	if err != nil || len(page.Outcomes) != 1 || page.Outcomes[0].Turn.NativeTurnID == nil || *page.Outcomes[0].Turn.NativeTurnID != "native-autonomous" {
+		t.Fatalf("detached continuation was lost behind previous observer: %+v %v", page, err)
+	}
+}
+
+func TestForegroundReceiptPagesKeepCanonicalOrderAndExactACK(t *testing.T) {
+	c, ctx, session, _ := newFixture(t, "receipts", agentclient.HostCallbacks{})
+	var expected []string
+	for range 6 {
+		result := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+		if result.Outcome == nil || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+			t.Fatalf("prompt lost terminal: %+v", result)
+		}
+		expected = append(expected, result.Outcome.Turn.InvocationID)
+	}
+	request := acpmeta.NativeTurnReceiptsRequest{SessionID: string(session)}
+	page, err := c.ReadNativeOutcomes(ctx, request, false)
+	if err != nil || !page.More || len(page.Outcomes) != 4 {
+		t.Fatalf("first native page: %+v %v", page, err)
+	}
+	for i, o := range page.Outcomes {
+		if o.Turn.InvocationID != expected[i] {
+			t.Fatalf("wrong completion order: %+v", page)
+		}
+	}
+	request.AckInvocationIDs = []string{"unknown", expected[0], expected[1], expected[2], expected[3]}
+	page, err = c.ReadNativeOutcomes(ctx, request, false)
+	if err != nil || page.More || len(page.Outcomes) != 2 {
+		t.Fatalf("remaining native page: %+v %v", page, err)
+	}
+	for i, o := range page.Outcomes {
+		if o.Turn.InvocationID != expected[4+i] {
+			t.Fatalf("ACK removed another invocation: %+v", page)
+		}
+	}
 }

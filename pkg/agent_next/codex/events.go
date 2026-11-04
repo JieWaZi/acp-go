@@ -70,13 +70,31 @@ func (c *Client) receiveLocked(method string, raw json.RawMessage) {
 	if s == nil {
 		return
 	}
-	if s.active == nil {
+	t := s.active
+	if method == protocol.MethodItemStarted || method == protocol.MethodItemCompleted {
+		if event.Item.Type == protocol.UserMessage && event.TurnID != "" {
+			for previous := range s.draining {
+				if value(previous.outcome.Turn.NativeTurnID) == event.TurnID && previous.steerPending > 0 {
+					recordSteeredItem(previous, event.Item)
+					return
+				}
+			}
+			if t != nil && t.steerPending > 0 && value(t.outcome.Turn.NativeTurnID) == event.TurnID {
+				recordSteeredItem(t, event.Item)
+			}
+		}
+	}
+	if method == protocol.MethodTurnStarted && (t == nil || !t.writing || t.outcome.Turn.Status != "") {
+		if started := c.startAutonomousLocked(s, event); started != nil {
+			t = started
+		}
+	}
+	if t == nil {
 		if method == protocol.MethodThreadTokenUsageUpdated {
 			s.usageCheckpoint = nil
 		}
 		return
 	}
-	t := s.active
 	if !t.writing || t.finishing || t.outcome.Turn.Status != "" {
 		if method == protocol.MethodThreadTokenUsageUpdated {
 			s.usageCheckpoint = nil
@@ -232,6 +250,10 @@ func (c *Client) captureTerminalLocked(t *turn, native protocol.TurnElement) {
 		c.receiveItemLocked(t, item, true)
 	}
 	t.nativeStatus = string(native.Status)
+	if t.consumed == nil {
+		t.session.usageCheckpoint = nil
+	}
+	c.orderOutcomeLocked(t)
 	t.outcome.Turn.TerminalEventID = pointer(native.ID)
 	if usage := t.outcome.Turn.Usage; usage != nil {
 		usage.Complete = !t.usageGap && native.Status == protocol.FluffyCompleted
@@ -347,22 +369,35 @@ func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
 	if last != nil {
 		t.outcome.ContextUsage = agentclient.ContextUsage{UsedTokens: nonnegative(last.Context), WindowTokens: nonnegative(snapshot.Window)}
 	}
+	if t.previous != nil && total != nil && countersRegressed(total, t.previous) {
+		t.usageReset = true
+		t.breakUsageContinuity()
+	}
+	if t.usageReset {
+		// A matching last request is evidence within the turn, even though
+		// its cumulative snapshot cannot be joined to the previous epoch.
+		if t.consumed == nil && last != nil {
+			c.publishUsageLocked(t, last, "last_request")
+		}
+		return
+	}
 	if total == nil || nonnegative(total.Context) == nil {
 		t.breakUsageContinuity()
-		if t.consumed != nil || last == nil {
-			return
+		if t.consumed == nil && last != nil {
+			c.publishUsageLocked(t, last, "last_request")
 		}
+		return
 	}
 	var delta tokenCounters
 	switch {
-	case t.previous != nil && total != nil:
+	case t.previous != nil:
 		var monotonic bool
 		delta, monotonic = subtractCounters(total, t.previous)
 		if !monotonic {
 			t.usageGap = true
 		}
 	case last != nil:
-		if t.usageHigh != nil && (total == nil || value(total.Context) <= *t.usageHigh || value(total.Context)-*t.usageHigh < value(last.Context)) {
+		if t.usageHigh != nil && (*total.Context <= *t.usageHigh || *total.Context-*t.usageHigh < value(last.Context)) {
 			return
 		}
 		delta = *last
@@ -370,17 +405,29 @@ func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
 	default:
 		return
 	}
-	if total != nil && nonnegative(total.Context) != nil {
-		if t.usageHigh == nil || *total.Context > *t.usageHigh {
-			t.usageHigh = total.Context
-		}
-		if t.previous == nil || value(total.Context) >= value(t.previous.Context) {
-			t.previous = total
-			t.session.usageCheckpoint = total
-		}
+	if t.usageHigh == nil || *total.Context > *t.usageHigh {
+		t.usageHigh = total.Context
+	}
+	t.previous = total
+	t.session.usageCheckpoint = total
+	if t.consumed == nil || value(delta.Context) > 0 {
+		t.usageSamples++
 	}
 	t.consumed = addCounters(t.consumed, delta)
-	counters := t.consumed
+	coverage := "observed_turn"
+	if t.usageGap {
+		coverage = "observed_requests"
+		if t.usageSamples == 1 {
+			coverage = "last_request"
+		}
+	}
+	c.publishUsageLocked(t, t.consumed, coverage)
+}
+
+func (c *Client) publishUsageLocked(t *turn, counters *tokenCounters, coverage string) {
+	// The v0.163 native schema defaults absent cacheWriteInputTokens to
+	// zero for input decomposition. Keep absence distinct in the receipt.
+
 	var input *int64
 	if counters.Input != nil && counters.Read != nil && *counters.Read <= *counters.Input &&
 		value(counters.Write) <= *counters.Input-*counters.Read {
@@ -390,10 +437,7 @@ func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
 	if t.rerouted {
 		model = ""
 	}
-	coverage := "observed_turn"
-	if t.usageGap {
-		coverage = "observed_requests"
-	}
+
 	t.outcome.Turn.Usage = &acpmeta.TurnUsage{InputTokens: input, CacheReadTokens: nonnegative(counters.Read), CacheWriteTokens: nonnegative(counters.Write),
 		OutputTokens: nonnegative(counters.Output), ReasoningTokens: nonnegative(counters.Reasoning), Model: model,
 		Source: "codex/thread/tokenUsage/updated", Coverage: coverage, ContextKnown: t.outcome.ContextUsage.UsedTokens != nil && t.outcome.ContextUsage.WindowTokens != nil}
@@ -410,6 +454,12 @@ func nonnegative(n *int64) *int64 {
 		return nil
 	}
 	return n
+}
+
+func countersRegressed(end, start *tokenCounters) bool {
+	regressed := func(a, b *int64) bool { return nonnegative(a) != nil && nonnegative(b) != nil && *a < *b }
+	return regressed(end.Context, start.Context) || regressed(end.Input, start.Input) || regressed(end.Read, start.Read) ||
+		regressed(end.Write, start.Write) || regressed(end.Output, start.Output) || regressed(end.Reasoning, start.Reasoning)
 }
 
 func subtractCounters(end, start *tokenCounters) (tokenCounters, bool) {
@@ -656,4 +706,12 @@ func (c *Client) captureMCPStartupLocked(raw json.RawMessage) {
 		defer cancel()
 		_ = c.host.Observe(ctx, agentclient.Scope{SessionID: s.id}, acp.SessionNotification{SessionId: s.id, Update: update})
 	}()
+}
+
+func recordSteeredItem(t *turn, item protocol.ThreadItem) {
+	if id := value(item.ClientID); id != "" {
+		if _, attempted := t.steerInputs[id]; attempted {
+			consumeInput(t, id)
+		}
+	}
 }

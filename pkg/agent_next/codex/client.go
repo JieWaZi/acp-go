@@ -69,8 +69,10 @@ type Client struct {
 	host agentclient.HostCallbacks
 	// life ends on transport failure or client shutdown.
 	life context.Context
-	// fail cancels life with the original transport cause.
-	fail context.CancelCauseFunc
+	// endLife publishes the first native failure or an orderly client close.
+	endLife context.CancelCauseFunc
+	// retireOnce schedules cleanup of the failed physical child once.
+	retireOnce sync.Once
 	// startDone publishes the initialize attempt, including failure.
 	startDone chan struct{}
 	// startErr records a failed initialize attempt.
@@ -97,6 +99,14 @@ type Client struct {
 	recentTurns []turnIdentity
 	// nextRecentTurn replaces the oldest native turn once retention is full.
 	nextRecentTurn int
+	// foregroundReceipts retains direct Prompt outcomes only when negotiated.
+	foregroundReceipts bool
+	// receipts owns completed, unacknowledged outcomes by native session.
+	receipts map[acp.SessionId][]*outcomeEntry
+	// retainedOutcomes includes completed receipts and reservations.
+	retainedOutcomes int
+	// receiptChanged wakes readers on outcome or session lifecycle changes.
+	receiptChanged chan struct{}
 	// managing holds known native IDs during resume, fork, and archive.
 	managing map[acp.SessionId]bool
 	// login receives login completion for the one account operation in flight.
@@ -125,10 +135,14 @@ type Client struct {
 	drainOnce sync.Once
 	// callbacksDone closes after all callbacks have returned.
 	callbacksDone chan struct{}
-	// skillsGate protects the process-wide extra skill roots during refresh.
-	skillsGate chan struct{}
-	// skillRoots records the last native acknowledgement of global extra roots.
+	// skillRoots records the confirmed process-wide extra roots.
 	skillRoots []string
+	// skillUsers counts native consumers holding the current roots.
+	skillUsers int
+	// skillChanging excludes consumers while a root change is in flight.
+	skillChanging bool
+	// skillChanged wakes waiters after root changes and lease releases.
+	skillChanged chan struct{}
 	// probing keeps a management timeout from starting redundant health checks.
 	probing bool
 }
@@ -214,9 +228,9 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	}
 	life, fail := context.WithCancelCause(context.Background())
 	return &Client{
-		options: options, host: host, process: process, life: life, fail: fail,
-		writeGate: make(chan struct{}, 1), readerDone: make(chan struct{}), callbacksDone: make(chan struct{}), skillsGate: make(chan struct{}, 1),
-		pending: make(map[string]*pendingCall), sessions: make(map[acp.SessionId]*session), seenTurns: make(map[turnIdentity]struct{}),
+		options: options, host: host, process: process, life: life, endLife: fail,
+		writeGate: make(chan struct{}, 1), readerDone: make(chan struct{}), callbacksDone: make(chan struct{}), skillChanged: make(chan struct{}),
+		pending: make(map[string]*pendingCall), sessions: make(map[acp.SessionId]*session), seenTurns: make(map[turnIdentity]struct{}), receipts: make(map[acp.SessionId][]*outcomeEntry), receiptChanged: make(chan struct{}),
 	}, nil
 }
 
@@ -237,6 +251,7 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 	if start == nil {
 		start = make(chan struct{})
 		c.startDone = start
+		c.foregroundReceipts, _ = request.ClientCapabilities.Meta[acpmeta.NativeTurnReceiptsCapability].(bool)
 		c.fullTerminalOutput, _ = request.ClientCapabilities.Meta["terminal_output"].(bool)
 		elicitation := request.ClientCapabilities.Elicitation
 		c.formEnabled = c.host.CreateElicitation != nil && (elicitation == nil && !c.wireBound || elicitation != nil && elicitation.Form != nil)
@@ -281,9 +296,10 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 			},
 		},
 		Meta: map[string]any{
-			"developerInstructions": acpmeta.DeveloperInstructionsCapability(capability != nil),
-			"fork":                  map[string]any{"mode": c.forkMode},
-			"steering":              map[string]bool{"supported": true},
+			"developerInstructions":              acpmeta.DeveloperInstructionsCapability(capability != nil),
+			acpmeta.NativeTurnReceiptsCapability: acpmeta.NativeTurnReceiptsMethod,
+			"fork":                               map[string]any{"mode": c.forkMode},
+			"steering":                           map[string]bool{"supported": true},
 			"native_management": map[string]any{"account_read": true, "account_usage": true, "compact": true,
 				"codex_thread_archive": ThreadArchiveMethod, "codex_thread_unarchive": ThreadUnarchiveMethod, "codex_session_settings": SessionSettingsMethod,
 				"schema_version": "0.148.0", "provider_support": "unknown"},
@@ -404,7 +420,7 @@ func (c *Client) call(ctx context.Context, method string, params, result any, ad
 		}
 	}
 	if frame.Error != nil {
-		return written, frame.Error
+		return written, immutableNativeError(frame.Error)
 	}
 	if len(frame.Result) == 0 || bytes.Equal(frame.Result, []byte("null")) {
 		return written, errors.New("Codex returned no native result")
@@ -483,7 +499,7 @@ func (c *Client) readFrames() {
 			if message == "" {
 				message = "Codex rejected the native request"
 			}
-			frame.Error = &acp.RequestError{Code: frame.Error.Code, Message: message}
+			frame.Error = &acp.RequestError{Code: frame.Error.Code, Message: message, Data: safeRPCData(frame.Error.Data)}
 		}
 		c.mu.Lock()
 		switch {
@@ -520,9 +536,13 @@ func (c *Client) readFrames() {
 func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	c.closing = true
+	c.signalReceiptsLocked()
 	start := c.startDone
 	active := make([]*turn, 0, len(c.sessions))
 	for _, s := range c.sessions {
+		for draining := range s.draining {
+			active = append(active, draining)
+		}
 		if s.active != nil {
 			active = append(active, s.active)
 			c.cancelTurnLocked(s.active)
@@ -534,7 +554,7 @@ func (c *Client) Close(ctx context.Context) error {
 			return err
 		}
 	}
-	c.fail(errUnavailable)
+	c.endLife(errUnavailable)
 	if err := c.process.Close(ctx); err != nil {
 		return err
 	}
@@ -567,6 +587,68 @@ func waitDone(ctx context.Context, done <-chan struct{}) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// fail withdraws the native transport and starts releasing the same child
+// even if the caller has already received its final result.
+func (c *Client) fail(err error) {
+	c.endLife(err)
+	c.retireOnce.Do(func() {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+			defer cancel()
+			if err := c.process.Close(ctx); err != nil && c.options.Logger != nil {
+				c.options.Logger.Warn("Codex app server cleanup requires retry", "error", err)
+			}
+		}()
+	})
+}
+
+type nativeRequestError struct {
+	// code and message are the retained, sanitized native RPC rejection.
+	code    int
+	message string
+	// data stores an immutable JSON representation of allowed diagnostic facts.
+	data string
+}
+
+func immutableNativeError(rpc *acp.RequestError) error {
+	data, _ := json.Marshal(rpc.Data)
+	return nativeRequestError{code: rpc.Code, message: rpc.Message, data: string(data)}
+}
+
+func (e nativeRequestError) Error() string { return e.message }
+
+func (e nativeRequestError) As(target any) bool {
+	rpc, ok := target.(**acp.RequestError)
+	if !ok {
+		return false
+	}
+	result := &acp.RequestError{Code: e.code, Message: e.message}
+	_ = json.Unmarshal([]byte(e.data), &result.Data)
+	*rpc = result
+	return true
+}
+
+func safeRPCData(raw any) any {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	facts := make(map[string]any)
+	if resource, ok := m["resource"].(string); ok {
+		switch resource {
+		case "thread", "workspace", "workspace-template", "rollout":
+			facts["resource"] = resource
+		}
+	}
+	if id, ok := m["threadId"].(string); ok && uuidPattern.MatchString(id) {
+		facts["threadId"] = id
+	}
+	if len(facts) == 0 {
+		return nil
+	}
+	return facts
 }
 
 func safeDiagnostic(record string) string {

@@ -67,6 +67,12 @@ type turn struct {
 	interactions sync.WaitGroup
 	// observerDone publishes delivery completion.
 	observerDone chan struct{}
+	// outcomeEntry is the ordered receipt slot opened by the native terminal.
+	outcomeEntry *outcomeEntry
+	// retainOutcome reserves one slot for this turn's canonical outcome.
+	retainOutcome bool
+	// autonomous identifies a native execution with no host input submission.
+	autonomous bool
 	// compact distinguishes native compaction from a user prompt.
 	compact bool
 	// writing is the linearized decision to allow native write.
@@ -95,6 +101,10 @@ type turn struct {
 	consumed *tokenCounters
 	// usageGap indicates an unscoped observation or a missing start baseline.
 	usageGap bool
+	// usageReset fences off totals after an unexplained cumulative regression.
+	usageReset bool
+	// usageSamples counts distinct attributable requests for coverage metadata.
+	usageSamples int
 	// usageHigh records the highest total sampled on the exact native turn.
 	usageHigh *int64
 	// nativeStatus retains the actual status for provider-specific controls.
@@ -113,8 +123,12 @@ type turn struct {
 	toolOutput map[string]string
 	// streamed tracks text that has already been emitted for a native message.
 	streamed map[string]int
-	// steerInputs binds additional inputs to this exact owner.
+	// steerInputs retains attempted native input identities for this exact turn.
 	steerInputs map[string]struct{}
+	// steerPending counts committed controls awaiting their own native evidence.
+	steerPending int
+	// steerSettled closes when the current set of committed controls has settled.
+	steerSettled chan struct{}
 }
 
 type earlyFrame struct {
@@ -153,7 +167,10 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 	if options.HostInvocationID == "" {
 		options.HostInvocationID = newID()
 	}
-	t := c.installTurnLocked(ctx, s, false)
+	t, err := c.installTurnLocked(ctx, s, false, c.foregroundReceipts)
+	if err != nil {
+		return nil, err
+	}
 	t.input = agentclient.PromptSubmission{SessionID: s.id, HostInvocationID: options.HostInvocationID, InputID: id, NativeInputID: pointer(id)}
 	t.options = options
 	s.inputs[id] = struct{}{}
@@ -167,7 +184,10 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 	}, nil
 }
 
-func (c *Client) installTurnLocked(ctx context.Context, s *session, compact bool) *turn {
+func (c *Client) installTurnLocked(ctx context.Context, s *session, compact, retain bool) (*turn, error) {
+	if retain && c.retainedOutcomes == maxRetainedOutcomes {
+		return nil, acp.NewInvalidRequest("Codex native receipts are full")
+	}
 	prepare, stopPrepare := context.WithCancelCause(ctx)
 	native, stopNative := context.WithCancelCause(c.life)
 	observeCtx, stopObserve := context.WithCancel(c.life)
@@ -184,9 +204,13 @@ func (c *Client) installTurnLocked(ctx context.Context, s *session, compact bool
 	if t.request.Model != nil && *t.request.Model != t.model {
 		t.model = ""
 	}
+	if retain {
+		c.retainedOutcomes++
+		t.retainOutcome = true
+	}
 	s.active = t
 	c.interactions.Add(1)
-	return t
+	return t, nil
 }
 
 func (c *Client) runPrompt(t *turn) (result agentclient.PromptResult) {
@@ -201,7 +225,7 @@ func (c *Client) executeTurn(t *turn) (frameWrite, error) {
 		c.mu.Unlock()
 	})
 	defer stop()
-	go func() { defer c.interactions.Done(); c.observeTurn(t) }()
+	c.startTurnObserver(t)
 	if err := context.Cause(t.prepare); err != nil {
 		return frameWrite{}, err
 	}
@@ -215,16 +239,18 @@ func (c *Client) executeTurn(t *turn) (frameWrite, error) {
 	if cause := context.Cause(t.prepare); cause != nil {
 		return frameWrite{}, cause
 	}
-	if !t.compact {
-		if err := c.refreshSkills(t.prepare, append([]string{t.session.cwd}, t.session.roots...)); err != nil {
-			return frameWrite{}, err
-		}
-	}
+
 	if t.options.BeforeSubmit != nil {
 		if err := t.options.BeforeSubmit(t.prepare, t.input.Snapshot()); err != nil {
 			return frameWrite{}, err
 		}
 	}
+	releaseSkills, err := c.claimSkills(t.prepare, append([]string{t.session.cwd}, t.session.roots...))
+	if err != nil {
+		return frameWrite{}, err
+	}
+	defer releaseSkills()
+
 	method := "turn/start"
 	var params any = t.request
 	if t.compact {
@@ -239,6 +265,7 @@ func (c *Client) executeTurn(t *turn) (frameWrite, error) {
 			return cause
 		}
 		t.writing = true
+		t.session.skillRoots = slices.Clone(c.skillRoots)
 		t.admission = agentclient.AdmissionUnknown
 		return nil
 	}, func(frame rpcFrame) {
@@ -305,8 +332,16 @@ func (c *Client) activeLocked(t *turn) bool {
 	return c.sessions[t.session.id] == t.session && t.session.active == t
 }
 
+func (c *Client) ownsTurnLocked(t *turn) bool {
+	if c.sessions[t.session.id] != t.session {
+		return false
+	}
+	_, draining := t.session.draining[t]
+	return t.session.active == t || draining
+}
+
 func (c *Client) bindTurnLocked(t *turn, id string) {
-	if t.outcome.Turn.NativeTurnID != nil || id == "" {
+	if t.outcome.Turn.NativeTurnID != nil || id == "" || len(id) > maxNativeIDBytes {
 		return
 	}
 	if c.seenTurnLocked(t.session.id, id) {
@@ -334,8 +369,12 @@ func (c *Client) finishTurn(t *turn, written frameWrite, err error) agentclient.
 	t.stopNative(err)
 	c.mu.Lock()
 	t.finishing = true
+	steerSettled := t.steerSettled
 	close(t.updates)
 	c.mu.Unlock()
+	if steerSettled != nil {
+		<-steerSettled
+	}
 	drained := make(chan struct{})
 	go func() {
 		<-t.observerDone
@@ -366,6 +405,7 @@ func (c *Client) finishTurn(t *turn, written frameWrite, err error) agentclient.
 			t.session.usageCheckpoint = nil
 		}
 	}
+	delete(t.session.draining, t)
 	close(t.released)
 	submission := written.submission()
 	admission := t.admission
@@ -373,7 +413,7 @@ func (c *Client) finishTurn(t *turn, written frameWrite, err error) agentclient.
 		admission = agentclient.AdmissionNotAccepted
 	}
 	result := agentclient.PromptResult{Receipt: agentclient.PromptReceipt{Input: t.input, Submission: submission, Admission: admission, OperationError: err}}
-	if submission != agentclient.SubmissionNotSent && t.outcome.Turn.NativeTurnID != nil {
+	if (submission != agentclient.SubmissionNotSent || t.autonomous) && t.outcome.Turn.NativeTurnID != nil {
 		t.outcome.PossibleSideEffects = true
 		if t.outcome.Turn.Status == "" {
 			t.outcome.OperationError = err
@@ -382,8 +422,12 @@ func (c *Client) finishTurn(t *turn, written frameWrite, err error) agentclient.
 			}
 		}
 		o := t.outcome.Snapshot()
+		if t.retainOutcome {
+			capOutcome(&o)
+		}
 		result.Outcome = &o
 	}
+	c.publishOutcomeLocked(t, result.Outcome)
 	return result
 }
 
@@ -457,13 +501,18 @@ func (c *Client) Steer(ctx context.Context, request agentclient.SteerRequest) (a
 		return agentclient.SteerResponse{}, err
 	}
 	t := s.active
-	if t == nil && !s.busy && !s.closing && !request.PromptRequired {
+	if t == nil && len(s.draining) == 0 && !s.busy && !s.closing && !request.PromptRequired {
 		if err := ctx.Err(); err != nil {
 			c.mu.Unlock()
 			return agentclient.SteerResponse{}, err
 		}
 		turnCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
-		t = c.installTurnLocked(turnCtx, s, false)
+		t, err = c.installTurnLocked(turnCtx, s, false, true)
+		if err != nil {
+			cancel(err)
+			c.mu.Unlock()
+			return agentclient.SteerResponse{}, err
+		}
 		id := newID()
 		t.input = agentclient.PromptSubmission{SessionID: s.id, HostInvocationID: newID(), InputID: id, NativeInputID: pointer(id)}
 		t.request.Input = input
@@ -509,26 +558,65 @@ func (c *Client) Steer(ctx context.Context, request agentclient.SteerRequest) (a
 	nativeID := value(t.outcome.Turn.NativeTurnID)
 	c.mu.Unlock()
 	params := protocol.TurnSteerParams{ThreadID: string(s.id), ExpectedTurnID: nativeID, Input: input, ClientUserMessageID: &id}
+	result := make(chan error, 1)
+	go func() { result <- c.submitSteer(ctx, t, params, id) }()
+	select {
+	case err := <-result:
+		if err != nil {
+			return agentclient.SteerResponse{}, err
+		}
+		return agentclient.SteerResponse{Outcome: "injected"}, nil
+	case <-ctx.Done():
+		return agentclient.SteerResponse{}, ctx.Err()
+	}
+}
+
+// submitSteer owns one independent write-to-ack interval. After the write is
+// committed, foreground cancellation does not discard native input evidence.
+func (c *Client) submitSteer(waiter context.Context, t *turn, params protocol.TurnSteerParams, id string) error {
+	ctx, cancel := context.WithTimeout(c.life, controlTimeout)
+	defer cancel()
+	admitted := false
+	defer func() {
+		if !admitted {
+			return
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		t.steerPending--
+		if t.steerPending == 0 {
+			close(t.steerSettled)
+		}
+	}()
 	var reply protocol.TurnSteerResponse
-	_, err = c.call(ctx, "turn/steer", params, &reply, func() error {
-		if !c.activeLocked(t) || t.stopped || t.outcome.Turn.Status != "" || s.closing || value(t.outcome.Turn.NativeTurnID) != nativeID {
+	_, err := c.call(ctx, "turn/steer", params, &reply, func() error {
+		if err := waiter.Err(); err != nil {
+			return err
+		}
+		if !c.activeLocked(t) || t.stopped || t.finishing || t.outcome.Turn.Status != "" || t.session.closing ||
+			value(t.outcome.Turn.NativeTurnID) != params.ExpectedTurnID {
 			return errTurnChanged
 		}
+		if len(t.steerInputs) >= maxPendingUpdates {
+			return acp.NewInvalidRequest("Codex steering input retention is full")
+		}
+		if t.steerPending == 0 {
+			t.steerSettled = make(chan struct{})
+		}
+		t.steerPending++
 		t.steerInputs[id] = struct{}{}
+		admitted = true
 		return nil
 	}, func(frame rpcFrame) {
 		var ack protocol.TurnSteerResponse
-		if c.activeLocked(t) && t.outcome.Turn.Status == "" && json.Unmarshal(frame.Result, &ack) == nil && ack.TurnID == nativeID {
+		if admitted && c.ownsTurnLocked(t) && frame.Error == nil && json.Unmarshal(frame.Result, &ack) == nil && ack.TurnID == params.ExpectedTurnID {
 			consumeInput(t, id)
 		}
 	})
-	if err != nil {
-		return agentclient.SteerResponse{}, err
+	if err == nil && reply.TurnID != params.ExpectedTurnID {
+		err = errTurnChanged
 	}
-	if reply.TurnID != nativeID {
-		return agentclient.SteerResponse{}, errTurnChanged
-	}
-	return agentclient.SteerResponse{Outcome: "injected"}, nil
+	return err
 }
 
 func consumeInput(t *turn, id string) {
@@ -544,8 +632,11 @@ func (c *Client) Compact(ctx context.Context, request acpmeta.CompactRequest) (a
 		c.mu.Unlock()
 		return acpmeta.CompactResponse{}, err
 	}
-	t := c.installTurnLocked(ctx, s, true)
+	t, err := c.installTurnLocked(ctx, s, true, false)
 	c.mu.Unlock()
+	if err != nil {
+		return acpmeta.CompactResponse{}, err
+	}
 	written, err := c.executeTurn(t)
 	r := c.finishTurn(t, written, err)
 	if r.Outcome == nil {
@@ -589,4 +680,63 @@ func (c *Client) rememberTurnLocked(thread acp.SessionId, id string) {
 		c.nextRecentTurn = (c.nextRecentTurn + 1) % retention
 	}
 	c.seenTurns[key] = struct{}{}
+}
+
+func (c *Client) startTurnObserver(t *turn) {
+	go func() { defer c.interactions.Done(); c.observeTurn(t) }()
+}
+
+func (c *Client) startAutonomousLocked(s *session, event turnEvent) *turn {
+	id := event.Turn.ID
+	if c.closing || c.life.Err() != nil || s.busy || s.closing || id == "" || len(id) > maxNativeIDBytes ||
+		event.Turn.Status != protocol.PurpleInProgress || c.seenTurnLocked(s.id, id) {
+		return nil
+	}
+	previous := s.active
+	if previous != nil {
+		if previous.writing && previous.outcome.Turn.Status == "" {
+			return nil
+		}
+		c.cancelTurnLocked(previous)
+	}
+	t, err := c.installTurnLocked(c.life, s, false, true)
+	if err != nil {
+		c.fail(err)
+		return nil
+	}
+	if previous != nil {
+		if s.draining == nil {
+			s.draining = make(map[*turn]struct{})
+		}
+		s.draining[previous] = struct{}{}
+	}
+	t.autonomous = true
+	t.model = value(s.settings.Observed.Model)
+	t.request.Model = nil
+	t.writing = true
+	t.input.SessionID = s.id
+	t.outcome.Turn.Origin = acpmeta.NativeTurnOriginUnknown
+	if event.Unprompted {
+		t.outcome.Turn.Origin = acpmeta.NativeTurnOriginProvider
+	}
+	c.bindTurnLocked(t, id)
+	lease := !c.skillChanging && slices.Equal(c.skillRoots, s.skillRoots)
+	if lease {
+		c.skillUsers++
+	} else {
+		c.cancelTurnLocked(t)
+	}
+	go func() {
+		c.startTurnObserver(t)
+		<-t.native.Done()
+		cause := context.Cause(t.native)
+		if errors.Is(cause, errTerminal) {
+			cause = nil
+		}
+		if lease {
+			c.releaseSkills()
+		}
+		c.finishTurn(t, frameWrite{}, cause)
+	}()
+	return t
 }

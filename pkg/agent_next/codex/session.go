@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -60,6 +61,8 @@ type session struct {
 	cwd string
 	// roots are the host-authorized additional writable directories.
 	roots []string
+	// skillRoots are the most recently applied extra roots for this generation.
+	skillRoots []string
 	// mode is the local permission preset applied to the next turn.
 	mode acp.SessionModeId
 	// settings contains local intent and independent native settings receipts.
@@ -70,8 +73,10 @@ type session struct {
 	busy bool
 	// closing prevents new work until exact-generation cleanup succeeds.
 	closing bool
-	// active is the sole turn and control slot.
+	// active is the sole native turn and control slot.
 	active *turn
+	// draining retains retired owners until their host and input cleanup completes.
+	draining map[*turn]struct{}
 	// inputs rejects reuse of input IDs within the opened generation.
 	inputs map[string]struct{}
 	// mcpServers stores the requested names and whether startup failure was published.
@@ -118,7 +123,7 @@ func (c *Client) idleSessionLocked(id acp.SessionId) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.active != nil || s.busy || s.closing {
+	if s.active != nil || len(s.draining) > 0 || s.busy || s.closing {
 		return nil, errTurnBusy
 	}
 	return s, nil
@@ -214,7 +219,7 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 		return acp.NewSessionResponse{}, acp.NewInvalidParams("session ID is required")
 	}
 	if source != nil {
-		if source.busy || source.active != nil || source.closing || method == "thread/resume" {
+		if source.busy || source.active != nil || len(source.draining) > 0 || source.closing || method == "thread/resume" {
 			c.mu.Unlock()
 			return acp.NewSessionResponse{}, errTurnBusy
 		}
@@ -271,6 +276,11 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 	if method == "thread/resume" {
 		params["excludeTurns"] = true
 	}
+	releaseSkills, err := c.claimSkills(ctx, roots)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	defer releaseSkills()
 	if fork != nil {
 		if position := acpmeta.ForkPosition(input.meta); position != "" {
 			params["lastTurnId"] = position
@@ -322,6 +332,7 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 				return
 			}
 			s.id = nativeID
+			s.skillRoots = slices.Clone(c.skillRoots)
 			c.sessions[nativeID] = s
 			installed = true
 			s.observe(strings.ReplaceAll(method, "/", "_"), opened.Model, opened.Effort, opened.Tier)
@@ -331,12 +342,13 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 		})
 	}
 	written, err := submit()
-	if method == "thread/resume" && archivedThreadError(err) {
+	if method == "thread/resume" && archivedThreadError(err, input.id) {
 		if unarchiveErr := c.request(ctx, "thread/unarchive", map[string]any{"threadId": input.id}, nil); unarchiveErr != nil {
 			return acp.NewSessionResponse{}, errors.Join(err, unarchiveErr)
 		}
 		written, err = submit()
 	}
+	releaseSkills()
 	if nativeID == "" {
 		var nativeRejection *acp.RequestError
 		if written.submission() != agentclient.SubmissionNotSent && !errors.As(err, &nativeRejection) {
@@ -409,22 +421,25 @@ func (c *Client) CloseSession(ctx context.Context, r acp.CloseSessionRequest) (a
 	}
 	s.busy = true
 	s.closing = true
-	active := s.active
-	if active != nil {
-		c.cancelTurnLocked(active)
+	c.signalReceiptsLocked()
+	closing := make([]*turn, 0, 1+len(s.draining))
+	for t := range s.draining {
+		closing = append(closing, t)
+	}
+	if s.active != nil {
+		closing = append(closing, s.active)
+		c.cancelTurnLocked(s.active)
 	}
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); s.busy = false; c.mu.Unlock() }()
-	if active != nil {
-		select {
-		case <-active.released:
-		case <-ctx.Done():
-			return acp.CloseSessionResponse{}, ctx.Err()
+	for _, t := range closing {
+		if err := waitDone(ctx, t.released); err != nil {
+			return acp.CloseSessionResponse{}, err
 		}
 	}
 	var response protocol.ThreadUnsubscribeResponse
 	_, err := c.call(ctx, "thread/unsubscribe", protocol.ThreadUnsubscribeParams{ThreadID: string(s.id)}, &response, func() error {
-		if c.sessions[s.id] != s || s.active != nil {
+		if c.sessions[s.id] != s || s.active != nil || len(s.draining) > 0 {
 			return errTurnChanged
 		}
 		return nil
@@ -550,23 +565,22 @@ func (c *Client) openConfig(ctx context.Context, roots []string, servers []acp.M
 			config["mcp_servers."+name], _ = json.Marshal(native)
 		}
 	}
-	if err := c.refreshSkills(ctx, roots); err != nil {
-		return nil, err
-	}
 	return config, nil
 }
 
-func (c *Client) refreshSkills(ctx context.Context, roots []string) error {
+// claimSkills pins the global Codex roots until the native consumer is done.
+// Callers acquire after host preparation and release before observer draining.
+func (c *Client) claimSkills(ctx context.Context, roots []string) (func(), error) {
 	extra := make([]string, 0, len(roots)-1)
 	hasSkills := false
 	for i, root := range roots {
 		path := filepath.Join(root, ".agents", "skills")
 		info, err := os.Stat(path)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			return nil, err
 		}
 		if err == nil && !info.IsDir() {
-			return errors.New("Codex skill path is not a directory")
+			return nil, errors.New("Codex skill path is not a directory")
 		}
 		if err == nil {
 			hasSkills = true
@@ -575,26 +589,83 @@ func (c *Client) refreshSkills(ctx context.Context, roots []string) error {
 			}
 		}
 	}
-	select {
-	case c.skillsGate <- struct{}{}:
-		defer func() { <-c.skillsGate }()
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.life.Done():
-		return context.Cause(c.life)
-	}
-	if !slices.Equal(c.skillRoots, extra) {
-		if err := c.request(ctx, protocol.MethodSkillsExtraRootsSet, protocol.SkillsExtraRootsSetParams{ExtraRoots: extra}, nil); err != nil {
-			return fmt.Errorf("configure Codex skill roots: %w", err)
+	for {
+		c.mu.Lock()
+		if cause := context.Cause(c.life); cause != nil {
+			c.mu.Unlock()
+			return nil, cause
 		}
-		c.skillRoots = extra
+		if cause := context.Cause(ctx); cause != nil {
+			c.mu.Unlock()
+			return nil, cause
+		}
+		if !c.skillChanging && slices.Equal(c.skillRoots, extra) {
+			c.skillUsers++
+			c.mu.Unlock()
+			break
+		}
+		if !c.skillChanging && c.skillUsers == 0 {
+			c.skillChanging = true
+			c.mu.Unlock()
+			err := c.setSkillRoots(ctx, extra)
+			c.mu.Lock()
+			c.skillChanging = false
+			if err == nil {
+				c.skillRoots = extra
+				c.skillUsers++
+			}
+			c.signalSkillsLocked()
+			c.mu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+		changed := c.skillChanged
+		c.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		case <-c.life.Done():
+			return nil, context.Cause(c.life)
+		}
 	}
+	var once sync.Once
+	release := func() { once.Do(c.releaseSkills) }
 	if hasSkills {
 		if err := c.request(ctx, protocol.MethodSkillsList, protocol.SkillsListParams{Cwds: roots, ForceReload: pointer(true)}, nil); err != nil {
-			return fmt.Errorf("reload Codex skills: %w", err)
+			release()
+			return nil, fmt.Errorf("reload Codex skills: %w", err)
 		}
 	}
-	return nil
+	return release, nil
+}
+
+func (c *Client) setSkillRoots(ctx context.Context, extra []string) error {
+	written, err := c.call(ctx, protocol.MethodSkillsExtraRootsSet, protocol.SkillsExtraRootsSetParams{ExtraRoots: extra}, nil, nil, nil)
+	if err == nil {
+		return nil
+	}
+	var rejected *acp.RequestError
+	if written.submission() != agentclient.SubmissionNotSent && !errors.As(err, &rejected) {
+		c.fail(errors.New("Codex global skill roots changed without a confirmed result"))
+	}
+	return fmt.Errorf("configure Codex skill roots: %w", err)
+}
+
+func (c *Client) releaseSkills() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.skillUsers--
+	if c.skillUsers == 0 {
+		c.signalSkillsLocked()
+	}
+}
+
+func (c *Client) signalSkillsLocked() {
+	close(c.skillChanged)
+	c.skillChanged = make(chan struct{})
 }
 
 func mcpConfig(server acp.McpServer) (string, map[string]any, error) {
@@ -638,9 +709,16 @@ func mcpConfig(server acp.McpServer) (string, map[string]any, error) {
 	return name, native, nil
 }
 
-func archivedThreadError(err error) bool {
+// archivedThreadError recognizes the resume-specific rejection proven by
+// rust-v0.163.0 read_stored_thread_for_resume. Both native IDs must be the
+// requested thread. Unknown forms leave the original error untouched.
+func archivedThreadError(err error, id acp.SessionId) bool {
 	var rpc *acp.RequestError
-	return errors.As(err, &rpc) && strings.Contains(strings.ToLower(rpc.Message), "archived")
+	if !uuidPattern.MatchString(string(id)) || !errors.As(err, &rpc) || rpc.Code != -32600 {
+		return false
+	}
+	want := fmt.Sprintf("session %s is archived. Run `codex unarchive %s` to unarchive it first.", id, id)
+	return rpc.Message == want
 }
 
 // ThreadArchiveResponse reports the state confirmed by the native operation.
@@ -662,7 +740,7 @@ func (c *Client) SetThreadArchived(ctx context.Context, id string, archived bool
 		return ThreadArchiveResponse{}, err
 	}
 	s := c.sessions[threadID]
-	if c.managing[threadID] || s != nil && (s.active != nil || s.busy || s.closing) {
+	if c.managing[threadID] || s != nil && (s.active != nil || len(s.draining) > 0 || s.busy || s.closing) {
 		c.mu.Unlock()
 		return ThreadArchiveResponse{}, errTurnBusy
 	}
@@ -851,4 +929,16 @@ func (s *session) setConfig(id acp.SessionConfigId, selected string) error {
 		}
 	}
 	return acp.NewInvalidParams(fmt.Sprintf("unsupported Codex value %q for %s", selected, id))
+}
+
+func (s *session) hasPendingOutcome() bool {
+	if s.active != nil && s.active.retainOutcome {
+		return true
+	}
+	for t := range s.draining {
+		if t.retainOutcome {
+			return true
+		}
+	}
+	return false
 }
