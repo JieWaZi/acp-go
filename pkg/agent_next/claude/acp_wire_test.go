@@ -574,3 +574,68 @@ func TestBackgroundLevelCannotReviveEndedNativeRun(t *testing.T) {
 		})
 	}
 }
+
+func TestACPWirePipelineUsageKeepsHighWaterUntilNativeReset(t *testing.T) {
+	for _, tc := range []struct {
+		// mode selects the native result and reset frames.
+		mode string
+		// input and output are the third result's attributable pipeline tokens.
+		input, output int64
+		// read and reasoning are the third result's cache-read and thinking deltas.
+		read, reasoning int64
+		// cost is the third result's attributable pipeline and model estimate.
+		cost string
+	}{
+		{"pipeline-dip", 10, 5, 4, 2, "0.100000000000000000"},
+		{"pipeline-token-dip", 10, 5, 4, 2, "0.100000000000000000"},
+		{"pipeline-system-reset", 10, 5, 4, 2, "0.100000000000000000"},
+		{"pipeline-reset", 30, 15, 6, 7, "0.300000000000000000"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			peer, id, _, ctx := startACP(t, tc.mode, nil, nil)
+			prompt := func(text string) *acpmeta.TurnUsage {
+				t.Helper()
+				response, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				turn, ok := acpmeta.ReadNativeTurn(response.Meta)
+				if !ok || turn.Usage == nil {
+					t.Fatalf("missing usage for %q: %+v", text, response)
+				}
+				return turn.Usage
+			}
+			checkPipeline := func(u *acpmeta.TurnUsage, input, output int64, cost string) {
+				t.Helper()
+				if u.Coverage != "query_pipeline" || !u.Complete || u.InputTokens == nil || *u.InputTokens != input ||
+					u.OutputTokens == nil || *u.OutputTokens != output || u.Cost == nil || string(u.Cost.Amount) != cost {
+					t.Errorf("pipeline usage = %+v, want %d/%d and %s", u, input, output, cost)
+				}
+				if model := u.Models["sonnet"]; model.Cost == nil || string(model.Cost.Amount) != cost {
+					t.Errorf("model cost = %+v, want %s", model.Cost, cost)
+				}
+			}
+			checkPipeline(prompt("establish baseline"), 100, 50, "1.000000000000000000")
+			second := prompt("lower cumulative sample")
+			if tc.mode == "pipeline-reset" {
+				checkPipeline(second, 80, 40, "0.800000000000000000")
+			} else {
+				if second.Coverage != "main_loop" || second.InputTokens == nil || *second.InputTokens != 7 ||
+					len(second.Observations) != 1 || second.Observations[0].Coverage != "query_pipeline" ||
+					second.Observations[0].Complete || second.Observations[0].Tokens.InputTokens != nil || second.Observations[0].Tokens.OutputTokens != nil {
+					t.Errorf("lower sample obscured scope or exposed unproven usage: %+v", second)
+				}
+				if tc.mode != "pipeline-token-dip" && second.Cost != nil {
+					t.Errorf("lower cost was attributed to the turn: %+v", second.Cost)
+				}
+			}
+			third := prompt("recover above high water")
+			checkPipeline(third, tc.input, tc.output, tc.cost)
+			if third.CacheReadTokens == nil || *third.CacheReadTokens != tc.read ||
+				third.CacheWriteTokens == nil || *third.CacheWriteTokens != 2 ||
+				third.ReasoningTokens == nil || *third.ReasoningTokens != tc.reasoning {
+				t.Errorf("pipeline cache/thinking usage = %+v, want %d/2/%d", third, tc.read, tc.reasoning)
+			}
+		})
+	}
+}

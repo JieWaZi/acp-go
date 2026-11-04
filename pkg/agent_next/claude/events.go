@@ -43,6 +43,10 @@ func (s *session) receive(frame protocol.Message) {
 		if s.matches(m.SessionID) {
 			s.systemLocked(m)
 		}
+	case *protocol.ConversationResetMessage:
+		if m.SessionID == string(s.id) && isUUID(m.UUID) && isUUID(m.NewConversationID) {
+			s.counters.reset(m.NewConversationID)
+		}
 	case *protocol.ResultMessage:
 		if s.matches(m.SessionID) {
 			s.resultLocked(m)
@@ -116,8 +120,6 @@ func (s *session) systemLocked(m *protocol.SystemMessage) {
 		if s.current != nil && m.FallbackScope != "local" {
 			s.current.output.evict(m.RetractedMessages)
 		}
-	case "conversation_reset":
-		s.counters = newQueryCounters(false)
 	}
 }
 

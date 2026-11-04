@@ -79,7 +79,7 @@ func (s *session) observeMainLocked(identity protocol.TurnIdentity) *invocation 
 	if inv != nil && inv.opening.observed && identity.ResumeReason != "" && inv.opening.recovery != identity.ResumeReason {
 		inv.outcome.OperationError = errors.New("Claude recovered before the prior native result was observed")
 		s.sealLocked(inv)
-		s.counters = newQueryCounters(true)
+		s.counters.breakContinuity()
 		inv = nil
 	}
 	if inv == nil {
@@ -162,7 +162,7 @@ func (s *session) associateResultLocked(identity protocol.TurnIdentity, gap bool
 			current.outcome.OperationError = errors.New("Claude did not report the preceding native result")
 			s.freezeNativeLocked(current)
 			lost, current = current, nil
-			s.counters = newQueryCounters(true)
+			s.counters.breakContinuity()
 		}
 	} else if current != nil && gap {
 		// A status-only owner has no opening identity to bridge a gap.
@@ -171,7 +171,7 @@ func (s *session) associateResultLocked(identity protocol.TurnIdentity, gap bool
 		lost, current = current, nil
 	}
 	if gap {
-		s.counters = newQueryCounters(true)
+		s.counters.breakContinuity()
 	}
 	if current == nil {
 		current = s.beginNativeLocked()

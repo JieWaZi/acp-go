@@ -2,7 +2,6 @@ package claude
 
 import (
 	"encoding/json"
-	"maps"
 	"math"
 	"math/big"
 	"strings"
@@ -24,10 +23,12 @@ type requestUsage struct {
 }
 
 type queryCounters struct {
-	// models is nil until a resumed pipeline reports its first baseline.
+	// models holds adjacent per-model high-water marks, or nil across a reporting gap.
 	models map[string]protocol.ModelUsage
-	// cost is independently known and can be absent from a model report.
+	// cost holds the independent query estimate high-water mark.
 	cost *json.Number
+	// conversationID identifies the latest confirmed native reset in this stream.
+	conversationID string
 }
 
 func newQueryCounters(resume bool) queryCounters {
@@ -35,6 +36,18 @@ func newQueryCounters(resume bool) queryCounters {
 		return queryCounters{}
 	}
 	return queryCounters{models: make(map[string]protocol.ModelUsage), cost: acp.Ptr(json.Number("0"))}
+}
+
+func (q *queryCounters) breakContinuity() {
+	q.models, q.cost = nil, nil
+}
+
+func (q *queryCounters) reset(conversationID string) {
+	if conversationID == q.conversationID {
+		return
+	}
+	*q = newQueryCounters(false)
+	q.conversationID = conversationID
 }
 
 func nonnegative(value int64) *int64 {
@@ -172,8 +185,8 @@ func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, r
 	// A missing or zeroized report breaks adjacency for that counter alone.
 	// The next usable report seeds a new boundary without claiming the gap.
 	models, nextModelBoundary := modelDeltas(q.models, modelReport)
-	cost := costDelta(q.cost, costReport)
-	q.models, q.cost = nextModelBoundary, costReport
+	cost, nextCostBoundary := advanceCost(q.cost, costReport)
+	q.models, q.cost = nextModelBoundary, nextCostBoundary
 
 	var observations []acpmeta.UsageObservation
 	if models != nil {
@@ -245,13 +258,10 @@ func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]a
 		return nil, current
 	}
 	rows := make(map[string]acpmeta.ModelUsage, len(current))
-	var next map[string]protocol.ModelUsage
+	next := make(map[string]protocol.ModelUsage, len(current))
 	for model := range previous {
 		if _, exists := current[model]; !exists {
-			if next == nil {
-				next = maps.Clone(current)
-			}
-			if len(next) >= maxUsageRows {
+			if len(current)+len(next) >= maxUsageRows {
 				// Dropping a missing model's history would turn its next
 				// appearance into a false delta from zero.
 				return nil, nil
@@ -260,75 +270,88 @@ func modelDeltas(previous, current map[string]protocol.ModelUsage) (map[string]a
 			rows[model] = acpmeta.ModelUsage{}
 		}
 	}
-	if next == nil {
-		next = current
-	}
 	for model, to := range current {
 		from, had := previous[model]
 		if model == "" {
 			return nil, nil
 		}
-		delta := func(key string, before, after int64) *int64 {
+		advance := func(key string, before int64, after *int64) *int64 {
 			if !to.KnownCounters[key] || had && !from.KnownCounters[key] {
 				return nil
 			}
-			return deltaCounter(before, after)
+			delta, high := advanceCounter(before, *after)
+			*after = high
+			return delta
 		}
 		row := acpmeta.ModelUsage{
-			InputTokens:      delta("input", from.InputTokens, to.InputTokens),
-			OutputTokens:     delta("output", from.OutputTokens, to.OutputTokens),
-			CacheReadTokens:  delta("read", from.CacheReadInputTokens, to.CacheReadInputTokens),
-			CacheWriteTokens: delta("write", from.CacheCreationInputTokens, to.CacheCreationInputTokens),
+			InputTokens:      advance("input", from.InputTokens, &to.InputTokens),
+			OutputTokens:     advance("output", from.OutputTokens, &to.OutputTokens),
+			CacheReadTokens:  advance("read", from.CacheReadInputTokens, &to.CacheReadInputTokens),
+			CacheWriteTokens: advance("write", from.CacheCreationInputTokens, &to.CacheCreationInputTokens),
 		}
 		if to.ThinkingTokens != nil && (!had || from.ThinkingTokens != nil) {
 			var baseline int64
 			if had {
 				baseline = *from.ThinkingTokens
 			}
-			row.ReasoningTokens = deltaCounter(baseline, *to.ThinkingTokens)
+			delta, high := advanceCounter(baseline, *to.ThinkingTokens)
+			row.ReasoningTokens = delta
+			if high != *to.ThinkingTokens {
+				to.ThinkingTokens = acp.Ptr(high)
+			}
 			if row.ReasoningTokens != nil && (row.OutputTokens == nil || *row.ReasoningTokens > *row.OutputTokens) {
 				row.ReasoningTokens = nil
 			}
 		}
 		if !had {
 			from.CostUSD = acp.Ptr(json.Number("0"))
+		} else if from.CostBasis != to.CostBasis {
+			from.CostUSD = nil
 		}
-		row.Cost = costDelta(from.CostUSD, to.CostUSD)
-		if row.Cost != nil && had && from.CostBasis != to.CostBasis {
-			row.Cost = nil
-		}
+		row.Cost, to.CostUSD = advanceCost(from.CostUSD, to.CostUSD)
 		rows[model] = row
+		next[model] = to
 	}
 	return rows, next
 }
 
-func deltaCounter(from, to int64) *int64 {
-	if from < 0 || to < from {
-		return nil
+// A lower cumulative sample has no attributable delta within the same epoch.
+func advanceCounter(from, to int64) (*int64, int64) {
+	if to < from {
+		return nil, from
 	}
-	return acp.Ptr(to - from)
+	if from < 0 {
+		return nil, to
+	}
+	return acp.Ptr(to - from), to
 }
 
-func costDelta(previous, current *json.Number) *acpmeta.UsageCost {
-	if previous == nil || current == nil || len(*previous) > 32 || len(*current) > 32 {
-		return nil
-	}
+func advanceCost(previous, current *json.Number) (*acpmeta.UsageCost, *json.Number) {
 	// Bound exponent magnitude before parsing decimal estimates.
-	parse := func(n json.Number) *big.Rat {
-		f, err := n.Float64()
-		if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f == 0 && strings.ContainsAny(string(n), "eE") {
+	parse := func(n *json.Number) *big.Rat {
+		if n == nil || len(*n) > 32 {
 			return nil
 		}
-		r, ok := new(big.Rat).SetString(string(n))
+		f, err := n.Float64()
+		if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f == 0 && strings.ContainsAny(string(*n), "eE") {
+			return nil
+		}
+		r, ok := new(big.Rat).SetString(string(*n))
 		if !ok {
 			return nil
 		}
 		return r
 	}
-	from, to := parse(*previous), parse(*current)
-	if from == nil || to == nil || to.Cmp(from) < 0 {
-		return nil
+	from, to := parse(previous), parse(current)
+	if to == nil {
+		return nil, nil
+	}
+	if from == nil {
+		return nil, current
+	}
+	if to.Cmp(from) < 0 {
+		return nil, previous
 	}
 	diff := to.Sub(to, from)
-	return &acpmeta.UsageCost{Amount: json.Number(diff.FloatString(18)), Currency: "USD", Source: "claude.result.cost", Scope: queryCoverage, Aggregation: "turn_delta", Valuation: "estimated"}
+	return &acpmeta.UsageCost{Amount: json.Number(diff.FloatString(18)), Currency: "USD", Source: "claude.result.cost", Scope: queryCoverage, Aggregation: "turn_delta", Valuation: "estimated"}, current
 }

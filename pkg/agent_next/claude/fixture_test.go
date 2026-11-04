@@ -344,6 +344,28 @@ func (f *fixture) user(frame fixtureFrame) {
 			"resume_reason": "interrupted_turn", "user_message_uuid": frame.UUID, "user_message_uuids": []string{frame.UUID},
 			"result": "new provider answer", "usage": map[string]any{"input_tokens": 17, "output_tokens": 4}})
 		f.mark("emitted-rerun", "true")
+	case "pipeline-dip", "pipeline-token-dip", "pipeline-reset", "pipeline-system-reset":
+		if f.mode == "pipeline-reset" && f.index > 0 {
+			f.emit(map[string]any{"type": "conversation_reset", "new_conversation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+				"uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "trigger": "clear"})
+		}
+		if f.mode == "pipeline-system-reset" && f.index == 1 {
+			f.emit(map[string]any{"type": "system", "subtype": "conversation_reset"})
+		}
+		input := []int{100, 80, 110}[f.index]
+		output := []int{50, 40, 55}[f.index]
+		cost := []json.Number{"1.0", "0.8", "1.1"}[f.index]
+		if f.mode == "pipeline-token-dip" && f.index == 1 {
+			cost = "1.0"
+		}
+		f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": fmt.Sprintf("pipeline-usage-%d", f.index),
+			"result_index": f.index, "user_message_uuid": frame.UUID,
+			"usage": map[string]any{"input_tokens": 7, "output_tokens": 4},
+			"modelUsage": map[string]any{"sonnet": map[string]any{"inputTokens": input, "outputTokens": output,
+				"cacheReadInputTokens": []int{20, 18, 24}[f.index], "cacheCreationInputTokens": []int{10, 11, 13}[f.index],
+				"thinkingTokens": []int{10, 5, 12}[f.index], "costUSD": cost}}, "total_cost_usd": cost,
+		})
+		f.index++
 	case "rereview-partial-counter":
 		if f.index == 0 {
 			f.emit(map[string]any{"type": "result", "subtype": "success", "uuid": "complete-baseline", "result_index": 0,
@@ -516,7 +538,8 @@ func (f *fixture) user(frame fixtureFrame) {
 		case "/compact":
 			f.emit(map[string]any{"type": "system", "subtype": "compact_boundary", "compact_metadata": map[string]any{"trigger": "manual"}})
 		case "clear":
-			f.emit(map[string]any{"type": "system", "subtype": "conversation_reset"})
+			f.emit(map[string]any{"type": "conversation_reset", "new_conversation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+				"uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "trigger": "clear"})
 		}
 		frameResult := map[string]any{"type": "result", "subtype": "success", "uuid": fmt.Sprintf("counter-%d", f.index),
 			"result_index": f.index, "user_message_uuid": frame.UUID, "result": text, "usage": map[string]any{"input_tokens": 3, "output_tokens": 1},

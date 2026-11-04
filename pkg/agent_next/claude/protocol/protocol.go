@@ -14,6 +14,7 @@ var ErrInvalidMessage = errors.New("invalid Claude protocol message")
 // 顶层消息类型常量集中维护 stream-json 消息与 control envelope 的判别值。
 const (
 	TypeSystem               = "system"
+	TypeConversationReset    = "conversation_reset"
 	TypeAssistant            = "assistant"
 	TypeUser                 = "user"
 	TypeResult               = "result"
@@ -196,6 +197,18 @@ type MCPServerStatus struct {
 	Status string `json:"status"`
 	// Source is the native scope or plugin origin of this MCP definition.
 	Source string `json:"source,omitempty"`
+}
+
+// ConversationResetMessage identifies a fresh conversation in the native session stream.
+type ConversationResetMessage struct {
+	// messageBase preserves the top-level discriminator and raw JSON.
+	messageBase
+	// SessionID identifies the native session carrying the reset.
+	SessionID string `json:"session_id"`
+	// UUID identifies the reset event.
+	UUID string `json:"uuid"`
+	// NewConversationID identifies the new conversation within that session.
+	NewConversationID string `json:"new_conversation_id"`
 }
 
 // SystemMessage carries native system events without dedicated message types.
@@ -626,6 +639,8 @@ func DecodeMessage(data []byte) (Message, error) {
 		default:
 			target = &SystemMessage{messageBase: base, Data: raw}
 		}
+	case TypeConversationReset:
+		target = &ConversationResetMessage{messageBase: base}
 	case TypeAssistant:
 		target = &AssistantMessage{messageBase: base}
 	case TypeUser:
