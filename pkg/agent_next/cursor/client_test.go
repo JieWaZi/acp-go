@@ -958,7 +958,7 @@ func TestCloseRetriesWithoutReleasingBlockedObserver(t *testing.T) {
 	}
 }
 
-func TestCursorStartupRejectsNativeCredentialAndPermissionOverrides(t *testing.T) {
+func TestCursorStartupRejectsOverridesOfFrozenLaunch(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -972,6 +972,9 @@ func TestCursorStartupRejectsNativeCredentialAndPermissionOverrides(t *testing.T
 		{name: "token", args: []string{"--auth-token=fixture-secret"}},
 		{name: "environment token", env: []string{"CURSOR_AUTH_TOKEN=fixture-secret"}},
 		{name: "force", args: []string{"-f"}},
+		{name: "force before print", args: []string{"-fp"}},
+		{name: "force after print", args: []string{"-pf"}},
+		{name: "combined insecure", args: []string{"-pk"}},
 		{name: "force long", args: []string{"--yolo"}},
 		{name: "auto review", args: []string{"--auto-review"}},
 		{name: "sandbox", args: []string{"--sandbox=disabled"}},
@@ -980,6 +983,13 @@ func TestCursorStartupRejectsNativeCredentialAndPermissionOverrides(t *testing.T
 		{name: "attached endpoint", args: []string{"-ehttps://example.invalid"}},
 		{name: "attached header", args: []string{"-HAuthorization: fixture-secret"}},
 		{name: "data root", args: []string{"--data-dir", "another-account"}},
+		{name: "workspace root", args: []string{"--workspace", "different-root"}},
+		{name: "additional directory", args: []string{"--add-dir=different-root"}},
+		{name: "worktree", args: []string{"--worktree=other"}},
+		{name: "short worktree", args: []string{"-wother"}},
+		{name: "combined worktree", args: []string{"-pwother"}},
+		{name: "worktree base", args: []string{"--worktree-base", "main"}},
+		{name: "plugin directory", args: []string{"--plugin-dir", "different-root"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, err := cursor.NewClient(t.Context(), cursor.Options{

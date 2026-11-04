@@ -21,7 +21,7 @@ import (
 type Options struct {
 	// Executable is the selected Cursor CLI path or command name.
 	Executable string
-	// PrefixArgs precede each Cursor subcommand. Native account and policy flags are reserved.
+	// PrefixArgs precede each Cursor subcommand. Native account, policy, and workspace flags are reserved.
 	PrefixArgs []string
 	// Environment is the complete launch environment, or nil to freeze the host environment.
 	Environment []string
@@ -90,7 +90,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	}
 	for _, arg := range options.PrefixArgs {
 		if cursorLaunchOverride(arg) {
-			return nil, invalid("Cursor launcher arguments cannot override the selected account or policy")
+			return nil, invalid("Cursor launcher arguments cannot override the selected account, policy, or workspace")
 		}
 	}
 	if options.Dashboard != nil {
@@ -175,15 +175,26 @@ func cursorLaunchOverride(arg string) bool {
 	flag, _, _ := strings.Cut(arg, "=")
 	switch flag {
 	case "--api-key", "--auth-token", "--header", "--endpoint", "--website-url", "--insecure", "--data-dir",
-		"--force", "--yolo", "--auto-review", "--sandbox", "--approve-mcps", "--trust", "-k":
+		"--force", "--yolo", "--auto-review", "--sandbox", "--approve-mcps", "--trust",
+		"--workspace", "--add-dir", "--worktree", "--worktree-base", "--skip-worktree-setup", "--plugin-dir":
 		return true
 	}
 	if len(flag) < 2 || flag[0] != '-' || flag[1] == '-' {
 		return false
 	}
-	// Cursor accepts short options with attached values and combined force flags.
-	short := strings.TrimLeft(flag[1:], "f")
-	return short == "" || strings.HasPrefix(short, "H") || strings.HasPrefix(short, "e")
+	// Cursor's Commander parser can split known boolean options in a group
+	// such as -pf. An unrecognized leading option can be wrapper syntax.
+	for _, option := range flag[1:] {
+		switch option {
+		case 'f', 'k', 'H', 'e', 'w':
+			return true
+		case 'p', 'v', 'h', 'c', 'b':
+			continue
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func envValue(env []string, key string) string {
