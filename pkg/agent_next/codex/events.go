@@ -250,7 +250,7 @@ func (c *Client) captureTerminalLocked(t *turn, native protocol.TurnElement) {
 		c.receiveItemLocked(t, item, true)
 	}
 	t.nativeStatus = string(native.Status)
-	if t.consumed == nil {
+	if t.consumed == nil && (t.previous == nil || !t.previous.disputed) {
 		t.session.usageCheckpoint = nil
 	}
 	c.orderOutcomeLocked(t)
@@ -358,10 +358,42 @@ type tokenCounters struct {
 	Context *int64 `json:"totalTokens"`
 }
 
+type tokenCheckpoint struct {
+	// total is the highest accepted cumulative sample for this boundary.
+	total *tokenCounters
+	// disputed means a regression left an interval requiring last-request proof.
+	disputed bool
+}
+
+func (t *turn) checkpoint(total *tokenCounters, disputed bool) {
+	t.previous = &tokenCheckpoint{total: total, disputed: disputed}
+	t.session.usageCheckpoint = t.previous
+	if t.usageHigh == nil || *total.Context > *t.usageHigh {
+		t.usageHigh = total.Context
+	}
+}
+
 func (t *turn) breakUsageContinuity() {
 	t.previous = nil
-	t.usageGap = true
+	t.markUsageGap()
 	t.session.usageCheckpoint = nil
+}
+
+func (t *turn) markUsageGap() {
+	t.usageGap = true
+	if t.consumed != nil && t.outcome.Turn.Usage != nil {
+		t.outcome.Turn.Usage.Coverage = t.usageCoverage()
+	}
+}
+
+func (t *turn) usageCoverage() string {
+	if !t.usageGap {
+		return "observed_turn"
+	}
+	if t.usageOnlyLast {
+		return "last_request"
+	}
+	return "observed_requests"
 }
 
 func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
@@ -369,33 +401,38 @@ func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
 	if last != nil {
 		t.outcome.ContextUsage = agentclient.ContextUsage{UsedTokens: nonnegative(last.Context), WindowTokens: nonnegative(snapshot.Window)}
 	}
-	if t.previous != nil && total != nil && countersRegressed(total, t.previous) {
-		t.usageReset = true
-		t.breakUsageContinuity()
-	}
-	if t.usageReset {
-		// A matching last request is evidence within the turn, even though
-		// its cumulative snapshot cannot be joined to the previous epoch.
-		if t.consumed == nil && last != nil {
-			c.publishUsageLocked(t, last, "last_request")
-		}
-		return
-	}
 	if total == nil || nonnegative(total.Context) == nil {
 		t.breakUsageContinuity()
-		if t.consumed == nil && last != nil {
-			c.publishUsageLocked(t, last, "last_request")
-		}
+		c.publishLastRequestLocked(t, last)
 		return
 	}
 	var delta tokenCounters
 	switch {
 	case t.previous != nil:
-		var monotonic bool
-		delta, monotonic = subtractCounters(total, t.previous)
-		if !monotonic {
-			t.usageGap = true
+		before := t.previous.total
+		if countersRegressed(total, before) {
+			// A lower report is not a new counter epoch. Keep the high
+			// water mark and avoid charging the disputed interval.
+			t.markUsageGap()
+			t.checkpoint(before, true)
+			c.publishLastRequestLocked(t, last)
+			return
 		}
+		var comparable bool
+		delta, comparable = subtractCounters(total, before)
+		if t.previous.disputed {
+			if !comparable || value(delta.Context) <= 0 {
+				return
+			}
+			if !matchesLastRequest(delta, last) {
+				// This advance provides a new floor, but not a proven
+				// turn delta. The next matching request can resume accounting.
+				t.checkpoint(total, true)
+				c.publishLastRequestLocked(t, last)
+				return
+			}
+		}
+		t.usageGap = t.usageGap || !comparable
 	case last != nil:
 		if t.usageHigh != nil && (*total.Context <= *t.usageHigh || *total.Context-*t.usageHigh < value(last.Context)) {
 			return
@@ -405,23 +442,34 @@ func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
 	default:
 		return
 	}
-	if t.usageHigh == nil || *total.Context > *t.usageHigh {
-		t.usageHigh = total.Context
-	}
-	t.previous = total
-	t.session.usageCheckpoint = total
-	if t.consumed == nil || value(delta.Context) > 0 {
-		t.usageSamples++
+	t.checkpoint(total, false)
+	if t.consumed == nil {
+		t.usageOnlyLast = matchesLastRequest(delta, last)
+	} else if value(delta.Context) > 0 {
+		t.usageOnlyLast = false
 	}
 	t.consumed = addCounters(t.consumed, delta)
-	coverage := "observed_turn"
-	if t.usageGap {
-		coverage = "observed_requests"
-		if t.usageSamples == 1 {
-			coverage = "last_request"
-		}
+	c.publishUsageLocked(t, t.consumed, t.usageCoverage())
+}
+
+func (c *Client) publishLastRequestLocked(t *turn, last *tokenCounters) {
+	// Standalone request evidence is useful until an attributable sum exists.
+	// It never participates in that sum or replaces existing evidence.
+	if t.outcome.Turn.Usage == nil && last != nil {
+		c.publishUsageLocked(t, last, "last_request")
 	}
-	c.publishUsageLocked(t, t.consumed, coverage)
+}
+
+func matchesLastRequest(delta tokenCounters, last *tokenCounters) bool {
+	if last == nil {
+		return false
+	}
+	equal := func(a, b *int64) bool {
+		return a == nil && b == nil || a != nil && b != nil && *a == *b
+	}
+	return equal(delta.Context, last.Context) && equal(delta.Input, last.Input) &&
+		equal(delta.Read, last.Read) && equal(delta.Write, last.Write) &&
+		equal(delta.Output, last.Output) && equal(delta.Reasoning, last.Reasoning)
 }
 
 func (c *Client) publishUsageLocked(t *turn, counters *tokenCounters, coverage string) {

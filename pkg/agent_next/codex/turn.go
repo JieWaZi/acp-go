@@ -95,17 +95,15 @@ type turn struct {
 	model string
 	// rerouted records that one model cannot be used for aggregate attribution.
 	rerouted bool
-	// previous is the latest trustworthy cumulative point for delta accounting.
-	previous *tokenCounters
+	// previous is the cumulative floor used for delta accounting.
+	previous *tokenCheckpoint
 	// consumed is the sum of deltas supported by turn attribution.
 	consumed *tokenCounters
 	// usageGap indicates an unscoped observation or a missing start baseline.
 	usageGap bool
-	// usageReset fences off totals after an unexplained cumulative regression.
-	usageReset bool
-	// usageSamples counts distinct attributable requests for coverage metadata.
-	usageSamples int
-	// usageHigh records the highest total sampled on the exact native turn.
+	// usageOnlyLast means the attributed sum is proven to be one request.
+	usageOnlyLast bool
+	// usageHigh keeps the total-token floor if this turn loses its cumulative boundary.
 	usageHigh *int64
 	// nativeStatus retains the actual status for provider-specific controls.
 	nativeStatus string
@@ -197,8 +195,11 @@ func (c *Client) installTurnLocked(ctx context.Context, s *session, compact, ret
 		updates: make(chan observation, maxPendingUpdates), observerDone: make(chan struct{}),
 		admission: agentclient.AdmissionNotAccepted, tools: make(map[string]acp.ToolCallStatus), toolOutput: make(map[string]string), streamed: make(map[string]int),
 		steerInputs: make(map[string]struct{}), completedMessages: make(map[string]struct{}), model: value(s.settings.Observed.Model),
-		previous: s.usageCheckpoint, usageGap: s.usageCheckpoint == nil,
+		previous: s.usageCheckpoint, usageGap: s.usageCheckpoint == nil || s.usageCheckpoint.disputed,
 		outcome: agentclient.NativeOutcome{Turn: acpmeta.NativeTurn{InvocationID: newID(), Origin: acpmeta.NativeTurnOriginHost}},
+	}
+	if t.previous != nil {
+		t.usageHigh = t.previous.total.Context
 	}
 	t.request = s.turnParams()
 	if t.request.Model != nil && *t.request.Model != t.model {
@@ -401,7 +402,7 @@ func (c *Client) finishTurn(t *turn, written frameWrite, err error) agentclient.
 	defer c.mu.Unlock()
 	if c.activeLocked(t) {
 		t.session.active = nil
-		if t.outcome.Turn.Status == "" || t.consumed == nil {
+		if t.outcome.Turn.Status == "" || t.consumed == nil && (t.previous == nil || !t.previous.disputed) {
 			t.session.usageCheckpoint = nil
 		}
 	}

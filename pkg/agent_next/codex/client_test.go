@@ -33,7 +33,7 @@ func TestAppServerFixture(t *testing.T) {
 	}
 	input := bufio.NewScanner(os.Stdin)
 	out := json.NewEncoder(os.Stdout)
-	if mode == "malformed_live" {
+	if mode == "malformed_live" || mode == "initialize_rejected_live" {
 		_ = os.WriteFile(os.Getenv("CODEX_NEXT_TRACE")+".pid", []byte(strconv.Itoa(os.Getpid())), 0600)
 	}
 	turnNumber := 0
@@ -60,6 +60,10 @@ func TestAppServerFixture(t *testing.T) {
 		}
 		switch call.Method {
 		case "initialize":
+			if mode == "initialize_rejected_live" {
+				_ = out.Encode(map[string]any{"id": call.ID, "error": map[string]any{"code": -32602, "message": "initialize rejected"}})
+				continue
+			}
 			ack(map[string]any{"userAgent": "codex/0.163.0"})
 		case "initialized":
 		case "account/read":
@@ -147,6 +151,37 @@ func TestAppServerFixture(t *testing.T) {
 			if mode == "late_steer_ack" {
 				ack(turn("inProgress"))
 				emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": "message-1", "delta": "hold"})
+				continue
+			}
+			if strings.HasPrefix(mode, "usage_dip") {
+				ack(turn("inProgress"))
+				report := func(input, read, output, lastInput int) {
+					last := map[string]any{"inputTokens": lastInput, "cachedInputTokens": 0, "outputTokens": 1, "reasoningOutputTokens": 0, "totalTokens": lastInput + 1}
+					total := map[string]any{"inputTokens": input, "cachedInputTokens": read, "outputTokens": output, "reasoningOutputTokens": 2, "totalTokens": input + output}
+					emit("thread/tokenUsage/updated", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "tokenUsage": map[string]any{"last": last, "total": total, "modelContextWindow": 100}})
+				}
+				switch turnNumber {
+				case 1:
+					emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, 19))
+				case 2:
+					dip := func() { emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, 9)) }
+					if mode == "usage_dip_terminal" {
+						report(39, 4, 8, 20)
+						dip()
+						break
+					}
+					dip()
+					if mode == "usage_dip_mismatch" {
+						report(39, 4, 8, 3)
+					} else {
+						report(39, 4, 8, 20)
+					}
+					report(41, 4, 9, 2)
+					report(41, 4, 9, 2)
+				case 3:
+					report(43, 4, 10, 2)
+				}
+				emit("turn/completed", turn("completed"))
 				continue
 			}
 			if mode == "usage_reset" {
@@ -1143,5 +1178,113 @@ func TestForegroundReceiptPagesKeepCanonicalOrderAndExactACK(t *testing.T) {
 		if o.Turn.InvocationID != expected[4+i] {
 			t.Fatalf("ACK removed another invocation: %+v", page)
 		}
+	}
+}
+
+func TestRereviewHandshakeRejectionRetiresLiveProcess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	trace := filepath.Join(dir, "trace.ndjson")
+	c, err := codex.NewClient(ctx, codex.Options{
+		Executable: os.Args[0], PrefixArgs: []string{"-test.run=^TestAppServerFixture$", "--"},
+		Environment:      append(os.Environ(), "CODEX_NEXT_FIXTURE=initialize_rejected_live", "CODEX_NEXT_TRACE="+trace),
+		WorkingDirectory: dir,
+	}, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := c.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	for range 2 {
+		_, err = c.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1})
+		var rpc *acp.RequestError
+		if !errors.As(err, &rpc) || rpc.Code != -32602 || rpc.Message != "initialize rejected" {
+			t.Fatalf("Initialize did not retain the native rejection: %v", err)
+		}
+		t.Logf("initialize error: %v", err)
+	}
+	frames, err := os.ReadFile(trace)
+	if err != nil || strings.Count(string(frames), `"method":"initialize"`) != 1 {
+		t.Fatalf("native initialization was not single-attempt: %s, %v", frames, err)
+	}
+	raw, err := os.ReadFile(trace + ".pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	defer p.Release()
+	deadline := time.After(350 * time.Millisecond)
+	for p.Signal(syscall.Signal(0)) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("permanently unusable client left its live native process running")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestRereviewUsageDipKeepsEstablishedHighWater(t *testing.T) {
+	c, ctx, session, _ := newFixture(t, "usage_dip", agentclient.HostCallbacks{})
+	first := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	if first.Outcome == nil || first.Outcome.Turn.Usage == nil {
+		t.Fatal("fixture did not establish high water")
+	}
+	second := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	if second.Outcome == nil || second.Outcome.Turn.Usage == nil {
+		t.Fatal("matching usage absent")
+	}
+	u := second.Outcome.Turn.Usage
+	if u.InputTokens == nil || u.OutputTokens == nil {
+		t.Fatalf("usage absent: %+v", u)
+	}
+	t.Logf("after valid cumulative 19→9→39→41→41, got input=%d output=%d coverage=%s complete=%t", *u.InputTokens, *u.OutputTokens, u.Coverage, u.Complete)
+	if *u.InputTokens != 22 || *u.OutputTokens != 2 || u.Coverage != "observed_requests" || u.Complete {
+		t.Fatalf("exact-turn monotonic observations above original high water discarded, duplicate fixture must not double count")
+	}
+}
+
+func TestUsageRecoverySkipsUncorroboratedAdvance(t *testing.T) {
+	c, ctx, session, _ := newFixture(t, "usage_dip_mismatch", agentclient.HostCallbacks{})
+	_ = reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	assert := func(wantInput, wantOutput int64, wantCoverage string, complete bool) {
+		t.Helper()
+		got := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+		if got.Outcome == nil || got.Outcome.Turn.Usage == nil {
+			t.Fatalf("missing usage: %+v", got)
+		}
+		u := got.Outcome.Turn.Usage
+		if u.InputTokens == nil || *u.InputTokens != wantInput || u.OutputTokens == nil || *u.OutputTokens != wantOutput ||
+			u.Coverage != wantCoverage || u.Complete != complete {
+			t.Fatalf("usage = %+v (input=%v output=%v)", u, printableReviewCount(u.InputTokens), printableReviewCount(u.OutputTokens))
+		}
+	}
+	assert(2, 1, "last_request", false)
+	assert(2, 1, "observed_turn", true)
+}
+
+func TestUsageDipAfterAttributionDowngradesCoverage(t *testing.T) {
+	c, ctx, session, _ := newFixture(t, "usage_dip_terminal", agentclient.HostCallbacks{})
+	_ = reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	got := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+	if got.Outcome == nil || got.Outcome.Turn.Usage == nil {
+		t.Fatalf("missing usage: %+v", got)
+	}
+	u := got.Outcome.Turn.Usage
+	if u.InputTokens == nil || *u.InputTokens != 20 || u.OutputTokens == nil || *u.OutputTokens != 1 ||
+		u.Coverage != "last_request" || u.Complete {
+		t.Fatalf("usage after a late dip = %+v", u)
 	}
 }

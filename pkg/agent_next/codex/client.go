@@ -243,11 +243,11 @@ func (c *Client) BindWirePeer(_ *acp.AgentSideConnection) {
 
 func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	c.mu.Lock()
-	if c.closing || c.life.Err() != nil {
+	start := c.startDone
+	if c.closing || start == nil && c.life.Err() != nil {
 		c.mu.Unlock()
 		return acp.InitializeResponse{}, errUnavailable
 	}
-	start := c.startDone
 	if start == nil {
 		start = make(chan struct{})
 		c.startDone = start
@@ -260,7 +260,12 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 		err := c.initialize(ctx, request.ClientInfo)
 		c.mu.Lock()
 		c.startErr = err
-		c.ready = err == nil && !c.closing
+		if err != nil {
+			// The process belongs to this attempt until the handshake succeeds.
+			// Publish the original failure even after retiring the transport.
+			c.fail(err)
+		}
+		c.ready = err == nil && !c.closing && c.life.Err() == nil
 		close(start)
 		c.mu.Unlock()
 	} else {

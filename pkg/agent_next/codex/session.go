@@ -81,8 +81,8 @@ type session struct {
 	inputs map[string]struct{}
 	// mcpServers stores the requested names and whether startup failure was published.
 	mcpServers map[string]bool
-	// usageCheckpoint is the most recent attributable cumulative token count.
-	usageCheckpoint *tokenCounters
+	// usageCheckpoint keeps the cumulative floor and whether it needs corroboration.
+	usageCheckpoint *tokenCheckpoint
 }
 
 func OpenSettingsMetadata(settings OpenSettings) map[string]any {
