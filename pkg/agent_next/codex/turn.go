@@ -345,10 +345,15 @@ func (c *Client) bindTurnLocked(t *turn, id string) {
 	c.rememberTurnLocked(t.session.id, id)
 	t.outcome.Turn.NativeTurnID = pointer(id)
 	t.admission = agentclient.AdmissionConfirmed
-	if t.writing && !t.compact && t.request.ServiceTier.IsPresent() && t.tierRevision == t.session.tierRevision {
-		// Admission supplies inheritance evidence only. The effective tier is
-		// still unknown until Codex reports it.
-		t.session.inheritedTier, _ = t.request.ServiceTier.Value()
+	if t.writing && !t.compact {
+		if model := value(t.request.Model); model != "" {
+			t.session.admittedModel = model
+		}
+		if t.request.ServiceTier.IsPresent() && t.tierRevision == t.session.tierRevision {
+			// Admission supplies inheritance evidence only. The effective tier is
+			// still unknown until Codex reports it.
+			t.session.inheritedTier, _ = t.request.ServiceTier.Value()
+		}
 	}
 	if t.input.NativeInputID != nil {
 		t.outcome.Turn.ConsumedInputIDs = append(t.outcome.Turn.ConsumedInputIDs, *t.input.NativeInputID)

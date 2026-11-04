@@ -69,8 +69,12 @@ type session struct {
 	mode acp.SessionModeId
 	// settings contains local intent and independent native settings receipts.
 	settings SessionSettings
-	// clearTier carries the native reset until a turn accepts the model transition.
-	clearTier bool
+	// admittedModel identifies the most recent native open or accepted model selection.
+	admittedModel string
+	// inheritedTier is the last reported tier or an admitted explicit override when no newer report exists.
+	inheritedTier string
+	// tierRevision orders native tier reports against an in-flight turn submission.
+	tierRevision uint64
 	// models is the catalog frozen when the session opened.
 	models []protocol.ModelListResponseDatum
 	// busy covers configuration, history replay, fork, and archive while active is nil.
@@ -254,19 +258,22 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 	if err := c.checkAccount(ctx); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
-	config, err := c.openConfig(ctx, roots, input.servers, intent)
-	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-	models, err := c.readModelPages(ctx)
-	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
 	mode := acp.SessionModeId(intent.Mode)
 	if mode == "" {
 		mode = "agent"
 	}
 	approval, sandbox, _ := codexModePolicy(mode, roots[1:])
+	config, err := c.openConfig(ctx, roots, input.servers, intent)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
+	if sandbox == "workspace-write" {
+		config["sandbox_workspace_write.network_access"] = json.RawMessage("false")
+	}
+	models, err := c.readModelPages(ctx)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
 	params := map[string]any{"cwd": input.cwd, "config": config, "approvalPolicy": approval, "sandbox": sandbox}
 	if instructions != nil {
 		params["developerInstructions"] = *instructions
@@ -300,6 +307,8 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 	}
 	s := &session{cwd: input.cwd, roots: roots[1:], mode: mode, models: models, busy: true,
 		settings: SessionSettings{Requested: intent}, inputs: make(map[string]struct{}), mcpServers: make(map[string]bool)}
+	s.admittedModel = value(intent.Model)
+	s.inheritedTier, _ = intent.ServiceTier.Value()
 	for key := range config {
 		if name, ok := strings.CutPrefix(key, "mcp_servers."); ok && name != "" {
 			s.mcpServers[name] = false
@@ -344,6 +353,9 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 			s.skillRoots = slices.Clone(c.skillRoots)
 			c.sessions[nativeID] = s
 			installed = true
+			if opened.Model != "" {
+				s.admittedModel = opened.Model
+			}
 			s.observe(strings.ReplaceAll(method, "/", "_"), opened.Model, opened.Effort, opened.Tier)
 			if opened.Cwd != "" && filepath.Clean(opened.Cwd) != input.cwd {
 				captureErr = errors.New("Codex opened an unexpected working directory")
@@ -474,6 +486,10 @@ func (s *session) observe(source, model string, effort *string, tier protocol.Op
 	if model != "" {
 		s.settings.Observed.Model = pointer(model)
 	}
+	if tier.IsPresent() {
+		s.inheritedTier, _ = tier.Value()
+		s.tierRevision++
+	}
 }
 
 func (s *session) turnParams() protocol.TurnStartParams {
@@ -481,8 +497,12 @@ func (s *session) turnParams() protocol.TurnStartParams {
 		ThreadID: string(s.id), Cwd: pointer(s.cwd), Model: s.settings.Requested.Model, Effort: s.settings.Requested.ReasoningEffort,
 		ServiceTier: s.settings.Requested.ServiceTier,
 	}
-	if s.clearTier && !p.ServiceTier.IsPresent() {
-		p.ServiceTier = protocol.NewOptionalNull[string]()
+	if value(p.Model) != s.admittedModel && s.inheritedTier != "" && !p.ServiceTier.IsPresent() {
+		// Codex keeps the thread's tier when omitted. Reset only a tier known
+		// to be incompatible with the next model, leaving the host intent unset.
+		if target := lookupModel(s.models, value(p.Model)); target != nil && !supportsTier(target, s.inheritedTier) {
+			p.ServiceTier = protocol.NewOptionalNull[string]()
+		}
 	}
 	approval, _, sandbox := codexModePolicy(s.mode, s.roots)
 	p.ApprovalPolicy = &protocol.ApprovalPolicy{Enum: &approval}
@@ -939,17 +959,6 @@ func (c *Client) ConfigureTurn(_ context.Context, id acp.SessionId, model, effor
 		} else {
 			settings.ServiceTier = protocol.NewOptionalNull[string]()
 		}
-	}
-	if fast != nil {
-		s.clearTier = false
-	} else if target != s.currentModel() {
-		tier, requested := s.settings.Requested.ServiceTier.Value()
-		if !requested {
-			tier, _ = s.settings.Observed.ServiceTier.Value()
-		}
-		// Codex retains an omitted tier on the thread. Clear an incompatible tier
-		// on model transition without changing the host's unset Fast preference.
-		s.clearTier = tier != "" && !supportsTier(catalog, tier)
 	}
 	s.settings.Requested = settings
 	return s.configOptions(), nil

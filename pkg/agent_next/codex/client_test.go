@@ -36,7 +36,7 @@ func TestAppServerFixture(t *testing.T) {
 	if mode == "malformed_live" || mode == "initialize_rejected_live" {
 		_ = os.WriteFile(os.Getenv("CODEX_NEXT_TRACE")+".pid", []byte(strconv.Itoa(os.Getpid())), 0600)
 	}
-	turnNumber := 0
+	turnNumber, catalogReads := 0, 0
 	archived := true
 	nativeTurn := "turn-0"
 	for input.Scan() {
@@ -91,6 +91,20 @@ func TestAppServerFixture(t *testing.T) {
 		case "config/read":
 			ack(map[string]any{"config": map[string]any{}})
 		case "model/list":
+			if mode == "catalog_data" {
+				catalogReads++
+				switch catalogReads {
+				case 2, 5:
+					ack(map[string]any{})
+				case 3:
+					ack(map[string]any{"data": nil})
+				case 4:
+					ack(map[string]any{"data": []any{map[string]any{"model": "partial"}}, "nextCursor": "second"})
+				default:
+					ack(map[string]any{"data": []any{}})
+				}
+				continue
+			}
 			if mode == "management" || mode == "settings_transition" {
 				if call.Params["cursor"] == nil {
 					ack(map[string]any{"data": []any{map[string]any{"id": "internal-a", "model": "actual-model", "displayName": "Model A", "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "medium"}, map[string]any{"reasoningEffort": "high"}}, "serviceTiers": []any{map[string]any{"id": "priority-a", "name": "Fast"}}}}, "nextCursor": "second"})
@@ -147,6 +161,10 @@ func TestAppServerFixture(t *testing.T) {
 		case "turn/start":
 			turnNumber++
 			nativeTurn = fmt.Sprintf("turn-%d", turnNumber)
+			if mode == "settings_transition" && turnNumber == 3 {
+				emit("thread/settings/updated", map[string]any{"threadId": "thread-1",
+					"threadSettings": map[string]any{"model": "standard", "serviceTier": "default"}})
+			}
 			if mode == "message_reconciliation" {
 				ack(turn("inProgress"))
 				for _, test := range reconciliationCases {
@@ -361,7 +379,12 @@ func newFixture(t *testing.T, mode string, host agentclient.HostCallbacks) (*cod
 	t.Cleanup(cancel)
 	dir := t.TempDir()
 	trace := filepath.Join(dir, "trace.ndjson")
+	var config map[string]json.RawMessage
+	if mode == "workspace_network_enabled" {
+		config = map[string]json.RawMessage{"sandbox_workspace_write.network_access": json.RawMessage("true")}
+	}
 	client, err := codex.NewClient(ctx, codex.Options{
+		ConfigOverrides:  config,
 		Executable:       os.Args[0],
 		PrefixArgs:       []string{"-test.run=^TestAppServerFixture$", "--"},
 		Environment:      append(os.Environ(), "CODEX_NEXT_FIXTURE="+mode, "CODEX_NEXT_TRACE="+trace),
@@ -1464,7 +1487,7 @@ func TestCodexPermissionModeKeepsThreadAndTurnPoliciesAligned(t *testing.T) {
 		{"agent-full-access", "danger-full-access", "dangerFullAccess", "never"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
-			c, ctx, id, trace := newFixture(t, "normal", agentclient.HostCallbacks{})
+			c, ctx, id, trace := newFixture(t, "workspace_network_enabled", agentclient.HostCallbacks{})
 			if _, err := c.CloseSession(ctx, acp.CloseSessionRequest{SessionId: id}); err != nil {
 				t.Fatal(err)
 			}
@@ -1477,12 +1500,19 @@ func TestCodexPermissionModeKeepsThreadAndTurnPoliciesAligned(t *testing.T) {
 			if result.Outcome == nil || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
 				t.Fatalf("turn did not complete: %+v", result)
 			}
+			if _, err := c.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: session.SessionId, Cwd: filepath.Dir(trace),
+				Meta: codex.OpenSettingsMetadata(codex.OpenSettings{Mode: tc.mode})}); err != nil {
+				t.Fatal(err)
+			}
 			file, err := os.Open(trace)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer file.Close()
-			var opened, prompted map[string]any
+			var opened, resumed, prompted map[string]any
 			scanner := bufio.NewScanner(file)
 			for scanner.Scan() {
 				var frame struct {
@@ -1497,14 +1527,27 @@ func TestCodexPermissionModeKeepsThreadAndTurnPoliciesAligned(t *testing.T) {
 				switch frame.Method {
 				case "thread/start":
 					opened = frame.Params
+				case "thread/resume":
+					resumed = frame.Params
 				case "turn/start":
 					prompted = frame.Params
 				}
 			}
 			sandbox, _ := prompted["sandboxPolicy"].(map[string]any)
-			if opened["sandbox"] != tc.openSandbox || opened["approvalPolicy"] != tc.approval ||
-				sandbox["type"] != tc.turnSandbox || prompted["approvalPolicy"] != tc.approval {
-				t.Fatalf("thread and turn policies diverged: open=%v turn=%v", opened, prompted)
+			for _, params := range []map[string]any{opened, resumed} {
+				if params["sandbox"] != tc.openSandbox || params["approvalPolicy"] != tc.approval {
+					t.Fatalf("thread policy diverged: %v", params)
+				}
+				if tc.mode == "agent" {
+					config, _ := params["config"].(map[string]any)
+					if config["sandbox_workspace_write.network_access"] != false {
+						t.Fatalf("workspace thread inherits network access: %v", params)
+					}
+				}
+			}
+			if sandbox["type"] != tc.turnSandbox || prompted["approvalPolicy"] != tc.approval ||
+				tc.mode != "agent-full-access" && sandbox["networkAccess"] != false {
+				t.Fatalf("turn policy diverged: %v", prompted)
 			}
 		})
 	}
@@ -1512,7 +1555,7 @@ func TestCodexPermissionModeKeepsThreadAndTurnPoliciesAligned(t *testing.T) {
 
 func TestCodexModelTransitionClearsIncompatibleTierOnWire(t *testing.T) {
 	c, ctx, session, trace := newFixture(t, "settings_transition", agentclient.HostCallbacks{})
-	on := true
+	on, off := true, false
 	if _, err := c.ConfigureTurn(ctx, session, "actual-model", "high", &on); err != nil {
 		t.Fatal(err)
 	}
@@ -1523,11 +1566,25 @@ func TestCodexModelTransitionClearsIncompatibleTierOnWire(t *testing.T) {
 		}
 	}
 	prompt()
+	if _, err := c.ConfigureTurn(ctx, session, "actual-model", "", &off); err != nil {
+		t.Fatal(err)
+	}
+	refused := errors.New("admission refused")
+	rejected := reserve(t, c, ctx, session, agentclient.PromptOptions{
+		BeforeSubmit: func(context.Context, agentclient.PromptSubmission) error { return refused },
+	})()
+	if rejected.Receipt.Submission != agentclient.SubmissionNotSent || !errors.Is(rejected.Receipt.OperationError, refused) {
+		t.Fatalf("fixture failed to reject the attempted Fast disable: %+v", rejected)
+	}
+	if _, err := c.ConfigureTurn(ctx, session, "actual-model", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	prompt()
 	if _, err := c.ConfigureTurn(ctx, session, "standard", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	settings, err := c.ReadSessionSettings(ctx, session)
-	if err != nil || settings.Requested.ServiceTier.IsPresent() {
+	if err != nil || settings.Requested.ServiceTier.IsPresent() || settings.Observed.ServiceTier.IsPresent() {
 		t.Fatalf("wire compatibility changed the host intent: %+v %v", settings, err)
 	}
 	prompt()
@@ -1548,7 +1605,19 @@ func TestCodexModelTransitionClearsIncompatibleTierOnWire(t *testing.T) {
 			tierFrames = append(tierFrames, frame.Params["serviceTier"])
 		}
 	}
-	if len(tierFrames) != 3 || string(tierFrames[0]) != `"priority-a"` || string(tierFrames[1]) != "null" || tierFrames[2] != nil {
+	if len(tierFrames) != 4 || string(tierFrames[0]) != `"priority-a"` || tierFrames[1] != nil || string(tierFrames[2]) != "null" || tierFrames[3] != nil {
 		t.Fatalf("tier leaked across models or reset was repeated: %s", data)
+	}
+}
+
+func TestCodexRejectsMissingOrNullCatalogDataWithoutPublishingPartialPages(t *testing.T) {
+	c, ctx, _, _ := newFixture(t, "catalog_data", agentclient.HostCallbacks{})
+	for _, failure := range []string{"missing first page data", "null first page data", "missing later page data"} {
+		if catalog, err := c.ReadModels(ctx); err == nil || catalog.Options.Ungrouped != nil {
+			t.Fatalf("%s published a catalog: %+v, %v", failure, catalog, err)
+		}
+	}
+	if catalog, err := c.ReadModels(ctx); err != nil || catalog.Options.Ungrouped == nil || len(*catalog.Options.Ungrouped) != 0 {
+		t.Fatalf("explicit empty catalog was not accepted: %+v, %v", catalog, err)
 	}
 }

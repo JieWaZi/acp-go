@@ -35,6 +35,9 @@ func (c *Client) readModelPages(ctx context.Context) ([]protocol.ModelListRespon
 		if err := c.request(ctx, "model/list", params, &reply); err != nil {
 			return nil, err
 		}
+		if reply.Data == nil {
+			return nil, errors.New("Codex model catalog response omitted the data array")
+		}
 		for _, model := range reply.Data {
 			id := modelID(model)
 			if id != "" && !seenIDs[id] {
