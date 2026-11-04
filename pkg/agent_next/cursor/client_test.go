@@ -65,7 +65,7 @@ func TestCursorFixture(t *testing.T) {
 		case "status-invalid":
 			_, _ = fmt.Fprintln(os.Stdout, `{"accessToken":"fixture-secret"}`)
 		default:
-			_, _ = fmt.Fprintln(os.Stdout, `{"isAuthenticated":true,"userInfo":{"email":"cursor@example.invalid","userId":"native-id"},"accessToken":"fixture-secret"}`)
+			_, _ = fmt.Fprintln(os.Stdout, `{"isAuthenticated":true,"userInfo":{"email":"cursor@example.invalid","userId":2147483201},"accessToken":"fixture-secret"}`)
 		}
 		os.Exit(0)
 	}
@@ -1083,7 +1083,7 @@ func TestReadAccountUsesNativeLoginWithoutACPOrDashboard(t *testing.T) {
 			wantCommands := "status\n"
 			if tc.signedIn {
 				status, err := client.ReadLoginStatus(ctx)
-				if err != nil || !status.Authenticated || status.UserID != "native-id" {
+				if err != nil || !status.Authenticated || status.UserID != "2147483201" {
 					t.Fatalf("native login identity = %+v, %v", status, err)
 				}
 				wantCommands += "status\n"
@@ -1107,6 +1107,8 @@ func TestDashboardReadsOnlyBoundDefaultCredential(t *testing.T) {
 			return
 		}
 		switch filepath.Base(r.URL.Path) {
+		case "GetMe":
+			_, _ = io.WriteString(w, `{"userId":2147483201}`)
 		case "GetCurrentPeriodUsage":
 			_, _ = io.WriteString(w, `{"billingCycleStart":"1000","billingCycleEnd":"3000","planUsage":{"autoPercentUsed":11,"apiPercentUsed":22,"totalPercentUsed":0}}`)
 		case "GetPlanInfo":
@@ -1117,7 +1119,7 @@ func TestDashboardReadsOnlyBoundDefaultCredential(t *testing.T) {
 	}))
 	defer server.Close()
 	selection := cursor.CredentialSelection{Source: cursor.DefaultLogin, ID: "bound"}
-	dashboard := cursor.Dashboard{Endpoint: server.URL, Credential: func(_ context.Context, binding cursor.CredentialSelection) (cursor.DashboardCredential, error) {
+	dashboard := cursor.Dashboard{Endpoint: server.URL, ExpectedUserID: "2147483201", Credential: func(_ context.Context, binding cursor.CredentialSelection) (cursor.DashboardCredential, error) {
 		if binding != selection {
 			t.Fatalf("unexpected quota binding: %#v", binding)
 		}
@@ -1132,14 +1134,14 @@ func TestDashboardReadsOnlyBoundDefaultCredential(t *testing.T) {
 	}
 	window := got.Buckets[0].Windows[0]
 	if window.UsedPercent == nil || *window.UsedPercent != 0 || window.ResetAtUnixSeconds == nil || *window.ResetAtUnixSeconds != 3 ||
-		window.DurationSeconds == nil || *window.DurationSeconds != 2 || calls.Load() != 2 {
+		window.DurationSeconds == nil || *window.DurationSeconds != 2 || calls.Load() != 3 {
 		t.Fatalf("quota window = %#v, calls %d", window, calls.Load())
 	}
 	api, apiCtx, _ := candidate(t, "", agentclient.HostCallbacks{}, func(o *cursor.Options) {
 		o.Environment = append(o.Environment, "CURSOR_API_KEY=explicit-key")
 		o.Dashboard, o.Credential = &dashboard, selection
 	})
-	if _, err := api.ReadAccountUsage(apiCtx); err == nil || calls.Load() != 2 {
+	if _, err := api.ReadAccountUsage(apiCtx); err == nil || calls.Load() != 3 {
 		t.Fatalf("API-key selection used a default login: %v, calls %d", err, calls.Load())
 	}
 
@@ -1184,7 +1186,8 @@ func TestDashboardDefaultOriginIgnoresCLIEnvironment(t *testing.T) {
 	client, err := cursor.NewClient(ctx, cursor.Options{
 		Executable: executable, Environment: []string{"CURSOR_API_ENDPOINT=http://127.0.0.1:1"}, Credential: selection,
 		Dashboard: &cursor.Dashboard{
-			HTTPClient: &http.Client{Transport: transport},
+			ExpectedUserID: "2147483201",
+			HTTPClient:     &http.Client{Transport: transport},
 			Credential: func(context.Context, cursor.CredentialSelection) (cursor.DashboardCredential, error) {
 				return cursor.DashboardCredential{Selection: selection, AccessToken: "synthetic"}, nil
 			},
@@ -1219,7 +1222,8 @@ func TestDashboardCloseWaitsForAdmittedCredentialRead(t *testing.T) {
 	client, err := cursor.NewClient(ctx, cursor.Options{
 		Executable: executable, Environment: []string{}, Credential: selection,
 		Dashboard: &cursor.Dashboard{
-			Endpoint: "http://127.0.0.1:1",
+			ExpectedUserID: "2147483201",
+			Endpoint:       "http://127.0.0.1:1",
 			Credential: func(ctx context.Context, _ cursor.CredentialSelection) (cursor.DashboardCredential, error) {
 				if calls.Add(1) == 1 {
 					close(entered)
@@ -1584,6 +1588,50 @@ func TestFamilyClosureKnownInvocationScopesArePreserved(t *testing.T) {
 			}
 			checkTokenCount(t, u.InputTokens, 8)
 			checkTokenCount(t, u.OutputTokens, 5)
+		})
+	}
+}
+
+func TestDashboardRejectsCredentialFromAnotherNativeAccount(t *testing.T) {
+	for _, body := range []string{"{\"userId\":78}", "{\"userId\":0}", "{}"} {
+		t.Run(body, func(t *testing.T) {
+			var identityReads, quotaReads atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch filepath.Base(r.URL.Path) {
+				case "GetMe":
+					identityReads.Add(1)
+					if r.Header.Get("Authorization") != "Bearer unbound-token" {
+						t.Error("identity probe used a different token")
+					}
+					_, _ = io.WriteString(w, body)
+				default:
+					quotaReads.Add(1)
+					_, _ = io.WriteString(w, "{\"planUsage\":{\"totalPercentUsed\":42}}")
+				}
+			}))
+			defer server.Close()
+			binary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			selection := cursor.CredentialSelection{Source: cursor.DefaultLogin, ID: "host-binding"}
+			client, err := cursor.NewClient(t.Context(), cursor.Options{
+				Executable: binary, Environment: []string{}, Credential: selection,
+				Dashboard: &cursor.Dashboard{
+					Endpoint: server.URL, ExpectedUserID: "77",
+					Credential: func(context.Context, cursor.CredentialSelection) (cursor.DashboardCredential, error) {
+						return cursor.DashboardCredential{Selection: selection, AccessToken: "unbound-token"}, nil
+					},
+				},
+			}, agentclient.HostCallbacks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = client.Close(t.Context()) }()
+			usage, err := client.ReadAccountUsage(t.Context())
+			if !errors.Is(err, cursor.ErrQuotaCredential) || len(usage.Buckets) != 0 || identityReads.Load() != 1 || quotaReads.Load() != 0 {
+				t.Fatalf("unproven token read quota: error=%v, identity calls=%d, quota calls=%d", err, identityReads.Load(), quotaReads.Load())
+			}
 		})
 	}
 }

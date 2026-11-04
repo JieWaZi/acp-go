@@ -46,7 +46,7 @@ type CredentialSelection struct {
 	ID string
 }
 
-// DashboardCredential identifies the exact verified native login and token.
+// DashboardCredential supplies a token for the host-selected login. Dashboard verifies its user.
 type DashboardCredential struct {
 	// Selection must match the requested host binding.
 	Selection CredentialSelection
@@ -59,6 +59,8 @@ type Dashboard struct {
 	// Endpoint is the explicitly trusted Dashboard HTTPS or loopback endpoint.
 	// An empty value uses Cursor's default independently of the CLI environment.
 	Endpoint string
+	// ExpectedUserID is the verified native status user required for quota reads.
+	ExpectedUserID string
 	// HTTPClient provides optional caller-owned transport.
 	HTTPClient *http.Client
 	// Credential resolves exactly the requested login without ambient fallback.
@@ -240,8 +242,8 @@ func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
 		Authenticated *bool `json:"isAuthenticated"`
 		// UserInfo identifies a locally signed-in account when available.
 		UserInfo struct {
-			// UserID is Cursor's stable native user ID.
-			UserID string `json:"userId"`
+			// UserID is the native GetMeResponse user_id, serialized as an int32.
+			UserID json.Number `json:"userId"`
 			// Email is the native label displayed by account consumers.
 			Email string `json:"email"`
 		} `json:"userInfo"`
@@ -254,12 +256,12 @@ func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
 	}
 	return LoginStatus{
 		Authenticated: true,
-		UserID:        strings.TrimSpace(status.UserInfo.UserID),
+		UserID:        cursorUserID(status.UserInfo.UserID),
 		Email:         strings.TrimSpace(status.UserInfo.Email),
 	}, nil
 }
 
-// ReadAccount projects the locally signed-in account without consulting Dashboard.
+// ReadAccount projects native status independently of the quota reader.
 func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return acpmeta.AccountInfo{}, err
@@ -326,7 +328,8 @@ func (c *Client) finishQuotaRead() {
 
 func (d Dashboard) read(ctx context.Context, selection CredentialSelection) (acpmeta.AccountUsage, error) {
 	var usage acpmeta.AccountUsage
-	if selection.Source != DefaultLogin || selection.ID == "" || d.Credential == nil {
+	expectedUser := cursorUserID(json.Number(d.ExpectedUserID))
+	if selection.Source != DefaultLogin || selection.ID == "" || d.Credential == nil || expectedUser == "" {
 		return usage, ErrQuotaCredential
 	}
 	endpoint := strings.TrimRight(strings.TrimSpace(d.Endpoint), "/")
@@ -362,6 +365,7 @@ func (d Dashboard) read(ctx context.Context, selection CredentialSelection) (acp
 		}
 		request.Header.Set("Authorization", "Bearer "+credential.AccessToken)
 		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Connect-Protocol-Version", "1")
 		response, err := noRedirect.Do(request)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -381,6 +385,18 @@ func (d Dashboard) read(ctx context.Context, selection CredentialSelection) (acp
 			return errors.New("Cursor Dashboard response is invalid")
 		}
 		return nil
+	}
+	// Native status copies GetMeResponse.userId. Verify that same identity
+	// with the exact bearer that will read the quota, even on the first use.
+	var identity struct {
+		// UserID identifies the bearer account independently of its label or plan.
+		UserID json.Number `json:"userId"`
+	}
+	if err := post("GetMe", &identity); err != nil {
+		return usage, err
+	}
+	if cursorUserID(identity.UserID) != expectedUser {
+		return usage, ErrQuotaCredential
 	}
 	var period struct {
 		// Start and End are Connect JSON int64 values, in milliseconds.
@@ -430,6 +446,14 @@ func (d Dashboard) read(ctx context.Context, selection CredentialSelection) (acp
 		usage.Buckets = []acpmeta.AccountUsageBucket{{ID: "cursor", Windows: windows}}
 	}
 	return usage, nil
+}
+
+func cursorUserID(value json.Number) string {
+	id, err := strconv.ParseUint(string(value), 10, 31)
+	if err != nil || id == 0 {
+		return ""
+	}
+	return strconv.FormatUint(id, 10)
 }
 
 func dashboardMillis(raw json.RawMessage) *int64 {
