@@ -7,7 +7,7 @@ import (
 
 const turnUsageKey = "acp-go/turn-usage"
 
-// TurnUsage 是当前 Prompt 的累计消费快照；可空字段区分未知与已报告零。
+// TurnUsage is a replaceable invocation snapshot with independent token and valuation evidence.
 type TurnUsage struct {
 	// InputTokens 是不含缓存读写的输入 token 数。
 	InputTokens *int64 `json:"inputTokens,omitempty"`
@@ -31,6 +31,25 @@ type TurnUsage struct {
 	Model string `json:"model,omitempty"`
 	// Cost is independent of token coverage and is absent without a reliable valuation.
 	Cost *UsageCost `json:"cost,omitempty"`
+	// Models attributes the same totals to models. It is not additional usage.
+	// Nil is unknown; an empty map is a known empty attribution.
+	Models map[string]ModelUsage `json:"models,omitempty"`
+}
+
+// ModelUsage attributes known counters and cost to one native model.
+type ModelUsage struct {
+	// InputTokens counts uncached input.
+	InputTokens *int64 `json:"inputTokens,omitempty"`
+	// CacheReadTokens counts input read from cache.
+	CacheReadTokens *int64 `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens counts input written to cache.
+	CacheWriteTokens *int64 `json:"cacheWriteTokens,omitempty"`
+	// OutputTokens includes any separately reported reasoning tokens.
+	OutputTokens *int64 `json:"outputTokens,omitempty"`
+	// ReasoningTokens is an optional subset of output.
+	ReasoningTokens *int64 `json:"reasoningTokens,omitempty"`
+	// Cost describes only this model, independently of known token components.
+	Cost *UsageCost `json:"cost,omitempty"`
 }
 
 // UsageCost describes an independently measured or estimated monetary amount.
@@ -49,6 +68,7 @@ type UsageCost struct {
 	Valuation string `json:"valuation"`
 }
 
+// valid checks valuation metadata and rejects invalid monetary numbers.
 func (c UsageCost) valid() bool {
 	if c.Currency == "" || c.Source == "" || c.Scope == "" || c.Aggregation == "" || c.Valuation == "" {
 		return false
@@ -61,37 +81,33 @@ func (c UsageCost) valid() bool {
 	return err == nil && c.Amount != ""
 }
 
-// WithTurnUsage 克隆元数据并写入可替换快照，不修改调用方的元数据。
+// WithTurnUsage copies metadata and writes independent invocation consumption evidence.
 func WithTurnUsage(meta map[string]any, usage TurnUsage) map[string]any {
-	result := make(map[string]any, len(meta)+1)
-	for key, value := range meta {
-		result[key] = value
-	}
-	value := map[string]any{"source": usage.Source, "complete": usage.Complete, "contextKnown": usage.ContextKnown}
-	fields := map[string]*int64{"inputTokens": usage.InputTokens, "cacheReadTokens": usage.CacheReadTokens, "cacheWriteTokens": usage.CacheWriteTokens, "outputTokens": usage.OutputTokens, "reasoningTokens": usage.ReasoningTokens}
-	for key, counter := range fields {
-		if counter != nil {
-			value[key] = *counter
-		}
-	}
+	result := copyMetadata(meta)
+	value := encodeUsageCounters(ModelUsage{
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
+		CacheReadTokens: usage.CacheReadTokens, CacheWriteTokens: usage.CacheWriteTokens,
+		ReasoningTokens: usage.ReasoningTokens, Cost: usage.Cost,
+	})
+	value["source"], value["complete"], value["contextKnown"] = usage.Source, usage.Complete, usage.ContextKnown
 	if usage.Coverage != "" {
 		value["coverage"] = usage.Coverage
 	}
 	if usage.Model != "" {
 		value["model"] = usage.Model
 	}
-	if usage.Cost != nil && usage.Cost.valid() {
-		c := *usage.Cost
-		value["cost"] = map[string]any{
-			"amount": c.Amount.String(), "currency": c.Currency, "source": c.Source,
-			"scope": c.Scope, "aggregation": c.Aggregation, "valuation": c.Valuation,
+	if usage.Models != nil {
+		models := make(map[string]any, len(usage.Models))
+		for id, model := range usage.Models {
+			models[id] = encodeUsageCounters(model)
 		}
+		value["models"] = models
 	}
 	result[turnUsageKey] = value
 	return result
 }
 
-// ReadTurnUsage 读取直接或 JSON 往返的快照；拒绝负数、分数与不安全浮点整数。
+// ReadTurnUsage decodes invocation evidence before or after an ACP JSON round trip.
 func ReadTurnUsage(meta map[string]any) (TurnUsage, bool) {
 	value, ok := meta[turnUsageKey].(map[string]any)
 	if !ok {
@@ -100,19 +116,15 @@ func ReadTurnUsage(meta map[string]any) (TurnUsage, bool) {
 	source, sourceOK := value["source"].(string)
 	complete, completeOK := value["complete"].(bool)
 	contextKnown, contextOK := value["contextKnown"].(bool)
-	if !sourceOK || source == "" || !completeOK || !contextOK {
+	counters, countersOK := decodeUsageCounters(value)
+	if !sourceOK || source == "" || !completeOK || !contextOK || !countersOK {
 		return TurnUsage{}, false
 	}
-	result := TurnUsage{Source: source, Complete: complete, ContextKnown: contextKnown}
-	targets := map[string]**int64{"inputTokens": &result.InputTokens, "cacheReadTokens": &result.CacheReadTokens, "cacheWriteTokens": &result.CacheWriteTokens, "outputTokens": &result.OutputTokens, "reasoningTokens": &result.ReasoningTokens}
-	for key, target := range targets {
-		if raw, exists := value[key]; exists && raw != nil {
-			counter, valid := usageInteger(raw)
-			if !valid {
-				return TurnUsage{}, false
-			}
-			*target = &counter
-		}
+	result := TurnUsage{
+		Source: source, Complete: complete, ContextKnown: contextKnown,
+		InputTokens: counters.InputTokens, OutputTokens: counters.OutputTokens,
+		CacheReadTokens: counters.CacheReadTokens, CacheWriteTokens: counters.CacheWriteTokens,
+		ReasoningTokens: counters.ReasoningTokens, Cost: counters.Cost,
 	}
 	if coverage, exists := value["coverage"]; exists {
 		var valid bool
@@ -128,11 +140,69 @@ func ReadTurnUsage(meta map[string]any) (TurnUsage, bool) {
 			return TurnUsage{}, false
 		}
 	}
+	if raw, exists := value["models"]; exists {
+		models, ok := raw.(map[string]any)
+		if !ok {
+			return TurnUsage{}, false
+		}
+		result.Models = make(map[string]ModelUsage, len(models))
+		for id, rawModel := range models {
+			model, object := rawModel.(map[string]any)
+			detail, valid := decodeUsageCounters(model)
+			if id == "" || !object || !valid {
+				return TurnUsage{}, false
+			}
+			result.Models[id] = detail
+		}
+	}
+	return result, true
+}
+
+// encodeUsageCounters shares the precise token and cost encoding between totals and attribution.
+func encodeUsageCounters(usage ModelUsage) map[string]any {
+	value := make(map[string]any)
+	fields := map[string]*int64{
+		"inputTokens": usage.InputTokens, "cacheReadTokens": usage.CacheReadTokens,
+		"cacheWriteTokens": usage.CacheWriteTokens, "outputTokens": usage.OutputTokens,
+		"reasoningTokens": usage.ReasoningTokens,
+	}
+	for key, counter := range fields {
+		if counter != nil {
+			value[key] = *counter
+		}
+	}
+	if usage.Cost != nil && usage.Cost.valid() {
+		c := *usage.Cost
+		value["cost"] = map[string]any{
+			"amount": c.Amount.String(), "currency": c.Currency, "source": c.Source,
+			"scope": c.Scope, "aggregation": c.Aggregation, "valuation": c.Valuation,
+		}
+	}
+	return value
+}
+
+// decodeUsageCounters validates optional counters without coercing unknown values to zero.
+func decodeUsageCounters(value map[string]any) (ModelUsage, bool) {
+	var result ModelUsage
+	targets := map[string]**int64{
+		"inputTokens": &result.InputTokens, "cacheReadTokens": &result.CacheReadTokens,
+		"cacheWriteTokens": &result.CacheWriteTokens, "outputTokens": &result.OutputTokens,
+		"reasoningTokens": &result.ReasoningTokens,
+	}
+	for key, target := range targets {
+		if raw, exists := value[key]; exists && raw != nil {
+			counter, valid := usageInteger(raw)
+			if !valid {
+				return ModelUsage{}, false
+			}
+			*target = &counter
+		}
+	}
 	if raw, exists := value["cost"]; exists {
 		data, err := json.Marshal(raw)
 		var cost UsageCost
 		if err != nil || json.Unmarshal(data, &cost) != nil || !cost.valid() {
-			return TurnUsage{}, false
+			return ModelUsage{}, false
 		}
 		result.Cost = &cost
 	}

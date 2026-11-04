@@ -129,6 +129,7 @@ func ReadNativeBackground(meta map[string]any) (NativeBackground, bool) {
 	return NativeBackground{}, true
 }
 
+// copyMetadata copies the metadata envelope before replacing an owned namespace.
 func copyMetadata(meta map[string]any) map[string]any {
 	result := make(map[string]any, len(meta)+1)
 	for key, value := range meta {

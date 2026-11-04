@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// TestNativeTurnMetadataRoundTripPreservesIndependentCost checks ACP serialization and snapshot independence.
 func TestNativeTurnMetadataRoundTripPreservesIndependentCost(t *testing.T) {
 	input := int64(21)
 	event := "result-event"
@@ -14,7 +15,10 @@ func TestNativeTurnMetadataRoundTripPreservesIndependentCost(t *testing.T) {
 		Status: "failed", Usage: &TurnUsage{InputTokens: &input, Source: "synthetic", Coverage: "main_loop", Cost: &UsageCost{
 			Amount: json.Number("0.1234567890123456789"), Currency: "USD", Source: "provider", Scope: "query_pipeline",
 			Aggregation: "turn_delta", Valuation: "estimated",
-		}},
+		}, Models: map[string]ModelUsage{"one-model": {InputTokens: &input, Cost: &UsageCost{
+			Amount: "0.0000000000000000001", Currency: "USD", Source: "model", Scope: "query_pipeline",
+			Aggregation: "turn_delta", Valuation: "estimated",
+		}}}},
 	}
 	meta := WithNativeTurn(nil, turn)
 	original := turn
@@ -37,6 +41,7 @@ func TestNativeTurnMetadataRoundTripPreservesIndependentCost(t *testing.T) {
 	}
 }
 
+// TestNativeBackgroundUnknownAndKnownEmpty distinguishes an unknown native snapshot from a known empty level.
 func TestNativeBackgroundUnknownAndKnownEmpty(t *testing.T) {
 	for _, value := range []*int64{nil, new(int64)} {
 		result, ok := ReadNativeBackground(WithNativeBackground(nil, NativeBackground{ActiveCount: value}))
@@ -46,6 +51,7 @@ func TestNativeBackgroundUnknownAndKnownEmpty(t *testing.T) {
 	}
 }
 
+// TestTurnUsageCostKeepsDecimalAndRejectsInvalidAmounts checks decimal precision and rejects invalid observations.
 func TestTurnUsageCostKeepsDecimalAndRejectsInvalidAmounts(t *testing.T) {
 	const amount = "0.000001234567890123456789"
 	usage := TurnUsage{Source: "native", Cost: &UsageCost{
@@ -71,6 +77,16 @@ func TestTurnUsageCostKeepsDecimalAndRejectsInvalidAmounts(t *testing.T) {
 		got, _ := ReadTurnUsage(bad)
 		if got.Cost != nil {
 			t.Fatalf("invalid amount %q survived", invalid)
+		}
+	}
+}
+
+// TestTurnUsageDistinguishesUnknownAndEmptyModelAttribution checks metadata field presence.
+func TestTurnUsageDistinguishesUnknownAndEmptyModelAttribution(t *testing.T) {
+	for _, models := range []map[string]ModelUsage{nil, {}} {
+		got, ok := ReadTurnUsage(WithTurnUsage(nil, TurnUsage{Source: "synthetic", Models: models}))
+		if !ok || (got.Models == nil) != (models == nil) {
+			t.Fatalf("models = %#v, known = %v, want %#v", got.Models, ok, models)
 		}
 	}
 }
