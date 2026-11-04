@@ -342,6 +342,9 @@ func (c *Client) bindTurnLocked(t *turn, id string) {
 	c.rememberTurnLocked(t.session.id, id)
 	t.outcome.Turn.NativeTurnID = pointer(id)
 	t.admission = agentclient.AdmissionConfirmed
+	if !t.compact && t.request.ServiceTier.IsNull() {
+		t.session.clearTier = false
+	}
 	if t.input.NativeInputID != nil {
 		t.outcome.Turn.ConsumedInputIDs = append(t.outcome.Turn.ConsumedInputIDs, *t.input.NativeInputID)
 	}

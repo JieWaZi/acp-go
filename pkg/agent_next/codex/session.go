@@ -69,6 +69,8 @@ type session struct {
 	mode acp.SessionModeId
 	// settings contains local intent and independent native settings receipts.
 	settings SessionSettings
+	// clearTier carries the native reset until a turn accepts the model transition.
+	clearTier bool
 	// models is the catalog frozen when the session opened.
 	models []protocol.ModelListResponseDatum
 	// busy covers configuration, history replay, fork, and archive while active is nil.
@@ -478,6 +480,9 @@ func (s *session) turnParams() protocol.TurnStartParams {
 	p := protocol.TurnStartParams{
 		ThreadID: string(s.id), Cwd: pointer(s.cwd), Model: s.settings.Requested.Model, Effort: s.settings.Requested.ReasoningEffort,
 		ServiceTier: s.settings.Requested.ServiceTier,
+	}
+	if s.clearTier && !p.ServiceTier.IsPresent() {
+		p.ServiceTier = protocol.NewOptionalNull[string]()
 	}
 	approval, _, sandbox := codexModePolicy(s.mode, s.roots)
 	p.ApprovalPolicy = &protocol.ApprovalPolicy{Enum: &approval}
@@ -934,6 +939,17 @@ func (c *Client) ConfigureTurn(_ context.Context, id acp.SessionId, model, effor
 		} else {
 			settings.ServiceTier = protocol.NewOptionalNull[string]()
 		}
+	}
+	if fast != nil {
+		s.clearTier = false
+	} else if target != s.currentModel() {
+		tier, requested := s.settings.Requested.ServiceTier.Value()
+		if !requested {
+			tier, _ = s.settings.Observed.ServiceTier.Value()
+		}
+		// Codex retains an omitted tier on the thread. Clear an incompatible tier
+		// on model transition without changing the host's unset Fast preference.
+		s.clearTier = tier != "" && !supportsTier(catalog, tier)
 	}
 	s.settings.Requested = settings
 	return s.configOptions(), nil

@@ -91,11 +91,15 @@ func TestAppServerFixture(t *testing.T) {
 		case "config/read":
 			ack(map[string]any{"config": map[string]any{}})
 		case "model/list":
-			if mode == "management" {
+			if mode == "management" || mode == "settings_transition" {
 				if call.Params["cursor"] == nil {
 					ack(map[string]any{"data": []any{map[string]any{"id": "internal-a", "model": "actual-model", "displayName": "Model A", "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "medium"}, map[string]any{"reasoningEffort": "high"}}, "serviceTiers": []any{map[string]any{"id": "priority-a", "name": "Fast"}}}}, "nextCursor": "second"})
 				} else {
-					ack(map[string]any{"data": []any{map[string]any{"id": "internal-b", "model": "legacy-model", "displayName": "Legacy Model", "additionalSpeedTiers": []string{"fast"}}}})
+					rows := []any{map[string]any{"id": "internal-b", "model": "legacy-model", "displayName": "Legacy Model", "additionalSpeedTiers": []string{"fast"}}}
+					if mode == "settings_transition" {
+						rows = append(rows, map[string]any{"id": "standard", "model": "standard", "supportedReasoningEfforts": []any{}})
+					}
+					ack(map[string]any{"data": rows})
 				}
 			} else {
 				ack(map[string]any{"data": []any{}, "nextCursor": nil})
@@ -1503,5 +1507,48 @@ func TestCodexPermissionModeKeepsThreadAndTurnPoliciesAligned(t *testing.T) {
 				t.Fatalf("thread and turn policies diverged: open=%v turn=%v", opened, prompted)
 			}
 		})
+	}
+}
+
+func TestCodexModelTransitionClearsIncompatibleTierOnWire(t *testing.T) {
+	c, ctx, session, trace := newFixture(t, "settings_transition", agentclient.HostCallbacks{})
+	on := true
+	if _, err := c.ConfigureTurn(ctx, session, "actual-model", "high", &on); err != nil {
+		t.Fatal(err)
+	}
+	prompt := func() {
+		t.Helper()
+		if result := reserve(t, c, ctx, session, agentclient.PromptOptions{})(); result.Outcome == nil || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted {
+			t.Fatalf("turn did not complete: %+v", result)
+		}
+	}
+	prompt()
+	if _, err := c.ConfigureTurn(ctx, session, "standard", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := c.ReadSessionSettings(ctx, session)
+	if err != nil || settings.Requested.ServiceTier.IsPresent() {
+		t.Fatalf("wire compatibility changed the host intent: %+v %v", settings, err)
+	}
+	prompt()
+	prompt()
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tierFrames []json.RawMessage
+	for _, line := range strings.Split(string(data), "\n") {
+		var frame struct {
+			// Method identifies the actual App Server operation.
+			Method string
+			// Params carries the raw serialized service tier.
+			Params map[string]json.RawMessage
+		}
+		if json.Unmarshal([]byte(line), &frame) == nil && frame.Method == "turn/start" {
+			tierFrames = append(tierFrames, frame.Params["serviceTier"])
+		}
+	}
+	if len(tierFrames) != 3 || string(tierFrames[0]) != `"priority-a"` || string(tierFrames[1]) != "null" || tierFrames[2] != nil {
+		t.Fatalf("tier leaked across models or reset was repeated: %s", data)
 	}
 }
