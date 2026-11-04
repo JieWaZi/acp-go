@@ -29,6 +29,36 @@ type TurnUsage struct {
 	ContextKnown bool `json:"contextKnown"`
 	// Model 仅在原生明确报告时填写。
 	Model string `json:"model,omitempty"`
+	// Cost is independent of token coverage and is absent without a reliable valuation.
+	Cost *UsageCost `json:"cost,omitempty"`
+}
+
+// UsageCost describes an independently measured or estimated monetary amount.
+type UsageCost struct {
+	// Amount is encoded as decimal text in metadata to survive ACP's generic JSON maps.
+	Amount json.Number `json:"amount,string"`
+	// Currency names the reported currency.
+	Currency string `json:"currency"`
+	// Source identifies the native report or calculation that produced the amount.
+	Source string `json:"source"`
+	// Scope identifies the work covered by the amount independently of token coverage.
+	Scope string `json:"scope"`
+	// Aggregation distinguishes a turn delta from a cumulative observation.
+	Aggregation string `json:"aggregation"`
+	// Valuation distinguishes an estimate from reported charges.
+	Valuation string `json:"valuation"`
+}
+
+func (c UsageCost) valid() bool {
+	if c.Currency == "" || c.Source == "" || c.Scope == "" || c.Aggregation == "" || c.Valuation == "" {
+		return false
+	}
+	value, err := c.Amount.Float64()
+	if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return false
+	}
+	_, err = json.Marshal(c.Amount)
+	return err == nil && c.Amount != ""
 }
 
 // WithTurnUsage 克隆元数据并写入可替换快照，不修改调用方的元数据。
@@ -49,6 +79,13 @@ func WithTurnUsage(meta map[string]any, usage TurnUsage) map[string]any {
 	}
 	if usage.Model != "" {
 		value["model"] = usage.Model
+	}
+	if usage.Cost != nil && usage.Cost.valid() {
+		c := *usage.Cost
+		value["cost"] = map[string]any{
+			"amount": c.Amount.String(), "currency": c.Currency, "source": c.Source,
+			"scope": c.Scope, "aggregation": c.Aggregation, "valuation": c.Valuation,
+		}
 	}
 	result[turnUsageKey] = value
 	return result
@@ -90,6 +127,14 @@ func ReadTurnUsage(meta map[string]any) (TurnUsage, bool) {
 		if !valid {
 			return TurnUsage{}, false
 		}
+	}
+	if raw, exists := value["cost"]; exists {
+		data, err := json.Marshal(raw)
+		var cost UsageCost
+		if err != nil || json.Unmarshal(data, &cost) != nil || !cost.valid() {
+			return TurnUsage{}, false
+		}
+		result.Cost = &cost
 	}
 	return result, true
 }

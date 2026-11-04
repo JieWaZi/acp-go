@@ -75,3 +75,14 @@ func decodeModelConfig(value any, dst any) bool {
 	encoded, err := json.Marshal(value)
 	return err == nil && json.Unmarshal(encoded, dst) == nil
 }
+
+// ModelCatalogMethod reads the native model catalog without sending a prompt.
+const ModelCatalogMethod = "_model/list"
+
+// ModelCatalog describes known model options from one native read.
+type ModelCatalog struct {
+	// DefaultID is present only when the provider identified the default row.
+	DefaultID *acp.SessionConfigValueId `json:"default_id,omitempty"`
+	// Options preserves provider grouping and distinguishes an empty catalog from unknown.
+	Options acp.SessionConfigSelectOptions `json:"options"`
+}
