@@ -79,7 +79,7 @@ func (c *Client) receiveLocked(method string, raw json.RawMessage) {
 					return
 				}
 			}
-			if t != nil && t.steerPending > 0 && value(t.outcome.Turn.NativeTurnID) == event.TurnID {
+			if t != nil && !t.finishing && value(t.outcome.Turn.NativeTurnID) == event.TurnID {
 				recordSteeredItem(t, event.Item)
 			}
 		}

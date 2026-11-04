@@ -148,9 +148,21 @@ func TestAppServerFixture(t *testing.T) {
 				fmt.Fprintln(os.Stdout, "this is not a native frame")
 				continue
 			}
-			if mode == "late_steer_ack" {
+			if mode == "late_steer_ack" || mode == "steer_target_completes" {
 				ack(turn("inProgress"))
 				emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": "message-1", "delta": "hold"})
+				if mode == "steer_target_completes" {
+					marker := os.Getenv("CODEX_NEXT_TRACE") + ".complete"
+					for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+						if _, err := os.Stat(marker); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							os.Exit(3)
+						}
+					}
+					emit("turn/completed", turn("completed"))
+				}
 				continue
 			}
 			if strings.HasPrefix(mode, "usage_dip") {
@@ -836,7 +848,7 @@ func TestReviewDetachedNativeOutcomeOnWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "startedNewTurn") {
+	if string(raw) != `{"outcome":"startedNewTurn"}` {
 		t.Fatalf("steering not admitted: %s", raw)
 	}
 	t.Logf("steering ACK: %s", raw)

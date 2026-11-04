@@ -106,37 +106,39 @@ func (s *session) reserve(ctx context.Context, req acp.PromptRequest, opts agent
 	if req.MessageId != nil && isUUID(*req.MessageId) {
 		id = strings.ToLower(*req.MessageId)
 	}
-	if opts.HostInvocationID == "" {
-		opts.HostInvocationID = generated
-	}
-
 	s.mu.Lock()
+	in, err := s.reserveInputLocked(ctx, id, generated, content, opts, detached, compact)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	run := sync.OnceValue(func() agentclient.PromptResult { return s.runInput(in) })
+	return func() agentclient.PromptResult { return run().Snapshot() }, nil
+}
+
+func (s *session) reserveInputLocked(ctx context.Context, id, generated string, content json.RawMessage, opts agentclient.PromptOptions, detached, compact bool) (*input, error) {
 	if err := s.admissibleLocked(); err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
 	if len(s.queued) >= maxPendingInputs || len(s.used) >= maxRememberedIDs || s.ledger.full() {
-		s.mu.Unlock()
 		return nil, errCapacity
 	}
 	if compact && s.busyLocked() {
-		s.mu.Unlock()
 		return nil, errBusy
 	}
 	if _, exists := s.used[id]; exists {
 		id = generated
 	}
+	if opts.HostInvocationID == "" {
+		opts.HostInvocationID = generated
+	}
 	in := s.newInputLocked(ctx, id, content, opts, detached, compact)
 	s.queued = append(s.queued, in)
 	s.signalLocked()
-	s.mu.Unlock()
-
-	run := sync.OnceValue(func() agentclient.PromptResult { return s.runInput(in) })
-	return func() agentclient.PromptResult { return run().Snapshot() }, nil
+	return in, nil
 }
 
 func (s *session) newInputLocked(ctx context.Context, id string, content json.RawMessage, opts agentclient.PromptOptions, detached, compact bool) *input {
@@ -187,22 +189,9 @@ func (s *session) runInput(in *input) agentclient.PromptResult {
 		_ = await(in.ctx, changed)
 	}
 
-	var cleanup func()
-	var err error
-	if in.options.Prepare != nil {
-		cleanup, err = in.options.Prepare(in.ctx)
-	}
+	cleanup, err := in.options.PrepareSubmission(in.ctx, in.identity)
 	if cleanup != nil {
 		defer cleanup()
-	}
-	if err == nil {
-		err = in.ctx.Err()
-	}
-	if err == nil && in.options.BeforeSubmit != nil {
-		err = in.options.BeforeSubmit(in.ctx, in.identity.Snapshot())
-	}
-	if err == nil {
-		err = in.ctx.Err()
 	}
 	if err == nil {
 		s.mu.Lock()
@@ -231,7 +220,7 @@ func (s *session) interruptingLocked() bool {
 
 func (s *session) submitHostInput(in *input) error {
 	for {
-		err := s.submit(in, nil)
+		err := s.submit(in, nil, agentclient.Scope{})
 		if !errors.Is(err, errInterrupting) {
 			return err
 		}
@@ -247,7 +236,7 @@ func (s *session) submitHostInput(in *input) error {
 	}
 }
 
-func (s *session) submit(in *input, target *invocation) error {
+func (s *session) submit(in *input, target *invocation, scope agentclient.Scope) error {
 	return s.wire.write(s.ctx, in.message, func() error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -260,7 +249,8 @@ func (s *session) submit(in *input, target *invocation) error {
 		if in.settled || in.cancelRequested || in.phase != ready {
 			return firstError(in.err, context.Canceled)
 		}
-		if target != nil && (s.current != target || target.cancelRequested || target.terminal) {
+		if target != nil && (s.current != target || target.cancelRequested || target.terminal ||
+			scope != (agentclient.Scope{}) && target.scope != scope) {
 			return errStale
 		}
 		if target == nil && s.interruptingLocked() {
@@ -555,27 +545,51 @@ func (c *Client) Steer(ctx context.Context, req agentclient.SteerRequest) (agent
 		return agentclient.SteerResponse{}, err
 	}
 	target := s.current
-	if target == nil || target.cancelRequested {
+	if req.Target != (agentclient.Scope{}) && (target == nil || target.scope != req.Target || target.cancelRequested || target.terminal) {
 		s.mu.Unlock()
+		return agentclient.SteerResponse{}, errStale
+	}
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return agentclient.SteerResponse{}, err
+	}
+	if target == nil || target.cancelRequested {
 		if req.PromptRequired {
+			s.mu.Unlock()
 			return agentclient.SteerResponse{Outcome: "promptRequired", Reason: "noRunningTurn"}, nil
 		}
-		if err := ctx.Err(); err != nil {
-			return agentclient.SteerResponse{}, err
-		}
-		run, err := s.reserve(s.ctx, acp.PromptRequest{SessionId: s.id, Prompt: req.Prompt}, agentclient.PromptOptions{}, true, false)
+		turnCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		in, err := s.reserveInputLocked(turnCtx, id, id, content, req.Options, true, false)
 		if err != nil {
+			s.mu.Unlock()
+			cancel()
 			return agentclient.SteerResponse{}, err
 		}
-		go run()
-		return agentclient.SteerResponse{Outcome: "startedNewTurn"}, nil
+		// ACP callers without admission options acknowledge the FIFO reservation.
+		// A host gate needs the actual submission receipt before it can proceed.
+		legacy := req.Options.HostInvocationID == "" && req.Options.Prepare == nil && req.Options.BeforeSubmit == nil
+		reserved, _ := steerReply("startedNewTurn", in, nil)
+		s.mu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer cancel()
+			s.runInput(in)
+		}()
+		if legacy {
+			return reserved, nil
+		}
+		return s.waitIdleSteer(ctx, in, cancel, done)
 	}
 	if len(s.sent) >= maxPendingInputs || len(s.used) >= maxRememberedIDs || s.ledger.full() {
 		s.mu.Unlock()
 		return agentclient.SteerResponse{}, errCapacity
 	}
-	in := s.newInputLocked(ctx, id, content, agentclient.PromptOptions{}, true, false)
-	in.phase = ready
+	if req.Options.HostInvocationID == "" {
+		req.Options.HostInvocationID = id
+	}
+	in := s.newInputLocked(ctx, id, content, req.Options, true, false)
+	in.phase = preparing
 	in.message.Priority = "now"
 	s.tasks++
 	s.mu.Unlock()
@@ -587,10 +601,63 @@ func (c *Client) Steer(ctx context.Context, req agentclient.SteerRequest) (agent
 		s.signalLocked()
 		s.mu.Unlock()
 	}()
-	if err := s.submit(in, target); err != nil {
-		return agentclient.SteerResponse{}, err
+
+	gateCtx, cancel := context.WithCancelCause(in.ctx)
+	stop := context.AfterFunc(target.ctx, func() { cancel(errStale) })
+	defer func() { stop(); cancel(nil) }()
+	cleanup, err := in.options.PrepareSubmission(gateCtx, in.identity)
+	if cleanup != nil {
+		defer cleanup()
 	}
-	return agentclient.SteerResponse{Outcome: "injected"}, nil
+	if err == nil {
+		s.mu.Lock()
+		if !in.settled {
+			in.phase = ready
+		}
+		s.mu.Unlock()
+		err = s.submit(in, target, req.Target)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil && in.phase < writing {
+		s.finishInputLocked(in, err)
+	}
+	return steerReply("injected", in, err)
+}
+
+func (s *session) waitIdleSteer(ctx context.Context, in *input, cancel context.CancelFunc, done <-chan struct{}) (agentclient.SteerResponse, error) {
+	for {
+		s.mu.Lock()
+		if in.submission == agentclient.SubmissionSent {
+			response, err := steerReply("startedNewTurn", in, nil)
+			s.mu.Unlock()
+			return response, err
+		}
+		if in.settled {
+			response, err := steerReply("", in, firstError(in.err, errTransport))
+			s.mu.Unlock()
+			_ = await(ctx, done)
+			return response, err
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		if err := await(ctx, changed); err != nil {
+			cancel()
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return steerReply("", in, err)
+		}
+	}
+}
+
+// steerReply copies receipt evidence under the input owner's state lock.
+func steerReply(outcome string, in *input, err error) (agentclient.SteerResponse, error) {
+	if err != nil {
+		outcome = ""
+	}
+	return agentclient.SteerResponse{Outcome: outcome, Receipt: &agentclient.PromptReceipt{
+		Input: in.identity.Snapshot(), Submission: in.submission, Admission: in.admission, OperationError: err,
+	}}, err
 }
 
 // Compact reserves the same FIFO owner, then requires a native manual boundary.

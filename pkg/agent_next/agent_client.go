@@ -67,6 +67,27 @@ type PromptOptions struct {
 	Prepare acp.PromptPreparation
 }
 
+// PrepareSubmission runs host preparation and admission outside provider locks.
+// The owner must call returned cleanup even when preparation returns an error.
+func (o PromptOptions) PrepareSubmission(ctx context.Context, input PromptSubmission) (cleanup func(), err error) {
+	if err = context.Cause(ctx); err != nil {
+		return nil, err
+	}
+	if o.Prepare != nil {
+		cleanup, err = o.Prepare(ctx)
+	}
+	if err == nil {
+		err = context.Cause(ctx)
+	}
+	if err == nil && o.BeforeSubmit != nil {
+		err = o.BeforeSubmit(ctx, input.Snapshot())
+	}
+	if err == nil {
+		err = context.Cause(ctx)
+	}
+	return cleanup, err
+}
+
 // PromptSubmission is frozen before business admission and reused in the receipt.
 type PromptSubmission struct {
 	// SessionID is the opened target session.
@@ -176,7 +197,7 @@ type NativeOutcomePage struct {
 	More bool
 }
 
-// SteerRequest is the common public extension input for supporting providers.
+// SteerRequest carries additional input for supporting providers.
 type SteerRequest struct {
 	// SessionID identifies the session whose execution may receive the input.
 	SessionID acp.SessionId `json:"sessionId"`
@@ -184,6 +205,11 @@ type SteerRequest struct {
 	Prompt []acp.ContentBlock `json:"prompt"`
 	// PromptRequired requires a standard Prompt when idle, rather than starting work through steering.
 	PromptRequired bool `json:"-"`
+	// Target is the exact observed scope. A nonzero value requires every field
+	// to match and disables idle fallback. The zero value preserves ACP policy.
+	Target Scope `json:"-"`
+	// Options admits this input independently of the target's opening input.
+	Options PromptOptions `json:"-"`
 }
 
 // SteerResponse reports the native operation rather than an invented new turn.
@@ -192,6 +218,10 @@ type SteerResponse struct {
 	Outcome string `json:"outcome"`
 	// Reason explains a provider's unsupported or rejected operation when supplied.
 	Reason string `json:"reason,omitempty"`
+	// Receipt is an independent snapshot once an input identity was allocated.
+	// Legacy idle steering can acknowledge a local queue before bytes are sent.
+	// It may accompany an error. NativeOutcome is the authority for consumption.
+	Receipt *PromptReceipt `json:"-"`
 }
 
 // SteeringClient exposes steering only where the native protocol supports it.

@@ -156,30 +156,35 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 	if err != nil {
 		return nil, err
 	}
-	id := newID()
-	if request.MessageId != nil && uuidPattern.MatchString(*request.MessageId) {
-		if _, used := s.inputs[*request.MessageId]; !used {
-			id = *request.MessageId
-		}
-	}
-	if options.HostInvocationID == "" {
-		options.HostInvocationID = newID()
-	}
-	t, err := c.installTurnLocked(ctx, s, false, c.foregroundReceipts)
+	t, err := c.reservePromptLocked(ctx, s, input, request.MessageId, options, c.foregroundReceipts)
 	if err != nil {
 		return nil, err
 	}
-	t.input = agentclient.PromptSubmission{SessionID: s.id, HostInvocationID: options.HostInvocationID, InputID: id, NativeInputID: pointer(id)}
-	t.options = options
-	s.inputs[id] = struct{}{}
-	t.request.Input = input
-	t.request.ClientUserMessageID = pointer(id)
 	var once sync.Once
 	var result agentclient.PromptResult
 	return func() agentclient.PromptResult {
 		once.Do(func() { result = c.runPrompt(t) })
 		return result.Snapshot()
 	}, nil
+}
+
+func (c *Client) reservePromptLocked(ctx context.Context, s *session, input []protocol.InputElement, requestedID *string, options agentclient.PromptOptions, retain bool) (*turn, error) {
+	t, err := c.installTurnLocked(ctx, s, false, retain)
+	if err != nil {
+		return nil, err
+	}
+	t.input = newInputIdentity(s.id, options.HostInvocationID)
+	if requestedID != nil && uuidPattern.MatchString(*requestedID) {
+		if _, used := s.inputs[*requestedID]; !used {
+			t.input.InputID = *requestedID
+			t.input.NativeInputID = pointer(*requestedID)
+		}
+	}
+	t.options = options
+	s.inputs[t.input.InputID] = struct{}{}
+	t.request.Input = input
+	t.request.ClientUserMessageID = pointer(t.input.InputID)
+	return t, nil
 }
 
 func (c *Client) installTurnLocked(ctx context.Context, s *session, compact, retain bool) (*turn, error) {
@@ -227,24 +232,10 @@ func (c *Client) executeTurn(t *turn) (frameWrite, error) {
 	})
 	defer stop()
 	c.startTurnObserver(t)
-	if err := context.Cause(t.prepare); err != nil {
+	cleanup, err := t.options.PrepareSubmission(t.prepare, t.input)
+	t.cleanup = cleanup
+	if err != nil {
 		return frameWrite{}, err
-	}
-	if t.options.Prepare != nil {
-		cleanup, err := t.options.Prepare(t.prepare)
-		t.cleanup = cleanup
-		if err != nil {
-			return frameWrite{}, err
-		}
-	}
-	if cause := context.Cause(t.prepare); cause != nil {
-		return frameWrite{}, cause
-	}
-
-	if t.options.BeforeSubmit != nil {
-		if err := t.options.BeforeSubmit(t.prepare, t.input.Snapshot()); err != nil {
-			return frameWrite{}, err
-		}
 	}
 	releaseSkills, err := c.claimSkills(t.prepare, append([]string{t.session.cwd}, t.session.roots...))
 	if err != nil {
@@ -502,47 +493,29 @@ func (c *Client) Steer(ctx context.Context, request agentclient.SteerRequest) (a
 		return agentclient.SteerResponse{}, err
 	}
 	t := s.active
+	exact := request.Target != (agentclient.Scope{})
+	if exact && (t == nil || request.Target != (agentclient.Scope{
+		SessionID: s.id, HostInvocationID: t.input.HostInvocationID, NativeInvocationID: t.outcome.Turn.InvocationID,
+	}) || t.outcome.Turn.NativeTurnID == nil) {
+		c.mu.Unlock()
+		return agentclient.SteerResponse{}, errTurnChanged
+	}
 	if t == nil && len(s.draining) == 0 && !s.busy && !s.closing && !request.PromptRequired {
 		if err := ctx.Err(); err != nil {
 			c.mu.Unlock()
 			return agentclient.SteerResponse{}, err
 		}
 		turnCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
-		t, err = c.installTurnLocked(turnCtx, s, false, true)
+		t, err = c.reservePromptLocked(turnCtx, s, input, nil, request.Options, true)
 		if err != nil {
 			cancel(err)
 			c.mu.Unlock()
 			return agentclient.SteerResponse{}, err
 		}
-		id := newID()
-		t.input = agentclient.PromptSubmission{SessionID: s.id, HostInvocationID: newID(), InputID: id, NativeInputID: pointer(id)}
-		t.request.Input = input
-		t.request.ClientUserMessageID = pointer(id)
-		s.inputs[id] = struct{}{}
 		c.mu.Unlock()
-		results := make(chan agentclient.PromptResult, 1)
-		go func() {
-			defer cancel(nil)
-			results <- c.runPrompt(t)
-		}()
-		select {
-		case <-t.ready:
-			return agentclient.SteerResponse{Outcome: "startedNewTurn"}, nil
-		case result := <-results:
-			if result.Receipt.Admission == agentclient.AdmissionConfirmed {
-				return agentclient.SteerResponse{Outcome: "startedNewTurn"}, nil
-			}
-			err := result.Receipt.OperationError
-			if err == nil {
-				err = errUnconfirmed
-			}
-			return agentclient.SteerResponse{}, err
-		case <-ctx.Done():
-			cancel(ctx.Err())
-			return agentclient.SteerResponse{}, ctx.Err()
-		}
+		return c.runIdleSteer(ctx, t, cancel)
 	}
-	if t == nil || t.compact || t.stopped || t.outcome.Turn.Status != "" || s.closing {
+	if t == nil || t.compact || t.stopped || t.finishing || t.outcome.Turn.Status != "" || s.closing {
 		c.mu.Unlock()
 		return agentclient.SteerResponse{}, errTurnBusy
 	}
@@ -554,48 +527,125 @@ func (c *Client) Steer(ctx context.Context, request agentclient.SteerRequest) (a
 	case <-ctx.Done():
 		return agentclient.SteerResponse{}, ctx.Err()
 	}
-	id := newID()
 	c.mu.Lock()
 	nativeID := value(t.outcome.Turn.NativeTurnID)
-	c.mu.Unlock()
-	params := protocol.TurnSteerParams{ThreadID: string(s.id), ExpectedTurnID: nativeID, Input: input, ClientUserMessageID: &id}
-	result := make(chan error, 1)
-	go func() { result <- c.submitSteer(ctx, t, params, id) }()
-	select {
-	case err := <-result:
-		if err != nil {
-			return agentclient.SteerResponse{}, err
-		}
-		return agentclient.SteerResponse{Outcome: "injected"}, nil
-	case <-ctx.Done():
-		return agentclient.SteerResponse{}, ctx.Err()
+	if !c.steerTargetLocked(t, nativeID) {
+		c.mu.Unlock()
+		return agentclient.SteerResponse{}, errTurnChanged
 	}
+	identity := newInputIdentity(s.id, request.Options.HostInvocationID)
+	s.inputs[identity.InputID] = struct{}{}
+	t.interactions.Add(1)
+	c.mu.Unlock()
+	defer t.interactions.Done()
+
+	gateCtx, cancel := context.WithCancelCause(ctx)
+	stopNative := context.AfterFunc(t.native, func() { cancel(errTurnChanged) })
+	stopPrepare := context.AfterFunc(t.prepare, func() { cancel(context.Cause(t.prepare)) })
+	defer func() { stopNative(); stopPrepare(); cancel(nil) }()
+	cleanup, err := request.Options.PrepareSubmission(gateCtx, identity)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return steerReply("", identity, agentclient.SubmissionNotSent, agentclient.AdmissionNotAccepted, err)
+	}
+	params := protocol.TurnSteerParams{ThreadID: string(s.id), ExpectedTurnID: nativeID, Input: input, ClientUserMessageID: pointer(identity.InputID)}
+	result := make(chan agentclient.PromptReceipt, 1)
+	go func() { result <- c.submitSteer(ctx, t, params, identity) }()
+	select {
+	case receipt := <-result:
+		return steerReply("injected", identity, receipt.Submission, receipt.Admission, receipt.OperationError)
+	case <-ctx.Done():
+		// Cancellation can race a committed write. Preserve the canonical
+		// reader's ability to capture native evidence even after we return.
+		select {
+		case receipt := <-result:
+			return steerReply("injected", identity, receipt.Submission, receipt.Admission, receipt.OperationError)
+		default:
+		}
+		c.mu.Lock()
+		submission, admission := agentclient.SubmissionNotSent, agentclient.AdmissionNotAccepted
+		if _, attempted := t.steerInputs[identity.InputID]; attempted {
+			submission, admission = agentclient.SubmissionUnknown, agentclient.AdmissionUnknown
+		}
+		if slices.Contains(t.outcome.Turn.ConsumedInputIDs, identity.InputID) {
+			submission, admission = agentclient.SubmissionSent, agentclient.AdmissionConfirmed
+		}
+		c.mu.Unlock()
+		return steerReply("", identity, submission, admission, ctx.Err())
+	}
+}
+
+func newInputIdentity(sessionID acp.SessionId, hostID string) agentclient.PromptSubmission {
+	id := newID()
+	if hostID == "" {
+		hostID = newID()
+	}
+	return agentclient.PromptSubmission{SessionID: sessionID, HostInvocationID: hostID, InputID: id, NativeInputID: pointer(id)}
+}
+
+func steerReply(outcome string, identity agentclient.PromptSubmission, submission agentclient.Submission, admission agentclient.Admission, err error) (agentclient.SteerResponse, error) {
+	if err != nil {
+		outcome = ""
+	}
+	return agentclient.SteerResponse{Outcome: outcome, Receipt: &agentclient.PromptReceipt{
+		Input: identity.Snapshot(), Submission: submission, Admission: admission, OperationError: err,
+	}}, err
+}
+
+func (c *Client) runIdleSteer(ctx context.Context, t *turn, cancel context.CancelCauseFunc) (agentclient.SteerResponse, error) {
+	results := make(chan agentclient.PromptResult, 1)
+	go func() {
+		defer cancel(nil)
+		results <- c.runPrompt(t)
+	}()
+	select {
+	case <-t.ready:
+		return steerReply("startedNewTurn", t.input, agentclient.SubmissionSent, agentclient.AdmissionConfirmed, nil)
+	case result := <-results:
+		err := result.Receipt.OperationError
+		if result.Receipt.Admission == agentclient.AdmissionConfirmed {
+			err = nil
+		} else if err == nil {
+			err = errUnconfirmed
+		}
+		return steerReply("startedNewTurn", t.input, result.Receipt.Submission, result.Receipt.Admission, err)
+	case <-ctx.Done():
+		cancel(ctx.Err())
+		c.mu.Lock()
+		admission := t.admission
+		submission := agentclient.SubmissionNotSent
+		if t.writing {
+			submission = agentclient.SubmissionUnknown
+		}
+		if admission == agentclient.AdmissionConfirmed {
+			submission = agentclient.SubmissionSent
+		}
+		c.mu.Unlock()
+		return steerReply("", t.input, submission, admission, ctx.Err())
+	}
+}
+
+func (c *Client) steerTargetLocked(t *turn, nativeID string) bool {
+	return nativeID != "" && c.activeLocked(t) && !t.stopped && !t.finishing && t.outcome.Turn.Status == "" &&
+		!t.session.closing && value(t.outcome.Turn.NativeTurnID) == nativeID
 }
 
 // submitSteer owns one independent write-to-ack interval. After the write is
 // committed, foreground cancellation does not discard native input evidence.
-func (c *Client) submitSteer(waiter context.Context, t *turn, params protocol.TurnSteerParams, id string) error {
+func (c *Client) submitSteer(waiter context.Context, t *turn, params protocol.TurnSteerParams, input agentclient.PromptSubmission) agentclient.PromptReceipt {
 	ctx, cancel := context.WithTimeout(c.life, controlTimeout)
 	defer cancel()
+	id := input.InputID
 	admitted := false
-	defer func() {
-		if !admitted {
-			return
-		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		t.steerPending--
-		if t.steerPending == 0 {
-			close(t.steerSettled)
-		}
-	}()
+	admission := agentclient.AdmissionNotAccepted
 	var reply protocol.TurnSteerResponse
-	_, err := c.call(ctx, "turn/steer", params, &reply, func() error {
+	written, err := c.call(ctx, "turn/steer", params, &reply, func() error {
 		if err := waiter.Err(); err != nil {
 			return err
 		}
-		if !c.activeLocked(t) || t.stopped || t.finishing || t.outcome.Turn.Status != "" || t.session.closing ||
-			value(t.outcome.Turn.NativeTurnID) != params.ExpectedTurnID {
+		if !c.steerTargetLocked(t, params.ExpectedTurnID) {
 			return errTurnChanged
 		}
 		if len(t.steerInputs) >= maxPendingUpdates {
@@ -607,17 +657,37 @@ func (c *Client) submitSteer(waiter context.Context, t *turn, params protocol.Tu
 		t.steerPending++
 		t.steerInputs[id] = struct{}{}
 		admitted = true
+		admission = agentclient.AdmissionUnknown
 		return nil
 	}, func(frame rpcFrame) {
+		if !admitted || !c.ownsTurnLocked(t) {
+			return
+		}
 		var ack protocol.TurnSteerResponse
-		if admitted && c.ownsTurnLocked(t) && frame.Error == nil && json.Unmarshal(frame.Result, &ack) == nil && ack.TurnID == params.ExpectedTurnID {
+		if frame.Error == nil && json.Unmarshal(frame.Result, &ack) == nil && ack.TurnID == params.ExpectedTurnID {
 			consumeInput(t, id)
+		} else if frame.Error != nil && knownPreAdmissionRejection(frame.Error) {
+			admission = agentclient.AdmissionNotAccepted
 		}
 	})
 	if err == nil && reply.TurnID != params.ExpectedTurnID {
 		err = errTurnChanged
 	}
-	return err
+	submission := written.submission()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if admitted {
+		t.steerPending--
+		if t.steerPending == 0 {
+			close(t.steerSettled)
+		}
+	}
+	if slices.Contains(t.outcome.Turn.ConsumedInputIDs, id) {
+		submission, admission = agentclient.SubmissionSent, agentclient.AdmissionConfirmed
+	} else if submission == agentclient.SubmissionNotSent {
+		admission = agentclient.AdmissionNotAccepted
+	}
+	return agentclient.PromptReceipt{Input: input, Submission: submission, Admission: admission, OperationError: err}
 }
 
 func consumeInput(t *turn, id string) {

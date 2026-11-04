@@ -336,6 +336,19 @@ func (f *fixture) user(frame fixtureFrame) {
 	}
 	f.active = frame.UUID
 	switch f.mode {
+	case "steer-admission", "steer-target-completes":
+		if frame.Priority == "" {
+			f.active = frame.UUID
+			f.assistant(frame.UUID, "opening", false)
+			if f.mode == "steer-target-completes" {
+				f.waitMarker("finish-opening")
+				f.result(frame.UUID, "opening completed", "completed")
+			}
+			return
+		}
+		f.waitMarker("consume-steer")
+		f.assistant(frame.UUID, "priority input consumed", false)
+		f.result(f.active, "both inputs consumed", "completed")
 	case "rereview-retired-rerun":
 		f.assistant(frame.UUID, "original host", false)
 		f.result(frame.UUID, "", "aborted_streaming")
