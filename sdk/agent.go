@@ -7,6 +7,13 @@ import (
 	"sync"
 )
 
+// SessionLifecycleOwner opts an Agent into owning session-scoped prompt admission and cancellation.
+// The SDK still propagates cancellation of an individual request or its connection.
+type SessionLifecycleOwner interface {
+	// ManagesSessionLifecycle reports whether the agent owns the session lifecycle.
+	ManagesSessionLifecycle() bool
+}
+
 // AgentSideConnection represents the agent's view of a connection to a client.
 type AgentSideConnection struct {
 	conn  *Connection

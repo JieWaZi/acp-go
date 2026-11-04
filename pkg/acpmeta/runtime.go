@@ -79,10 +79,10 @@ type CompactRequest struct {
 
 // CompactResponse contains the native turn identity and terminal status.
 type CompactResponse struct {
-	// TurnID is the provider-issued identity from the turn-started notification.
-	TurnID string `json:"turn_id"`
+	// TurnID is the provider-issued turn identity, when reported.
+	TurnID string `json:"turn_id,omitempty"`
 	// Status is the native terminal status.
 	Status string `json:"status"`
-	// Meta carries usage observed for this native compaction turn.
+	// Meta carries invocation identity and other evidence observed during compaction.
 	Meta map[string]any `json:"_meta,omitempty"`
 }

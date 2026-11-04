@@ -1,6 +1,7 @@
 package acpmeta
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -47,5 +48,13 @@ func TestRuntimeVersionRejectsMissingOrMalformedMetadata(t *testing.T) {
 
 	if meta := RuntimeVersionMetadata("  "); meta != nil {
 		t.Fatalf("空版本元数据为 %#v，期望 nil", meta)
+	}
+}
+
+// TestCompactResponseOmitsUnreportedNativeTurn preserves invocation evidence without inventing a native ID.
+func TestCompactResponseOmitsUnreportedNativeTurn(t *testing.T) {
+	raw, err := json.Marshal(CompactResponse{Status: "completed", Meta: map[string]any{"invocation_id": "invocation"}})
+	if err != nil || string(raw) != `{"status":"completed","_meta":{"invocation_id":"invocation"}}` {
+		t.Fatalf("compact response: %s / %v", raw, err)
 	}
 }

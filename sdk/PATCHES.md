@@ -6,4 +6,8 @@
 
 `tool_call_update.go` 保留非 nil 空 Content/Locations 的 `[]` 编码语义，nil 时省略，允许工具更新明确清空集合。
 
+`errors.go` 在上游 JSON-RPC 错误出口增加 `errors.As`，保留 Adapter 包装后的 `RequestError` code、message 和 data。普通错误与取消保留原映射，回归见 `errors_test.go`。
+
+`agent.go` 与手写 `extensions.go` 增加 `SessionLifecycleOwner` opt-in。接管者直接收到同样校验的 `session/prompt` 和 `session/cancel`。SDK 保留请求和连接取消，session 级排他与原生中断由 Adapter 决定。默认继续走上游生成 dispatch。验证见 `session_lifecycle_test.go`。
+
 本地验证在此目录运行 `GOWORK=off go test -race .`；上层 Adapter 与使用方须引用同一 SDK 版本。

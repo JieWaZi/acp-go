@@ -49,3 +49,16 @@ func TestAccountUsagePreservesFractionAndPresence(t *testing.T) {
 		t.Fatal("infinity accepted")
 	}
 }
+
+// TestAccountUsagePreservesExactExtraAllowanceNumbers protects native allowance precision.
+func TestAccountUsagePreservesExactExtraAllowanceNumbers(t *testing.T) {
+	raw := []byte(`{"available":false,"buckets":[{"name":"Model quota","windows":null,"extra":{"enabled":false,"used":0,"limit":9007199254740993}}]}`)
+	var usage AccountUsage
+	if err := json.Unmarshal(raw, &usage); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(usage)
+	if err != nil || string(encoded) != string(raw) {
+		t.Fatalf("quota observation changed: %s / %v", encoded, err)
+	}
+}

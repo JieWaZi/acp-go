@@ -47,6 +47,30 @@ func (a *AgentSideConnection) handleWithExtensions(ctx context.Context, method s
 		return resp, nil
 	}
 
+	if owner, ok := a.agent.(SessionLifecycleOwner); ok && owner.ManagesSessionLifecycle() {
+		switch method {
+		case AgentMethodSessionPrompt:
+			var request PromptRequest
+			if err := json.Unmarshal(params, &request); err != nil {
+				return nil, NewInvalidParams(map[string]any{"error": err.Error()})
+			}
+			if err := request.Validate(); err != nil {
+				return nil, NewInvalidParams(map[string]any{"error": err.Error()})
+			}
+			response, err := a.agent.Prompt(ctx, request)
+			return response, toReqErr(err)
+		case AgentMethodSessionCancel:
+			var notification CancelNotification
+			if err := json.Unmarshal(params, &notification); err != nil {
+				return nil, NewInvalidParams(map[string]any{"error": err.Error()})
+			}
+			if err := notification.Validate(); err != nil {
+				return nil, NewInvalidParams(map[string]any{"error": err.Error()})
+			}
+			return nil, toReqErr(a.agent.Cancel(ctx, notification))
+		}
+	}
+
 	return a.handle(ctx, method, params)
 }
 

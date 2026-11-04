@@ -38,6 +38,15 @@ func Wrap(agent acp.Agent) *Agent {
 	return &Agent{Agent: agent, bound: make(chan struct{}), sessions: map[acp.SessionId]*endpoint{}}
 }
 
+// ManagesSessionLifecycle preserves the native adapter's ACP lifecycle ownership.
+func (a *Agent) ManagesSessionLifecycle() bool {
+	owner, ok := a.Agent.(interface {
+		// ManagesSessionLifecycle reports the underlying adapter's SDK opt-in.
+		ManagesSessionLifecycle() bool
+	})
+	return ok && owner.ManagesSessionLifecycle()
+}
+
 // SetAgentConnection 将同一 SDK 连接注入原适配器与问答端口。
 func (a *Agent) SetAgentConnection(host *acp.AgentSideConnection) {
 	a.mutex.Lock()
