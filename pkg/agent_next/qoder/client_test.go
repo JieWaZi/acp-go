@@ -2,11 +2,13 @@ package qoder_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,6 +129,11 @@ func TestNativeQoder(t *testing.T) {
 		case "session/prompt":
 			prompts++
 			promptID = frame.ID
+			if os.Getenv("ACP_FAMILY_QODER_DIAGNOSTIC") == "1" {
+				fmt.Fprintln(os.Stderr, "safe startup evidence")
+				fmt.Fprintln(os.Stderr, os.Getenv("QODER_PERSONAL_ACCESS_TOKEN"))
+				os.Exit(12)
+			}
 			if os.Getenv("ACP_FAMILY_QODER_PERMISSION") == "1" {
 				promptSession = id
 				_ = out.Encode(map[string]any{"jsonrpc": "2.0", "id": "permission", "method": "session/request_permission", "params": map[string]any{
@@ -239,6 +246,39 @@ func TestQoderPATSelectsTheRegionalNativeCredential(t *testing.T) {
 				t.Fatal("PAT or interactive login escaped the frozen launch")
 			}
 		})
+	}
+}
+
+func TestQoderProcessDiagnosticSuppressesBareSelectedPAT(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	options, _ := fixtureOptions(t, false)
+	options.Environment = append(options.Environment, "ACP_FAMILY_QODER_DIAGNOSTIC=1")
+	const secret = "fixture-unlabelled-credential"
+	options.PersonalAccessToken = secret
+	var output bytes.Buffer
+	options.Logger = slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: options.WorkingDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := client.ReservePrompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("test")}}, agentclient.PromptOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := run(); result.Receipt.OperationError == nil && (result.Outcome == nil || result.Outcome.OperationError == nil) {
+		t.Fatal("expected native process failure")
+	}
+	if strings.Contains(output.String(), secret) || !strings.Contains(output.String(), "safe startup evidence") {
+		t.Fatal("bare PAT escaped the native process diagnostic guard or hid a safe record")
 	}
 }
 

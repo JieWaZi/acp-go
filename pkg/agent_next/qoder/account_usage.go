@@ -69,7 +69,7 @@ func (c *Client) ReadAccountUsage(ctx context.Context) (acpmeta.AccountUsage, er
 		if native.UserID != "" && account.UserID != "" && native.UserID != account.UserID {
 			return errors.New("Qoder CLI quota does not match the selected subject")
 		}
-		if account.UserID == "" && !tokenSelected(m.options) {
+		if account.UserID == "" && selectedToken(m.options) == "" {
 			return errors.New("Qoder CLI quota has no verified account identity")
 		}
 		usage = native.project()

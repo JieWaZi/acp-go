@@ -55,17 +55,24 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	if err != nil {
 		return nil, err
 	}
+	token := selectedToken(options)
 	client, err := acpclient.NewClient(ctx, acpclient.Options{
 		Process: agentclient.ProcessSpec{
 			Executable: options.Executable, Args: append(slices.Clone(options.PrefixArgs), "--acp"),
-			Env: options.Environment, Dir: options.WorkingDirectory, Redact: agentclient.RedactProcessDiagnostic,
+			Env: options.Environment, Dir: options.WorkingDirectory,
+			Redact: func(record string) string {
+				if token != "" && strings.Contains(record, token) {
+					return ""
+				}
+				return agentclient.RedactProcessDiagnostic(record)
+			},
 		},
 		Version:   acpclient.VersionProbe{Args: append(slices.Clone(options.PrefixArgs), "--version"), Required: true},
 		RuntimeID: options.RuntimeID, Logger: options.Logger,
 		Protocol: acpclient.Protocol{
 			NormalizeOption: normalizeOption,
 			SessionMissing:  sessionMissing,
-			Authentication:  acpclient.Authentication{Disabled: tokenSelected(options)},
+			Authentication:  acpclient.Authentication{Disabled: token != ""},
 		},
 	}, host)
 	if err != nil {
@@ -128,15 +135,15 @@ func tokenEnvironment(runtimeID string) string {
 	return "QODER_PERSONAL_ACCESS_TOKEN"
 }
 
-func tokenSelected(options Options) bool {
+func selectedToken(options Options) string {
 	key := tokenEnvironment(options.RuntimeID)
 	for i := len(options.Environment) - 1; i >= 0; i-- {
 		name, value, valid := strings.Cut(options.Environment[i], "=")
 		if valid && (name == key || runtime.GOOS == "windows" && strings.EqualFold(name, key)) {
-			return value != ""
+			return value
 		}
 	}
-	return false
+	return ""
 }
 
 // Close reaps the same management and ACP processes and permits cleanup retry.

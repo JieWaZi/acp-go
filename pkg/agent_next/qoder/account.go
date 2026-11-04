@@ -136,7 +136,7 @@ func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
 	identity, err := c.ReadNativeIdentity(ctx)
 	if err == nil && identity.UserID != "" {
 		kind := "default_login"
-		if tokenSelected(c.management.options) {
+		if selectedToken(c.management.options) != "" {
 			kind = "personal_access_token"
 		}
 		return accountInfo(kind, identity.Email, identity.Name, identity.Plan), nil
@@ -147,7 +147,7 @@ func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
 	if errors.Is(err, acpclient.ErrBusy) || errors.Is(err, acpclient.ErrRestartRequired) {
 		return acpmeta.AccountInfo{}, err
 	}
-	if tokenSelected(c.management.options) || c.management.options.ExpectedUserID != "" {
+	if selectedToken(c.management.options) != "" || c.management.options.ExpectedUserID != "" {
 		// Local status could belong to a different credential or have no subject.
 		if err == nil {
 			err = errors.New("Qoder CLI did not confirm the selected account")
