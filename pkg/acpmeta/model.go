@@ -85,4 +85,6 @@ type ModelCatalog struct {
 	DefaultID *acp.SessionConfigValueId `json:"default_id,omitempty"`
 	// Options preserves provider grouping and distinguishes an empty catalog from unknown.
 	Options acp.SessionConfigSelectOptions `json:"options"`
+	// Modes is the permission menu observed on the discovery session, if supplied.
+	Modes []acp.SessionMode `json:"modes,omitempty"`
 }

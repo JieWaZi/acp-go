@@ -487,5 +487,183 @@ func (c *Client) ReadModels(ctx context.Context) (acpmeta.ModelCatalog, error) {
 	if fallbackSeq != 0 {
 		return clone(fallback)
 	}
-	return acpmeta.ModelCatalog{}, acp.NewMethodNotFound(acpmeta.ModelCatalogMethod)
+	return c.discoverModels(ctx, conn)
+}
+
+// discoverModels follows the standard ACP discovery path: an empty session,
+// bounded per-model configuration receipts, restoration, then native close.
+// It runs under ReadModels' single operation admission. The probe never enters
+// the chat session registry, so its callbacks cannot acquire host privileges.
+func (c *Client) discoverModels(ctx context.Context, conn *acp.ClientSideConnection) (catalog acpmeta.ModelCatalog, err error) {
+	c.mu.Lock()
+	if len(c.sessions) != 0 {
+		c.mu.Unlock()
+		return catalog, invalid("ACP discovery requires an isolated connection")
+	}
+	c.processModel = ""
+	c.mu.Unlock()
+	op, cancel := c.operationContext(ctx, 15*time.Second)
+	defer cancel()
+	r := send[setupResult](conn, op, acp.AgentMethodSessionNew, acp.NewSessionRequest{Cwd: c.opts.Process.Dir, McpServers: []acp.McpServer{}})
+	if err = receiptFailure(r, acp.AgentMethodSessionNew); err != nil {
+		if r.PeerErr == nil && r.Write.BytesWritten != 0 {
+			c.invalidate()
+		}
+		return catalog, err
+	}
+	if r.Result.ID == "" {
+		c.invalidate()
+		return catalog, invalid("ACP discovery did not identify its probe session")
+	}
+	defer func() {
+		if c.initialized.AgentCapabilities.SessionCapabilities.Close == nil {
+			return
+		}
+		cleanup, stop := c.operationContext(context.WithoutCancel(ctx), time.Second)
+		defer stop()
+		closed := send[acp.CloseSessionResponse](conn, cleanup, acp.AgentMethodSessionClose, acp.CloseSessionRequest{SessionId: r.Result.ID})
+		if failure := receiptFailure(closed, acp.AgentMethodSessionClose); failure != nil && closed.PeerErr == nil {
+			c.invalidate()
+		}
+	}()
+	probe := &session{}
+	if err = c.applyConfigurationLocked(probe, r.Result.ConfigOptions, r.Result.Models, r.Sequence); err != nil {
+		return catalog, err
+	}
+	model := modelOption(probe.config.options)
+	if model == nil {
+		return catalog, acp.NewMethodNotFound(acpmeta.ModelCatalogMethod)
+	}
+	if r.Result.Modes != nil {
+		catalog.Modes = slices.Clone(r.Result.Modes.AvailableModes)
+	}
+	catalog.Options, err = clone(model.Options)
+	if err != nil {
+		return catalog, err
+	}
+	opening := model.CurrentValue
+	if probe.config.currentAt[model.Id] != 0 && hasChoice(model, opening) {
+		catalog.DefaultID = &opening
+	}
+	// Modern setters remain authoritative. Legacy rows can carry additional
+	// per-model facts; retain those only for an identical listed model ID.
+	if present(r.Result.Models) && !probe.config.legacy {
+		legacy, current, legacyErr := parseLegacyModels(r.Result.Models)
+		if legacyErr != nil {
+			return catalog, legacyErr
+		}
+		if legacy != nil && legacy.Options.Ungrouped != nil {
+			mergeRows := func(rows []acp.SessionConfigSelectOption) {
+				for i := range rows {
+					for _, old := range *legacy.Options.Ungrouped {
+						if old.Value != rows[i].Value {
+							continue
+						}
+						meta := copyMeta(old.Meta)
+						for key, value := range rows[i].Meta {
+							meta[key] = value
+						}
+						rows[i].Meta = meta
+					}
+				}
+			}
+			if catalog.Options.Ungrouped != nil {
+				mergeRows(*catalog.Options.Ungrouped)
+			}
+			if catalog.Options.Grouped != nil {
+				for _, group := range *catalog.Options.Grouped {
+					mergeRows(group.Options)
+				}
+			}
+			if catalog.DefaultID == nil && current && hasChoice(model, legacy.CurrentValue) {
+				selected := legacy.CurrentValue
+				catalog.DefaultID = &selected
+			}
+		}
+	}
+	// Legacy catalogs without a configurable model cannot establish per-model
+	// dependent selectors; their existing native model metadata is preserved.
+	if !probe.config.legacy && probe.config.currentAt[model.Id] != 0 && hasChoice(model, opening) {
+		deadline := time.Now().Add(5 * time.Second)
+		if end, ok := op.Deadline(); ok && end.Add(-2250*time.Millisecond).Before(deadline) {
+			deadline = end.Add(-2250 * time.Millisecond)
+		}
+		selected := opening
+		uncertain := false
+		visit := func(row *acp.SessionConfigSelectOption) {
+			if _, known := acpmeta.ReadModelConfigCatalog(row.Meta); known {
+				return
+			}
+			options := probe.config.options
+			if row.Value != opening {
+				options = nil
+				if !uncertain && time.Now().Before(deadline) {
+					until := time.Now().Add(time.Second)
+					if deadline.Before(until) {
+						until = deadline
+					}
+					requestCtx, stop := context.WithDeadline(op, until)
+					receipt := send[setupResult](conn, requestCtx, acp.AgentMethodSessionSetConfigOption, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{SessionId: r.Result.ID, ConfigId: model.Id, Value: row.Value}})
+					stop()
+					if receiptFailure(receipt, acp.AgentMethodSessionSetConfigOption) == nil {
+						selected = row.Value
+						var snapshot session
+						if c.applyConfigurationLocked(&snapshot, receipt.Result.ConfigOptions, receipt.Result.Models, receipt.Sequence) == nil {
+							if current := modelOption(snapshot.config.options); current != nil && snapshot.config.currentAt[current.Id] != 0 && current.CurrentValue == row.Value {
+								options = snapshot.config.options
+							}
+						}
+					} else if receipt.PeerErr == nil && receipt.Write.BytesWritten != 0 {
+						uncertain = true
+						c.invalidate()
+					}
+				}
+			}
+			// Model directories are represented once at the catalog level. Repeating
+			// the full list inside each model would make snapshots quadratic.
+			settings := slices.DeleteFunc(slices.Clone(options), func(option acp.SessionConfigOption) bool {
+				return option.Select != nil && (option.Select.Id == model.Id || option.Select.Category != nil && *option.Select.Category == acp.SessionConfigOptionCategoryModel)
+			})
+			config := acpmeta.ModelConfigCatalog{Options: settings}
+			if options == nil {
+				config.UnknownConfigIDs = []acp.SessionConfigId{"reasoning", "fast"}
+			}
+			row.Meta = acpmeta.WithModelConfigCatalog(row.Meta, config)
+		}
+		if catalog.Options.Ungrouped != nil {
+			for i := range *catalog.Options.Ungrouped {
+				visit(&(*catalog.Options.Ungrouped)[i])
+			}
+		}
+		if catalog.Options.Grouped != nil {
+			for i := range *catalog.Options.Grouped {
+				for j := range (*catalog.Options.Grouped)[i].Options {
+					visit(&(*catalog.Options.Grouped)[i].Options[j])
+				}
+			}
+		}
+		if selected != opening && !uncertain {
+			restore, stop := c.operationContext(context.WithoutCancel(ctx), time.Second)
+			receipt := send[setupResult](conn, restore, acp.AgentMethodSessionSetConfigOption, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{SessionId: r.Result.ID, ConfigId: model.Id, Value: opening}})
+			stop()
+			if failure := receiptFailure(receipt, acp.AgentMethodSessionSetConfigOption); failure != nil {
+				c.invalidate()
+				return acpmeta.ModelCatalog{}, failure
+			}
+			var restored session
+			failure := c.applyConfigurationLocked(&restored, receipt.Result.ConfigOptions, receipt.Result.Models, receipt.Sequence)
+			current := modelOption(restored.config.options)
+			if failure != nil || current == nil || restored.config.currentAt[current.Id] == 0 || current.CurrentValue != opening {
+				c.invalidate()
+				return acpmeta.ModelCatalog{}, errUnconfirmedSetting
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return acpmeta.ModelCatalog{}, ctx.Err()
+	}
+	c.mu.Lock()
+	c.catalog = &catalog
+	c.mu.Unlock()
+	return clone(catalog)
 }
