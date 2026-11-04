@@ -3,6 +3,8 @@ package codex
 import (
 	"math"
 	"testing"
+
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 )
 
 func TestOptionalCacheWriteDeltaUsesNativeDefaultAndPreservesPresence(t *testing.T) {
@@ -71,12 +73,37 @@ func TestUsageInputBreakdownRejectsInvalidCacheCounts(t *testing.T) {
 		{Input: maxCount, Read: maxCount, Write: one, Output: one},
 		{Input: maxCount, Read: negative, Output: one},
 	} {
-		for _, observed := range []*tokenCounters{&counts, addCounters(nil, counts)} {
+		for _, observed := range []acpmeta.ModelUsage{intervalConsumption(counts), *addConsumption(nil, intervalConsumption(counts))} {
 			client.publishUsageLocked(&owner, observed, "last_request")
 			usage := owner.outcome.Turn.Usage
 			if usage.InputTokens != nil || usage.OutputTokens == nil || *usage.OutputTokens != 1 {
 				t.Fatalf("invalid cache breakdown must leave uncached input unknown and preserve output: %+v", usage)
 			}
 		}
+	}
+}
+func TestUsageOnlyDecomposesCacheEvidenceWithinSameInterval(t *testing.T) {
+	client := &Client{}
+	owner := &turn{session: &session{}}
+	counts := func(input int64, read *int64) *tokenCounters {
+		return &tokenCounters{
+			Input: pointer(input), Read: read, Output: pointer(int64(0)),
+			Reasoning: pointer(int64(0)), Context: pointer(input),
+		}
+	}
+	// First sample identifies this request's inclusive input, but says nothing
+	// about cache reads. The next sample provides a cumulative cache count.
+	// Its cache-read delta remains unknown until both endpoints have a count.
+	client.captureUsageLocked(owner, tokenSnapshot{Total: counts(100, nil), Last: counts(100, nil)})
+	client.captureUsageLocked(owner, tokenSnapshot{Total: counts(200, pointer(int64(60))), Last: counts(100, pointer(int64(20)))})
+	// The final interval has both endpoints. Only its 75 uncached tokens
+	// and 25 cache reads can enter the known disjoint subtotals.
+	client.captureUsageLocked(owner, tokenSnapshot{Total: counts(300, pointer(int64(85))), Last: counts(100, pointer(int64(25)))})
+	got := owner.outcome.Turn.Usage
+	if got == nil || value(got.InputTokens) != 75 || value(got.CacheReadTokens) != 25 {
+		if got == nil {
+			t.Fatal("expected known request counters")
+		}
+		t.Fatalf("uncached known=%d, cached known=%d, coverage=%s, complete=%t; want uncached known=75, cached known=25", value(got.InputTokens), value(got.CacheReadTokens), got.Coverage, got.Complete)
 	}
 }

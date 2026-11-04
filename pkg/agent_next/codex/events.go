@@ -515,15 +515,17 @@ func (c *Client) captureUsageLocked(t *turn, snapshot tokenSnapshot) {
 	} else if value(delta.Context) > 0 {
 		t.usageOnlyLast = false
 	}
-	t.consumed = addCounters(t.consumed, delta)
-	c.publishUsageLocked(t, t.consumed, t.usageCoverage())
+	counters := intervalConsumption(delta)
+	t.usageGap = t.usageGap || counters.InputTokens == nil
+	t.consumed = addConsumption(t.consumed, counters)
+	c.publishUsageLocked(t, *t.consumed, t.usageCoverage())
 }
 
 func (c *Client) publishLastRequestLocked(t *turn, last *tokenCounters) {
 	// Standalone request evidence is useful until an attributable sum exists.
 	// It never participates in that sum or replaces existing evidence.
 	if t.outcome.Turn.Usage == nil && last != nil {
-		c.publishUsageLocked(t, last, "last_request")
+		c.publishUsageLocked(t, intervalConsumption(*last), "last_request")
 	}
 }
 
@@ -539,19 +541,14 @@ func matchesLastRequest(delta tokenCounters, last *tokenCounters) bool {
 		equal(delta.Output, last.Output) && equal(delta.Reasoning, last.Reasoning)
 }
 
-func (c *Client) publishUsageLocked(t *turn, counters *tokenCounters, coverage string) {
-	var input *int64
-	total, read, write := nonnegative(counters.Input), nonnegative(counters.Read), nonnegative(counters.cacheWriteCount())
-	if total != nil && read != nil && write != nil && *read <= *total && *write <= *total-*read {
-		input = pointer(*total - *read - *write)
-	}
+func (c *Client) publishUsageLocked(t *turn, counters acpmeta.ModelUsage, coverage string) {
 	model := t.model
 	if t.rerouted {
 		model = ""
 	}
 
-	t.outcome.Turn.Usage = &acpmeta.TurnUsage{InputTokens: input, CacheReadTokens: nonnegative(counters.Read), CacheWriteTokens: nonnegative(counters.Write),
-		OutputTokens: nonnegative(counters.Output), ReasoningTokens: nonnegative(counters.Reasoning), Model: model,
+	t.outcome.Turn.Usage = &acpmeta.TurnUsage{InputTokens: counters.InputTokens, CacheReadTokens: counters.CacheReadTokens, CacheWriteTokens: counters.CacheWriteTokens,
+		OutputTokens: counters.OutputTokens, ReasoningTokens: counters.ReasoningTokens, Model: model,
 		Source: "codex/thread/tokenUsage/updated", Coverage: coverage, ContextKnown: t.outcome.ContextUsage.UsedTokens != nil && t.outcome.ContextUsage.WindowTokens != nil}
 	update := &acp.SessionUsageUpdate{Meta: acpmeta.WithTurnUsage(nil, *t.outcome.Turn.Usage)}
 	used, window := t.outcome.ContextUsage.UsedTokens, t.outcome.ContextUsage.WindowTokens
@@ -597,22 +594,32 @@ func subtractCounters(end, start *tokenCounters) (tokenCounters, bool) {
 	return result, valid
 }
 
-func addCounters(previous *tokenCounters, delta tokenCounters) *tokenCounters {
-	if nonnegative(delta.cacheWriteCount()) == nil {
-		delta.Input = nil
+// intervalConsumption splits inclusive input using evidence from the same interval.
+func intervalConsumption(counters tokenCounters) acpmeta.ModelUsage {
+	var input *int64
+	total, read, write := nonnegative(counters.Input), nonnegative(counters.Read), nonnegative(counters.cacheWriteCount())
+	if total != nil && read != nil && write != nil && *read <= *total && *write <= *total-*read {
+		input = pointer(*total - *read - *write)
 	}
+	return acpmeta.ModelUsage{InputTokens: input, CacheReadTokens: read, CacheWriteTokens: nonnegative(counters.Write),
+		OutputTokens: nonnegative(counters.Output), ReasoningTokens: nonnegative(counters.Reasoning)}
+}
+
+func addConsumption(previous *acpmeta.ModelUsage, delta acpmeta.ModelUsage) *acpmeta.ModelUsage {
 	if previous == nil {
-		return &tokenCounters{Input: nonnegative(delta.Input), Read: nonnegative(delta.Read), Write: nonnegative(delta.Write),
-			Output: nonnegative(delta.Output), Reasoning: nonnegative(delta.Reasoning), Context: nonnegative(delta.Context)}
+		return &delta
 	}
 	add := func(old, change *int64) *int64 {
-		if nonnegative(change) == nil || value(old) > math.MaxInt64-*change {
+		if change == nil || value(old) > math.MaxInt64-*change {
 			return old
 		}
 		return pointer(value(old) + *change)
 	}
-	return &tokenCounters{Input: add(previous.Input, delta.Input), Read: add(previous.Read, delta.Read), Write: add(previous.Write, delta.Write),
-		Output: add(previous.Output, delta.Output), Reasoning: add(previous.Reasoning, delta.Reasoning), Context: add(previous.Context, delta.Context)}
+	return &acpmeta.ModelUsage{
+		InputTokens: add(previous.InputTokens, delta.InputTokens), CacheReadTokens: add(previous.CacheReadTokens, delta.CacheReadTokens),
+		CacheWriteTokens: add(previous.CacheWriteTokens, delta.CacheWriteTokens), OutputTokens: add(previous.OutputTokens, delta.OutputTokens),
+		ReasoningTokens: add(previous.ReasoningTokens, delta.ReasoningTokens),
+	}
 }
 
 func encodePrompt(blocks []acp.ContentBlock) ([]protocol.InputElement, error) {

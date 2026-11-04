@@ -77,6 +77,8 @@ type turn struct {
 	compact bool
 	// writing is the linearized decision to allow native write.
 	writing bool
+	// tierRevision is the last native tier report when this turn allowed its write.
+	tierRevision uint64
 	// stopped is the synchronous cancellation intent.
 	stopped bool
 	// finishing fences reader updates before observation drains.
@@ -98,7 +100,7 @@ type turn struct {
 	// previous is the cumulative floor used for delta accounting.
 	previous *tokenCheckpoint
 	// consumed is the sum of deltas supported by turn attribution.
-	consumed *tokenCounters
+	consumed *acpmeta.ModelUsage
 	// usageGap indicates an unscoped observation or a missing start baseline.
 	usageGap bool
 	// usageOnlyLast means the attributed sum is proven to be one request.
@@ -257,6 +259,7 @@ func (c *Client) executeTurn(t *turn) (frameWrite, error) {
 			return cause
 		}
 		t.writing = true
+		t.tierRevision = t.session.tierRevision
 		t.session.skillRoots = slices.Clone(c.skillRoots)
 		t.admission = agentclient.AdmissionUnknown
 		return nil
@@ -342,8 +345,10 @@ func (c *Client) bindTurnLocked(t *turn, id string) {
 	c.rememberTurnLocked(t.session.id, id)
 	t.outcome.Turn.NativeTurnID = pointer(id)
 	t.admission = agentclient.AdmissionConfirmed
-	if !t.compact && t.request.ServiceTier.IsNull() {
-		t.session.clearTier = false
+	if t.writing && !t.compact && t.request.ServiceTier.IsPresent() && t.tierRevision == t.session.tierRevision {
+		// Admission supplies inheritance evidence only. The effective tier is
+		// still unknown until Codex reports it.
+		t.session.inheritedTier, _ = t.request.ServiceTier.Value()
 	}
 	if t.input.NativeInputID != nil {
 		t.outcome.Turn.ConsumedInputIDs = append(t.outcome.Turn.ConsumedInputIDs, *t.input.NativeInputID)
