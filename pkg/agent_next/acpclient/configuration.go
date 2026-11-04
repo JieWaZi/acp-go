@@ -459,7 +459,11 @@ func (c *Client) ReadModels(ctx context.Context) (acpmeta.ModelCatalog, error) {
 	c.mu.Unlock()
 	probe := c.opts.Protocol.Catalog
 	if probe != nil {
-		op, cancel := c.operationContext(ctx, 3*time.Second)
+		timeout := probe.Timeout
+		if timeout <= 0 {
+			timeout = 3 * time.Second
+		}
+		op, cancel := c.operationContext(ctx, timeout)
 		defer cancel()
 		r := send[json.RawMessage](conn, op, probe.Method, struct{}{})
 		if err := receiptFailure(r, probe.Method); err != nil {

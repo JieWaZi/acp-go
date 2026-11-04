@@ -6,6 +6,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/agent_next/acpclient"
 	acp "github.com/JieWaZi/acp-go/sdk"
@@ -15,13 +16,17 @@ const observedVersion = "2026.10.22-27dcf5f"
 
 func cursorProtocol(c *Client) acpclient.Protocol {
 	return acpclient.Protocol{
-		ModelScope:               acpclient.ModelPerProcess,
-		PromptUsage:              acpclient.UsageSessionCumulative,
-		ExecutionOption:          func(category acp.SessionConfigOptionCategory) bool { return category == "model_config" },
-		SessionMissing:           cursorMissingSession,
-		ClassifyText:             classifyCursorText,
-		Private:                  privateProtocol{},
-		Catalog:                  &acpclient.CatalogProbe{Method: "cursor/list_available_models", Decode: decodeModelCatalog},
+		ModelScope:      acpclient.ModelPerProcess,
+		PromptUsage:     acpclient.UsageSessionCumulative,
+		ExecutionOption: func(category acp.SessionConfigOptionCategory) bool { return category == "model_config" },
+		SessionMissing:  cursorMissingSession,
+		ClassifyText:    classifyCursorText,
+		Private:         privateProtocol{},
+		Catalog: &acpclient.CatalogProbe{
+			Method: "cursor/list_available_models", Decode: decodeModelCatalog,
+			// A cold request initializes backend services before fetching models.
+			Timeout: 15 * time.Second,
+		},
 		ParameterizedModelPicker: true,
 		Authentication: acpclient.Authentication{
 			Disabled: c.apiKey != "", Method: "cursor_login", RetireOnLogout: true,

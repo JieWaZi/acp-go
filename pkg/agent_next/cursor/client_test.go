@@ -154,6 +154,8 @@ func TestCursorFixture(t *testing.T) {
 		case "cursor/list_available_models":
 			models := []any{map[string]any{"value": "model-a", "name": "Model A", "configOptions": fixtureOptions("native-fast", false)[1:]}}
 			switch scenario {
+			case "catalog-slow":
+				time.Sleep(3250 * time.Millisecond)
 			case "catalog-unconfirmed":
 				models = []any{}
 			case "catalog-parameterized":
@@ -692,6 +694,27 @@ func TestCursorCatalogRejectsEmptyUnconfirmedDirectory(t *testing.T) {
 	client, ctx, _ := candidate(t, "catalog-unconfirmed", agentclient.HostCallbacks{})
 	if _, err := client.ReadModels(ctx); err == nil {
 		t.Fatal("empty Cursor directory was accepted as fresh discovery evidence")
+	}
+}
+
+func TestCursorCatalogAllowsNativeColdDiscovery(t *testing.T) {
+	client, ctx, _ := candidate(t, "catalog-slow", agentclient.HostCallbacks{})
+	models, err := client.ReadModels(ctx)
+	if err != nil || models.Options.Ungrouped == nil || len(*models.Options.Ungrouped) != 1 || (*models.Options.Ungrouped)[0].Value != "model-a" {
+		t.Fatalf("cold model discovery = %+v, %v", models, err)
+	}
+}
+
+func TestCursorCatalogHonorsCallerDeadline(t *testing.T) {
+	client, ctx, trace := candidate(t, "catalog-slow", agentclient.HostCallbacks{})
+	short, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	if _, err := client.ReadModels(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("model discovery ignored caller deadline: %v", err)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil || !strings.Contains(string(data), `"method":"cursor/list_available_models"`) {
+		t.Fatalf("caller deadline did not expire during native discovery: %v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package acpclient
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/JieWaZi/acp-go/sdk"
@@ -74,6 +75,8 @@ type Authentication struct {
 type CatalogProbe struct {
 	// Method is the exact native catalog method.
 	Method string
+	// Timeout bounds this probe within the caller's deadline. Zero uses the default.
+	Timeout time.Duration
 	// Decode returns only native catalog facts, independently of session selection.
 	Decode func(json.RawMessage) (acpmeta.ModelCatalog, error)
 }
