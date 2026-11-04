@@ -57,6 +57,18 @@ func TestCursorFixture(t *testing.T) {
 		_, _ = fmt.Fprintln(os.Stdout, "2026.10.22-27dcf5f")
 		os.Exit(0)
 	}
+	if len(os.Args) >= 3 && strings.Join(os.Args[len(os.Args)-3:], " ") == "status --format json" {
+		_, _ = fmt.Fprintln(trace, "status")
+		switch scenario {
+		case "status-signed-out":
+			_ = encoder.Encode(map[string]any{"isAuthenticated": false})
+		case "status-invalid":
+			_, _ = fmt.Fprintln(os.Stdout, `{"accessToken":"fixture-secret"}`)
+		default:
+			_, _ = fmt.Fprintln(os.Stdout, `{"isAuthenticated":true,"userInfo":{"email":"cursor@example.invalid","userId":"native-id"},"accessToken":"fixture-secret"}`)
+		}
+		os.Exit(0)
+	}
 	for scanner.Scan() {
 		var msg struct {
 			ID     json.RawMessage `json:"id"`
@@ -140,7 +152,19 @@ func TestCursorFixture(t *testing.T) {
 				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": -32602, "message": "unexpected setting"}})
 			}
 		case "cursor/list_available_models":
-			reply(msg.ID, map[string]any{"models": []any{map[string]any{"value": "model-a", "name": "Model A", "configOptions": fixtureOptions("native-fast", false)[1:]}}})
+			models := []any{map[string]any{"value": "model-a", "name": "Model A", "configOptions": fixtureOptions("native-fast", false)[1:]}}
+			switch scenario {
+			case "catalog-unconfirmed":
+				models = []any{}
+			case "catalog-parameterized":
+				models = []any{map[string]any{"value": "model-a", "name": "Model A", "configOptions": []any{
+					map[string]any{"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "high",
+						"options": []any{map[string]any{"value": "high", "name": "High"}}},
+					map[string]any{"id": "fast", "name": "Fast", "category": "model_config", "type": "select", "currentValue": "false",
+						"options": []any{map[string]any{"value": "false", "name": "Off"}, map[string]any{"value": "true", "name": "On"}}},
+				}}}
+			}
+			reply(msg.ID, map[string]any{"models": models})
 		case "session/close", "session/list":
 			reply(msg.ID, map[string]any{"sessions": []any{}})
 		case "session/prompt":
@@ -664,6 +688,33 @@ func TestModelDirectoryKeepsFastSeparateAndUnknownDefault(t *testing.T) {
 	}
 }
 
+func TestCursorCatalogRejectsEmptyUnconfirmedDirectory(t *testing.T) {
+	client, ctx, _ := candidate(t, "catalog-unconfirmed", agentclient.HostCallbacks{})
+	if _, err := client.ReadModels(ctx); err == nil {
+		t.Fatal("empty Cursor directory was accepted as fresh discovery evidence")
+	}
+}
+
+func TestCursorCatalogPreservesNativeEffortAndFastSelectValues(t *testing.T) {
+	client, ctx, _ := candidate(t, "catalog-parameterized", agentclient.HostCallbacks{})
+	models, err := client.ReadModels(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, ok := acpmeta.ModelConfigOptions((*models.Options.Ungrouped)[0].Meta)
+	if !ok || len(settings) != 2 || settings[0].Select == nil || settings[1].Select == nil {
+		t.Fatalf("missing native select options: %#v", settings)
+	}
+	effort, fast := settings[0].Select, settings[1].Select
+	if effort.Id != "effort" || effort.CurrentValue != "high" || effort.Category == nil || *effort.Category != "thought_level" {
+		t.Fatalf("effort lost native identity: %+v", effort)
+	}
+	if fast.Id != "fast" || fast.CurrentValue != "false" || fast.Category == nil || *fast.Category != "model_config" ||
+		fast.Options.Ungrouped == nil || len(*fast.Options.Ungrouped) != 2 || (*fast.Options.Ungrouped)[1].Value != "true" {
+		t.Fatalf("fast lost native select values: %+v", fast)
+	}
+}
+
 func TestPublicACPAdjacentPromptCancelCapturesBeforePreparation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
@@ -904,6 +955,135 @@ func TestCloseRetriesWithoutReleasingBlockedObserver(t *testing.T) {
 	case <-result:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+}
+
+func TestCursorStartupRejectsNativeCredentialAndPermissionOverrides(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  []string
+	}{
+		{name: "key", args: []string{"--api-key", "fixture-secret"}},
+		{name: "token", args: []string{"--auth-token=fixture-secret"}},
+		{name: "environment token", env: []string{"CURSOR_AUTH_TOKEN=fixture-secret"}},
+		{name: "force", args: []string{"-f"}},
+		{name: "force long", args: []string{"--yolo"}},
+		{name: "auto review", args: []string{"--auto-review"}},
+		{name: "sandbox", args: []string{"--sandbox=disabled"}},
+		{name: "MCP approval", args: []string{"--approve-mcps"}},
+		{name: "workspace trust", args: []string{"--trust"}},
+		{name: "attached endpoint", args: []string{"-ehttps://example.invalid"}},
+		{name: "attached header", args: []string{"-HAuthorization: fixture-secret"}},
+		{name: "data root", args: []string{"--data-dir", "another-account"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := cursor.NewClient(t.Context(), cursor.Options{
+				Executable: binary, PrefixArgs: tc.args, Environment: tc.env,
+			}, agentclient.HostCallbacks{})
+			if err == nil {
+				_ = client.Close(t.Context())
+				t.Fatal("unfrozen launch override was admitted")
+			}
+			if strings.Contains(err.Error(), "fixture-secret") {
+				t.Fatal("startup error exposed credential input")
+			}
+		})
+	}
+}
+
+func TestCursorACPAutoReviewIsUnavailable(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := cursor.NewClient(t.Context(), cursor.Options{
+		Executable: binary, PermissionMode: "auto",
+	}, agentclient.HostCallbacks{})
+	if err == nil {
+		_ = client.Close(t.Context())
+		t.Fatal("Cursor ACP accepted an unsupported auto-review policy")
+	}
+	if !errors.Is(err, cursor.ErrPermissionModeUnsupported) {
+		t.Fatalf("unexpected auto-review policy error: %v", err)
+	}
+}
+
+func TestReadAccountUsesNativeLoginWithoutACPOrDashboard(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		key        string
+		signedIn   bool
+		signedOut  bool
+		wantErr    bool
+		wantStatus bool
+	}{
+		{name: "status-signed-in", signedIn: true, wantStatus: true},
+		{name: "status-signed-out", signedOut: true, wantStatus: true},
+		{name: "status-invalid", wantErr: true, wantStatus: true},
+		{name: "status-api-key", key: "test-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			dir := t.TempDir()
+			trace := filepath.Join(dir, "wire")
+			client, err := cursor.NewClient(ctx, cursor.Options{
+				Executable: binary, PrefixArgs: []string{"-test.run=^TestCursorFixture$", "--"},
+				Environment:      append(os.Environ(), "CURSOR_NEXT_FIXTURE=1", "CURSOR_NEXT_SCENARIO="+tc.name, "CURSOR_NEXT_TRACE="+trace, "CURSOR_API_KEY="+tc.key),
+				WorkingDirectory: dir,
+			}, agentclient.HostCallbacks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := client.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			}()
+			account, err := client.ReadAccount(ctx)
+			if (err != nil) != tc.wantErr || err != nil && strings.Contains(err.Error(), "fixture-secret") {
+				t.Fatalf("unexpected native status error: %v", err)
+			}
+			if tc.signedIn && (account.Account == nil || account.Account.Kind != "default_login" ||
+				account.Account.Label == nil || *account.Account.Label != "cursor@example.invalid" ||
+				account.Account.Plan != nil || account.RequiresAuthentication) {
+				t.Fatalf("signed in account = %+v", account)
+			}
+			if tc.signedOut && (!account.RequiresAuthentication || account.Account != nil) {
+				t.Fatalf("signed out account = %+v", account)
+			}
+			if tc.key != "" {
+				if account.Account == nil || account.Account.Kind != "api_key" || account.RequiresAuthentication ||
+					account.Account.Label != nil || account.Account.Plan != nil {
+					t.Fatalf("API key selection = %+v", account)
+				}
+				if _, err := client.ReadLoginStatus(ctx); err == nil {
+					t.Fatal("API key selection read the ambient native login")
+				}
+			}
+			wantCommands := "status\n"
+			if tc.signedIn {
+				status, err := client.ReadLoginStatus(ctx)
+				if err != nil || !status.Authenticated || status.UserID != "native-id" {
+					t.Fatalf("native login identity = %+v, %v", status, err)
+				}
+				wantCommands += "status\n"
+			}
+			commands, traceErr := os.ReadFile(trace)
+			if tc.wantStatus && (traceErr != nil || string(commands) != wantCommands) ||
+				!tc.wantStatus && !errors.Is(traceErr, os.ErrNotExist) {
+				t.Fatalf("unexpected commands %q: %v", commands, traceErr)
+			}
+		})
 	}
 }
 

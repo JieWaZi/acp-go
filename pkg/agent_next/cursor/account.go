@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -128,9 +129,10 @@ func cliName(path string) string {
 	}
 }
 
-func (c *Client) runCommandTo(ctx context.Context, env []string, command string, limit int64, output io.Writer) (result error) {
+func (c *Client) runCommandTo(ctx context.Context, env []string, command string, limit int64, output io.Writer, args ...string) (result error) {
+	argv := append(slices.Clone(c.opts.PrefixArgs), command)
 	proc, err := agentclient.NewProcess(agentclient.ProcessSpec{
-		Executable: c.opts.Executable, Args: append(slices.Clone(c.opts.PrefixArgs), command), Env: env, Dir: c.opts.WorkingDirectory,
+		Executable: c.opts.Executable, Args: append(argv, args...), Env: env, Dir: c.opts.WorkingDirectory,
 	})
 	if err != nil {
 		return err
@@ -204,17 +206,84 @@ func (c *Client) managementContext(ctx context.Context, timeout time.Duration) (
 	return op, func() { stop(); cancel() }
 }
 
-func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
-	if c.opts.Dashboard == nil || c.apiKey != "" {
-		return acpmeta.AccountInfo{}, acp.NewMethodNotFound(acpmeta.AccountReadMethod)
+// LoginStatus describes the selected native sign-in independently of plan usage.
+type LoginStatus struct {
+	// Authenticated is the local login status reported by the CLI.
+	Authenticated bool
+	// UserID is the provider's account identity when the CLI reports it.
+	UserID string
+	// Email is the optional provider label.
+	Email string
+}
+
+// ReadLoginStatus reads Cursor's local sign-in without starting an ACP session.
+// The CLI status command describes the stored login even when an API key is selected.
+func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
+	if c.apiKey != "" {
+		return LoginStatus{}, acp.NewMethodNotFound(acpmeta.AccountReadMethod)
 	}
-	if _, err := c.ReadAccountUsage(ctx); err != nil {
-		if errors.Is(err, ErrQuotaUnauthorized) {
-			return acpmeta.AccountInfo{RequiresAuthentication: true}, nil
-		}
+	op, cancel := c.managementContext(ctx, 5*time.Second)
+	defer cancel()
+	var output bytes.Buffer
+	err := c.runCommandTo(op, c.opts.Environment, "status", 64<<10, &output, "--format", "json")
+	if ctx.Err() != nil {
+		return LoginStatus{}, ctx.Err()
+	}
+	if c.management.Err() != nil {
+		return LoginStatus{}, ErrRestartRequired
+	}
+	if err != nil {
+		return LoginStatus{}, err
+	}
+	var status struct {
+		// Authenticated is required to distinguish an absent field from a signed-out account.
+		Authenticated *bool `json:"isAuthenticated"`
+		// UserInfo identifies a locally signed-in account when available.
+		UserInfo struct {
+			// UserID is Cursor's stable native user ID.
+			UserID string `json:"userId"`
+			// Email is the native label displayed by account consumers.
+			Email string `json:"email"`
+		} `json:"userInfo"`
+	}
+	if json.Unmarshal(output.Bytes(), &status) != nil || status.Authenticated == nil {
+		return LoginStatus{}, errors.New("Cursor CLI account status is invalid")
+	}
+	if !*status.Authenticated {
+		return LoginStatus{}, nil
+	}
+	return LoginStatus{
+		Authenticated: true,
+		UserID:        strings.TrimSpace(status.UserInfo.UserID),
+		Email:         strings.TrimSpace(status.UserInfo.Email),
+	}, nil
+}
+
+// ReadAccount projects the locally signed-in account without consulting Dashboard.
+func (c *Client) ReadAccount(ctx context.Context) (acpmeta.AccountInfo, error) {
+	if err := ctx.Err(); err != nil {
 		return acpmeta.AccountInfo{}, err
 	}
-	return acpmeta.AccountInfo{Account: &acpmeta.AccountIdentity{Kind: string(DefaultLogin)}}, nil
+	if c.management.Err() != nil {
+		return acpmeta.AccountInfo{}, ErrRestartRequired
+	}
+	if c.AuthenticationSource() == APIKey {
+		// This describes the frozen launch credential. Only a native provider
+		// operation can verify the key, and local sign-in says nothing about it.
+		return acpmeta.AccountInfo{Account: &acpmeta.AccountIdentity{Kind: string(APIKey)}}, nil
+	}
+	status, err := c.ReadLoginStatus(ctx)
+	if err != nil {
+		return acpmeta.AccountInfo{}, err
+	}
+	if !status.Authenticated {
+		return acpmeta.AccountInfo{RequiresAuthentication: true}, nil
+	}
+	account := &acpmeta.AccountIdentity{Kind: string(DefaultLogin)}
+	if status.Email != "" {
+		account.Label = &status.Email
+	}
+	return acpmeta.AccountInfo{Account: account}, nil
 }
 
 func (c *Client) ReadAccountUsage(ctx context.Context) (acpmeta.AccountUsage, error) {

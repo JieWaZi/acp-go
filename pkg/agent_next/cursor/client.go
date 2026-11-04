@@ -21,7 +21,7 @@ import (
 type Options struct {
 	// Executable is the selected Cursor CLI path or command name.
 	Executable string
-	// PrefixArgs precede each Cursor subcommand.
+	// PrefixArgs precede each Cursor subcommand. Native account and policy flags are reserved.
 	PrefixArgs []string
 	// Environment is the complete launch environment, or nil to freeze the host environment.
 	Environment []string
@@ -29,7 +29,7 @@ type Options struct {
 	WorkingDirectory string
 	// Logger is reserved for safe SDK diagnostics.
 	Logger *slog.Logger
-	// PermissionMode is the startup policy: default, auto, or full-access.
+	// PermissionMode selects native defaults or the CLI force policy (full-access).
 	PermissionMode string
 	// RequireVerifiedMCP rejects servers when Cursor cannot verify their registration.
 	RequireVerifiedMCP bool
@@ -64,6 +64,9 @@ type Client struct {
 var (
 	ErrBusy            = acpclient.ErrBusy
 	ErrRestartRequired = acpclient.ErrRestartRequired
+
+	// ErrPermissionModeUnsupported identifies a policy the ACP implementation does not apply.
+	ErrPermissionModeUnsupported = errors.New("Cursor ACP does not support this permission mode")
 )
 
 var _ agentclient.Client = (*Client)(nil)
@@ -82,6 +85,14 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	}
 	options.Environment = slices.Clone(options.Environment)
 	options.PrefixArgs = slices.Clone(options.PrefixArgs)
+	if envValue(options.Environment, "CURSOR_AUTH_TOKEN") != "" {
+		return nil, invalid("Cursor launch does not support a raw authentication token")
+	}
+	for _, arg := range options.PrefixArgs {
+		if cursorLaunchOverride(arg) {
+			return nil, invalid("Cursor launcher arguments cannot override the selected account or policy")
+		}
+	}
 	if options.Dashboard != nil {
 		dashboard := *options.Dashboard
 		if dashboard.HTTPClient != nil {
@@ -104,12 +115,14 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		}
 		options.WorkingDirectory = dir
 	}
-	apiKey := strings.TrimSpace(envValue(options.Environment, "CURSOR_API_KEY"))
+	apiKey := envValue(options.Environment, "CURSOR_API_KEY")
 	args := slices.Clone(options.PrefixArgs)
 	switch options.PermissionMode {
 	case "", "default":
 	case "auto":
-		args = append(args, "--auto-review")
+		// Cursor 2026.10.22-27dcf5f accepts the global flag, but its ACP
+		// session resource builder only reads force.
+		return nil, ErrPermissionModeUnsupported
 	case "full-access":
 		args = append(args, "--force")
 	default:
@@ -156,6 +169,21 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	}
 	client.Client = shared
 	return client, nil
+}
+
+func cursorLaunchOverride(arg string) bool {
+	flag, _, _ := strings.Cut(arg, "=")
+	switch flag {
+	case "--api-key", "--auth-token", "--header", "--endpoint", "--website-url", "--insecure", "--data-dir",
+		"--force", "--yolo", "--auto-review", "--sandbox", "--approve-mcps", "--trust", "-k":
+		return true
+	}
+	if len(flag) < 2 || flag[0] != '-' || flag[1] == '-' {
+		return false
+	}
+	// Cursor accepts short options with attached values and combined force flags.
+	short := strings.TrimLeft(flag[1:], "f")
+	return short == "" || strings.HasPrefix(short, "H") || strings.HasPrefix(short, "e")
 }
 
 func envValue(env []string, key string) string {

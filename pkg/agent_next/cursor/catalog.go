@@ -29,6 +29,11 @@ func decodeModelCatalog(raw json.RawMessage) (acpmeta.ModelCatalog, error) {
 	if reply.Models == nil {
 		return acpmeta.ModelCatalog{}, acp.NewMethodNotFound(acpmeta.ModelCatalogMethod)
 	}
+	// Cursor 2026.10.22-27dcf5f returns an empty array on upstream
+	// model fetch failure. It cannot prove an account's directory is empty.
+	if len(reply.Models) == 0 {
+		return acpmeta.ModelCatalog{}, errors.New("Cursor did not report an available model directory")
+	}
 	models := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(reply.Models))
 	seen := make(map[acp.SessionConfigValueId]bool)
 	for _, row := range reply.Models {
