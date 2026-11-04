@@ -117,8 +117,6 @@ type Agent struct {
 	toolRevisions map[acp.ToolCallId]*toolEvidenceRevision
 	// toolChanged wakes approval requests waiting for preceding tool notifications.
 	toolChanged chan struct{}
-	// silentLoads suppresses history when loading only to recover configuration.
-	silentLoads map[acp.SessionId]bool
 	// messageSequence assigns non-reusable identities to messages without native IDs.
 	messageSequence uint64
 }
@@ -201,6 +199,7 @@ func NewAgent(ctx context.Context, config Config) (*Agent, error) {
 	}
 	go func() {
 		<-agent.conn.Done()
+		agent.closePromptQueues()
 		// Explicit shutdown drains stderr within its bounded exit window; disconnection terminates the process.
 		select {
 		case <-agent.closed:
@@ -230,6 +229,16 @@ type diagnosticWriter struct {
 	pending []byte
 	// depth tracks structured payloads across pretty-printed lines.
 	depth int
+	// opening holds a bracket until the following text establishes record syntax.
+	opening byte
+	// openingNewline records whether bracket classification crossed a line boundary.
+	openingNewline bool
+	// openingIndented distinguishes inspected object fields from following prose.
+	openingIndented bool
+	// inspect accepts native console object strings and indentation boundaries.
+	inspect bool
+	// inspectLine waits for the next line's first character before continuing a dump.
+	inspectLine bool
 	// quote tracks JSON and inspected object strings within a payload.
 	quote byte
 	// escaped records a string escape across pipe chunks.
@@ -246,10 +255,54 @@ func (writer *diagnosticWriter) Write(data []byte) (int, error) {
 	writer.mutex.Lock()
 	defer writer.mutex.Unlock()
 	for _, b := range data {
-		if writer.stripControl(b) {
-			continue
+		if !writer.stripControl(b) {
+			writer.recordByte(b)
 		}
-		if writer.depth > 0 && writer.quote != 0 {
+	}
+	return len(data), nil
+}
+
+// recordByte classifies a record once, preserving scan state between chunks.
+func (writer *diagnosticWriter) recordByte(b byte) {
+	if writer.opening != 0 {
+		switch b {
+		case '\n':
+			writer.openingNewline = true
+			writer.openingIndented = false
+			writer.appendByte(b)
+			return
+		case ' ', '\t', '\r':
+			if writer.openingNewline && b != '\r' {
+				writer.openingIndented = true
+			}
+			writer.appendByte(b)
+			return
+		}
+		structured := b == '"' || b == '{' || b == '[' || b == '}' || b == ']'
+		if writer.opening == '[' && (b == '-' || b >= '0' && b <= '9' || b == 't' || b == 'f' || b == 'n') {
+			structured = true
+		}
+		inspect := writer.openingNewline && writer.openingIndented && !structured
+		writer.opening = 0
+		if structured || inspect {
+			writer.depth = 1
+			writer.inspect = inspect
+		} else if writer.openingNewline {
+			writer.line()
+		}
+		writer.openingNewline, writer.openingIndented = false, false
+	}
+	if writer.inspectLine {
+		writer.inspectLine = false
+		if b != ' ' && b != '\t' && b != '}' && b != ']' {
+			// A malformed inspected payload cannot lend its field labels to an
+			// unrelated following line; suppress the incomplete payload as a unit.
+			writer.overflow = true
+			writer.line()
+		}
+	}
+	if writer.depth > 0 {
+		if writer.quote != 0 {
 			if writer.escaped {
 				writer.escaped = false
 			} else if b == '\\' {
@@ -259,30 +312,43 @@ func (writer *diagnosticWriter) Write(data []byte) (int, error) {
 			}
 		} else {
 			switch b {
+			case '"':
+				writer.quote = b
+			case '\'', '`':
+				if writer.inspect {
+					writer.quote = b
+				}
 			case '{', '[':
 				writer.depth++
 			case '}', ']':
-				if writer.depth > 0 {
-					writer.depth--
-				}
-			case '"', '\'', '`':
-				if writer.depth > 0 {
-					writer.quote = b
-				}
+				writer.depth--
 			}
 		}
-		if b == '\n' && writer.depth == 0 {
-			writer.line()
-		} else if !writer.overflow {
-			if len(writer.pending) == maxNativeDiagnosticRecordBytes {
-				writer.pending = nil
-				writer.overflow = true
-			} else {
-				writer.pending = append(writer.pending, b)
-			}
+		if writer.inspect && b == '\n' {
+			writer.inspectLine = true
+			writer.quote = 0
+			writer.escaped = false
 		}
+	} else if b == '{' || b == '[' {
+		writer.opening = b
 	}
-	return len(data), nil
+	if b == '\n' && writer.depth == 0 && writer.opening == 0 {
+		writer.line()
+	} else {
+		writer.appendByte(b)
+	}
+}
+
+func (writer *diagnosticWriter) appendByte(b byte) {
+	if writer.overflow {
+		return
+	}
+	if len(writer.pending) == maxNativeDiagnosticRecordBytes {
+		writer.pending = nil
+		writer.overflow = true
+		return
+	}
+	writer.pending = append(writer.pending, b)
 }
 
 // stripControl consumes CSI, OSC and two-byte terminal escape sequences incrementally.
@@ -338,6 +404,8 @@ func (writer *diagnosticWriter) line() {
 		}
 	}
 	writer.pending, writer.overflow = nil, false
+	writer.depth, writer.quote, writer.opening = 0, 0, 0
+	writer.inspect, writer.inspectLine, writer.escaped = false, false, false
 	if safe == "" {
 		return
 	}
@@ -493,11 +561,11 @@ func (agent *Agent) Cancel(ctx context.Context, request acp.CancelNotification) 
 
 // CloseSession seals admission and settles the native operation before closing its session.
 func (agent *Agent) CloseSession(ctx context.Context, request acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
-	release, err := agent.beginSessionTransition(request.SessionId, true)
+	release, err := agent.beginSessionTransition(request.SessionId, true, false)
 	if err != nil {
 		return acp.CloseSessionResponse{}, err
 	}
-	defer release()
+	defer release(nil, false)
 	agent.mutex.Lock()
 	state := agent.sessions[request.SessionId]
 	agent.mutex.Unlock()

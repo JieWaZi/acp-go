@@ -11,11 +11,13 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
+var errEndpointUnavailable = errors.New("managed user input endpoint unavailable")
+
 // Agent 在原生适配器外补充统一问答，模型、审批与执行仍由原适配器拥有。
 type Agent struct {
 	// Agent 保留标准 ACP 方法和原生能力。
 	acp.Agent
-	// mutex 保护连接、能力、关闭标志和会话端点。
+	// mutex protects the connection, capabilities, endpoints, and publication state.
 	mutex sync.Mutex
 	// host 是唯一的宿主交互连接。
 	host *acp.AgentSideConnection
@@ -25,6 +27,8 @@ type Agent struct {
 	closed bool
 	// sessions 按原生会话身份持有问答端点。
 	sessions map[acp.SessionId]*endpoint
+	// changing marks session operations that have yet to publish or retire an endpoint.
+	changing map[acp.SessionId]bool
 	// bound 在宿主连接注入后关闭，避免快速初始化越过绑定。
 	bound chan struct{}
 	// bindOnce 保证连接就绪通知只发送一次。
@@ -33,9 +37,13 @@ type Agent struct {
 	requireReady bool
 }
 
-// Wrap 补充模型可调用的问答工具；未声明表单交互的宿主保持原始行为。
+// Wrap adds a model-callable input tool when the host supports forms.
 func Wrap(agent acp.Agent) *Agent {
-	return &Agent{Agent: agent, bound: make(chan struct{}), sessions: map[acp.SessionId]*endpoint{}}
+	return &Agent{
+		Agent: agent, bound: make(chan struct{}),
+		sessions: make(map[acp.SessionId]*endpoint),
+		changing: make(map[acp.SessionId]bool),
+	}
 }
 
 // ManagesSessionLifecycle preserves the native adapter's ACP lifecycle ownership.
@@ -47,21 +55,22 @@ func (a *Agent) ManagesSessionLifecycle() bool {
 	return ok && owner.ManagesSessionLifecycle()
 }
 
-// SetAgentConnection 将同一 SDK 连接注入原适配器与问答端口。
+// SetAgentConnection shares the same SDK connection with the adapter and the input tool.
 func (a *Agent) SetAgentConnection(host *acp.AgentSideConnection) {
-	a.mutex.Lock()
-	a.host = host
-	a.mutex.Unlock()
+	host.SetPromptPreparation(a.capturePromptPreparation)
 	if binder, ok := a.Agent.(interface {
 		// SetAgentConnection 传递唯一宿主连接。
 		SetAgentConnection(*acp.AgentSideConnection)
 	}); ok {
 		binder.SetAgentConnection(host)
 	}
+	a.mutex.Lock()
+	a.host = host
+	a.mutex.Unlock()
 	a.bindOnce.Do(func() { close(a.bound) })
 }
 
-// Initialize 只有标准表单和 HTTP MCP 都可用时启用问答工具。
+// Initialize enables managed input when standard forms and HTTP MCP are available.
 func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	select {
 	case <-a.bound:
@@ -82,14 +91,15 @@ func (a *Agent) Initialize(ctx context.Context, request acp.InitializeRequest) (
 	if forms && !response.AgentCapabilities.McpCapabilities.Http {
 		return response, errors.New("this CLI version cannot provide unified user input: HTTP MCP is required")
 	}
-	a.mutex.Lock()
-	a.enabled = forms
+	var requireReady bool
 	if agent, ok := a.Agent.(interface {
 		// UserInputRequiresReady 表示执行前必须验证受管工具已完成发现。
 		UserInputRequiresReady() bool
 	}); ok {
-		a.requireReady = agent.UserInputRequiresReady()
+		requireReady = agent.UserInputRequiresReady()
 	}
+	a.mutex.Lock()
+	a.enabled, a.requireReady = forms, requireReady
 	a.mutex.Unlock()
 	return response, nil
 }
@@ -117,7 +127,7 @@ func (a *Agent) prepare(servers []acp.McpServer) ([]acp.McpServer, *endpoint, er
 	return append(append([]acp.McpServer{}, servers...), ep.config), ep, nil
 }
 
-// attach 绑定创建成功的原生会话；关闭或失败后立即回收临时端点。
+// attach publishes the endpoint for a successful session operation and closes unused endpoints.
 func (a *Agent) attach(ep *endpoint, sid acp.SessionId, err error) error {
 	if ep == nil {
 		return err
@@ -127,19 +137,39 @@ func (a *Agent) attach(ep *endpoint, sid acp.SessionId, err error) error {
 		return err
 	}
 	a.mutex.Lock()
-	defer a.mutex.Unlock()
 	if a.closed || sid == "" {
+		a.mutex.Unlock()
 		ep.stop()
 		return errors.New("session unavailable")
 	}
-	if previous := a.sessions[sid]; previous != nil {
-		previous.stop()
-	}
+	previous := a.sessions[sid]
 	ep.mutex.Lock()
 	ep.sid = sid
 	ep.mutex.Unlock()
 	a.sessions[sid] = ep
+	a.mutex.Unlock()
+	if previous != nil {
+		previous.stop()
+	}
 	return nil
+}
+
+// beginEndpointChange reserves the session through the native change and endpoint publication.
+func (a *Agent) beginEndpointChange(sid acp.SessionId) (func(), error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if !a.enabled && a.sessions[sid] == nil {
+		return func() {}, nil
+	}
+	if a.closed || a.changing[sid] {
+		return nil, errEndpointUnavailable
+	}
+	a.changing[sid] = true
+	return func() {
+		a.mutex.Lock()
+		delete(a.changing, sid)
+		a.mutex.Unlock()
+	}, nil
 }
 
 // NewSession 在原生会话初始化时提供问答工具。
@@ -153,12 +183,17 @@ func (a *Agent) NewSession(ctx context.Context, r acp.NewSessionRequest) (acp.Ne
 	return response, a.attach(ep, response.SessionId, err)
 }
 
-// LoadSession 恢复历史时重新挂载当前进程的问答端点。
+// LoadSession mounts this process’s input endpoint when restoring session history.
 func (a *Agent) LoadSession(ctx context.Context, r acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	loader, ok := a.Agent.(acp.AgentLoader)
 	if !ok {
 		return acp.LoadSessionResponse{}, acp.NewMethodNotFound("session/load")
 	}
+	finish, err := a.beginEndpointChange(r.SessionId)
+	if err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	defer finish()
 	servers, ep, err := a.prepare(r.McpServers)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
@@ -168,8 +203,13 @@ func (a *Agent) LoadSession(ctx context.Context, r acp.LoadSessionRequest) (acp.
 	return response, a.attach(ep, r.SessionId, err)
 }
 
-// ResumeSession 无重放恢复也使用新凭据，避免沿用历史端口。
+// ResumeSession mounts a fresh input endpoint when resuming without replay.
 func (a *Agent) ResumeSession(ctx context.Context, r acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+	finish, err := a.beginEndpointChange(r.SessionId)
+	if err != nil {
+		return acp.ResumeSessionResponse{}, err
+	}
+	defer finish()
 	servers, ep, err := a.prepare(r.McpServers)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
@@ -210,39 +250,86 @@ func (a *Agent) UnstableForkSession(ctx context.Context, r acp.UnstableForkSessi
 	return response, a.attach(ep, response.SessionId, err)
 }
 
-// Prompt 将问答等待限定在当前执行中，不修改用户消息或原生历史。
-func (a *Agent) Prompt(ctx context.Context, r acp.PromptRequest) (acp.PromptResponse, error) {
+// capturePromptPreparation freezes the endpoint and readiness policy at ingress.
+func (a *Agent) capturePromptPreparation(r acp.PromptRequest) acp.PromptPreparation {
+	sid := r.SessionId
 	a.mutex.Lock()
-	ep := a.sessions[r.SessionId]
-	ready := a.requireReady
+	ep, ready := a.sessions[sid], a.requireReady
+	unavailable := a.closed || a.changing[sid]
 	a.mutex.Unlock()
-	if ep == nil {
-		return a.Agent.Prompt(ctx, r)
+	if unavailable {
+		return func(context.Context) (func(), error) { return nil, errEndpointUnavailable }
 	}
-	if ready {
-		timer := time.NewTimer(10 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-ep.ready:
-		case <-timer.C:
-			return acp.PromptResponse{}, errors.New("managed user input tool was not loaded by CLI")
-		case <-ctx.Done():
-			return acp.PromptResponse{}, ctx.Err()
+	if ep == nil {
+		return nil
+	}
+
+	return func(ctx context.Context) (func(), error) {
+		if ready {
+			timer := time.NewTimer(10 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-ep.ready:
+			case <-ep.closed:
+				return nil, errEndpointUnavailable
+			case <-timer.C:
+				return nil, errors.New("managed user input tool was not loaded by CLI")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		a.mutex.Lock()
+		defer a.mutex.Unlock()
+		if a.closed || a.changing[sid] || a.sessions[sid] != ep {
+			return nil, errEndpointUnavailable
+		}
+		return ep.bindTurn(ctx)
+	}
+}
+
+// boundAdmission retrieves the operation owner explicitly installed on the connection.
+func (a *Agent) boundAdmission() (acp.SessionAdmission, bool) {
+	a.mutex.Lock()
+	host := a.host
+	a.mutex.Unlock()
+	if host == nil {
+		return acp.SessionAdmission{}, false
+	}
+	return host.SessionAdmission()
+}
+
+// Prompt scopes input to the current operation and forwards the original request.
+func (a *Agent) Prompt(ctx context.Context, r acp.PromptRequest) (acp.PromptResponse, error) {
+	preparation := a.capturePromptPreparation(r)
+	if admission, ok := a.boundAdmission(); ok {
+		run, err := admission.Prompt(ctx, r, preparation)
+		if err != nil {
+			return acp.PromptResponse{}, err
+		}
+		return run()
+	}
+	if preparation != nil {
+		cleanup, err := preparation(ctx)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if err != nil {
+			return acp.PromptResponse{}, err
 		}
 	}
-	ep.mutex.Lock()
-	if ep.turn != nil {
-		ep.mutex.Unlock()
-		return acp.PromptResponse{}, errors.New("session turn already active")
-	}
-	ep.turn, ep.cancel = context.WithCancel(ctx)
-	ep.mutex.Unlock()
-	defer ep.endTurn()
 	return a.Agent.Prompt(ctx, r)
 }
 
-// Cancel 先解除问答等待，再取消原生执行。
+// Cancel interrupts the operation and its associated input wait.
 func (a *Agent) Cancel(ctx context.Context, r acp.CancelNotification) error {
+	if admission, ok := a.boundAdmission(); ok {
+		run, err := admission.Cancel(r)
+		if err != nil || run == nil {
+			return err
+		}
+		return run(ctx)
+	}
 	a.mutex.Lock()
 	ep := a.sessions[r.SessionId]
 	a.mutex.Unlock()
@@ -263,13 +350,18 @@ func (a *Agent) remove(sid acp.SessionId) {
 	}
 }
 
-// CloseSession 释放本机端点与原生会话。
+// CloseSession releases the local input endpoint and closes the native session.
 func (a *Agent) CloseSession(ctx context.Context, r acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+	finish, err := a.beginEndpointChange(r.SessionId)
+	if err != nil {
+		return acp.CloseSessionResponse{}, err
+	}
+	defer finish()
 	a.remove(r.SessionId)
 	return a.Agent.CloseSession(ctx, r)
 }
 
-// UnstableDeleteSession 保留原适配器的可选历史删除能力。
+// UnstableDeleteSession forwards optional history deletion and releases its input endpoint.
 func (a *Agent) UnstableDeleteSession(ctx context.Context, r acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
 	agent, ok := a.Agent.(interface {
 		// UnstableDeleteSession 只删除适配器拥有的历史。
@@ -278,6 +370,11 @@ func (a *Agent) UnstableDeleteSession(ctx context.Context, r acp.UnstableDeleteS
 	if !ok {
 		return acp.UnstableDeleteSessionResponse{}, acp.NewMethodNotFound("session/delete")
 	}
+	finish, err := a.beginEndpointChange(r.SessionId)
+	if err != nil {
+		return acp.UnstableDeleteSessionResponse{}, err
+	}
+	defer finish()
 	response, err := agent.UnstableDeleteSession(ctx, r)
 	if err == nil {
 		a.remove(r.SessionId)

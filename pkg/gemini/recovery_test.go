@@ -101,10 +101,12 @@ func TestPartialPromptHistorySurvives(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan error, 1)
+			stop := make(chan acp.StopReason, 1)
 			go func() {
-				_, err := agent.Prompt(ctx, acp.PromptRequest{
+				response, err := agent.Prompt(ctx, acp.PromptRequest{
 					SessionId: created.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock(text)},
 				})
+				stop <- response.StopReason
 				done <- err
 			}()
 			select {
@@ -117,11 +119,20 @@ func TestPartialPromptHistorySurvives(t *testing.T) {
 			}
 			select {
 			case err := <-done:
-				if text != "uncommitted-history" && err == nil {
-					t.Fatal("partial prompt should fail or cancel")
-				}
-				if text == "uncommitted-history" && err != nil {
-					t.Fatal(err)
+				reason := <-stop
+				switch text {
+				case "partial-wait":
+					if err != nil || reason != acp.StopReasonCancelled {
+						t.Fatalf("native cancellation terminal lost: stop=%s err=%v", reason, err)
+					}
+				case "partial-error":
+					if err == nil {
+						t.Fatal("native partial failure was hidden")
+					}
+				default:
+					if err != nil || reason != acp.StopReasonEndTurn {
+						t.Fatalf("native completion lost: stop=%s err=%v", reason, err)
+					}
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("partial prompt blocked")

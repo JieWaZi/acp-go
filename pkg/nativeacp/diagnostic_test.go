@@ -51,3 +51,14 @@ func TestDiagnosticPreservesStructuredRedactionContext(t *testing.T) {
 		t.Fatal("structured secret escaped redactor")
 	}
 }
+
+func TestDiagnosticProseBracketDoesNotSwallowFollowingRecords(t *testing.T) {
+	var records []string
+	writer := &diagnosticWriter{redact: func(s string) string { records = append(records, strings.TrimSpace(s)); return s }}
+	for _, part := range []string{"ordinary note {\n", "safe diagnostic\n", "[WARN] another diagnostic\n"} {
+		_, _ = writer.Write([]byte(part))
+	}
+	if len(records) != 3 || records[0] != "ordinary note {" || records[1] != "safe diagnostic" || records[2] != "[WARN] another diagnostic" {
+		t.Fatalf("prose swallowed diagnostics: %#v", records)
+	}
+}

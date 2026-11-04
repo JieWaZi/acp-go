@@ -3,17 +3,24 @@ package nativeacp
 import (
 	"context"
 	"encoding/json"
-	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	"errors"
 	"strings"
 	"sync"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 // sessionOptions maps normalized host configuration to native session state.
 type sessionOptions struct {
-	// transitioning excludes concurrent lifecycle RPCs and prompt admission.
+	// transitioning freezes admission while a lifecycle RPC owns this generation.
 	transitioning bool
+	// silent suppresses history only for the exact configuration-only load owner.
+	silent bool
+	// pendingOptions retains native configuration observed before opening completes.
+	pendingOptions []acp.SessionConfigOption
+	// hasPendingOptions distinguishes an observed empty catalog from no notification.
+	hasPendingOptions bool
 	// workingDirectory retains the observed session cwd for permission evidence.
 	workingDirectory string
 	// queue owns prompt admission for this opened session generation.
@@ -61,15 +68,26 @@ func (agent *Agent) NewSession(ctx context.Context, request acp.NewSessionReques
 
 // LoadSession restores native history and its observed configuration catalog.
 func (agent *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	release, err := agent.beginSessionTransition(request.SessionId, false)
+	return agent.loadSession(ctx, request, false)
+}
+
+// LoadSessionConfiguration restores configuration without publishing native history.
+func (agent *Agent) LoadSessionConfiguration(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	return agent.loadSession(ctx, request, true)
+}
+
+func (agent *Agent) loadSession(ctx context.Context, request acp.LoadSessionRequest, silent bool) (acp.LoadSessionResponse, error) {
+	release, err := agent.beginSessionTransition(request.SessionId, false, silent)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
-	defer release()
+	submitted := false
+	defer func() { release(err, submitted) }()
 	if request.McpServers == nil {
 		request.McpServers = []acp.McpServer{}
 	}
-	response, err := sendNativeRequest[nativeSessionResponse](agent, ctx, "session/load", request)
+	var response nativeSessionResponse
+	response, submitted, err = sendSessionRequest[nativeSessionResponse](agent, ctx, "session/load", request)
 	if err != nil {
 		return acp.LoadSessionResponse{}, err
 	}
@@ -84,12 +102,13 @@ func (agent *Agent) ResumeSession(
 	ctx context.Context,
 	request acp.ResumeSessionRequest,
 ) (acp.ResumeSessionResponse, error) {
-	release, err := agent.beginSessionTransition(request.SessionId, false)
+	release, err := agent.beginSessionTransition(request.SessionId, false, false)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	defer release()
-	response, err := sendNativeRequest[nativeSessionResponse](agent, ctx, "session/resume", request)
+	submitted := false
+	defer func() { release(err, submitted) }()
+	response, submitted, err := sendSessionRequest[nativeSessionResponse](agent, ctx, "session/resume", request)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
@@ -101,7 +120,7 @@ func (agent *Agent) ResumeSession(
 
 // beginSessionTransition reserves the native identity before issuing lifecycle RPCs.
 // An active execution cannot be silently replaced by a load or resume response.
-func (agent *Agent) beginSessionTransition(id acp.SessionId, closing bool) (func(), error) {
+func (agent *Agent) beginSessionTransition(id acp.SessionId, closing, silent bool) (func(error, bool), error) {
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state := agent.sessions[id]
@@ -112,20 +131,55 @@ func (agent *Agent) beginSessionTransition(id acp.SessionId, closing bool) (func
 		return nil, acp.NewInvalidParams(map[string]any{"message": "cannot restore an active native execution"})
 	}
 	if state == nil {
-		state = &sessionOptions{}
+		state = &sessionOptions{ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
 		agent.sessions[id] = state
 	}
-	state.transitioning = true
-	if state.queue != nil {
-		state.queue.close()
+	state.transitioning, state.silent = true, silent
+	state.pendingOptions, state.hasPendingOptions = nil, false
+	if closing && state.queue != nil {
+		agent.closePromptQueue(id, state.queue)
 	}
-	return func() {
+	return func(cause error, submitted bool) {
 		agent.mutex.Lock()
 		defer agent.mutex.Unlock()
-		if agent.sessions[id] == state {
-			state.transitioning = false
+		if agent.sessions[id] != state {
+			return
 		}
+		state.transitioning, state.silent = false, false
+		if cause != nil && !closing {
+			if !submitted || definiteSessionRejection(cause) {
+				if state.queue == nil {
+					delete(agent.sessions, id)
+					return
+				}
+				if state.hasPendingOptions {
+					state.options = agent.normalizeOptionsLocked(id, state, state.pendingOptions)
+				}
+			} else if state.queue != nil {
+				agent.closePromptQueue(id, state.queue)
+			}
+		}
+		state.pendingOptions, state.hasPendingOptions = nil, false
 	}, nil
+}
+
+// sendSessionRequest records whether a lifecycle call could have mutated native state.
+func sendSessionRequest[T any](agent *Agent, ctx context.Context, method string, request any) (T, bool, error) {
+	submitted := false
+	response, err := acp.SendRequestWithWriteHooks[T](agent.conn, ctx, method, request, acp.RequestWriteHooks{
+		Commit:   func() error { submitted = true; return nil },
+		Complete: func(result acp.RequestWriteResult) { submitted = result.BytesWritten != 0 },
+	})
+	return response, submitted, agent.transportError(err)
+}
+
+// Only protocol-level rejection proves that a submitted lifecycle operation did not execute.
+func definiteSessionRejection(err error) bool {
+	var requestError *acp.RequestError
+	if !errors.As(err, &requestError) {
+		return false
+	}
+	return requestError.Code == -32600 || requestError.Code == -32601 || requestError.Code == -32602
 }
 
 // normalizeSession installs configuration and admission state for the opened generation.
@@ -135,8 +189,29 @@ func (agent *Agent) normalizeSession(
 	id acp.SessionId,
 	cwd string,
 ) error {
-	state := &sessionOptions{workingDirectory: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId)}
-	state.models = append(json.RawMessage{}, response.Models...)
+	state := &sessionOptions{workingDirectory: cwd, ids: make(map[acp.SessionConfigId]acp.SessionConfigId), transitioning: true}
+	state.models = append(json.RawMessage(nil), response.Models...)
+	// The response is the latest baseline. If it omitted the catalog, an
+	// earlier notification remains the only observed catalog for this opening.
+	agent.mutex.Lock()
+	if previous := agent.sessions[id]; previous != nil {
+		state.silent = previous.silent
+		if response.ConfigOptions == nil && previous.hasPendingOptions {
+			response.ConfigOptions = previous.pendingOptions
+		}
+	}
+	agent.sessions[id] = state
+	agent.mutex.Unlock()
+	opened := false
+	defer func() {
+		if !opened {
+			agent.mutex.Lock()
+			if agent.sessions[id] == state {
+				state.transitioning, state.silent = false, false
+			}
+			agent.mutex.Unlock()
+		}
+	}()
 	if agent.config.SessionAdapter != nil {
 		snapshot := SessionSnapshot{
 			ConfigOptions:    response.ConfigOptions,
@@ -156,11 +231,14 @@ func (agent *Agent) normalizeSession(
 	agent.mutex.Lock()
 	defer agent.mutex.Unlock()
 	state.options = response.ConfigOptions
-	if old := agent.sessions[id]; old != nil && old.queue != nil {
-		old.queue.close()
+	if state.hasPendingOptions {
+		state.options = agent.normalizeOptionsLocked(id, state, state.pendingOptions)
+		response.ConfigOptions = state.options
 	}
+	state.pendingOptions, state.hasPendingOptions = nil, false
+	state.transitioning, state.silent = false, false
 	state.queue = &promptQueue{}
-	agent.sessions[id] = state
+	opened = true
 	return nil
 }
 
@@ -283,13 +361,15 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 	}
 	if update := request.Update.ConfigOptionUpdate; update != nil {
 		if state := agent.sessions[request.SessionId]; state != nil {
-			if agent.config.SessionAdapter != nil {
-				update.ConfigOptions = agent.config.SessionAdapter.NormalizeUpdate(request.SessionId, update.ConfigOptions)
+			if state.transitioning {
+				state.pendingOptions = append([]acp.SessionConfigOption{}, update.ConfigOptions...)
+				state.hasPendingOptions = true
+				// Do not mutate an adapter's previous generation during opening.
+				update.ConfigOptions = NormalizeOptions(update.ConfigOptions, make(map[acp.SessionConfigId]acp.SessionConfigId))
 			} else {
-				update.ConfigOptions = NormalizeOptions(update.ConfigOptions, state.ids)
+				update.ConfigOptions = agent.normalizeOptionsLocked(request.SessionId, state, update.ConfigOptions)
+				state.options = update.ConfigOptions
 			}
-			update.ConfigOptions = agent.enrichConfigOptions(state, update.ConfigOptions)
-			state.options = update.ConfigOptions
 		}
 	}
 	if request.Update.ToolCall != nil || request.Update.ToolCallUpdate != nil {
@@ -298,6 +378,16 @@ func (agent *Agent) normalizeUpdate(request *acp.SessionNotification) {
 		}
 		agent.toolChanged = make(chan struct{})
 	}
+}
+
+// normalizeOptionsLocked updates the owning adapter only after its baseline exists.
+func (agent *Agent) normalizeOptionsLocked(id acp.SessionId, state *sessionOptions, options []acp.SessionConfigOption) []acp.SessionConfigOption {
+	if agent.config.SessionAdapter != nil {
+		options = agent.config.SessionAdapter.NormalizeUpdate(id, options)
+	} else {
+		options = NormalizeOptions(options, state.ids)
+	}
+	return agent.enrichConfigOptions(state, options)
 }
 
 // enrichConfigOptions supplies an immutable catalog snapshot to the configured pure projection.

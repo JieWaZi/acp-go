@@ -15,3 +15,7 @@
 `connection.go` 的 `SendRequestWithWriteHooks` 使用既有 pending 请求所有者，在同一连接写入门内执行同步准入及真实字节回执。写入等待 context 可与原生响应等待分开；取消发生在编码或写入准入前时不提交请求。部分写入或写入错误使连接失效，避免后续帧复用损坏的 JSONL 流。所有请求、通知、响应共用该写入门，既有通知水位屏障保留。验证见 `connection_write_test.go`。
 
 `pkg/nativeacp` 消费这些钩子，以同一 Prompt 所有者处理准备、FIFO／拒绝并发、交互取消、原生终态和有序取消写入。未提交的 Prompt 不发送原生 cancel；已提交后等待真实终态，宽限期耗尽关闭连接。Adapter 无需另存一套 submitted/cancel 状态。该功能需要更新后的 SDK；仅使用本地 go.work 通过不能证明远端固定版本已发布。
+
+`agent.go` 提供一次性显式 `SessionAdmission` 绑定。`NewAgentSideConnectionWithBinder` 在读帧前完成绑定。合法的 Prompt 和 Cancel 在读取时按帧序登记或标记 Adapter 的确切所有者，返回的执行在现有请求协程和通知队列中运行。接纳钩子只做短时同步操作；问答包装层可冻结准备函数，由获准执行的所有者用其准备上下文运行，并在释放执行前完成清理。已接管的空闲 Cancel 直接结束，已捕获的取消延续在入队失败或队列无法排空时仍执行一次。验证见 `session_admission_test.go`。
+
+`connection.go` 优先交付已收到的完整响应，并继续检查该响应的先序通知水位。断线后通知交付失败仍返回错误，同时保留已收到的终态及用量。完整帧写入报错时，保留已发布到同一 pending 请求的响应和传输错误，立即收回尚未收到响应的 pending。验证见 `connection_terminal_test.go`。

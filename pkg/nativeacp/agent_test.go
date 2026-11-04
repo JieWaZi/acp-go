@@ -236,7 +236,7 @@ func TestNativeStartFailure(t *testing.T) {
 	}
 }
 
-// TestNativeStderrRequiresRedaction 验证原生 ACP 失败诊断保留 CLI 原始内容。
+// TestNativeStderrRequiresRedaction retains useful diagnostics only after sanitization.
 func TestNativeStderrRequiresRedaction(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {
@@ -263,11 +263,11 @@ func TestNativeStderrRequiresRedaction(t *testing.T) {
 		t.Fatalf("stderr 诊断不可见：%q", diagnostic)
 	}
 	if strings.Contains(diagnostic, "api_key=secret-value") || !strings.Contains(diagnostic, "[redacted]") {
-		t.Fatalf("stderr 原始诊断丢失：%q", diagnostic)
+		t.Fatalf("stderr sanitization failed:%q", diagnostic)
 	}
 }
 
-// TestNativeRequestReportsSafeCLIExit 验证请求失败时附加原始 CLI 退出诊断。
+// TestNativeRequestReportsSafeCLIExit attaches sanitized exit evidence to request failures.
 func TestNativeRequestReportsSafeCLIExit(t *testing.T) {
 	binary, err := os.Executable()
 	if err != nil {

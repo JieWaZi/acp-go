@@ -334,3 +334,59 @@ func closeTestPipe(t *testing.T, closer io.Closer) {
 		t.Errorf("关闭测试管道失败: %v", err)
 	}
 }
+
+// bindingAgent gives the test control over when connection binding completes.
+type bindingAgent struct {
+	// testAgent supplies the other ACP test methods.
+	*testAgent
+	// finishBinding unblocks connection binding.
+	finishBinding chan struct{}
+}
+
+func (a *bindingAgent) SetAgentConnection(connection *acp.AgentSideConnection) {
+	a.testAgent.SetAgentConnection(connection)
+	<-a.finishBinding
+}
+
+// ingressProbe records the SDK’s first read.
+type ingressProbe struct {
+	// reading closes when the first read starts.
+	reading chan struct{}
+}
+
+func (r ingressProbe) Read([]byte) (int, error) {
+	close(r.reading)
+	return 0, io.EOF
+}
+
+func TestServerBindsBeforeReadingHostFrames(t *testing.T) {
+	agent := &bindingAgent{testAgent: newTestAgent(), finishBinding: make(chan struct{})}
+	reading := make(chan struct{})
+	server, err := New(agent, ingressProbe{reading}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- server.Serve(context.Background()) }()
+	defer func() {
+		close(agent.finishBinding)
+		select {
+		case err := <-finished:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("注册完成后 Server 未退出")
+		}
+	}()
+	select {
+	case <-agent.connectionReady:
+	case <-time.After(time.Second):
+		t.Fatal("Server 未开始连接注册")
+	}
+	select {
+	case <-reading:
+		t.Fatal("连接注册结束前读取了宿主输入")
+	case <-time.After(50 * time.Millisecond):
+	}
+}

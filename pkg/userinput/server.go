@@ -103,6 +103,8 @@ type endpoint struct {
 	http *http.Server
 	// config 是仅该会话拥有的地址与本机用户稳定的 Basic 凭据。
 	config acp.McpServer
+	// closed wakes operations waiting for tool discovery when the endpoint stops.
+	closed chan struct{}
 	// ready 在真实 CLI 成功读取工具目录时关闭。
 	ready chan struct{}
 	// readyOnce 保证工具发现通知幂等。
@@ -126,7 +128,7 @@ func newEndpoint(host Requester) (*endpoint, error) {
 		return nil, err
 	}
 	endpointPath := "/mcp/" + hex.EncodeToString(pathSecret)
-	ep := &endpoint{ready: make(chan struct{}), config: acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Type: "http", Name: serverName, Url: "http://" + listener.Addr().String() + endpointPath, Headers: []acp.HttpHeader{{Name: "Authorization", Value: authorization}}}}}
+	ep := &endpoint{closed: make(chan struct{}), ready: make(chan struct{}), config: acp.McpServer{Http: &acp.McpServerHttpInline{Meta: map[string]any{"acp-go/user-input": true}, Type: "http", Name: serverName, Url: "http://" + listener.Addr().String() + endpointPath, Headers: []acp.HttpHeader{{Name: "Authorization", Value: authorization}}}}}
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: "1.0.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "AskUserQuestion", Description: "Ask the user a clarification or preference and wait for their answer. Available in every permission and working mode. Do not invent answers or treat permission approval as an answer. Supports text, single and multiple choices.", Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: acp.Ptr(false)}}, func(ctx context.Context, _ *mcp.CallToolRequest, input Questions) (*mcp.CallToolResult, Result, error) {
 		ep.mutex.Lock()
@@ -173,22 +175,52 @@ func newEndpoint(host Requester) (*endpoint, error) {
 	return ep, nil
 }
 
-// stop 先取消交互再释放本机会话端口。
+// stop cancels input and closes the local session endpoint.
 func (ep *endpoint) stop() {
-	activeEndpoints.Delete(ep.config.Http.Url)
-	ep.endTurn()
-	_ = ep.http.Close()
-}
-
-// endTurn 取消执行并使迟到的问答请求失效。
-func (ep *endpoint) endTurn() {
 	ep.mutex.Lock()
-	defer ep.mutex.Unlock()
+	select {
+	case <-ep.closed:
+		ep.mutex.Unlock()
+		return
+	default:
+		close(ep.closed)
+	}
 	if ep.cancel != nil {
 		ep.cancel()
 	}
 	ep.turn = nil
 	ep.cancel = nil
+	ep.mutex.Unlock()
+	activeEndpoints.Delete(ep.config.Http.Url)
+	_ = ep.http.Close()
+}
+
+// bindTurn leases this endpoint and releases only that operation during cleanup.
+func (ep *endpoint) bindTurn(ctx context.Context) (func(), error) {
+	ep.mutex.Lock()
+	defer ep.mutex.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ep.closed:
+		return nil, errEndpointUnavailable
+	default:
+	}
+	if ep.turn != nil {
+		return nil, errors.New("session turn already active")
+	}
+
+	turn, cancel := context.WithCancel(ctx)
+	ep.turn, ep.cancel = turn, cancel
+	return func() {
+		ep.mutex.Lock()
+		defer ep.mutex.Unlock()
+		cancel()
+		if ep.turn == turn {
+			ep.turn, ep.cancel = nil, nil
+		}
+	}, nil
 }
 
 // cancelTurn 只取消当前问答，保留执行占位直到原生 Prompt 返回。

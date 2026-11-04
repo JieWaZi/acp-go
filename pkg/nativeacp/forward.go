@@ -65,7 +65,8 @@ func (agent *Agent) dispatch(ctx context.Context, method string, params json.Raw
 		}
 		agent.normalizeUpdate(&request)
 		agent.mutex.Lock()
-		silent := agent.silentLoads[request.SessionId]
+		state := agent.sessions[request.SessionId]
+		silent := state != nil && state.silent
 		agent.mutex.Unlock()
 		if silent {
 			return nil, nil

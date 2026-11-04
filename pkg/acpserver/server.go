@@ -23,8 +23,8 @@ var (
 	ErrInvalidOutput = errors.New("invalid protocol output")
 )
 
-// connectionBinder 是协议服务消费的可选小接口。
-// Agent 只有在需要主动发送 session update、权限请求等客户端调用时才实现它。
+// connectionBinder lets an agent install admission hooks and acquire the
+// connection it uses to send updates and permission requests.
 type connectionBinder interface {
 	// SetAgentConnection 注入 SDK 创建的唯一 Agent 侧连接。
 	SetAgentConnection(connection *acp.AgentSideConnection)
@@ -65,18 +65,14 @@ func New(agent acp.Agent, input io.Reader, output io.Writer) (*Server, error) {
 	}, nil
 }
 
-// Serve 使用 acp-go-sdk 建立 Agent 侧连接，并阻塞到客户端断开或上下文取消。
+// Serve binds the SDK connection before reading and waits for disconnect or cancellation.
 func (s *Server) Serve(ctx context.Context) error {
-	// SDK 参数名从 peer 视角描述方向：Agent 的 output 是 peerInput，Agent 的 input 是 peerOutput。
-	// 保持这一处直接组合可以避免项目内出现第二套 JSON-RPC、dispatch 或 cancel 实现。
-	// v0.13.5 的构造函数会先启动读取 goroutine，随后调用 SetLogger 会产生无同步读写竞态；
-	// 因此保留 SDK 默认 slog logger（该进程未改写全局默认值，输出仍为 stderr），绝不污染 stdout。
-	connection := acp.NewAgentSideConnection(s.agent, s.output, s.input)
-
-	// 该接口复用 acp-go-sdk 官方示例的注入时序；不需要主动调用客户端的 Agent 不承担此依赖。
-	if binder, ok := s.agent.(connectionBinder); ok {
-		binder.SetAgentConnection(connection)
-	}
+	// The SDK names streams from the peer’s perspective. Agent output is peer input.
+	connection := acp.NewAgentSideConnectionWithBinder(s.agent, s.output, s.input, func(connection *acp.AgentSideConnection) {
+		if binder, ok := s.agent.(connectionBinder); ok {
+			binder.SetAgentConnection(connection)
+		}
+	})
 
 	select {
 	case <-connection.Done():

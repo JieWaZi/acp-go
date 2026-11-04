@@ -31,7 +31,9 @@ type lifecycleHost struct {
 // SessionUpdate 把事件交给测试同步器，不阻塞协议通知队列。
 func (host *lifecycleHost) SessionUpdate(_ context.Context, request acp.SessionNotification) error {
 	host.captureNotification("session/update", request)
-	host.updates <- string(request.SessionId) + ":" + request.Update.AgentMessageChunk.Content.Text.Text
+	if chunk := request.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
+		host.updates <- string(request.SessionId) + ":" + chunk.Content.Text.Text
+	}
 	return nil
 }
 
@@ -94,11 +96,14 @@ func promptAsync(peer *acp.ClientSideConnection, ctx context.Context, id, text s
 	return done
 }
 
-// promptAgentAsync 直接验证 Go API 的 FIFO，外层 SDK 对重叠请求会先取消旧上下文。
-func promptAgentAsync(agent *Agent, ctx context.Context, id, text string) <-chan error {
+// promptAgentAsync exercises direct admission and optionally asserts the exact native terminal.
+func promptAgentAsync(agent *Agent, ctx context.Context, id, text string, wantStop ...acp.StopReason) <-chan error {
 	done := make(chan error, 1)
 	go func() {
-		_, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: acp.SessionId(id), Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+		response, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: acp.SessionId(id), Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+		if err == nil && len(wantStop) != 0 && response.StopReason != wantStop[0] {
+			err = fmt.Errorf("native stop reason %q, want %q", response.StopReason, wantStop[0])
+		}
 		done <- err
 	}()
 	return done
@@ -206,7 +211,7 @@ func TestPromptQueueContextCancellation(t *testing.T) {
 // TestPromptCancelReleasesOnlyCurrentSession waits for the native cancellation terminal.
 func TestPromptCancelReleasesOnlyCurrentSession(t *testing.T) {
 	agent, peer, host := startLifecycleBridge(t, true, true)
-	first := promptAgentAsync(agent, context.Background(), "a", "first")
+	first := promptAgentAsync(agent, context.Background(), "a", "first", acp.StopReasonCancelled)
 	expectUpdate(t, host, "a:first")
 	next := promptAgentAsync(agent, context.Background(), "a", "next")
 	waitQueue(t, agent, "a", 1)
@@ -239,7 +244,7 @@ func TestPromptCloseSessionDiscardsOldQueueAndAllowsRestore(t *testing.T) {
 	for _, method := range []string{"load", "resume"} {
 		t.Run(method, func(t *testing.T) {
 			agent, peer, host := startLifecycleBridge(t, true, true)
-			current := promptAgentAsync(agent, context.Background(), "a", "old")
+			current := promptAgentAsync(agent, context.Background(), "a", "old", acp.StopReasonCancelled)
 			expectUpdate(t, host, "a:old")
 			old := promptAgentAsync(agent, context.Background(), "a", "old-queued")
 			waitQueue(t, agent, "a", 1)
@@ -336,6 +341,9 @@ func TestLifecycleProcess(t *testing.T) {
 		case "session/new":
 			return map[string]any{"sessionId": "new", "configOptions": []any{}}, nil
 		case "session/load", "session/resume":
+			if request.Meta["emit_config"] == true {
+				_ = connection.SendNotification(ctx, "session/update", json.RawMessage(`{"sessionId":"first-time","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"test","options":[{"value":"test","name":"Test"}]}]}}`))
+			}
 			if request.Meta["reject"] == true {
 				return nil, acp.NewInvalidParams(map[string]any{"reason": "restore rejected"})
 			}
@@ -448,4 +456,62 @@ func TestLifecycleProcess(t *testing.T) {
 	close(ready)
 	<-connection.Done()
 	os.Exit(0)
+}
+
+func TestRejectedRestorePreservesOpenSession(t *testing.T) {
+	agent, peer, host := startLifecycleBridge(t, true, true)
+	if _, err := agent.LoadSession(context.Background(), acp.LoadSessionRequest{SessionId: "a", Cwd: "/fixture", Meta: map[string]any{"reject": true}}); err == nil {
+		t.Fatal("fake CLI unexpectedly accepted restore")
+	}
+	done := promptAgentAsync(agent, context.Background(), "a", "after-rejected-load")
+	select {
+	case err := <-done:
+		t.Fatalf("opened session became unusable after rejected load: %v", err)
+	case got := <-host.updates:
+		if got != "a:after-rejected-load" {
+			t.Fatal(got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prompt never admitted after rejected load")
+	}
+	releaseNative(t, peer, "a")
+	awaitPrompt(t, done, false)
+}
+
+func TestDisconnectCancelsPreparation(t *testing.T) {
+	agent, peer, _ := startLifecycleBridge(t, true, true)
+	entered := make(chan struct{})
+	rescue := make(chan struct{})
+	defer close(rescue)
+	agent.config.PreparePrompt = func(ctx context.Context, _ acp.PromptRequest) error {
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-rescue:
+			return nil
+		}
+	}
+	prompt := promptAgentAsync(agent, context.Background(), "a", "prepare")
+	awaitGate(t, entered)
+	if _, err := peer.CallExtension(context.Background(), "_crash", nil); err == nil {
+		t.Fatal("fake CLI unexpectedly survived crash")
+	}
+	awaitGate(t, agent.conn.Done())
+	select {
+	case err := <-prompt:
+		if err == nil {
+			t.Fatal("expected disconnected prompt error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("native child disconnected, yet prompt prepare context remained active")
+	}
+}
+
+func TestLoadHandlesConfigNotificationBeforeResponse(t *testing.T) {
+	agent, _, _ := startLifecycleBridge(t, true, true)
+	_, err := agent.LoadSession(context.Background(), acp.LoadSessionRequest{SessionId: "first-time", Cwd: "/fixture", Meta: map[string]any{"emit_config": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
 }

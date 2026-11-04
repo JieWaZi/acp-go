@@ -34,6 +34,81 @@ func isExtensionMethodName(method string) bool {
 	return strings.HasPrefix(method, "_")
 }
 
+func (a *AgentSideConnection) prepareSessionInbound(ctx context.Context, msg *anyMessage) inboundContinuation {
+	if msg.Method != AgentMethodSessionPrompt && msg.Method != AgentMethodSessionCancel {
+		return nil
+	}
+	a.mu.Lock()
+	admission, capture := a.admission, a.promptPreparation
+	a.mu.Unlock()
+	if admission.Prompt == nil {
+		return nil
+	}
+	if msg.JSONRPC != "2.0" {
+		return completeInbound(NewInvalidRequest(nil))
+	}
+	switch msg.Method {
+	case AgentMethodSessionPrompt:
+		if msg.ID == nil {
+			return completeInbound(NewInvalidRequest(nil))
+		}
+		var request PromptRequest
+		if err := decodeSessionParams(msg.Params, &request, &request.SessionId); err != nil {
+			return completeInbound(err)
+		}
+		var preparation PromptPreparation
+		if capture != nil {
+			preparation = capture(request)
+		}
+		run, err := admission.Prompt(ctx, request, preparation)
+		if err != nil {
+			return completeInbound(toReqErr(err))
+		}
+		if run == nil {
+			return completeInbound(NewInternalError(nil))
+		}
+		return func(context.Context) (any, *RequestError) {
+			response, err := run()
+			return response, toReqErr(err)
+		}
+	case AgentMethodSessionCancel:
+		if msg.ID != nil {
+			return completeInbound(NewInvalidRequest(nil))
+		}
+		var notification CancelNotification
+		if err := decodeSessionParams(msg.Params, &notification, &notification.SessionId); err != nil {
+			return completeInbound(err)
+		}
+		run, err := admission.Cancel(notification)
+		if err != nil || run == nil {
+			return completeInbound(toReqErr(err))
+		}
+		return func(ctx context.Context) (any, *RequestError) {
+			return nil, toReqErr(run(ctx))
+		}
+	}
+	return nil
+}
+
+func decodeSessionParams(params json.RawMessage, value interface{ Validate() error }, sessionID *SessionId) *RequestError {
+	if err := json.Unmarshal(params, value); err != nil {
+		return NewInvalidParams(map[string]any{"error": err.Error()})
+	}
+	if *sessionID == "" {
+		return NewInvalidParams(map[string]any{"error": "sessionId is required"})
+	}
+	if err := value.Validate(); err != nil {
+		return NewInvalidParams(map[string]any{"error": err.Error()})
+	}
+	return nil
+}
+
+// A non-nil continuation preserves the existing response and logging path,
+// including a bound cancel that was fully handled at ingress.
+func completeInbound(err *RequestError) inboundContinuation {
+	return func(context.Context) (any, *RequestError) { return nil, err }
+}
+
 func (a *AgentSideConnection) handleWithExtensions(ctx context.Context, method string, params json.RawMessage) (any, *RequestError) {
 	if isExtensionMethodName(method) {
 		h, ok := a.agent.(ExtensionMethodHandler)

@@ -205,7 +205,7 @@ func TestPromptRestoreRejectsLiveQueue(t *testing.T) {
 func TestPromptActiveContextCancellationNotifiesNative(t *testing.T) {
 	agent, peer, host := startLifecycleBridge(t, true, true)
 	ctx, cancel := context.WithCancel(context.Background())
-	running := promptAgentAsync(agent, ctx, "a", "cancel-context")
+	running := promptAgentAsync(agent, ctx, "a", "cancel-context", acp.StopReasonCancelled)
 	expectUpdate(t, host, "a:cancel-context")
 	next := promptAgentAsync(agent, context.Background(), "a", "next")
 	waitQueue(t, agent, "a", 1)
