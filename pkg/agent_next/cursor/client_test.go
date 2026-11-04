@@ -187,6 +187,47 @@ func TestCursorFixture(t *testing.T) {
 				}
 				tokens = values[prompts-1]
 			}
+			if scenario == "family-closure-cumulative-notification" {
+				if prompts == 2 {
+					notify("one", "usage_update", map[string]any{"used": 9, "size": 100, "_meta": acpmeta.WithTurnUsage(nil, acpmeta.TurnUsage{
+						InputTokens: acp.Ptr(int64(110)), OutputTokens: acp.Ptr(int64(55)), Source: "fixture.session", Coverage: "session_cumulative", Complete: true,
+					})})
+				}
+				reply(msg.ID, map[string]any{"stopReason": "end_turn", "usage": map[string]any{
+					"inputTokens": 100 + (prompts-1)*10, "outputTokens": 50 + (prompts-1)*5, "cachedReadTokens": 0, "cachedWriteTokens": 0,
+				}})
+				continue
+			}
+			if scope, ok := strings.CutPrefix(scenario, "family-closure-known-"); ok {
+				meta := acpmeta.WithTurnUsage(nil, acpmeta.TurnUsage{
+					InputTokens: acp.Ptr(int64(8)), OutputTokens: acp.Ptr(int64(5)), Coverage: scope, Source: "fixture.known",
+				})
+				reply(msg.ID, map[string]any{"stopReason": "end_turn", "_meta": meta})
+				continue
+			}
+			if scenario == "family-closure-no-standard" {
+				report := func(source, scope string, input int64) acpmeta.TurnUsage {
+					return acpmeta.TurnUsage{InputTokens: acp.Ptr(input), OutputTokens: acp.Ptr(input / 2),
+						Coverage: scope, Source: source, Complete: true, ContextKnown: true}
+				}
+				if prompts == 2 {
+					notify("one", "usage_update", map[string]any{"used": 9, "size": 100, "_meta": acpmeta.WithTurnUsage(nil, report("fixture.invocation", "invocation", 8))})
+				}
+				for _, observed := range []acpmeta.TurnUsage{
+					report("fixture.future", "future_scope", 50),
+					report("fixture.empty", "", 40),
+					report("fixture.last", "last_request", 20),
+					report("fixture.context", "context", 60),
+				} {
+					notify("one", "usage_update", map[string]any{"used": 9, "size": 100, "_meta": acpmeta.WithTurnUsage(map[string]any{"fixture.retained": true}, observed)})
+				}
+				final := report("fixture.future", "future_scope", 80)
+				final.Observations = []acpmeta.UsageObservation{
+					{Source: final.Source, Coverage: final.Coverage, Tokens: acpmeta.ModelUsage{InputTokens: acp.Ptr(int64(70))}},
+				}
+				reply(msg.ID, map[string]any{"stopReason": "end_turn", "_meta": acpmeta.WithTurnUsage(nil, final)})
+				continue
+			}
 			if scenario == "family-scoped-usage" {
 				response := map[string]any{"stopReason": "end_turn", "usage": map[string]any{
 					"inputTokens": 100 + (prompts-1)*11, "outputTokens": 50 + (prompts-1)*6, "cachedReadTokens": 0, "cachedWriteTokens": 0,
@@ -1037,5 +1078,109 @@ func TestFamilyReviewFailedModelSetterInvalidatesProcessEvidence(t *testing.T) {
 	}
 	if strings.Join(sequence, ",") != "model-a,prompt,model-b,model-a,prompt" {
 		t.Fatalf("model write order: %v", sequence)
+	}
+}
+
+func TestFamilyClosureCumulativeNotificationCannotBecomeInvocation(t *testing.T) {
+	c, ctx, trace := candidate(t, "family-closure-cumulative-notification", agentclient.HostCallbacks{})
+	openOne(t, c, ctx, trace)
+	requireStopReason(t, reserve(t, c, ctx, agentclient.PromptOptions{})(), acp.StopReasonEndTurn)
+	out := reserve(t, c, ctx, agentclient.PromptOptions{})()
+	requireStopReason(t, out, acp.StopReasonEndTurn)
+	u := out.Outcome.Turn.Usage
+	if u == nil || u.InputTokens == nil || u.OutputTokens == nil {
+		t.Fatalf("missing independently attributable invocation: %+v", u)
+	}
+	t.Logf("primary source=%s scope=%s input=%d output=%d", u.Source, u.Coverage, *u.InputTokens, *u.OutputTokens)
+	if u.Coverage != "invocation" || *u.InputTokens != 10 || *u.OutputTokens != 5 {
+		t.Fatalf("cumulative notification became the second canonical invoice: %+v", u)
+	}
+	if len(u.Observations) != 2 {
+		t.Fatalf("lost distinct cumulative observations: %+v", u.Observations)
+	}
+	for _, observed := range u.Observations {
+		if observed.Coverage != "session_cumulative" {
+			t.Fatalf("unexpected cumulative scope: %+v", observed)
+		}
+		checkTokenCount(t, observed.Tokens.InputTokens, 110)
+		checkTokenCount(t, observed.Tokens.OutputTokens, 55)
+	}
+}
+
+func TestFamilyClosureUnattributedUsageRemainsObservationWithoutStandardUsage(t *testing.T) {
+	live := make(chan *acpmeta.TurnUsage, 16)
+	client, ctx, trace := candidate(t, "family-closure-no-standard", agentclient.HostCallbacks{
+		Observe: func(_ context.Context, _ agentclient.Scope, note acp.SessionNotification) error {
+			update := note.Update.UsageUpdate
+			if update != nil && update.Size == 100 {
+				if usage, ok := acpmeta.ReadTurnUsage(update.Meta); ok {
+					live <- &usage
+				} else if update.Used == 9 && update.Meta["fixture.retained"] == true {
+					live <- nil
+				}
+			}
+			return nil
+		},
+	})
+	openOne(t, client, ctx, trace)
+	for i := range 2 {
+		result := reserve(t, client, ctx, agentclient.PromptOptions{})()
+		requireStopReason(t, result, acp.StopReasonEndTurn)
+		u := result.Outcome.Turn.Usage
+		if u == nil || u.Coverage != "invocation" || !u.ContextKnown || len(u.Observations) != 4 {
+			t.Fatalf("turn %d: usage = %+v", i+1, u)
+		}
+		if i == 0 {
+			checkTokenCount(t, u.InputTokens, -1)
+			checkTokenCount(t, u.OutputTokens, -1)
+			if u.Complete {
+				t.Fatalf("observation-only report became complete: %+v", u)
+			}
+		} else {
+			checkTokenCount(t, u.InputTokens, 8)
+			checkTokenCount(t, u.OutputTokens, 4)
+		}
+		want := map[string]int64{"future_scope": 80, "unknown": 40, "last_request": 20, "context": 60}
+		for _, obs := range u.Observations {
+			count, ok := want[obs.Coverage]
+			if !ok {
+				t.Fatalf("unexpected duplicate or scope: %+v", obs)
+			}
+			delete(want, obs.Coverage)
+			checkTokenCount(t, obs.Tokens.InputTokens, count)
+		}
+	}
+	close(live)
+	var contextOnly, scoped int
+	for u := range live {
+		if u == nil {
+			contextOnly++
+			continue
+		}
+		scoped++
+		if u.Source != "fixture.invocation" || !u.ContextKnown {
+			t.Fatalf("unexpected invocation projection: %+v", u)
+		}
+		checkTokenCount(t, u.InputTokens, 8)
+	}
+	if contextOnly != 8 || scoped != 1 {
+		t.Fatalf("projected context-only=%d invocation=%d, want 8/1", contextOnly, scoped)
+	}
+}
+
+func TestFamilyClosureKnownInvocationScopesArePreserved(t *testing.T) {
+	for _, scope := range []string{"invocation", "native_turn", "main_loop", "observed_turn", "observed_requests", "query_pipeline"} {
+		t.Run(scope, func(t *testing.T) {
+			client, ctx, trace := candidate(t, "family-closure-known-"+scope, agentclient.HostCallbacks{})
+			openOne(t, client, ctx, trace)
+			result := reserve(t, client, ctx, agentclient.PromptOptions{})()
+			requireStopReason(t, result, acp.StopReasonEndTurn)
+			u := result.Outcome.Turn.Usage
+			if u == nil || u.Source != "fixture.known" || u.Coverage != scope {
+				t.Fatalf("known invocation scope lost: %+v", u)
+			}
+			checkTokenCount(t, u.InputTokens, 8)
+			checkTokenCount(t, u.OutputTokens, 5)
+		})
 	}
 }

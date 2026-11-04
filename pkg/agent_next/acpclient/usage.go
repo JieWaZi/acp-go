@@ -5,6 +5,95 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
+const maxPromptUsageObservations = 16
+
+type promptUsage struct {
+	// invocation is the latest explicitly attributable metadata snapshot.
+	invocation *acpmeta.TurnUsage
+	// observations holds the latest auxiliary snapshot for each source and scope.
+	observations []acpmeta.UsageObservation
+	// truncated records evidence lost to the independent observation limit.
+	truncated bool
+}
+
+func (usage *promptUsage) recordMetadata(meta map[string]any) (decoded, attributable bool) {
+	report, ok := acpmeta.ReadTurnUsage(meta)
+	if !ok {
+		return false, false
+	}
+	for _, observed := range report.Observations {
+		usage.recordObservation(observed)
+	}
+	tokens := acpmeta.ModelUsage{
+		InputTokens: report.InputTokens, OutputTokens: report.OutputTokens,
+		CacheReadTokens: report.CacheReadTokens, CacheWriteTokens: report.CacheWriteTokens,
+		ReasoningTokens: report.ReasoningTokens, Cost: report.Cost,
+	}
+	if tokens == (acpmeta.ModelUsage{}) && report.Models == nil {
+		return true, false
+	}
+	switch report.Coverage {
+	case "invocation", "native_turn", "observed_turn", "main_loop", "observed_requests", "query_pipeline":
+		report.Observations = nil
+		usage.invocation = &report
+		return true, true
+	}
+	coverage := report.Coverage
+	if coverage == "" {
+		coverage = "unknown"
+	}
+	usage.recordObservation(acpmeta.UsageObservation{
+		Source: report.Source, Coverage: coverage, Complete: report.Complete, Tokens: tokens, Models: report.Models,
+	})
+	return true, false
+}
+
+func (usage *promptUsage) recordObservation(observed acpmeta.UsageObservation) {
+	for i, old := range usage.observations {
+		if old.Source == observed.Source && old.Coverage == observed.Coverage {
+			usage.observations[i] = observed
+			return
+		}
+	}
+	if len(usage.observations) == maxPromptUsageObservations {
+		// Keep the bounded set available even when a terminal report adds a new source.
+		copy(usage.observations, usage.observations[1:])
+		usage.observations[len(usage.observations)-1] = observed
+		usage.truncated = true
+		return
+	}
+	usage.observations = append(usage.observations, observed)
+}
+
+func (usage *promptUsage) settle(counter *usageCounter, scope PromptUsageScope, response *promptResponse) *acpmeta.TurnUsage {
+	if response != nil {
+		standard := counter.consume(scope, response.Usage)
+		_, explicitFinal := usage.recordMetadata(response.Meta)
+		if standard != nil {
+			if !explicitFinal && (usage.invocation == nil || scope == UsageInvocation) {
+				usage.invocation = standard
+			}
+			for _, observed := range standard.Observations {
+				usage.recordObservation(observed)
+			}
+		}
+	}
+	if usage.invocation == nil && len(usage.observations) == 0 {
+		return nil
+	}
+	result := acpmeta.TurnUsage{Source: "acp/prompt", Coverage: "invocation"}
+	if usage.invocation != nil {
+		result = *usage.invocation
+		result.Observations = nil
+	}
+	for _, observed := range usage.observations {
+		if observed.Source != result.Source || observed.Coverage != result.Coverage {
+			result.Observations = append(result.Observations, observed)
+		}
+	}
+	return &result
+}
+
 // wireUsage retains independent presence for ACP's cumulative session counters.
 type wireUsage struct {
 	// Input includes both cache reads and cache writes.

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
@@ -268,9 +267,17 @@ func (c *Client) foldTurnUpdateLocked(t *turn, update receivedUpdate) {
 		if size := nonnegative(update.usage.Size); size != nil && *size > 0 {
 			t.contextUsage.WindowTokens = size
 		}
-		if usage, ok := acpmeta.ReadTurnUsage(update.usage.Meta); ok {
-			t.usage = &usage
-			t.associated = true
+		decoded, attributable := t.usage.recordMetadata(update.usage.Meta)
+		t.associated = t.associated || attributable
+		if decoded && !attributable && u.UsageUpdate != nil {
+			// The host treats TurnUsage metadata as an invocation snapshot. Keep
+			// the auxiliary evidence in the terminal result and project only
+			// the standard context update when both fields are actually present.
+			used, size := nonnegative(update.usage.Used), nonnegative(update.usage.Size)
+			if used == nil || size == nil || *size == 0 {
+				return
+			}
+			delete(u.UsageUpdate.Meta, "acp-go/turn-usage")
 		}
 	}
 	c.enqueueLocked(t.delivery, t.scope, update.note, update.size)

@@ -65,8 +65,8 @@ type turn struct {
 	elicitations map[acp.UnstableElicitationId]struct{}
 	// contextUsage holds known session context counters separately from consumption.
 	contextUsage agentclient.ContextUsage
-	// usage stores only turn-scoped native consumption evidence.
-	usage *acpmeta.TurnUsage
+	// usage keeps invocation accounting separate from auxiliary observations.
+	usage promptUsage
 	// outcome freezes terminal facts before observation drain.
 	outcome *agentclient.NativeOutcome
 	// controlErr preserves bounded native Cancel failure independently of delivery.
@@ -319,21 +319,14 @@ func (c *Client) capturePromptResponse(t *turn, r acp.RequestReceipt[promptRespo
 
 func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *acp.RequestError) *agentclient.NativeOutcome {
 	outcome := &agentclient.NativeOutcome{
-		Turn:         acpmeta.NativeTurn{InvocationID: t.scope.NativeInvocationID, Origin: acpmeta.NativeTurnOriginHost, Usage: t.usage},
+		Turn:         acpmeta.NativeTurn{InvocationID: t.scope.NativeInvocationID, Origin: acpmeta.NativeTurnOriginHost},
 		ContextUsage: t.contextUsage, ObservedOutput: t.observedOutput, PossibleSideEffects: true,
 	}
+	outcome.Turn.Usage = t.usage.settle(&t.session.usage, c.opts.Protocol.PromptUsage, response)
+	if t.usage.truncated {
+		outcome.Unavailable = append(outcome.Unavailable, "turn.usage.observations")
+	}
 	if response != nil {
-		standard := t.session.usage.consume(c.opts.Protocol.PromptUsage, response.Usage)
-		if native, ok := acpmeta.ReadTurnUsage(response.Meta); ok {
-			outcome.Turn.Usage = &native
-		} else if standard != nil && (t.usage == nil || c.opts.Protocol.PromptUsage == UsageInvocation) {
-			outcome.Turn.Usage = standard
-		}
-		if standard != nil && outcome.Turn.Usage != standard && len(standard.Observations) != 0 {
-			invocation := *outcome.Turn.Usage
-			invocation.Observations = slices.Concat(invocation.Observations, standard.Observations)
-			outcome.Turn.Usage = &invocation
-		}
 		switch response.StopReason {
 		case acp.StopReasonEndTurn, acp.StopReasonMaxTokens, acp.StopReasonMaxTurnRequests, acp.StopReasonRefusal:
 			outcome.StopReason, outcome.Turn.Status = &response.StopReason, acpmeta.NativeTurnCompleted
