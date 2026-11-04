@@ -160,6 +160,11 @@ func TestACPProjectionKeepsNativePositionAndRiskEvidence(t *testing.T) {
 				StopReason: &stop, ForkPosition: "native-position",
 				ObservedOutput: true, PossibleSideEffects: true,
 			}
+			input, output := int64(7), int64(4)
+			outcome.Turn.Usage = &acpmeta.TurnUsage{
+				Source: "native_main_loop", Coverage: "main_loop", InputTokens: &input, OutputTokens: &output,
+				Observations: []acpmeta.UsageObservation{{Source: "cumulative_delta", Coverage: "query_pipeline", Tokens: acpmeta.ModelUsage{InputTokens: &input}}},
+			}
 			if failed {
 				outcome.DeliveryError = acp.NewInternalError(map[string]any{"observedOutput": false, "possibleSideEffects": false})
 			}
@@ -181,6 +186,10 @@ func TestACPProjectionKeepsNativePositionAndRiskEvidence(t *testing.T) {
 			}
 			if acpmeta.ForkPosition(meta) != "native-position" || meta["observedOutput"] != true || meta["possibleSideEffects"] != true {
 				t.Fatalf("canonical native evidence was lost or overwritten by delivery classification: %#v", meta)
+			}
+			usage, ok := acpmeta.ReadTurnUsage(meta)
+			if !ok || usage.InputTokens == nil || *usage.InputTokens != 7 || usage.OutputTokens == nil || *usage.OutputTokens != 4 || len(usage.Observations) != 1 || usage.Observations[0].Coverage != "query_pipeline" || usage.Observations[0].Tokens.OutputTokens != nil {
+				t.Fatalf("wire changed accounting or dropped overlapping evidence: %+v", usage)
 			}
 		})
 	}

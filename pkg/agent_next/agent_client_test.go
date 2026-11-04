@@ -31,7 +31,19 @@ func TestPromptResultSnapshotDoesNotMutateRetainedOutcome(t *testing.T) {
 			Unavailable: []string{"tool_detail"},
 		},
 	}
+	retained.Outcome.Turn.Usage.Observations = []acpmeta.UsageObservation{{
+		Source: "cumulative_delta", Coverage: "query_pipeline",
+		Tokens: acpmeta.ModelUsage{InputTokens: &count, Cost: cost},
+		Models: map[string]acpmeta.ModelUsage{"model": {InputTokens: &count, Cost: cost}},
+	}}
 	consumer := retained.Snapshot()
+	observation := &consumer.Outcome.Turn.Usage.Observations[0]
+	observation.Coverage = "changed"
+	*observation.Tokens.InputTokens = 999
+	observation.Tokens.Cost.Amount = "999"
+	*observation.Models["model"].InputTokens = 999
+	observation.Models["model"].Cost.Amount = "999"
+	delete(observation.Models, "model")
 	*consumer.Receipt.Input.NativeInputID = "changed"
 	*consumer.Outcome.Turn.NativeTurnID = "changed"
 	*consumer.Outcome.Turn.TerminalEventID = "changed"
@@ -53,6 +65,9 @@ func TestPromptResultSnapshotDoesNotMutateRetainedOutcome(t *testing.T) {
 		t.Fatal("consumer changed retained identity")
 	}
 	usage := retained.Outcome.Turn.Usage
+	if usage.Observations[0].Coverage != "query_pipeline" || *usage.Observations[0].Tokens.InputTokens != 17 || usage.Observations[0].Tokens.Cost.Amount != "0.25" || len(usage.Observations[0].Models) != 1 || *usage.Observations[0].Models["model"].InputTokens != 17 || usage.Observations[0].Models["model"].Cost.Amount != "0.25" {
+		t.Fatal("consumer changed retained scoped observations")
+	}
 	if *usage.InputTokens != 17 || usage.Cost.Amount != "0.25" || len(usage.Models) != 1 {
 		t.Fatal("consumer changed retained usage")
 	}

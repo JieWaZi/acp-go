@@ -233,17 +233,11 @@ func (o NativeOutcome) Snapshot() NativeOutcome {
 		u.OutputTokens = copyValue(u.OutputTokens)
 		u.ReasoningTokens = copyValue(u.ReasoningTokens)
 		u.Cost = copyValue(u.Cost)
-		if u.Models != nil {
-			u.Models = make(map[string]acpmeta.ModelUsage, len(o.Turn.Usage.Models))
-			for id, model := range o.Turn.Usage.Models {
-				model.InputTokens = copyValue(model.InputTokens)
-				model.CacheReadTokens = copyValue(model.CacheReadTokens)
-				model.CacheWriteTokens = copyValue(model.CacheWriteTokens)
-				model.OutputTokens = copyValue(model.OutputTokens)
-				model.ReasoningTokens = copyValue(model.ReasoningTokens)
-				model.Cost = copyValue(model.Cost)
-				u.Models[id] = model
-			}
+		u.Models = copyUsageModels(u.Models)
+		u.Observations = slices.Clone(u.Observations)
+		for i := range u.Observations {
+			u.Observations[i].Tokens = copyModelUsage(u.Observations[i].Tokens)
+			u.Observations[i].Models = copyUsageModels(u.Observations[i].Models)
 		}
 		o.Turn.Usage = &u
 	}
@@ -261,4 +255,25 @@ func copyValue[T any](value *T) *T {
 	}
 	result := *value
 	return &result
+}
+
+func copyModelUsage(model acpmeta.ModelUsage) acpmeta.ModelUsage {
+	model.InputTokens = copyValue(model.InputTokens)
+	model.CacheReadTokens = copyValue(model.CacheReadTokens)
+	model.CacheWriteTokens = copyValue(model.CacheWriteTokens)
+	model.OutputTokens = copyValue(model.OutputTokens)
+	model.ReasoningTokens = copyValue(model.ReasoningTokens)
+	model.Cost = copyValue(model.Cost)
+	return model
+}
+
+func copyUsageModels(models map[string]acpmeta.ModelUsage) map[string]acpmeta.ModelUsage {
+	if models == nil {
+		return nil
+	}
+	copy := make(map[string]acpmeta.ModelUsage, len(models))
+	for id, model := range models {
+		copy[id] = copyModelUsage(model)
+	}
+	return copy
 }

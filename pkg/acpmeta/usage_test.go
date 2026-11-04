@@ -6,6 +6,36 @@ import (
 	"testing"
 )
 
+func TestTurnUsageRetainsOverlappingObservationWithoutReplacingAccounting(t *testing.T) {
+	input, output, zero := int64(7), int64(4), int64(0)
+	usage := TurnUsage{InputTokens: &input, OutputTokens: &output, Source: "result.usage", Coverage: "main_loop", Complete: true,
+		Observations: []UsageObservation{{Source: "model_usage_delta", Coverage: "query_pipeline", Tokens: ModelUsage{InputTokens: &input}, Models: map[string]ModelUsage{"model": {InputTokens: &input, CacheReadTokens: &zero}}}},
+	}
+	for _, wire := range []bool{false, true} {
+		meta := WithTurnUsage(nil, usage)
+		if wire {
+			data, err := json.Marshal(meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoder := json.NewDecoder(strings.NewReader(string(data)))
+			decoder.UseNumber()
+			if err := decoder.Decode(&meta); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, ok := ReadTurnUsage(meta)
+		if !ok || got.Coverage != "main_loop" || got.InputTokens == nil || *got.InputTokens != 7 || got.OutputTokens == nil || *got.OutputTokens != 4 || len(got.Observations) != 1 {
+			t.Fatalf("wire=%t: overlapping evidence replaced or disappeared from canonical usage: %+v", wire, got)
+		}
+		observation := got.Observations[0]
+		model := observation.Models["model"]
+		if observation.Coverage != "query_pipeline" || observation.Complete || observation.Tokens.OutputTokens != nil || model.CacheReadTokens == nil || *model.CacheReadTokens != 0 || model.CacheWriteTokens != nil {
+			t.Fatalf("wire=%t: partial observation became complete or unknown became zero: %+v", wire, observation)
+		}
+	}
+}
+
 // TestTurnUsageRoundTripPreservesUnknownAndZero 验证快照不混淆缺失与显式零。
 func TestTurnUsageRoundTripPreservesUnknownAndZero(t *testing.T) {
 	zero := int64(0)

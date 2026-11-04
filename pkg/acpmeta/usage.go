@@ -34,6 +34,24 @@ type TurnUsage struct {
 	// Models attributes the same totals to models. It is not additional usage.
 	// Nil is unknown; an empty map is a known empty attribution.
 	Models map[string]ModelUsage `json:"models"`
+	// Observations retain overlapping native evidence with a different coverage.
+	// They explain gaps in the accounting snapshot above and must never be added
+	// to it or booked as additional invocations.
+	Observations []UsageObservation `json:"observations,omitempty"`
+}
+
+// UsageObservation preserves a scoped native observation without a second ledger.
+type UsageObservation struct {
+	// Source identifies the native report that supplied this observation.
+	Source string `json:"source"`
+	// Coverage identifies the native calls covered by these counters.
+	Coverage string `json:"coverage"`
+	// Complete describes coverage of this observation, independently of missing components.
+	Complete bool `json:"complete"`
+	// Tokens contains aggregate evidence within Coverage, not additional consumption.
+	Tokens ModelUsage `json:"tokens"`
+	// Models attributes these same counters; nil means attribution is unknown.
+	Models map[string]ModelUsage `json:"models"`
 }
 
 // ModelUsage attributes known counters and cost to one native model.
@@ -97,11 +115,21 @@ func WithTurnUsage(meta map[string]any, usage TurnUsage) map[string]any {
 		value["model"] = usage.Model
 	}
 	if usage.Models != nil {
-		models := make(map[string]any, len(usage.Models))
-		for id, model := range usage.Models {
-			models[id] = encodeUsageCounters(model)
+		value["models"] = encodeUsageModels(usage.Models)
+	}
+	if usage.Observations != nil {
+		observations := make([]any, 0, len(usage.Observations))
+		for _, observation := range usage.Observations {
+			entry := map[string]any{
+				"source": observation.Source, "coverage": observation.Coverage,
+				"complete": observation.Complete, "tokens": encodeUsageCounters(observation.Tokens),
+			}
+			if observation.Models != nil {
+				entry["models"] = encodeUsageModels(observation.Models)
+			}
+			observations = append(observations, entry)
 		}
-		value["models"] = models
+		value["observations"] = observations
 	}
 	result[turnUsageKey] = value
 	return result
@@ -141,19 +169,68 @@ func ReadTurnUsage(meta map[string]any) (TurnUsage, bool) {
 		}
 	}
 	if raw, exists := value["models"]; exists {
-		models, ok := raw.(map[string]any)
-		if !ok {
+		var valid bool
+		result.Models, valid = decodeUsageModels(raw)
+		if !valid {
 			return TurnUsage{}, false
 		}
-		result.Models = make(map[string]ModelUsage, len(models))
-		for id, rawModel := range models {
-			model, object := rawModel.(map[string]any)
-			detail, valid := decodeUsageCounters(model)
-			if id == "" || !object || !valid {
+	}
+	if raw, exists := value["observations"]; exists {
+		observations, valid := raw.([]any)
+		if !valid {
+			return TurnUsage{}, false
+		}
+		result.Observations = make([]UsageObservation, 0, len(observations))
+		for _, rawObservation := range observations {
+			entry, object := rawObservation.(map[string]any)
+			if !object {
 				return TurnUsage{}, false
 			}
-			result.Models[id] = detail
+			var observation UsageObservation
+			observation.Source, sourceOK = entry["source"].(string)
+			observation.Coverage, valid = entry["coverage"].(string)
+			observation.Complete, completeOK = entry["complete"].(bool)
+			tokens, object := entry["tokens"].(map[string]any)
+			if !sourceOK || observation.Source == "" || !valid || observation.Coverage == "" || !completeOK || !object {
+				return TurnUsage{}, false
+			}
+			observation.Tokens, valid = decodeUsageCounters(tokens)
+			if !valid {
+				return TurnUsage{}, false
+			}
+			if rawModels, exists := entry["models"]; exists {
+				observation.Models, valid = decodeUsageModels(rawModels)
+				if !valid {
+					return TurnUsage{}, false
+				}
+			}
+			result.Observations = append(result.Observations, observation)
 		}
+	}
+	return result, true
+}
+
+func encodeUsageModels(models map[string]ModelUsage) map[string]any {
+	value := make(map[string]any, len(models))
+	for id, model := range models {
+		value[id] = encodeUsageCounters(model)
+	}
+	return value
+}
+
+func decodeUsageModels(raw any) (map[string]ModelUsage, bool) {
+	models, ok := raw.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	result := make(map[string]ModelUsage, len(models))
+	for id, rawModel := range models {
+		model, object := rawModel.(map[string]any)
+		detail, valid := decodeUsageCounters(model)
+		if id == "" || !object || !valid {
+			return nil, false
+		}
+		result[id] = detail
 	}
 	return result, true
 }
