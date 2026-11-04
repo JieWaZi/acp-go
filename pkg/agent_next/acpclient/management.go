@@ -12,6 +12,9 @@ import (
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
+// Executable returns the resolved launcher shared by this client's native operations.
+func (c *Client) Executable() string { return c.proc.Executable() }
+
 // VersionProbe reads bounded version evidence from the selected executable.
 type VersionProbe struct {
 	// Args is the complete argument list for the one-shot native command.

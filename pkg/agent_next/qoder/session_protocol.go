@@ -12,3 +12,9 @@ func normalizeOption(option acp.SessionConfigOption) acp.SessionConfigOption {
 	}
 	return option
 }
+
+// Qoder 1.1.53 uses an invalid-parameters response for an absent session.
+func sessionMissing(err *acp.RequestError, id acp.SessionId) bool {
+	data, ok := err.Data.(map[string]any)
+	return err.Code == -32602 && ok && data["code"] == "INVALID_SESSION_IDENTIFIER" && data["sessionId"] == string(id)
+}

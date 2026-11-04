@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,14 @@ func TestNativeQoder(t *testing.T) {
 		return
 	}
 	command := os.Args[len(os.Args)-1]
+	if len(os.Args) >= 3 && strings.Join(os.Args[len(os.Args)-3:], " ") == "status -o json" {
+		fmt.Println(os.Getenv("ACP_FAMILY_QODER_STATUS"))
+		os.Exit(0)
+	}
+	if strings.Contains(strings.Join(os.Args, " "), "--input-format stream-json") {
+		runManagementFixture()
+		os.Exit(0)
+	}
 	if command == "--version" {
 		fmt.Println("Qoder CLI 0.15.0")
 		os.Exit(0)
@@ -47,6 +56,7 @@ func TestNativeQoder(t *testing.T) {
 		}
 	}
 	var promptID json.RawMessage
+	var promptSession string
 	var opened int
 	var prompts int
 	reply := func(id json.RawMessage, result any) {
@@ -63,6 +73,7 @@ func TestNativeQoder(t *testing.T) {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
 			Params map[string]any  `json:"params"`
+			Result json.RawMessage `json:"result"`
 		}
 		if json.Unmarshal(in.Bytes(), &frame) != nil {
 			os.Exit(4)
@@ -71,7 +82,10 @@ func TestNativeQoder(t *testing.T) {
 		id, _ := frame.Params["sessionId"].(string)
 		switch frame.Method {
 		case "initialize":
-			reply(frame.ID, map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "sessionCapabilities": map[string]any{"resume": map[string]any{}}}})
+			if expected := os.Getenv("ACP_FAMILY_QODER_PAT_ENV"); expected != "" && os.Getenv(expected) != "fixture-selected-token" {
+				os.Exit(9)
+			}
+			reply(frame.ID, map[string]any{"protocolVersion": 1, "authMethods": []any{map[string]any{"id": "qodercli-login", "name": "CLI login"}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}, "sessionCapabilities": map[string]any{"resume": map[string]any{}}}})
 		case "session/new":
 			opened++
 			id = "first"
@@ -80,8 +94,23 @@ func TestNativeQoder(t *testing.T) {
 			}
 			config("foreign", "native-high")
 			config(id, "native-low")
-			reply(frame.ID, map[string]any{"sessionId": id, "configOptions": options(id, "native-low")})
+			reply(frame.ID, map[string]any{"sessionId": id, "configOptions": options(id, "native-low"), "modes": map[string]any{
+				"currentModeId": "default", "availableModes": []any{map[string]any{"id": "default", "name": "Default"}, map[string]any{"id": "auto", "name": "Auto"}},
+			}})
 		case "session/resume", "session/load":
+			if id == "missing" || id == "foreign-missing" || id == "bad-parameters" {
+				code, missingID := "INVALID_SESSION_IDENTIFIER", id
+				if id == "foreign-missing" {
+					missingID = "different"
+				}
+				if id == "bad-parameters" {
+					code = "INVALID_CWD"
+				}
+				_ = out.Encode(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "error": map[string]any{
+					"code": -32602, "message": "Invalid parameters", "data": map[string]any{"code": code, "sessionId": missingID, "projectRoot": "/private/project"},
+				}})
+				continue
+			}
 			config(id, "native-low")
 			reply(frame.ID, map[string]any{"configOptions": options(id, "native-low")})
 		case "session/set_config_option":
@@ -90,9 +119,23 @@ func TestNativeQoder(t *testing.T) {
 			}
 			config(id, "native-high")
 			reply(frame.ID, map[string]any{"configOptions": options(id, "native-high")})
+		case "session/set_mode":
+			if frame.Params["modeId"] != "auto" {
+				os.Exit(10)
+			}
+			reply(frame.ID, map[string]any{})
 		case "session/prompt":
 			prompts++
 			promptID = frame.ID
+			if os.Getenv("ACP_FAMILY_QODER_PERMISSION") == "1" {
+				promptSession = id
+				_ = out.Encode(map[string]any{"jsonrpc": "2.0", "id": "permission", "method": "session/request_permission", "params": map[string]any{
+					"sessionId": id,
+					"toolCall":  map[string]any{"toolCallId": "qoder-tool", "title": "Fixture tool"},
+					"options":   []any{map[string]any{"optionId": "native-allow", "name": "Allow", "kind": "allow_once"}},
+				}})
+				continue
+			}
 			notify("foreign", map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "unrelated"}})
 			notify(id, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "Error: RetriableError: WritableIterable is closed"}})
 			if os.Getenv("ACP_FAMILY_WIRE_CANCEL") != "1" {
@@ -100,11 +143,191 @@ func TestNativeQoder(t *testing.T) {
 			}
 		case "session/cancel":
 			reply(promptID, map[string]any{"stopReason": "cancelled", "usage": map[string]any{"inputTokens": 12, "cachedReadTokens": 0, "cachedWriteTokens": 0}})
+		case "":
+			var permission acp.RequestPermissionResponse
+			if string(frame.ID) != `"permission"` || json.Unmarshal(frame.Result, &permission) != nil || permission.Outcome.Selected == nil || permission.Outcome.Selected.OptionId != "native-allow" {
+				os.Exit(11)
+			}
+			notify(promptSession, map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "Approved"}})
+			reply(promptID, map[string]any{"stopReason": "end_turn"})
 		default:
 			os.Exit(6)
 		}
 	}
 	os.Exit(0)
+}
+
+func runManagementFixture() {
+	in := bufio.NewScanner(os.Stdin)
+	out := json.NewEncoder(os.Stdout)
+	trace, err := os.OpenFile(os.Getenv("ACP_FAMILY_TRACE"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		os.Exit(3)
+	}
+	defer trace.Close()
+	for in.Scan() {
+		var request struct {
+			Type    string `json:"type"`
+			ID      string `json:"request_id"`
+			Request struct {
+				Type string `json:"type"`
+			} `json:"request"`
+		}
+		if json.Unmarshal(in.Bytes(), &request) != nil || request.Type != "control_request" {
+			os.Exit(7)
+		}
+		fmt.Fprintln(trace, request.Request.Type)
+		var result any
+		switch request.Request.Type {
+		case "initialize":
+			result = map[string]any{"account": map[string]any{"name": "Bootstrap"}}
+		case "account_info":
+			result = map[string]any{"account": map[string]any{"userId": "native-id", "email": "account@example.test", "tokenSource": "selected", "subscriptionType": "Pro"}}
+		case "get_usage_info":
+			result = json.RawMessage(os.Getenv("ACP_FAMILY_QODER_QUOTA"))
+		default:
+			os.Exit(8)
+		}
+		_ = out.Encode(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": "foreign", "response": nil}})
+		_ = out.Encode(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": request.ID, "response": result}})
+	}
+}
+
+func TestQoderStatusReadsOnlyNativeAuthenticationFacts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	options, _ := fixtureOptions(t, false)
+	options.Environment = append(options.Environment, `ACP_FAMILY_QODER_STATUS={"logged_in":true,"auth_source":"browser","account_type":"individual","login_method":"oauth","username":"local","email":"local@example.test","user_type":"Pro"}`)
+	status, err := qoder.ReadLoginStatus(ctx, options)
+	if err != nil || !status.Authenticated || status.Email != "local@example.test" || status.AuthSource != "browser" || status.LoginMethod != "oauth" || status.AccountType != "individual" || status.UserType != "Pro" {
+		t.Fatalf("status = %+v, error = %v", status, err)
+	}
+	options.Environment = append(options.Environment, `ACP_FAMILY_QODER_STATUS={"logged_in":false,"email":"stale@example.test"}`)
+	status, err = qoder.ReadLoginStatus(ctx, options)
+	if err != nil || status.Authenticated || status.Email != "" {
+		t.Fatalf("signed-out status = %+v, error = %v", status, err)
+	}
+	options.Environment = append(options.Environment, `ACP_FAMILY_QODER_STATUS={"email":"unverified@example.test"}`)
+	if _, err := qoder.ReadLoginStatus(ctx, options); err == nil {
+		t.Fatal("ambiguous status was accepted")
+	}
+}
+
+func TestQoderPATSelectsTheRegionalNativeCredential(t *testing.T) {
+	for runtime, key := range map[string]string{"qoder": "QODER_PERSONAL_ACCESS_TOKEN", "qoder-cn": "QODERCN_PERSONAL_ACCESS_TOKEN"} {
+		t.Run(runtime, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+			defer cancel()
+			options, trace := fixtureOptions(t, false)
+			options.RuntimeID = runtime
+			options.Environment = append(options.Environment, key+"=ambient-token", "ACP_FAMILY_QODER_PAT_ENV="+key)
+			options.PersonalAccessToken = "fixture-selected-token"
+			client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+			initialized, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1})
+			if err != nil || len(initialized.AuthMethods) != 0 {
+				t.Fatalf("PAT initialize auth = %v, error = %v", initialized.AuthMethods, err)
+			}
+			if _, err := client.Authenticate(ctx, acp.AuthenticateRequest{MethodId: "qodercli-login"}); err == nil {
+				t.Fatal("PAT selection allowed CLI login")
+			}
+			wire, _ := os.ReadFile(trace)
+			if strings.Contains(string(wire), "fixture-selected-token") || strings.Contains(string(wire), "authenticate") {
+				t.Fatal("PAT or interactive login escaped the frozen launch")
+			}
+		})
+	}
+}
+
+func TestQoderManagementReadsSelectedNativeIdentityAndQuotaWithoutPrompt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	options, trace := fixtureOptions(t, false)
+	options.ExpectedUserID = "native-id"
+	options.Environment = append(options.Environment, `ACP_FAMILY_QODER_QUOTA={"usage":{"userId":"native-id","userQuota":{"total":12,"used":0,"remaining":12,"percentage":0,"unit":"Credits"}},"session":{"total_credits":99}}`)
+	identity, err := qoder.ReadNativeIdentity(ctx, options)
+	if err != nil || identity.UserID != "native-id" || identity.Email != "account@example.test" || identity.Plan != "Pro" || identity.TokenSource != "selected" {
+		t.Fatalf("identity = %+v, error = %v", identity, err)
+	}
+	client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	usage, err := client.ReadAccountUsage(ctx)
+	if err != nil || usage.Available == nil || !*usage.Available || len(usage.Buckets) != 1 {
+		t.Fatalf("quota = %+v, error = %v", usage, err)
+	}
+	bucket := usage.Buckets[0]
+	if bucket.ID != "userQuota" || bucket.Extra == nil || bucket.Extra.Unit == nil || *bucket.Extra.Unit != "Credits" || bucket.Extra.Used == nil || string(*bucket.Extra.Used) != "0" || len(bucket.Windows) != 1 || bucket.Windows[0].UsedPercent == nil || *bucket.Windows[0].UsedPercent != 0 || bucket.Windows[0].ResetAtUnixSeconds != nil {
+		t.Fatalf("quota bucket = %+v", bucket)
+	}
+	wire, _ := os.ReadFile(trace)
+	if string(wire) != "initialize\naccount_info\ninitialize\naccount_info\nget_usage_info\n" {
+		t.Fatalf("management wire = %q", wire)
+	}
+	options.ExpectedUserID = "different"
+	if _, err := qoder.ReadNativeIdentity(ctx, options); err == nil {
+		t.Fatal("accepted a different native account")
+	}
+}
+
+func TestQoderQuotaDoesNotCrossNativeSubjectsOrUseSessionCredits(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reply   string
+		wantErr bool
+	}{
+		{"foreign", `{"usage":{"userId":"foreign","userQuota":{"remaining":10}}}`, true},
+		{"session-only", `{"usage":null,"session":{"total_credits":99}}`, false},
+		{"omitted", `{"session":{"total_credits":99}}`, true},
+		{"empty-bucket", `{"usage":{"userId":"native-id","userQuota":{}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+			defer cancel()
+			options, _ := fixtureOptions(t, false)
+			options.ExpectedUserID = "native-id"
+			options.Environment = append(options.Environment, "ACP_FAMILY_QODER_QUOTA="+tc.reply)
+			client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+			usage, err := client.ReadAccountUsage(ctx)
+			if (err != nil) != tc.wantErr || len(usage.Buckets) != 0 || !tc.wantErr && (usage.Available == nil || *usage.Available) {
+				t.Fatalf("quota = %+v, error = %v", usage, err)
+			}
+		})
+	}
+}
+
+func TestQoderLoadOnlyClassifiesTheExactMissingSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	options, _ := fixtureOptions(t, false)
+	client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []acp.SessionId{"missing", "foreign-missing", "bad-parameters"} {
+		_, err := client.LoadSession(ctx, acp.LoadSessionRequest{SessionId: id, Cwd: options.WorkingDirectory})
+		var rejected *acp.RequestError
+		if !errors.As(err, &rejected) || rejected.Code != -32602 {
+			t.Fatalf("load %s returned %v", id, err)
+		}
+		data, _ := rejected.Data.(map[string]any)
+		if (data["classification"] == "session_missing") != (id == "missing") || data["projectRoot"] != nil {
+			t.Fatalf("load %s classification = %#v", id, data)
+		}
+	}
 }
 
 func fixtureOptions(t *testing.T, cancel bool) (qoder.Options, string) {
@@ -179,6 +402,9 @@ func TestQoderDirectNormalizesAllConfigurationEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkOptions(t, resumed.ConfigOptions, "native-low")
+			if _, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{SessionId: first.SessionId, ConfigId: "reasoning_effort", Value: "other"}}); err == nil {
+				t.Fatal("model ID was accepted as a reasoning effort")
+			}
 			set, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{SessionId: first.SessionId, ConfigId: "reasoning_effort", Value: "native-high"}})
 			if err != nil {
 				t.Fatal(err)
@@ -320,5 +546,62 @@ func TestQoderPublicACPUsesSameNativeCancelAndResult(t *testing.T) {
 	wire, _ := os.ReadFile(trace)
 	if strings.Count(string(wire), `"method":"session/cancel"`) != 1 || strings.Contains(string(wire), "cursor/") {
 		t.Fatalf("native control trace = %s", wire)
+	}
+}
+
+func TestQoderNativeModePermissionAndMCPUseTheSameSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	options, trace := fixtureOptions(t, false)
+	options.Environment = append(options.Environment, "ACP_FAMILY_QODER_PERMISSION=1")
+	seen := make(chan agentclient.Scope, 1)
+	client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{
+		RequestPermission: func(_ context.Context, scope agentclient.Scope, req acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+			if req.ToolCall.ToolCallId != "qoder-tool" {
+				t.Errorf("permission tool = %q", req.ToolCall.ToolCallId)
+			}
+			seen <- scope
+			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected("native-allow")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	servers := []acp.McpServer{{Http: &acp.McpServerHttpInline{Type: "http", Url: "https://example.test/mcp", Name: "project-tools", Headers: []acp.HttpHeader{}}}}
+	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: options.WorkingDirectory, McpServers: servers, Meta: acpmeta.DeveloperInstructionsMetadata(acp.Ptr("fixture developer instructions"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SetSessionMode(ctx, acp.SetSessionModeRequest{SessionId: session.SessionId, ModeId: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := client.ReservePrompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("question")}}, agentclient.PromptOptions{HostInvocationID: "host-invocation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := run()
+	if result.Outcome == nil || result.Outcome.StopReason == nil || *result.Outcome.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("outcome = %+v", result)
+	}
+	select {
+	case scope := <-seen:
+		if scope.SessionID != session.SessionId || scope.HostInvocationID != "host-invocation" || scope.NativeInvocationID == "" {
+			t.Fatalf("permission scope = %+v", scope)
+		}
+	default:
+		t.Fatal("permission callback was not received")
+	}
+	wire, _ := os.ReadFile(trace)
+	for _, piece := range []string{`"name":"project-tools"`, `"modeId":"auto"`, `fixture developer instructions`, `"optionId":"native-allow"`} {
+		if !strings.Contains(string(wire), piece) {
+			t.Fatalf("native wire is missing %q: %s", piece, wire)
+		}
+	}
+	if strings.Contains(string(wire), `"developerInstructions"`) {
+		t.Fatalf("host-only instruction metadata reached the peer: %s", wire)
 	}
 }
