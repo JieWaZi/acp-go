@@ -233,6 +233,8 @@ type LoginStatus struct {
 	Authenticated bool
 	// Kind distinguishes subscriptions, API keys and external cloud credentials.
 	Kind string
+	// AuthMethod is the recognized native sign-in method, separate from the inferred Kind.
+	AuthMethod string
 	// Email is the subscription label when reported.
 	Email *string
 	// Plan is the subscription type when reported.
@@ -279,6 +281,7 @@ func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
 	case status.Provider == "bedrock" || status.Provider == "vertex" || status.Provider == "foundry":
 		result.Kind = status.Provider
 	case status.Method == "claude.ai" || status.Method == "claudeai" || status.Method == "oauth":
+		result.AuthMethod = status.Method
 		result.Kind, result.Email, result.Plan = "subscription", status.Email, status.Plan
 		if isUUID(status.OrganizationID) {
 			result.OrganizationID = strings.ToLower(status.OrganizationID)
@@ -288,7 +291,9 @@ func (c *Client) ReadLoginStatus(ctx context.Context) (LoginStatus, error) {
 		}
 	case status.Method == "apiKey" || status.Method == "api_key" || status.Method == "anthropicConsole":
 		result.Kind = "api_key"
+		result.AuthMethod = status.Method
 	case status.Method == "oauth_token":
+		result.AuthMethod = status.Method
 		// Claude Code 2.1.159 reports the same method for a gateway token
 		// and a Claude subscription token. Only the frozen environment
 		// distinguishes the credential source in this response.

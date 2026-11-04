@@ -232,6 +232,10 @@ func TestReadAccountDistinguishesNativeEnvironmentTokenTypes(t *testing.T) {
 			client, _, ctx := startClientMode(t, agentclient.HostCallbacks{}, "legacy-auth-token", func(o *claude.Options) {
 				o.Environment = append(o.Environment, tc.variable+"=test")
 			})
+			status, err := client.ReadLoginStatus(ctx)
+			if err != nil || !status.Authenticated || status.Kind != tc.kind || status.AuthMethod != "oauth_token" {
+				t.Fatalf("native token status = %+v, %v", status, err)
+			}
 			account, err := client.ReadAccount(ctx)
 			if err != nil || account.Account == nil || account.Account.Kind != tc.kind {
 				t.Fatalf("account = %+v, %v, want %s", account, err, tc.kind)
