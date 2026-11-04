@@ -164,11 +164,21 @@ func TestAppServerFixture(t *testing.T) {
 					if mode == "usage_dip_explicit_zero_both" {
 						total["cacheWriteInputTokens"] = 0
 					}
+					if mode == "usage_dip_write_positive_absent" || mode == "usage_dip_write_positive_zero" {
+						total["cacheWriteInputTokens"] = 2
+						if input == 39 {
+							last["cacheWriteInputTokens"] = 2
+						}
+					}
 					emit("thread/tokenUsage/updated", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "tokenUsage": map[string]any{"last": last, "total": total, "modelContextWindow": 100}})
 				}
 				switch turnNumber {
 				case 1:
-					emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, 19))
+					initial := fixtureUsage("thread-1", nativeTurn, 19)
+					if mode == "usage_dip_write_positive_zero" {
+						initial["tokenUsage"].(map[string]any)["total"].(map[string]any)["cacheWriteInputTokens"] = 0
+					}
+					emit("thread/tokenUsage/updated", initial)
 				case 2:
 					dip := func() { emit("thread/tokenUsage/updated", fixtureUsage("thread-1", nativeTurn, 9)) }
 					if mode == "usage_dip_terminal" {
@@ -1315,6 +1325,25 @@ func TestUsageDipOptionalZeroKeepsCorroboratedRequests(t *testing.T) {
 				}
 			} else if u.CacheWriteTokens == nil || *u.CacheWriteTokens != 0 {
 				t.Fatalf("explicit cumulative cache-write zero was not retained: %+v", u)
+			}
+		})
+	}
+}
+
+func TestUsageDipOptionalCounterCanAdvanceFromDefault(t *testing.T) {
+	for _, mode := range []string{"usage_dip_write_positive_zero", "usage_dip_write_positive_absent"} {
+		t.Run(mode, func(t *testing.T) {
+			c, ctx, session, _ := newFixture(t, mode, agentclient.HostCallbacks{})
+			_ = reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+			result := reserve(t, c, ctx, session, agentclient.PromptOptions{})()
+			if result.Outcome == nil || result.Outcome.Turn.Usage == nil {
+				t.Fatalf("missing usage: %+v", result)
+			}
+			u := result.Outcome.Turn.Usage
+			if u.InputTokens == nil || *u.InputTokens != 20 || u.OutputTokens == nil || *u.OutputTokens != 2 ||
+				u.CacheWriteTokens == nil || *u.CacheWriteTokens != 2 || u.Coverage != "observed_requests" || u.Complete {
+				t.Fatalf("expected 20/2/2 observed requests, got %v/%v/%v, coverage=%s complete=%t",
+					printableReviewCount(u.InputTokens), printableReviewCount(u.OutputTokens), printableReviewCount(u.CacheWriteTokens), u.Coverage, u.Complete)
 			}
 		})
 	}

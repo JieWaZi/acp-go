@@ -358,6 +358,15 @@ type tokenCounters struct {
 	Context *int64 `json:"totalTokens"`
 }
 
+// cacheWriteCount supplies the native v0.163 default for arithmetic and proof.
+// Write itself retains whether the producer reported the field.
+func (c *tokenCounters) cacheWriteCount() *int64 {
+	if c.Write == nil {
+		return pointer(int64(0))
+	}
+	return c.Write
+}
+
 type tokenCheckpoint struct {
 	// total is the highest accepted cumulative sample for this boundary.
 	total *tokenCounters
@@ -465,21 +474,18 @@ func matchesLastRequest(delta tokenCounters, last *tokenCounters) bool {
 		return false
 	}
 	equal := func(a, b *int64) bool {
-		return a == nil && b == nil || a != nil && b != nil && *a == *b
+		return nonnegative(a) != nil && nonnegative(b) != nil && *a == *b
 	}
 	return equal(delta.Context, last.Context) && equal(delta.Input, last.Input) &&
-		equal(delta.Read, last.Read) && value(delta.Write) == value(last.Write) &&
+		equal(delta.Read, last.Read) && equal(delta.cacheWriteCount(), last.cacheWriteCount()) &&
 		equal(delta.Output, last.Output) && equal(delta.Reasoning, last.Reasoning)
 }
 
 func (c *Client) publishUsageLocked(t *turn, counters *tokenCounters, coverage string) {
-	// The v0.163 native schema defaults absent cacheWriteInputTokens to
-	// zero for input decomposition. Keep absence distinct in the receipt.
-
 	var input *int64
-	if counters.Input != nil && counters.Read != nil && *counters.Read <= *counters.Input &&
-		value(counters.Write) <= *counters.Input-*counters.Read {
-		input = pointer(*counters.Input - *counters.Read - value(counters.Write))
+	total, read, write := nonnegative(counters.Input), nonnegative(counters.Read), nonnegative(counters.cacheWriteCount())
+	if total != nil && read != nil && write != nil && *read <= *total && *write <= *total-*read {
+		input = pointer(*total - *read - *write)
 	}
 	model := t.model
 	if t.rerouted {
@@ -507,34 +513,36 @@ func nonnegative(n *int64) *int64 {
 func countersRegressed(end, start *tokenCounters) bool {
 	regressed := func(a, b *int64) bool { return nonnegative(a) != nil && nonnegative(b) != nil && *a < *b }
 	return regressed(end.Context, start.Context) || regressed(end.Input, start.Input) || regressed(end.Read, start.Read) ||
-		regressed(end.Write, start.Write) || regressed(end.Output, start.Output) || regressed(end.Reasoning, start.Reasoning)
+		regressed(end.cacheWriteCount(), start.cacheWriteCount()) || regressed(end.Output, start.Output) || regressed(end.Reasoning, start.Reasoning)
 }
 
 func subtractCounters(end, start *tokenCounters) (tokenCounters, bool) {
 	valid := true
 	subtract := func(a, b *int64) *int64 {
-		if a == nil && b == nil {
-			return nil
-		}
 		if nonnegative(a) == nil || nonnegative(b) == nil || *a < *b {
 			valid = false
 			return nil
 		}
 		return pointer(*a - *b)
 	}
-	// The native schema allows only cache writes to be omitted independently
-	// from an otherwise complete report. Compare missing and explicit zero
-	// as equal, but keep the closing cumulative sample's presence.
-	write := end.Write
-	if value(end.Write) != 0 || value(start.Write) != 0 {
-		write = subtract(end.Write, start.Write)
+	input := subtract(end.Input, start.Input)
+	write := subtract(end.cacheWriteCount(), start.cacheWriteCount())
+	if write == nil {
+		// An invalid cache-write delta cannot decompose the inclusive input delta.
+		input = nil
 	}
-	result := tokenCounters{Input: subtract(end.Input, start.Input), Read: subtract(end.Read, start.Read), Write: write,
+	if end.Write == nil {
+		write = nil
+	}
+	result := tokenCounters{Input: input, Read: subtract(end.Read, start.Read), Write: write,
 		Output: subtract(end.Output, start.Output), Reasoning: subtract(end.Reasoning, start.Reasoning), Context: subtract(end.Context, start.Context)}
 	return result, valid
 }
 
 func addCounters(previous *tokenCounters, delta tokenCounters) *tokenCounters {
+	if nonnegative(delta.cacheWriteCount()) == nil {
+		delta.Input = nil
+	}
 	if previous == nil {
 		return &tokenCounters{Input: nonnegative(delta.Input), Read: nonnegative(delta.Read), Write: nonnegative(delta.Write),
 			Output: nonnegative(delta.Output), Reasoning: nonnegative(delta.Reasoning), Context: nonnegative(delta.Context)}
