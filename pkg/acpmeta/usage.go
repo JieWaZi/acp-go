@@ -50,6 +50,10 @@ type UsageObservation struct {
 	Complete bool `json:"complete"`
 	// Tokens contains aggregate evidence within Coverage, not additional consumption.
 	Tokens ModelUsage `json:"tokens"`
+	// InputTotalTokens preserves reported native input without assuming cache inclusion.
+	InputTotalTokens *int64 `json:"inputTotalTokens,omitempty"`
+	// TotalTokens preserves the native reported total without inferring its accounting scope.
+	TotalTokens *int64 `json:"totalTokens,omitempty"`
 	// Models attributes these same counters; nil means attribution is unknown.
 	Models map[string]ModelUsage `json:"models"`
 }
@@ -127,6 +131,12 @@ func WithTurnUsage(meta map[string]any, usage TurnUsage) map[string]any {
 			if observation.Models != nil {
 				entry["models"] = encodeUsageModels(observation.Models)
 			}
+			if observation.InputTotalTokens != nil {
+				entry["inputTotalTokens"] = *observation.InputTotalTokens
+			}
+			if observation.TotalTokens != nil {
+				entry["totalTokens"] = *observation.TotalTokens
+			}
 			observations = append(observations, entry)
 		}
 		value["observations"] = observations
@@ -197,6 +207,15 @@ func ReadTurnUsage(meta map[string]any) (TurnUsage, bool) {
 			observation.Tokens, valid = decodeUsageCounters(tokens)
 			if !valid {
 				return TurnUsage{}, false
+			}
+			for key, target := range map[string]**int64{"inputTotalTokens": &observation.InputTotalTokens, "totalTokens": &observation.TotalTokens} {
+				if raw, exists := entry[key]; exists && raw != nil {
+					counter, ok := usageInteger(raw)
+					if !ok {
+						return TurnUsage{}, false
+					}
+					*target = &counter
+				}
 			}
 			if rawModels, exists := entry["models"]; exists {
 				observation.Models, valid = decodeUsageModels(rawModels)

@@ -72,6 +72,8 @@ const (
 	UsageSessionCumulative PromptUsageScope = iota
 	UsageInvocation
 	UsageUnavailable
+	// UsageUnattributed retains native counters when their turn/session scope is unproven.
+	UsageUnattributed
 )
 
 // TextClass describes a proven provider condition in a complete answer chunk.

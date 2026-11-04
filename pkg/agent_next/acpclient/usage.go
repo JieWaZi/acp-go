@@ -96,6 +96,8 @@ func (usage *promptUsage) settle(counter *usageCounter, scope PromptUsageScope, 
 
 // wireUsage retains independent presence for ACP's cumulative session counters.
 type wireUsage struct {
+	// Total retains the native sum without deriving its inclusion rules.
+	Total *int64 `json:"totalTokens"`
 	// Input includes both cache reads and cache writes.
 	Input *int64 `json:"inputTokens"`
 	// Output is the total output counter.
@@ -121,6 +123,17 @@ type usageCounter struct {
 func (counter *usageCounter) consume(scope PromptUsageScope, value *wireUsage) *acpmeta.TurnUsage {
 	if scope == UsageUnavailable {
 		return nil
+	}
+	if scope == UsageUnattributed {
+		if value == nil {
+			return nil
+		}
+		observed := value.normalized()
+		observed.InputTokens = nil // Cache inclusion is also unproven for this native payload.
+		return &acpmeta.TurnUsage{Source: "acp/prompt", Coverage: "invocation", Observations: []acpmeta.UsageObservation{{
+			Source: "acp/prompt", Coverage: "unknown", Tokens: observed,
+			InputTotalTokens: nonnegative(value.Input), TotalTokens: nonnegative(value.Total),
+		}}}
 	}
 	var sample wireUsage
 	if scope == UsageSessionCumulative {

@@ -580,7 +580,10 @@ func TestQoderPublicACPUsesSameNativeCancelAndResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	usage, ok := acpmeta.ReadTurnUsage(result.Meta)
-	if result.StopReason != acp.StopReasonCancelled || !ok || usage.InputTokens == nil || *usage.InputTokens != 12 {
+	if result.StopReason != acp.StopReasonCancelled || !ok || usage.InputTokens != nil || usage.Complete ||
+		len(usage.Observations) != 1 || usage.Observations[0].Coverage != "unknown" ||
+		usage.Observations[0].Tokens.InputTokens != nil ||
+		usage.Observations[0].InputTotalTokens == nil || *usage.Observations[0].InputTotalTokens != 12 {
 		t.Fatalf("public native result = %#v, usage = %#v", result, usage)
 	}
 	wire, _ := os.ReadFile(trace)

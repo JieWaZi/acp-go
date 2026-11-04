@@ -266,6 +266,8 @@ func (o NativeOutcome) Snapshot() NativeOutcome {
 		u.Models = copyUsageModels(u.Models)
 		u.Observations = slices.Clone(u.Observations)
 		for i := range u.Observations {
+			u.Observations[i].InputTotalTokens = copyValue(u.Observations[i].InputTotalTokens)
+			u.Observations[i].TotalTokens = copyValue(u.Observations[i].TotalTokens)
 			u.Observations[i].Tokens = copyModelUsage(u.Observations[i].Tokens)
 			u.Observations[i].Models = copyUsageModels(u.Observations[i].Models)
 		}

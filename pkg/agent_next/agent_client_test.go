@@ -33,12 +33,15 @@ func TestPromptResultSnapshotDoesNotMutateRetainedOutcome(t *testing.T) {
 	}
 	retained.Outcome.Turn.Usage.Observations = []acpmeta.UsageObservation{{
 		Source: "cumulative_delta", Coverage: "query_pipeline",
+		InputTotalTokens: &count, TotalTokens: &used,
 		Tokens: acpmeta.ModelUsage{InputTokens: &count, Cost: cost},
 		Models: map[string]acpmeta.ModelUsage{"model": {InputTokens: &count, Cost: cost}},
 	}}
 	consumer := retained.Snapshot()
 	observation := &consumer.Outcome.Turn.Usage.Observations[0]
 	observation.Coverage = "changed"
+	*observation.InputTotalTokens = 999
+	*observation.TotalTokens = 999
 	*observation.Tokens.InputTokens = 999
 	observation.Tokens.Cost.Amount = "999"
 	*observation.Models["model"].InputTokens = 999
@@ -60,6 +63,9 @@ func TestPromptResultSnapshotDoesNotMutateRetainedOutcome(t *testing.T) {
 	consumer.Outcome.FinalMessage.Text = "changed"
 	*consumer.Outcome.ContextUsage.UsedTokens = 999
 	consumer.Outcome.Unavailable[0] = "changed"
+	if *retained.Outcome.Turn.Usage.Observations[0].InputTotalTokens != 17 || *retained.Outcome.Turn.Usage.Observations[0].TotalTokens != 23 {
+		t.Fatal("consumer changed retained raw usage evidence")
+	}
 
 	if *retained.Receipt.Input.NativeInputID != "input-1" || *retained.Outcome.Turn.NativeTurnID != "native-1" || *retained.Outcome.Turn.TerminalEventID != "terminal-1" || retained.Outcome.Turn.ConsumedInputIDs[0] != "input-1" {
 		t.Fatal("consumer changed retained identity")
