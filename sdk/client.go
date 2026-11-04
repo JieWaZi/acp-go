@@ -5,6 +5,7 @@ package acp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -80,13 +81,31 @@ type RequestReceipt[T any] struct {
 // existing pending owner. It returns response evidence before notification
 // dispatch completes. The reader still applies the configured queue limits.
 // WaitForNotifications can check dispatch separately.
-func SendClientRequestWithReceipt[T any](c *ClientSideConnection, ctx context.Context, method string, params any, hooks RequestWriteHooks) RequestReceipt[T] {
-	exchange := c.conn.exchangeRequest(ctx, method, params, hooks)
-	response := exchange.response
+// At most one optional receive hook runs on the reader, before the next frame
+// and potentially before Write returns. Only response fields are available to
+// the hook. It must perform bounded local folding, not I/O, waits, observers or
+// calls into this connection. Do not mutate its borrowed Result or PeerErr.
+func SendClientRequestWithReceipt[T any](c *ClientSideConnection, ctx context.Context, method string, params any, hooks RequestWriteHooks, receive ...func(RequestReceipt[T])) RequestReceipt[T] {
+	if len(receive) > 1 {
+		return RequestReceipt[T]{PrepareErr: errors.New("only one response receive hook is allowed")}
+	}
+	var receipt RequestReceipt[T]
+	exchange := c.conn.exchangeRequest(ctx, method, params, hooks, func(response responseEnvelope) {
+		receipt = decodeRequestReceipt[T](response)
+		if len(receive) == 1 && receive[0] != nil {
+			receive[0](receipt)
+		}
+	})
+	// Every exchange return either synchronizes with response publication or
+	// retires pending under the same lock, so the reader cannot mutate this value.
+	receipt.PrepareErr = exchange.prepareErr
+	receipt.TransportErr = exchange.waitErr
+	receipt.Write = exchange.write
+	return receipt
+}
+
+func decodeRequestReceipt[T any](response responseEnvelope) RequestReceipt[T] {
 	receipt := RequestReceipt[T]{
-		PrepareErr:            exchange.prepareErr,
-		TransportErr:          exchange.waitErr,
-		Write:                 exchange.write,
 		Sequence:              response.sequence,
 		NotificationWatermark: response.notificationWatermark,
 	}
@@ -111,6 +130,23 @@ func SendClientRequestWithReceipt[T any](c *ClientSideConnection, ctx context.Co
 		}
 	}
 	return receipt
+}
+
+// SendClientNotificationWithWriteHooks uses the same write gate as requests, so
+// a captured control can recheck its native owner immediately before transmission.
+func SendClientNotificationWithWriteHooks(c *ClientSideConnection, ctx context.Context, method string, params any, hooks RequestWriteHooks) RequestWriteResult {
+	if method == "" {
+		return RequestWriteResult{Err: errors.New("notification method is required")}
+	}
+	msg := anyMessage{Method: method}
+	if params != nil {
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return RequestWriteResult{Err: errors.New("invalid notification parameters")}
+		}
+		msg.Params = encoded
+	}
+	return c.conn.writeMessage(ctx, msg, hooks)
 }
 
 // WaitForNotifications waits for dispatch through a receipt watermark from

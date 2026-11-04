@@ -41,6 +41,20 @@ type ConnectionOptions struct {
 	// to a bounded local state update. It must not wait, perform I/O, call back
 	// into the connection, or invoke application observers.
 	ReceiveNotification func(ReceiveNotification)
+	// PrepareRequest captures the owner of an opted-in request before dispatch.
+	// Return false to retain normal SDK routing. Capture must be short and perform
+	// no I/O; the returned continuation runs outside the reader, even if cancelled.
+	PrepareRequest func(context.Context, ReceiveRequest) (func(context.Context) (any, *RequestError), bool)
+}
+
+// ReceiveRequest describes a request at its position in native receive order.
+type ReceiveRequest struct {
+	// Sequence shares the notification and response sequence domain.
+	Sequence uint64
+	// Method is the exact method selected by the native client's allowlist.
+	Method string
+	// Params is borrowed read-only during capture; copy values retained by the continuation.
+	Params json.RawMessage
 }
 
 // ReceiveNotification identifies a notification in the reader's frame order.
@@ -81,6 +95,9 @@ type responseEnvelope struct {
 
 type pendingResponse struct {
 	ch chan responseEnvelope
+	// receive folds matched response evidence before publication and the next frame.
+	// It must not block or re-enter the connection while pending is serialized.
+	receive func(responseEnvelope)
 }
 
 type cancelRequestParams struct {
@@ -546,6 +563,17 @@ func (c *Connection) receive() {
 			c.mu.Unlock()
 
 			run := c.prepareMethod(reqCtx, &msg)
+			if run == nil && c.options != nil && c.options.PrepareRequest != nil {
+				if err != nil || msg.JSONRPC != "2.0" || fields["result"] != nil || fields["error"] != nil {
+					run = completeInbound(NewInvalidRequest(nil))
+				} else if prepared, handled := c.options.PrepareRequest(reqCtx, ReceiveRequest{Sequence: sequence, Method: msg.Method, Params: msg.Params}); handled {
+					if prepared == nil {
+						run = completeInbound(NewInternalError(nil))
+					} else {
+						run = prepared
+					}
+				}
+			}
 			m := msg
 			go func(m *anyMessage, idKey string, reqCtx context.Context, cancel context.CancelCauseFunc) {
 				defer func() {
@@ -801,6 +829,9 @@ func (c *Connection) handleResponse(fields map[string]json.RawMessage, unique bo
 	// operation, so cancellation cannot fall between them and lose the terminal.
 	response.sequence = sequence
 	response.notificationWatermark = watermark
+	if pr.receive != nil {
+		pr.receive(response)
+	}
 	pr.ch <- response
 	delete(c.pending, idStr)
 }
@@ -1036,13 +1067,16 @@ type requestExchange struct {
 	waitErr    error
 }
 
-func (c *Connection) exchangeRequest(ctx context.Context, method string, params any, hooks RequestWriteHooks) requestExchange {
+func (c *Connection) exchangeRequest(ctx context.Context, method string, params any, hooks RequestWriteHooks, receive ...func(responseEnvelope)) requestExchange {
 	msg, idKey, err := c.prepareRequest(method, params)
 	if err != nil {
 		return requestExchange{prepareErr: err}
 	}
 
 	pr := &pendingResponse{ch: make(chan responseEnvelope, 1)}
+	if len(receive) != 0 {
+		pr.receive = receive[0]
+	}
 	c.mu.Lock()
 	c.pending[idKey] = pr
 	c.mu.Unlock()

@@ -9,9 +9,138 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type receiptWriterFunction func([]byte) (int, error)
+
+func (write receiptWriterFunction) Write(p []byte) (int, error) { return write(p) }
+
+func TestRequestReceipt_NotificationRechecksOwnerAtSharedWriteGate(t *testing.T) {
+	entered := make(chan struct{})
+	var writes atomic.Int32
+	conn, requests, _ := receiptPipe(t, &clientFuncs{}, nil, func(writer io.Writer) io.Writer {
+		return receiptWriterFunction(func(p []byte) (int, error) {
+			if writes.Add(1) == 1 {
+				close(entered)
+			}
+			return writer.Write(p)
+		})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	first := make(chan RequestWriteResult, 1)
+	go func() { first <- SendClientNotificationWithWriteHooks(conn, ctx, "_occupy", nil, RequestWriteHooks{}) }()
+	receiveLifecycle(t, entered)
+	retired := errors.New("captured native owner retired")
+	var live atomic.Bool
+	live.Store(true)
+	second := make(chan RequestWriteResult, 1)
+	go func() {
+		second <- SendClientNotificationWithWriteHooks(conn, ctx, AgentMethodSessionCancel, CancelNotification{SessionId: "session"}, RequestWriteHooks{Commit: func() error {
+			if !live.Load() {
+				return retired
+			}
+			return nil
+		}})
+	}()
+	live.Store(false)
+	var sent anyMessage
+	if err := json.NewDecoder(requests).Decode(&sent); err != nil || sent.Method != "_occupy" {
+		t.Fatalf("unexpected first frame: %+v %v", sent, err)
+	}
+	if result := receiveLifecycle(t, first); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	result := receiveLifecycle(t, second)
+	if !errors.Is(result.Err, retired) || result.BytesWritten != 0 || writes.Load() != 1 {
+		t.Fatalf("stale native cancellation reached transport: %+v, writes=%d", result, writes.Load())
+	}
+}
+
+func TestRequestReceipt_ReceiveHookPrecedesLaterFramesAndWriteReturn(t *testing.T) {
+	var frozen atomic.Bool
+	observed := make(chan bool, 1)
+	releaseWrite := make(chan struct{})
+	conn, requests, responses := receiptPipe(t, &clientFuncs{}, func(frame ReceiveNotification) {
+		if frame.Method == "_after_terminal" {
+			observed <- frozen.Load()
+			close(releaseWrite)
+		}
+	}, func(writer io.Writer) io.Writer {
+		return receiptWriterFunction(func(p []byte) (int, error) {
+			n, err := writer.Write(p)
+			<-releaseWrite
+			return n, err
+		})
+	})
+	peerDone := receiptPeerReply(requests, responses, AgentMethodSessionPrompt,
+		`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`+"\n"+
+			`{"jsonrpc":"2.0","method":"_after_terminal"}`+"\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got := SendClientRequestWithReceipt[PromptResponse](conn, ctx, AgentMethodSessionPrompt, nil, RequestWriteHooks{}, func(receipt RequestReceipt[PromptResponse]) {
+		if receipt.ResultValid && receipt.Sequence == 1 && receipt.Result.StopReason == StopReasonEndTurn {
+			frozen.Store(true)
+		}
+	})
+	if err := receiveLifecycle(t, peerDone); err != nil {
+		t.Fatal(err)
+	}
+	if !receiveLifecycle(t, observed) || !got.ResultValid {
+		t.Fatal("later native frame crossed an unfrozen terminal owner")
+	}
+}
+
+func TestRequestReceipt_PrepareRequestCapturesOwnerBeforeLaterNotification(t *testing.T) {
+	requests, sendRequest := io.Pipe()
+	responses, sendResponse := io.Pipe()
+	release := make(chan struct{})
+	current := "first"
+	conn, err := NewClientSideConnectionWithOptions(&clientFuncs{}, sendRequest, responses, ConnectionOptions{
+		Context: context.Background(), NotificationQueueCapacity: 4, NotificationQueueBytes: 4096,
+		CloseTransport: func() error {
+			return errors.Join(requests.Close(), sendRequest.Close(), responses.Close(), sendResponse.Close())
+		},
+		ReceiveNotification: func(frame ReceiveNotification) {
+			if frame.Method == "_retire" {
+				current = "next"
+				close(release)
+			}
+		},
+		PrepareRequest: func(_ context.Context, frame ReceiveRequest) (func(context.Context) (any, *RequestError), bool) {
+			if frame.Method != "cursor/ask_question" {
+				return nil, false
+			}
+			captured := current
+			return func(context.Context) (any, *RequestError) {
+				<-release
+				return map[string]any{"owner": captured, "sequence": frame.Sequence}, nil
+			}, true
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(conn.Close)
+	peerResult := make(chan anyMessage, 1)
+	go func() {
+		_, _ = io.WriteString(sendResponse, `{"jsonrpc":"2.0","id":71,"method":"cursor/ask_question","params":{"sessionId":"session"}}`+"\n"+`{"jsonrpc":"2.0","method":"_retire"}`+"\n")
+		var message anyMessage
+		_ = json.NewDecoder(requests).Decode(&message)
+		peerResult <- message
+	}()
+	message := receiveLifecycle(t, peerResult)
+	var result struct {
+		Owner    string `json:"owner"`
+		Sequence uint64 `json:"sequence"`
+	}
+	if message.Error != nil || json.Unmarshal(message.Result, &result) != nil || result.Owner != "first" || result.Sequence != 1 {
+		t.Fatalf("native request lost its receive-time owner: %#v %s", message.Error, message.Result)
+	}
+}
 
 const receiptConfigFrame = `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"first","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","type":"select","currentValue":"peer-model","options":[{"value":"peer-model","name":"Peer Model"}]}]}}}` + "\n"
 
