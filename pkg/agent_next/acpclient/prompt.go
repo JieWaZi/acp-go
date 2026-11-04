@@ -248,16 +248,19 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		c.unusable = true
 	}
 	associated := t.outcome != nil && (t.associated || r.ResultValid && t.outcome.StopReason != nil)
-	if associated && r.Write.BytesWritten > 0 && !preAcceptanceRejection {
-		// The matched prompt or owned observation proves consumption of this
-		// adapter input. Standard ACP never supplied a native input ID.
-		t.outcome.Turn.ConsumedInputIDs = []string{t.input.InputID}
-	}
-	if t.outcome != nil && (associated || t.authLost) {
-		result.Receipt.Admission = agentclient.AdmissionConfirmed
-	}
-	if preAcceptanceRejection && result.Receipt.Admission != agentclient.AdmissionConfirmed {
+	switch {
+	case preAcceptanceRejection:
+		// An explicit matched refusal outweighs notifications stamped only
+		// with the session. They remain observations, not input acceptance.
 		result.Receipt.Admission = agentclient.AdmissionNotAccepted
+	case t.outcome != nil && r.Write.BytesWritten > 0:
+		if associated || t.authLost {
+			result.Receipt.Admission = agentclient.AdmissionConfirmed
+		}
+		if associated {
+			// Standard ACP never supplied a native input ID.
+			t.outcome.Turn.ConsumedInputIDs = []string{t.input.InputID}
+		}
 	}
 	if result.Receipt.Admission == agentclient.AdmissionConfirmed && t.session.instructionEpoch == epoch {
 		if instructions != "" {
@@ -299,6 +302,10 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		}
 	}
 	if outcome != nil {
+		if preAcceptanceRejection {
+			result.Receipt.OperationError = operationErr
+			operationErr = nil
+		}
 		outcome.OperationError = errors.Join(operationErr, controlErr)
 		outcome.DeliveryError = deliveryErr
 		result.Outcome = outcome
@@ -344,12 +351,15 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 			outcome.ForkPosition = acpmeta.ForkPosition(response.Meta)
 		}
 	}
-	if t.authLost {
+	rejected := c.preAcceptanceRejection(peer, t.session.id)
+	if rejected {
+		outcome.Turn.Origin = acpmeta.NativeTurnOriginUnknown
+	} else if t.authLost {
 		outcome.NativeFailure = freezeProtocolError(acp.NewAuthRequired(map[string]any{"method": acp.AgentMethodSessionPrompt, "classification": "authentication_lost", "restartRequired": true}))
 		if outcome.StopReason != nil || peer != nil {
 			outcome.Turn.Status = acpmeta.NativeTurnFailed
 		}
-	} else if peer != nil && t.associated && !c.preAcceptanceRejection(peer, t.session.id) {
+	} else if peer != nil && t.associated {
 		outcome.NativeFailure = freezeProtocolError(safePeerError(peer, acp.AgentMethodSessionPrompt))
 		outcome.Turn.Status = acpmeta.NativeTurnFailed
 	}
@@ -388,7 +398,17 @@ func knownStopReason(reason acp.StopReason) bool {
 }
 
 func (c *Client) preAcceptanceRejection(err *acp.RequestError, id acp.SessionId) bool {
-	return err != nil && (err.Code == -32000 || err.Code == -32601 || c.missingSession(err, id))
+	if err == nil {
+		return false
+	}
+	switch err.Code {
+	case -32700, -32600, -32601, -32602, -32000:
+		// JSON-RPC parse, request, method and parameter errors precede
+		// dispatch. ACP authentication refusal also prevents acceptance.
+		return true
+	default:
+		return c.missingSession(err, id)
+	}
 }
 
 func (c *Client) missingSession(err *acp.RequestError, id acp.SessionId) bool {

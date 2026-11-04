@@ -71,16 +71,18 @@ func (c *Client) receiveLocked(method string, raw json.RawMessage) {
 		return
 	}
 	t := s.active
-	if method == protocol.MethodItemStarted || method == protocol.MethodItemCompleted {
-		if event.Item.Type == protocol.UserMessage && event.TurnID != "" {
+	if (method == protocol.MethodItemStarted || method == protocol.MethodItemCompleted) && event.Item.Type == protocol.UserMessage && event.TurnID != "" {
+		// Observation delivery can be fenced before committed controls settle.
+		// Their exact input evidence remains writable on the original turn
+		// until the control settles, including while the next turn runs.
+		if t != nil && (!t.finishing || t.steerPending > 0) && value(t.outcome.Turn.NativeTurnID) == event.TurnID {
+			recordSteeredItem(t, event.Item)
+		} else {
 			for previous := range s.draining {
-				if value(previous.outcome.Turn.NativeTurnID) == event.TurnID && previous.steerPending > 0 {
+				if previous.steerPending > 0 && value(previous.outcome.Turn.NativeTurnID) == event.TurnID {
 					recordSteeredItem(previous, event.Item)
 					return
 				}
-			}
-			if t != nil && !t.finishing && value(t.outcome.Turn.NativeTurnID) == event.TurnID {
-				recordSteeredItem(t, event.Item)
 			}
 		}
 	}

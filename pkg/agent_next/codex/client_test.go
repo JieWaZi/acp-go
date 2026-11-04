@@ -148,7 +148,7 @@ func TestAppServerFixture(t *testing.T) {
 				fmt.Fprintln(os.Stdout, "this is not a native frame")
 				continue
 			}
-			if mode == "late_steer_ack" || mode == "steer_target_completes" {
+			if mode == "late_steer_ack" || mode == "steer_target_completes" || strings.HasPrefix(mode, "steer_evidence_") {
 				ack(turn("inProgress"))
 				emit("item/agentMessage/delta", map[string]any{"threadId": "thread-1", "turnId": nativeTurn, "itemId": "message-1", "delta": "hold"})
 				if mode == "steer_target_completes" {
@@ -280,6 +280,44 @@ func TestAppServerFixture(t *testing.T) {
 				emit("turn/completed", turn("completed"))
 			}
 		case "turn/steer":
+			if strings.HasPrefix(mode, "steer_evidence_") {
+				id := call.Params["clientUserMessageId"]
+				emitItem := func(turnID string, clientID any) {
+					emit("item/completed", map[string]any{"threadId": "thread-1", "turnId": turnID,
+						"item": map[string]any{"id": "priority-input", "type": "userMessage", "clientId": clientID}})
+				}
+				emitItem("foreign-turn", id)
+				emitItem(nativeTurn, "foreign-input")
+				if mode == "steer_evidence_active" {
+					ack(map[string]any{"turnId": "mismatched-ack"})
+					marker := os.Getenv("CODEX_NEXT_TRACE") + ".after-ack"
+					for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+						if _, err := os.Stat(marker); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							os.Exit(3)
+						}
+					}
+					emitItem(nativeTurn, id)
+					emit("turn/completed", turn("completed"))
+					continue
+				}
+				emit("turn/completed", turn("completed"))
+				if mode == "steer_evidence_draining" {
+					emit("turn/started", map[string]any{"threadId": "thread-1", "unprompted": true,
+						"turn": map[string]any{"id": "provider-successor", "status": "inProgress"}})
+				}
+				// The foreground finalizer can now fence ordinary delivery.
+				time.Sleep(80 * time.Millisecond)
+				emitItem(nativeTurn, id)
+				ack(map[string]any{"turnId": "mismatched-ack"})
+				if mode == "steer_evidence_draining" {
+					emit("turn/completed", map[string]any{"threadId": "thread-1",
+						"turn": map[string]any{"id": "provider-successor", "status": "completed"}})
+				}
+				continue
+			}
 			emit("turn/completed", turn("completed"))
 			ack(map[string]any{"turnId": nativeTurn})
 		case "turn/interrupt":

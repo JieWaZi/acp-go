@@ -161,3 +161,53 @@ func TestDirectIdleSteerUsesPromptGate(t *testing.T) {
 		t.Fatalf("denied idle prompt reached Codex: %s, %v", data, err)
 	}
 }
+
+func TestDirectSteerRetainsExactItemAcrossAcknowledgementAndTerminal(t *testing.T) {
+	for _, phase := range []string{"active", "finishing", "draining"} {
+		t.Run(phase, func(t *testing.T) {
+			active := make(chan agentclient.Scope, 1)
+			c, ctx, session, trace := newFixture(t, "steer_evidence_"+phase, agentclient.HostCallbacks{
+				Observe: func(_ context.Context, scope agentclient.Scope, n acp.SessionNotification) error {
+					if n.Update.AgentMessageChunk != nil {
+						active <- scope
+					}
+					return nil
+				},
+			})
+			run := reserve(t, c, ctx, session, agentclient.PromptOptions{HostInvocationID: "opening"})
+			done := make(chan agentclient.PromptResult, 1)
+			go func() { done <- run() }()
+			var target agentclient.Scope
+			select {
+			case target = <-active:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			reply, err := c.Steer(ctx, agentclient.SteerRequest{SessionID: session, Target: target, Prompt: []acp.ContentBlock{acp.TextBlock("extra")}})
+			admission := agentclient.AdmissionConfirmed
+			if phase == "active" {
+				admission = agentclient.AdmissionUnknown
+			}
+			if err == nil || reply.Receipt == nil || reply.Receipt.Admission != admission || reply.Receipt.Submission != agentclient.SubmissionSent {
+				t.Fatalf("receipt with mismatched ACK = %+v, %v", reply.Receipt, err)
+			}
+			if phase == "active" {
+				if err := os.WriteFile(trace+".after-ack", nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case result := <-done:
+				if result.Outcome == nil || result.Outcome.Turn.InvocationID != target.NativeInvocationID ||
+					len(result.Outcome.Turn.ConsumedInputIDs) != 2 || !slices.Contains(result.Outcome.Turn.ConsumedInputIDs, reply.Receipt.Input.InputID) {
+					t.Fatalf("canonical input ownership = %+v", result.Outcome)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if reply.Receipt.Admission != admission {
+				t.Fatalf("late event mutated receipt = %+v", reply.Receipt)
+			}
+		})
+	}
+}

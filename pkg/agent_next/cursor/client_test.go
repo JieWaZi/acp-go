@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,6 +146,18 @@ func TestCursorFixture(t *testing.T) {
 		case "session/prompt":
 			prompts++
 			promptID = msg.ID
+			if code, ok := strings.CutPrefix(scenario, "reject-after-output:"); ok || scenario == "wire-reject-after-output" && prompts == 3 {
+				if !ok {
+					code = "-32602"
+				}
+				rejection, err := strconv.Atoi(code)
+				if err != nil {
+					os.Exit(3)
+				}
+				notify("one", "agent_message_chunk", map[string]any{"content": map[string]any{"type": "text", "text": "session observation"}})
+				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": rejection, "message": "prompt rejected"}})
+				continue
+			}
 			switch scenario {
 			case "terminal-only":
 				reply(msg.ID, map[string]any{"stopReason": "end_turn"})
@@ -555,6 +568,29 @@ func TestStandardACPPromptConsumptionRequiresAssociation(t *testing.T) {
 	}
 }
 
+func TestStandardACPExplicitRejectionOutweighsObservation(t *testing.T) {
+	for _, code := range []int{-32700, -32600, -32601, -32602, -32000, -32002} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			client, ctx, trace := candidate(t, "reject-after-output:"+strconv.Itoa(code), agentclient.HostCallbacks{})
+			openOne(t, client, ctx, trace)
+			for range 2 {
+				result := reserve(t, client, ctx, agentclient.PromptOptions{})()
+				var rejection *acp.RequestError
+				if result.Receipt.Admission != agentclient.AdmissionNotAccepted || result.Receipt.Submission != agentclient.SubmissionSent ||
+					!errors.As(result.Receipt.OperationError, &rejection) || rejection.Code != code {
+					t.Fatalf("prompt rejection = %+v", result.Receipt)
+				}
+				outcome := result.Outcome
+				if outcome == nil || !outcome.ObservedOutput || len(outcome.Turn.ConsumedInputIDs) != 0 ||
+					outcome.Turn.Origin != acpmeta.NativeTurnOriginUnknown || outcome.Turn.Status != "" ||
+					outcome.NativeFailure != nil || outcome.OperationError != nil {
+					t.Fatalf("session observation was lost or falsely associated: %+v", outcome)
+				}
+			}
+		})
+	}
+}
+
 func TestOpeningObservationCanUseNativeSetter(t *testing.T) {
 	var client *cursor.Client
 	result := make(chan error, 1)
@@ -649,7 +685,7 @@ func TestPublicACPAdjacentPromptCancelCapturesBeforePreparation(t *testing.T) {
 		}
 		native, err = cursor.NewClient(ctx, cursor.Options{Executable: binary,
 			PrefixArgs:  []string{"-test.run=^TestCursorFixture$", "--"},
-			Environment: append(os.Environ(), "CURSOR_NEXT_FIXTURE=1", "CURSOR_NEXT_TRACE="+trace), WorkingDirectory: dir,
+			Environment: append(os.Environ(), "CURSOR_NEXT_FIXTURE=1", "CURSOR_NEXT_TRACE="+trace, "CURSOR_NEXT_SCENARIO=wire-reject-after-output"), WorkingDirectory: dir,
 		}, callbacks)
 		return native, err
 	})
@@ -748,6 +784,19 @@ func TestPublicACPAdjacentPromptCancelCapturesBeforePreparation(t *testing.T) {
 	if !ok || usage.InputTokens == nil || *usage.InputTokens != 17 || !nativeTurn || turn.Status != acpmeta.NativeTurnCompleted ||
 		data["acp-go/delivery-error"] != true || data["nativeStopReason"] != string(acp.StopReasonEndTurn) {
 		t.Fatalf("wire failure lost terminal evidence: %#v", data)
+	}
+
+	rejectObservation.Store(false)
+	f = request(6, "session/prompt", promptRequest())
+	if err := json.Unmarshal(f["error"], &rejection); err != nil || f["result"] != nil || rejection.Code != -32602 {
+		t.Fatalf("wire explicit rejection = %s / %s (%v)", f["error"], f["result"], err)
+	}
+	data, _ = rejection.Data.(map[string]any)
+	receipt, _ := data["acp-go/prompt-receipt"].(map[string]any)
+	turn, nativeTurn = acpmeta.ReadNativeTurn(data)
+	if !nativeTurn || turn.Status != "" || turn.Origin != acpmeta.NativeTurnOriginUnknown || len(turn.ConsumedInputIDs) != 0 ||
+		data["observedOutput"] != true || receipt["admission"] != "not_accepted" || receipt["submission"] != "sent" {
+		t.Fatalf("wire rejection facts = %#v", data)
 	}
 }
 
