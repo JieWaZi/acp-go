@@ -1374,7 +1374,7 @@ func TestTierObservationDoesNotChangeRequestedSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, options := sessionConfigurationResponse(state)
+	_, options, _ := sessionConfigurationResponse(state)
 	tier = selectOption(t, options, "service_tier")
 	if tier.Meta["observed_service_tier"] != "fast-native" {
 		t.Fatalf("local ACK changed observation: %#v", tier.Meta)
@@ -2527,5 +2527,393 @@ func TestNativeReadRemainsResponsiveDuringBlockedACPWrite(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("terminal did not follow the drained ACP update")
+	}
+}
+
+// TestProofBearingTerminalSurvivesPreAckOverflow checks that losing optional events does not lose terminal evidence.
+func TestProofBearingTerminalSurvivesPreAckOverflow(t *testing.T) {
+	for _, test := range []struct {
+		// name identifies the sequence around display capacity.
+		name string
+		// overflow drops one display frame before the terminal.
+		overflow bool
+		// separateProof supplies identity on a user item after the terminal.
+		separateProof bool
+	}{
+		{name: "full"},
+		{name: "overflow", overflow: true},
+		{name: "terminal_before_proof", overflow: true, separateProof: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			sent := make(chan struct{})
+			var agent *Agent
+			rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+				switch request := request.(type) {
+				case protocol.InitializeRequest:
+				case protocol.ThreadStartRequest:
+					result.(*protocol.ThreadStartResponse).Thread.ID = "review-thread"
+				case protocol.TurnStartRequest:
+					frames := maxEarlyTurnEvents
+					if test.overflow {
+						frames++
+					}
+					for range frames {
+						frame := decodeTestNotification(t, protocol.MethodAgentMessageDelta, map[string]any{
+							"threadId": "review-thread", "turnId": "review-turn", "itemId": "review-item", "delta": "a",
+						})
+						agent.client.HandleNotification(ctx, frame)
+					}
+					terminal := completeNotification(t, "review-thread", "review-turn", protocol.FluffyCompleted).(*protocol.TurnCompletedEnvelope)
+					if !test.separateProof {
+						terminal.Params.Turn.Items = []protocol.ThreadItem{{Type: protocol.UserMessage, ClientID: request.Params.ClientUserMessageID}}
+					}
+					agent.client.HandleNotification(ctx, terminal)
+					if test.separateProof {
+						agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemCompleted, map[string]any{
+							"threadId": "review-thread", "turnId": "review-turn", "item": map[string]any{
+								"type": "userMessage", "id": "user", "clientId": stringValue(request.Params.ClientUserMessageID),
+							},
+						}))
+					}
+					close(sent)
+					<-ctx.Done()
+					return ctx.Err()
+				default:
+					return fmt.Errorf("unexpected native method %s", request.Method())
+				}
+				return nil
+			}
+			agent = newRuntimeTestAgent(t, rpc)
+			if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+				t.Fatal(err)
+			}
+			state, _ := agent.sessions.get("review-thread")
+			done := make(chan error, 1)
+			go func() {
+				response, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "review-thread", Prompt: []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hi"}}}})
+				if err == nil && response.StopReason != acp.StopReasonEndTurn {
+					err = fmt.Errorf("unexpected terminal %q", response.StopReason)
+				}
+				done <- err
+			}()
+			select {
+			case <-sent:
+			case <-time.After(time.Second):
+				t.Fatal("fixture did not send terminal")
+			}
+			select {
+			case err := <-done:
+				if !test.overflow {
+					if err != nil {
+						t.Fatalf("full display buffer lost terminal: %v", err)
+					}
+					return
+				}
+				var failure *acp.RequestError
+				if !errors.As(err, &failure) || failure.Data.(map[string]any)["native_status"] != "completed" {
+					t.Fatalf("want delivery failure retaining native completed, got %v", err)
+				}
+			case <-time.After(time.Second):
+				prompt := sessionActiveTurn(state)
+				if prompt == nil {
+					t.Fatal("fixture lost active turn before returning result")
+				}
+				prompt.eventsMu.Lock()
+				id, terminal, overflow := prompt.confirmedTurnID(), prompt.terminal != nil, prompt.earlyOverflow
+				prompt.eventsMu.Unlock()
+				t.Fatalf("proof-bearing completed was received, but Prompt still waits for missing ACK; bound=%q terminal=%t overflow=%t", id, terminal, overflow)
+			}
+		})
+	}
+}
+
+// TestUsageDoesNotCountDuplicateAfterForeignFrame checks a repeated cumulative observation after continuity breaks.
+func TestUsageDoesNotCountDuplicateAfterForeignFrame(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	ready := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.(type) {
+		case protocol.InitializeRequest:
+		case protocol.ThreadStartRequest:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "review-thread"
+		case protocol.TurnStartRequest:
+			result.(*protocol.TurnStartResponse).Turn.ID = "review-turn"
+			close(ready)
+		default:
+			return fmt.Errorf("unexpected native method %s", request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	state, _ := agent.sessions.get("review-thread")
+	result := make(chan acp.PromptResponse, 1)
+	done := make(chan error, 1)
+	go func() {
+		response, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: "review-thread", Prompt: []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hi"}}}})
+		result <- response
+		done <- err
+	}()
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case <-sessionActiveTurn(state).turnStarted:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	send := func(id string, last, total int64) {
+		sample := usageSample(last, 0, total, 0)
+		sample.ThreadID, sample.TurnID = "review-thread", id
+		agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, sample))
+	}
+	send("review-turn", 10, 10)
+	send("other-turn", 5, 15)
+	send("review-turn", 10, 10)
+	send("review-turn", 7, 22)
+	send("review-turn", 10, 10)
+	send("review-turn", 7, 22)
+	agent.client.HandleNotification(ctx, completeNotification(t, "review-thread", "review-turn", protocol.FluffyCompleted))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	usage, ok := acpmeta.ReadTurnUsage((<-result).Meta)
+	if !ok || usage.InputTokens == nil {
+		t.Fatalf("missing usage: %+v", usage)
+	}
+	if *usage.InputTokens != 17 || usage.Complete {
+		t.Fatalf("expected exactly two owned samples with incomplete coverage, got input=%d complete=%t", *usage.InputTokens, usage.Complete)
+	}
+}
+
+// TestSessionOpenConfigReadPreservesNativeFailure checks a real preflight error.
+func TestSessionOpenConfigReadPreservesNativeFailure(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, _ any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodConfigRead:
+			return &rpcError{Code: -32042, Message: "configuration rejected", Data: json.RawMessage(`{"reason":"policy"}`)}
+		default:
+			return fmt.Errorf("unexpected method %s", request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	agent.defaultModeRequestUserInput = true
+	_, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()})
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("expected ACP request failure, got %v", err)
+	}
+	wire, _ := json.Marshal(failure.Data)
+	for _, want := range []string{`"phase":"config_read"`, `"code":-32042`, `"data":{"reason":"policy"}`} {
+		if !strings.Contains(string(wire), want) {
+			t.Fatalf("config failure lost %s: %s", want, wire)
+		}
+	}
+}
+
+// TestFailedTurnReportsNativeToolCompletionWithoutClaimingAnEffect checks both tool variants.
+func TestFailedTurnReportsNativeToolCompletionWithoutClaimingAnEffect(t *testing.T) {
+	for _, tool := range []map[string]any{
+		{"type": "commandExecution", "id": "tool", "status": "completed", "command": "echo result"},
+		{"type": "mcpToolCall", "id": "tool", "status": "failed", "server": "remote", "tool": "query"},
+		{"type": "commandExecution", "id": "tool", "status": "declined", "command": "echo result"},
+	} {
+		t.Run(fmt.Sprintf("%s_%s", tool["type"], tool["status"]), func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+				switch request.Method() {
+				case protocol.MethodInitialize:
+				case protocol.MethodThreadStart:
+					result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+				case protocol.MethodTurnStart:
+					result.(*protocol.TurnStartResponse).Turn.ID = "turn"
+				default:
+					return fmt.Errorf("unexpected method %s", request.Method())
+				}
+				return nil
+			}
+			agent := newRuntimeTestAgent(t, rpc)
+			rpc.afterObserved = func() {
+				ctx := context.Background()
+				agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemCompleted,
+					map[string]any{"threadId": "thread", "turnId": "turn", "item": tool}))
+				agent.client.HandleNotification(ctx, completeNotification(t, "thread", "turn", protocol.Failed))
+			}
+			if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+				t.Fatal(err)
+			}
+			_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread"})
+			var failure *acp.RequestError
+			if !errors.As(err, &failure) {
+				t.Fatalf("failed native turn: %v", err)
+			}
+			data := failure.Data.(map[string]any)
+			var wantToolCompletion any
+			if tool["status"] != "declined" {
+				wantToolCompletion = true
+			}
+			if data["tool_completion_observed"] != wantToolCompletion || data["file_change_observed"] != nil || data["output_observed"] != nil {
+				t.Fatalf("unexpected tool and effect evidence: %+v", data)
+			}
+		})
+	}
+}
+
+// TestThreadSettingsDuringOpenBelongToTheInstalledGeneration covers a notification on either side of the ACK.
+func TestThreadSettingsDuringOpenBelongToTheInstalledGeneration(t *testing.T) {
+	for _, stage := range []string{"start_before_ack", "fork_before_ack", "resume_before_ack", "load_during_read", "resume_during_catalog"} {
+		t.Run(stage, func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			var agent *Agent
+			notify := func(ctx context.Context) {
+				agent.client.HandleNotification(ctx, decodeTestNotification(t, "thread/settings/updated", map[string]any{
+					"threadId": "settings", "threadSettings": map[string]any{"model": "newer", "effort": "medium", "serviceTier": nil},
+				}))
+			}
+			rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+				switch request.Method() {
+				case protocol.MethodInitialize:
+					return nil
+				case protocol.MethodThreadStart:
+					notify(ctx)
+					return json.Unmarshal([]byte(`{"thread":{"id":"settings"},"model":"old","reasoningEffort":"low","serviceTier":"old-tier"}`), result)
+				case protocol.MethodThreadFork:
+					notify(ctx)
+					return json.Unmarshal([]byte(`{"thread":{"id":"settings"},"model":"old","reasoningEffort":"low","serviceTier":"old-tier"}`), result)
+				case protocol.MethodThreadResume:
+					if stage == "resume_before_ack" {
+						notify(ctx)
+					}
+					return json.Unmarshal([]byte(`{"thread":{"id":"settings"},"model":"old","reasoningEffort":"low","serviceTier":"old-tier"}`), result)
+				case protocol.MethodThreadRead:
+					notify(ctx)
+					return json.Unmarshal([]byte(`{"thread":{"id":"settings","turns":[]}}`), result)
+				case protocol.MethodModelList:
+					if stage == "resume_during_catalog" {
+						notify(ctx)
+					}
+					result.(*protocol.ModelListResponse).Data = testModels()
+					return nil
+				default:
+					return fmt.Errorf("unexpected method %s", request.Method())
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			agent = newAgentWithClient(slog.Default(), ctx, cancel, newAppServerClient(ctx, rpc))
+			initializeTestAgent(t, agent)
+			cwd := t.TempDir()
+			var err error
+			switch stage {
+			case "start_before_ack":
+				_, err = agent.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+			case "fork_before_ack":
+				_, err = agent.UnstableForkSession(ctx, acp.UnstableForkSessionRequest{
+					Cwd: cwd, SessionId: "source", Meta: map[string]any{"forkReceiptDirectory": t.TempDir()},
+				})
+			case "load_during_read":
+				_, err = agent.LoadSession(ctx, acp.LoadSessionRequest{Cwd: cwd, SessionId: "settings"})
+			default:
+				_, err = agent.ResumeSession(ctx, acp.ResumeSessionRequest{Cwd: cwd, SessionId: "settings"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := agent.HandleExtensionMethod(ctx, "_codex/session/settings", json.RawMessage(`{"session_id":"settings"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, _ := json.Marshal(result)
+			for _, want := range []string{`"model":"newer"`, `"reasoning_effort":"medium"`, `"service_tier":null`, `"source":"thread_settings_updated"`} {
+				if !strings.Contains(string(wire), want) {
+					t.Fatalf("settings lost %s: %s", want, wire)
+				}
+			}
+		})
+	}
+}
+
+// TestThreadArchiveReservationOutlivesCaller checks close and reopen while the native RPC is pending.
+func TestThreadArchiveReservationOutlivesCaller(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	pending, release := make(chan struct{}), make(chan struct{})
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize, protocol.MethodThreadUnsubscribe:
+		case "thread/archive":
+			close(pending)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case protocol.MethodThreadResume:
+			result.(*protocol.ThreadResumeResponse).Thread.ID = "saved"
+		default:
+			return fmt.Errorf("unexpected method %s", request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	callCtx, abandon := context.WithCancel(ctx)
+	defer abandon()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := agent.HandleExtensionMethod(callCtx, "_codex/thread/archive", json.RawMessage(`{"thread_id":"saved"}`))
+		finished <- err
+	}()
+	select {
+	case <-pending:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	cwd := t.TempDir()
+	checkBlocked := func() {
+		t.Helper()
+		if _, err := agent.CloseSession(ctx, acp.CloseSessionRequest{SessionId: "saved"}); err == nil {
+			t.Error("close crossed an in-flight archive")
+		}
+		if _, err := agent.ResumeSession(ctx, acp.ResumeSessionRequest{Cwd: cwd, SessionId: "saved"}); err == nil {
+			t.Error("resume crossed an in-flight archive")
+		}
+	}
+	checkBlocked()
+	abandon()
+	select {
+	case err := <-finished:
+		if err == nil {
+			t.Error("cancelled caller received success")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	checkBlocked()
+	close(release)
+	for {
+		_, err := agent.ResumeSession(ctx, acp.ResumeSessionRequest{Cwd: cwd, SessionId: "saved"})
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("archive never released its lane: %v", err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

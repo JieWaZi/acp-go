@@ -11,13 +11,7 @@ const maxEarlyTurnEvents = 32
 // handleNotification assigns native frames to the current thread owner and turn.
 func (a *Agent) handleNotification(ctx context.Context, notification protocol.ServerNotification) {
 	if changed, ok := notification.(*protocol.ThreadSettingsUpdatedEnvelope); ok {
-		native := changed.Params.ThreadSettings
-		_ = a.sessions.withCurrent(changed.Params.ThreadID, func(state *sessionState) error {
-			if state.configuration != nil {
-				state.configuration.observe("thread_settings_updated", native.Model, native.Effort, native.ServiceTier)
-			}
-			return nil
-		})
+		a.sessions.observeSettings(changed.Params.ThreadID, changed.Params.ThreadSettings)
 		return
 	}
 	if status, ok := notification.(*protocol.MCPServerStatusUpdatedEnvelope); ok {
@@ -60,22 +54,30 @@ func (a *Agent) handleNotification(ctx context.Context, notification protocol.Se
 		a.routeBoundTurnLocked(ctx, state, prompt, activeTurnID, turnID, notification)
 		return
 	}
-	if a.client.completions.hasCompleted(threadID, turnID) {
-		return
-	}
+	alreadyCompleted := a.client.completions.hasCompleted(threadID, turnID)
 	if prompt.kind == compactionTurn {
-		if _, started := notification.(*protocol.TurnStartedEnvelope); started {
+		if _, started := notification.(*protocol.TurnStartedEnvelope); started && !alreadyCompleted {
 			a.bindTurnLocked(state, prompt, turnID)
 		}
+		return
+	}
+	if prompt.clientMessageID != "" && notificationConfirmsUserMessage(notification, prompt.clientMessageID) {
+		if alreadyCompleted && (prompt.completionCapture == nil || a.client.completions.capturedCompletion(prompt.completionCapture, turnID) == nil) {
+			return
+		}
+		a.bindTurnLocked(state, prompt, turnID)
+		a.routeBoundTurnLocked(ctx, state, prompt, turnID, turnID, notification)
+		return
+	}
+	// The protocol tracker retains unmatched terminals. Only display and
+	// observation frames compete for this pre-identity buffer.
+	if _, terminal := notification.(*protocol.TurnCompletedEnvelope); terminal || alreadyCompleted {
 		return
 	}
 	if len(prompt.earlyEvents) < maxEarlyTurnEvents {
 		prompt.earlyEvents = append(prompt.earlyEvents, notification)
 	} else {
 		prompt.earlyOverflow = true
-	}
-	if prompt.clientMessageID != "" && notificationConfirmsUserMessage(notification, prompt.clientMessageID) {
-		a.bindTurnLocked(state, prompt, turnID)
 	}
 }
 
@@ -112,7 +114,7 @@ func (a *Agent) routeBoundTurnLocked(ctx context.Context, state *sessionState, p
 		return
 	}
 	usage, hasUsage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
-	if prompt.nativeTerminal {
+	if prompt.terminal != nil {
 		if hasUsage {
 			// The earlier terminal is already immutable. A late sample only affects
 			// whether the next invocation can safely use the thread checkpoint.
@@ -130,22 +132,15 @@ func (a *Agent) routeBoundTurnLocked(ctx context.Context, state *sessionState, p
 		}
 		return
 	}
-	if _, terminal := notification.(*protocol.TurnCompletedEnvelope); terminal {
-		prompt.nativeTerminal = true
-		close(prompt.terminalSignal)
+	if terminal, ok := notification.(*protocol.TurnCompletedEnvelope); ok {
+		prompt.recordTerminalLocked(terminal.Params)
 		return
 	}
 	switch event := notification.(type) {
 	case *protocol.AgentMessageDeltaEnvelope:
 		prompt.observed.output = prompt.observed.output || event.Params.Delta != ""
 	case *protocol.ItemCompletedEnvelope:
-		item := event.Params.Item
-		switch item.Type {
-		case protocol.AgentMessage:
-			prompt.observed.output = prompt.observed.output || stringValue(item.Text) != ""
-		case protocol.FileChange:
-			prompt.observed.fileChange = prompt.observed.fileChange || stringValue(item.Status) == "completed" && len(item.Changes) > 0
-		}
+		prompt.observed.recordCompletedItem(event.Params.Item)
 	case *protocol.ErrorEnvelope:
 		native := event.Params
 		prompt.observed.lastError = &native

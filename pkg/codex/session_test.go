@@ -13,7 +13,7 @@ func TestSessionStoreStaleOpenCannotCleanNewInstallation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("开始旧 open 失败: %v", err)
 	}
-	store.beginClose("thread-1")
+	store.beginCloseOwned("thread-1", nil)
 	store.endClose("thread-1")
 	newGeneration, err := store.beginOpen("thread-1")
 	if err != nil {
@@ -62,7 +62,7 @@ func TestSessionStoreWithCurrentLinearizesConfigurationAndClose(t *testing.T) {
 	<-mutationEntered
 	closeResult := make(chan struct{})
 	go func() {
-		store.beginClose("thread-config")
+		store.beginCloseOwned("thread-config", nil)
 		events <- "close"
 		close(closeResult)
 	}()
@@ -89,7 +89,7 @@ func TestSessionStoreRejectsConcurrentOpen(t *testing.T) {
 	if _, err := store.beginOpen("thread"); err == nil {
 		t.Fatal("concurrent open admitted")
 	}
-	if !store.openCanProceed("thread", generation) {
+	if !store.beginNativeOpen("thread", generation) {
 		t.Fatal("concurrent open invalidated the first subscription")
 	}
 }

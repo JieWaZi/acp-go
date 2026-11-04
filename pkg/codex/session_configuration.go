@@ -166,6 +166,11 @@ func (c *sessionConfiguration) observe(source, model string, effort *string, tie
 	}
 }
 
+// observeThreadSettings applies the full provider settings snapshot.
+func (c *sessionConfiguration) observeThreadSettings(settings protocol.ThreadSettings) {
+	c.observe("thread_settings_updated", settings.Model, settings.Effort, settings.ServiceTier)
+}
+
 // applyOpenIntent retains request values independently of the native receipt.
 func (c *sessionConfiguration) applyOpenIntent(settings OpenSettings) {
 	if settings.Model != nil {
@@ -191,13 +196,6 @@ func (c *sessionConfiguration) settings() SessionSettings {
 		*intent.ReasoningEffort = c.current.Effort
 	}
 	return SessionSettings{Requested: intent, Observed: c.observed}
-}
-
-// sessionSettingsMetadata projects the snapshot independently of catalog availability.
-func sessionSettingsMetadata(state *sessionState) map[string]any {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	return map[string]any{sessionSettingsKey: state.configuration.settings()}
 }
 
 // readSessionSettings returns the latest confirmed settings of an installed session.
@@ -398,14 +396,22 @@ func (c *sessionConfiguration) selectEffort(effort string) error {
 	return nil
 }
 
-// findModel 在 app-server 模型目录中按模型 ID 查找条目。
+// findModel looks up a model by its native request identifier.
 func (c *sessionConfiguration) findModel(id string) (protocol.ModelListResponseDatum, bool) {
 	for _, model := range c.models {
-		if model.ID == id {
+		if modelRequestID(model) == id {
 			return model, true
 		}
 	}
 	return protocol.ModelListResponseDatum{}, false
+}
+
+// modelRequestID selects the model name accepted by native requests.
+func modelRequestID(model protocol.ModelListResponseDatum) string {
+	if model.Model != "" {
+		return model.Model
+	}
+	return model.ID
 }
 
 // findSupportedEffort 在一个模型声明的可选 effort 中做精确匹配。
@@ -470,7 +476,7 @@ func (c *sessionConfiguration) modelOption() acp.SessionConfigOption {
 			}
 		}
 		options = append(options, acp.SessionConfigSelectOption{
-			Value: acp.SessionConfigValueId(model.ID), Name: model.DisplayName, Description: &description, Meta: meta,
+			Value: acp.SessionConfigValueId(modelRequestID(model)), Name: model.DisplayName, Description: &description, Meta: meta,
 		})
 	}
 	description := "Model Codex uses for the session"
@@ -481,7 +487,7 @@ func (c *sessionConfiguration) modelOption() acp.SessionConfigOption {
 	}}
 }
 
-// effortOption 将当前模型声明的 reasoning effort 转换为 ACP thought_level 配置。
+// effortOption projects a model reasoning levels into the ACP thought-level selector.
 func (c *sessionConfiguration) effortOption(model protocol.ModelListResponseDatum) acp.SessionConfigOption {
 	category := acp.SessionConfigOptionCategoryThoughtLevel
 	options := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(model.SupportedReasoningEfforts))
@@ -495,7 +501,7 @@ func (c *sessionConfiguration) effortOption(model protocol.ModelListResponseDatu
 	}
 	description := "How much reasoning effort the model should use"
 	current := c.current.Effort
-	if model.ID != c.current.Model {
+	if modelRequestID(model) != c.current.Model {
 		current = model.DefaultReasoningEffort
 	}
 	return acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{
@@ -572,13 +578,14 @@ func (c *sessionConfiguration) tierOption(model protocol.ModelListResponseDatum)
 		}
 	}
 	current := "inherit"
-	if model.ID == c.current.Model && c.current.ServiceTier.IsNull() {
+	currentModel := modelRequestID(model) == c.current.Model
+	if currentModel && c.current.ServiceTier.IsNull() {
 		current = "off"
-	} else if value, ok := c.current.ServiceTier.Value(); model.ID == c.current.Model && ok && supportsTier(model, value) {
+	} else if value, ok := c.current.ServiceTier.Value(); currentModel && ok && supportsTier(model, value) {
 		current = value
 	}
 	var meta map[string]any
-	if model.ID == c.current.Model && c.observed.ServiceTier.IsPresent() {
+	if currentModel && c.observed.ServiceTier.IsPresent() {
 		meta = map[string]any{"observed_service_tier": nil}
 		if value, ok := c.observed.ServiceTier.Value(); ok {
 			meta["observed_service_tier"] = value
@@ -604,11 +611,6 @@ func (a *Agent) configurationForSession(
 	if effort != nil {
 		currentEffort = *effort
 	}
-	for i := range models {
-		if models[i].Model != "" {
-			models[i].ID = models[i].Model
-		}
-	}
 	configuration, err := newSessionConfiguration(models, model, currentEffort, "agent")
 	if err != nil {
 		return nil, fmt.Errorf("building session configuration: %w", err)
@@ -616,20 +618,20 @@ func (a *Agent) configurationForSession(
 	return configuration, nil
 }
 
-// sessionConfigurationResponse snapshots ACP configuration under the thread lock.
+// sessionConfigurationResponse snapshots selectors and observed settings under the same thread lock.
 func sessionConfigurationResponse(
 	state *sessionState,
-) (*acp.SessionModeState, []acp.SessionConfigOption) {
+) (*acp.SessionModeState, []acp.SessionConfigOption, map[string]any) {
 	if state == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.configuration == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	modes := state.configuration.ModeState()
-	return &modes, state.configuration.Options()
+	return &modes, state.configuration.Options(), map[string]any{sessionSettingsKey: state.configuration.settings()}
 }
 
 // turnParamsForSession freezes and validates the effective overrides for one native submission.

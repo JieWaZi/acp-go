@@ -2,7 +2,9 @@ package codex
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"log/slog"
 	"reflect"
 	"testing"
 
@@ -375,4 +377,33 @@ func mustTurnParams(t *testing.T, state *sessionState) protocol.TurnStartParams 
 		t.Fatal(err)
 	}
 	return params
+}
+
+// TestSessionConfigurationPreservesNativeCatalogIdentity checks request projection without rewriting the receipt.
+func TestSessionConfigurationPreservesNativeCatalogIdentity(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if _, ok := request.(protocol.ModelListRequest); !ok {
+			t.Fatalf("unexpected method %s", request.Method())
+		}
+		model := testModels()[0]
+		model.ID, model.Model = "catalog-record", "native-request"
+		result.(*protocol.ModelListResponse).Data = []protocol.ModelListResponseDatum{model}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent := newAgentWithClient(slog.Default(), ctx, cancel, newAppServerClient(ctx, rpc))
+	configuration, err := agent.configurationForSession(ctx, "native-request", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, ok := configuration.findModel("native-request")
+	if !ok || native.ID != "catalog-record" || native.Model != "native-request" {
+		t.Fatalf("native catalog receipt was changed: %+v", native)
+	}
+	options := configuration.modelOption().Select.Options.Ungrouped
+	if options == nil || len(*options) != 1 || (*options)[0].Value != "native-request" {
+		t.Fatalf("ACP model selector used the wrong request identity: %+v", options)
+	}
 }

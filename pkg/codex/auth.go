@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"log/slog"
 	"math"
 	"sort"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
@@ -127,7 +126,7 @@ func (a *authenticator) Authenticate(ctx context.Context, request acp.Authentica
 	}
 }
 
-// authenticateAPIKey 按 request meta、CODEX_API_KEY、OPENAI_API_KEY 顺序选择凭据。
+// authenticateAPIKey selects request metadata before CODEX_API_KEY and OPENAI_API_KEY.
 func (a *authenticator) authenticateAPIKey(ctx context.Context, request acp.AuthenticateRequest) error {
 	apiKey := apiKeyFromMeta(request.Meta)
 	if apiKey == "" {
@@ -143,17 +142,24 @@ func (a *authenticator) authenticateAPIKey(ctx context.Context, request acp.Auth
 	subscription, err := a.subscriber.SubscribeLoginCompleted()
 	if err != nil {
 		a.logger.Error("Failed to subscribe to login completion notifications")
-		return errAuthenticationFailed
+		return codexAuthenticationFailure("account_login_subscribe", err)
 	}
 	defer subscription.Close()
 	if _, err := a.server.AccountLogin(ctx, protocol.LoginAccountParams{
 		Type: protocol.TypeAPIKey, APIKey: &apiKey,
 	}); err != nil {
-		// 不包装服务端错误：其文本可能包含服务端回显的 secret。
+		// Native error text may contain the echoed credential.
 		a.logger.Error("Failed to start API key login")
 		return codexAuthenticationFailure("account_login_start", err)
 	}
-	return waitForLoginCompletion(ctx, subscription)
+	completion, err := subscription.Wait(ctx, "")
+	if err != nil {
+		return codexAuthenticationFailure("account_login_completion", err)
+	}
+	if !completion.Success {
+		return codexAuthenticationFailure("account_login_completion", errAuthenticationFailed)
+	}
+	return nil
 }
 
 // authenticateChatGPT joins the completion for this exact browser login attempt.
@@ -215,15 +221,6 @@ func codexAuthenticationFailure(phase string, err error) *acp.RequestError {
 	}
 	failure.Message = errAuthenticationFailed.Error()
 	return failure
-}
-
-// waitForLoginCompletion 等待 typed 通知并返回不包含服务端错误文本的稳定错误。
-func waitForLoginCompletion(ctx context.Context, subscription loginCompletionSubscription) error {
-	completion, err := subscription.Wait(ctx, "")
-	if err != nil || !completion.Success {
-		return errAuthenticationFailed
-	}
-	return nil
 }
 
 // apiKeyFromMeta 读取 ACP `_meta.api-key.apiKey` 扩展。

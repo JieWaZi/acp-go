@@ -3,12 +3,13 @@ package codex
 import (
 	"context"
 	"errors"
+
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// UnstableForkSession 通过 thread/fork 保留原生上下文，并绑定独立工作区。
+// UnstableForkSession forks native context into an independently configured workspace.
 func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
 	if acpmeta.ReconcileOnly(request) {
 		id, err := acpmeta.ReadForkReceipt(request)
@@ -49,6 +50,8 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 		return acp.UnstableForkSessionResponse{}, err
 	}
 	mcpAfterVersion := a.currentMCPStatusVersion()
+	open := a.sessions.beginUnidentifiedOpen()
+	defer a.sessions.abandonUnidentifiedOpen(open)
 	response, err := a.client.ThreadFork(ctx, protocol.ThreadForkParams{
 		ThreadID:              string(request.SessionId),
 		LastTurnID:            optionalForkPosition(request.Meta),
@@ -64,7 +67,7 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 	if response.Thread.ID == "" || response.Thread.ID == string(request.SessionId) {
 		return acp.UnstableForkSessionResponse{}, errors.New("starting codex thread: empty thread id")
 	}
-	generation, err := a.sessions.beginOpen(response.Thread.ID)
+	generation, err := a.sessions.identifyOpen(open, response.Thread.ID)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -77,10 +80,10 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 		return acp.UnstableForkSessionResponse{}, err
 	}
 	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
-	modes, options := sessionConfigurationResponse(state)
+	modes, options, meta := sessionConfigurationResponse(state)
 	return acpmeta.ForkResponse(request.SessionId, acp.NewSessionResponse{
 		SessionId:     acp.SessionId(response.Thread.ID),
-		Meta:          sessionSettingsMetadata(state),
+		Meta:          meta,
 		Modes:         modes,
 		ConfigOptions: options,
 	})

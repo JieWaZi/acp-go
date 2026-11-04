@@ -337,15 +337,14 @@ func (t *appServerTransport) readLoop() {
 		t.dispatchLine(line)
 	}
 	if err := scanner.Err(); err != nil {
-		// Scanner 仅在 token 超上限或底层 I/O 失败时返回错误；两者都使帧边界不可恢复。
+		// Scanner loses its frame boundary after an oversized token or an I/O failure.
 		if errors.Is(err, bufio.ErrTooLong) || len(scanner.Bytes()) >= t.options.MaxLineBytes {
 			t.fail(ErrAppServerFrameTooLarge)
 			return
 		}
 		if (errors.Is(err, os.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded)) && t.options.EOFError != nil {
-			// Go exec.Cmd.Wait 会在返回前关闭 StdoutPipe，scanner 可能先观察到 os.ErrClosed；
-			// 仅当唯一 Wait owner 随后确认异常退出时，才用 exit code/stderr
-			// 覆盖这个运行时竞态；普通 reader I/O 错误仍保持原因。
+			// The process owns a separate stdout read end and bounds draining after
+			// Wait. Prefer a confirmed child exit over the resulting drain error.
 			if processErr := t.options.EOFError(); errors.Is(processErr, ErrAppServerExited) {
 				t.fail(processErr)
 				return

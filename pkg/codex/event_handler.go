@@ -88,17 +88,21 @@ type eventHandler struct {
 	terminalCommands map[string]struct{}
 	// terminalCommandOutputs 标记 terminal 命令已经发送过非空输出增量。
 	terminalCommandOutputs map[string]struct{}
-	// usageMu 保护通知线程与 Prompt 终态之间的用量快照。
+	// usageMu protects the counters shared by notifications and terminal handoff.
 	usageMu sync.Mutex
-	// previous 是同会话上一条可信累计快照。
+	// previous is the contiguous thread checkpoint used for cumulative differences.
 	previous *turnUsage
-	// counterInvalid 表示出现无 epoch 证据的累计回退，禁止向后续回合复用检查点。
+	// ownedTotal is the highest cumulative total consumed from this exact turn.
+	ownedTotal int64
+	// continuityBroken makes the owned watermark authoritative for subsequent replays.
+	continuityBroken bool
+	// counterInvalid prevents reuse of an uncertain checkpoint in a later turn.
 	counterInvalid bool
-	// baselineKnown 表示轮前基线有独立会话证据。
+	// baselineKnown records an independently established pre-turn checkpoint.
 	baselineKnown bool
-	// checkpoint 将最新累计值保存给同会话下一轮；nil 表示基线失效。
+	// checkpoint publishes the next thread baseline. Nil clears it.
 	checkpoint func(*turnUsage)
-	// usage 保存当前 turn 最新 usage 快照。
+	// usage retains the latest reported consumption for this turn.
 	usage *turnUsage
 }
 
@@ -431,7 +435,7 @@ func mapPlanStatus(status protocol.PlanStatus) (acp.PlanEntryStatus, error) {
 	}
 }
 
-// handleTokenUsage 按线程累计字段差分并发布可替换的消费快照，上下文仍使用最近请求。
+// handleTokenUsage publishes a replaceable snapshot of the observed consumption.
 func (h *eventHandler) handleTokenUsage(ctx context.Context, params protocol.ThreadTokenUsageUpdatedNotification) error {
 	if err := h.recordTokenUsage(params); err != nil {
 		return err
@@ -453,6 +457,15 @@ func (h *eventHandler) recordTokenUsage(params protocol.ThreadTokenUsageUpdatedN
 		return err
 	}
 	h.usageMu.Lock()
+	defer h.usageMu.Unlock()
+	if h.continuityBroken && h.usage != nil {
+		advance := total.TurnTokens - h.ownedTotal
+		if advance <= 0 || h.previous == nil && advance < last.TurnTokens {
+			// A repeated, late, or overlapping sample cannot establish a new segment.
+			return nil
+		}
+	}
+	h.ownedTotal = max(h.ownedTotal, total.TurnTokens)
 	if h.previous == nil {
 		if h.usage == nil {
 			h.usage = &last
@@ -488,7 +501,6 @@ func (h *eventHandler) recordTokenUsage(params protocol.ThreadTokenUsageUpdatedN
 	if h.checkpoint != nil && !h.counterInvalid {
 		h.checkpoint(&total)
 	}
-	h.usageMu.Unlock()
 	return nil
 }
 
@@ -497,10 +509,11 @@ func (h *eventHandler) breakUsageContinuity() {
 	h.usageMu.Lock()
 	defer h.usageMu.Unlock()
 	h.previous = nil
+	h.continuityBroken = true
 	h.invalidateUsageCheckpointLocked()
 }
 
-// invalidateUsageCheckpoint 保留已观测消费，但异常后不能声明覆盖整轮或复用旧基线。
+// invalidateUsageCheckpoint keeps observed consumption and marks coverage uncertain.
 func (h *eventHandler) invalidateUsageCheckpoint() {
 	h.usageMu.Lock()
 	defer h.usageMu.Unlock()

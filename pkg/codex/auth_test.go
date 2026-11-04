@@ -320,3 +320,25 @@ func TestChatGPTLoginIgnoresPreviousLoginCompletion(t *testing.T) {
 		t.Fatal("previous login success satisfied current login")
 	}
 }
+
+// TestAPIKeyCompletionFailureRetainsOnlySafeNativeFacts checks the public authenticator error.
+func TestAPIKeyCompletionFailureRetainsOnlySafeNativeFacts(t *testing.T) {
+	const secret = "sensitive native payload"
+	var events []string
+	auth := newAuthenticator(&recordingAuthServer{events: &events}, &recordingLoginSubscriber{
+		events: &events, waitErr: &rpcError{Code: -32077, Message: secret, Data: []byte(`"sensitive native payload"`)},
+	}, nil, func(string) string { return "fixture-key" }, nil)
+	err := auth.Authenticate(context.Background(), acp.AuthenticateRequest{MethodId: "api-key"})
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("expected typed authentication failure, got %v", err)
+	}
+	data := failure.Data.(map[string]any)
+	native, _ := data["native"].(map[string]any)
+	if data["phase"] != "account_login_completion" || len(native) != 1 || native["code"] != -32077 {
+		t.Fatalf("unexpected safe native facts: %+v", data)
+	}
+	if strings.Contains(failure.Error(), secret) {
+		t.Fatal("authentication error leaked native detail")
+	}
+}

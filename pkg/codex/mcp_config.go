@@ -18,8 +18,8 @@ const disableMCPConfigFilteringEnv = "DISABLE_MCP_CONFIG_FILTERING"
 // defaultModeRequestUserInputFeature 是 Codex 普通协作模式下结构化提问的功能开关。
 const defaultModeRequestUserInputFeature = "default_mode_request_user_input"
 
-// sessionConfig 合并工作范围、调用方提问默认策略与 ACP server，并返回清洗后的 MCP 请求名称。
-// 同名用户或项目配置默认保留，避免 Codex 深合并不同 transport 字段。
+// sessionConfig combines workspace, input defaults, and ACP-provided MCP servers.
+// Existing native MCP entries retain precedence to avoid merging different transports.
 func (a *Agent) sessionConfig(
 	ctx context.Context,
 	workspace codexWorkspace,
@@ -36,7 +36,7 @@ func (a *Agent) sessionConfig(
 		cwd := workspace.CWD
 		response, err := a.client.ConfigRead(ctx, protocol.ConfigReadParams{Cwd: &cwd, IncludeLayers: &includeLayers})
 		if err != nil {
-			return nil, nil, fmt.Errorf("reading Codex session config: %w", err)
+			return nil, nil, codexOperationFailure("config_read", err, nil)
 		}
 		if a.defaultModeRequestUserInput {
 			if err := applyDefaultModeRequestUserInput(config, response.Config); err != nil {

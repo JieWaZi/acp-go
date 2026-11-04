@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
-	"sync"
 )
 
 // turnKind distinguishes native operations with different admission semantics.
@@ -35,12 +36,14 @@ type nativeTurn struct {
 	clientMessageID string
 	// eventsMu serializes identity binding, pre-ACK frames, and mapping.
 	eventsMu sync.Mutex
+	// completionCapture holds unmatched completions received before this invocation binds.
+	completionCapture *completionCapture
 	// earlyEvents holds frames that cannot be published until the native identity is proven.
 	earlyEvents []protocol.ServerNotification
 	// earlyOverflow means an unknown-identity frame exceeded the bounded buffer.
 	earlyOverflow bool
-	// nativeTerminal rejects replay after the exact native turn has completed.
-	nativeTerminal bool
+	// terminal stores the exact native completion independently of buffered display frames.
+	terminal *protocol.TurnCompletedNotification
 	// terminalSignal closes when this exact native turn reaches a terminal notification.
 	terminalSignal chan struct{}
 	// observed collects positive native output, effect and retry evidence.
@@ -85,12 +88,26 @@ type nativeTurn struct {
 type turnObservation struct {
 	// output records positive evidence of generated assistant text.
 	output bool
-	// fileChange records a completed native file change, not an approval or attempt.
+	// fileChange records a native report of completed file changes.
 	fileChange bool
+	// toolCompletion records a native tool reaching its terminal item boundary.
+	toolCompletion bool
 	// lastError retains the last native error notification including willRetry.
 	lastError *protocol.ErrorNotification
 	// reroutes holds a bounded sequence of native model changes for this turn.
 	reroutes []modelReroute
+}
+
+// recordCompletedItem retains native completion evidence independently of ACP display.
+func (o *turnObservation) recordCompletedItem(item protocol.ThreadItem) {
+	switch item.Type {
+	case protocol.AgentMessage:
+		o.output = o.output || stringValue(item.Text) != ""
+	case protocol.FileChange:
+		o.fileChange = o.fileChange || stringValue(item.Status) == "completed" && len(item.Changes) > 0
+	case protocol.CommandExecution, protocol.MCPToolCall, protocol.DynamicToolCall, protocol.CollabAgentToolCall, protocol.WebSearch:
+		o.toolCompletion = o.toolCompletion || stringValue(item.Status) != "declined"
+	}
 }
 
 // modelReroute records a provider-reported change without reallocating token counts.
@@ -212,6 +229,7 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 		a.finishTurnBackground(prompt)
 		return acpmeta.CompactResponse{}, err
 	}
+	prompt.setCompletionCapture(capture)
 	type result struct {
 		// response carries the precise native terminal result.
 		response acpmeta.CompactResponse
@@ -276,7 +294,14 @@ func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.Compa
 			return
 		}
 		turnID, _ := prompt.currentTurn()
-		completion, completionErr := a.client.completions.waitAfterStart(prompt.runCtx, state.id, turnID, capture)
+		var completion protocol.TurnCompletedNotification
+		var completionErr error
+		if observed := prompt.observedCompletion(); observed != nil {
+			completion = *observed
+			a.client.completions.releaseCapture(state.id, capture)
+		} else {
+			completion, completionErr = a.client.completions.waitAfterStart(prompt.runCtx, state.id, turnID, capture)
+		}
 		router := prompt.currentEventRouter()
 		usage, observed := router.Usage()
 		if !observed || completionErr != nil || completion.Turn.Status != protocol.FluffyCompleted {
@@ -353,11 +378,11 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 		prompt.cancelRun()
 		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, err)
 	}
-	// 前台返回后立即释放 Session 槽位；普通提前取消时，RunTurn 观察者继续
-	// 等待迟到的 turn/start 并执行 stale interrupt。
+	// Release the foreground lane on return. After early cancellation, the
+	// native observer may still need to interrupt a late start.
 	defer func() {
 		if promptErr != nil || response.StopReason == acp.StopReasonCancelled {
-			// 失败或提前取消后可能仍有未观测尾部，下一轮不能借旧样本收取这些消费。
+			// A missing tail after failure or cancellation makes the next baseline uncertain.
 			state.mu.Lock()
 			state.usageTotal = nil
 			state.mu.Unlock()
@@ -367,9 +392,9 @@ func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response
 		a.finishTurnForeground(prompt)
 	}()
 
-	// turnResult 在后台 runtime 生命周期与前台 ACP 请求之间传递一次精确 turn 结果。
+	// turnResult transfers one exact native result to the foreground request.
 	type turnResult struct {
-		// completion 是精确 turn 的完成通知。
+		// completion is the exact native terminal notification.
 		completion protocol.TurnCompletedNotification
 		// err carries native submission and completion failures.
 		err error
@@ -499,6 +524,9 @@ func turnFailureWithUsage(prompt *nativeTurn, phase string, failure *acp.Request
 	}
 	if observation.fileChange {
 		data["file_change_observed"] = true
+	}
+	if observation.toolCompletion {
+		data["tool_completion_observed"] = true
 	}
 	if observation.lastError != nil {
 		data["native_error_observation"] = map[string]any{
@@ -664,15 +692,22 @@ func (a *Agent) bindTurnLocked(state *sessionState, prompt *nativeTurn, turnID s
 		updater = a.currentSessionUpdater()
 	}
 	a.attachTurnEvents(state, prompt, turnID, updater)
-	if prompt.earlyOverflow {
-		prompt.eventFailure = errEventDeliveryBackpressure
-		prompt.currentEventRouter().handler.breakUsageContinuity()
-	}
 	for _, notification := range prompt.earlyEvents {
 		_, id := notificationRouting(notification)
 		a.routeBoundTurnLocked(prompt.runCtx, state, prompt, turnID, id, notification)
 	}
 	prompt.earlyEvents = nil
+	if prompt.earlyOverflow {
+		if prompt.eventFailure == nil {
+			prompt.eventFailure = errEventDeliveryBackpressure
+		}
+		prompt.currentEventRouter().handler.breakUsageContinuity()
+	}
+	if prompt.completionCapture != nil {
+		if completion := a.client.completions.capturedCompletion(prompt.completionCapture, turnID); completion != nil {
+			prompt.recordTerminalLocked(*completion)
+		}
+	}
 	prompt.signalTurnStarted()
 	if late {
 		a.requestTurnInterrupt(state, prompt, turnID, false)
@@ -681,7 +716,49 @@ func (a *Agent) bindTurnLocked(state *sessionState, prompt *nativeTurn, turnID s
 
 // startObservation connects protocol ACK waiting to this turn's native evidence.
 func (p *nativeTurn) startObservation() turnStartObservation {
-	return turnStartObservation{confirmedID: p.confirmedTurnID, terminal: p.terminalSignal}
+	return turnStartObservation{
+		confirmedID: p.confirmedTurnID,
+		terminal:    p.terminalSignal,
+		capture:     p.setCompletionCapture,
+		completion:  p.observedCompletion,
+	}
+}
+
+// setCompletionCapture attaches the exact protocol capture before native submission.
+func (p *nativeTurn) setCompletionCapture(capture *completionCapture) {
+	p.eventsMu.Lock()
+	p.completionCapture = capture
+	p.eventsMu.Unlock()
+}
+
+// observedCompletion returns the exact terminal payload once it is immutable.
+func (p *nativeTurn) observedCompletion() *protocol.TurnCompletedNotification {
+	select {
+	case <-p.terminalSignal:
+		return p.terminal
+	default:
+		return nil
+	}
+}
+
+// recordTerminalLocked seals the owner after retaining the provider's terminal payload.
+func (p *nativeTurn) recordTerminalLocked(completion protocol.TurnCompletedNotification) {
+	if p.terminal != nil {
+		return
+	}
+	for _, item := range completion.Turn.Items {
+		switch item.Type {
+		case protocol.AgentMessage:
+			p.observed.recordCompletedItem(item)
+		default:
+			switch stringValue(item.Status) {
+			case "completed", "failed":
+				p.observed.recordCompletedItem(item)
+			}
+		}
+	}
+	p.terminal = &completion
+	close(p.terminalSignal)
 }
 
 var errNativeTerminalObserved = errors.New("native terminal observed before acknowledgment")

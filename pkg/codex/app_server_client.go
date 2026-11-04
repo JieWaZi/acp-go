@@ -236,6 +236,18 @@ func (t *completionTracker) waitAfterStart(
 	}
 }
 
+// capturedCompletion returns an unmatched terminal retained while identity was unknown.
+func (t *completionTracker) capturedCompletion(capture *completionCapture, turnID string) *protocol.TurnCompletedNotification {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, event := range capture.events {
+		if event.Turn.ID == turnID {
+			return &event
+		}
+	}
+	return nil
+}
+
 // hasCompleted rejects a replayed start before an identity-less compact can claim it.
 func (t *completionTracker) hasCompleted(threadID, turnID string) bool {
 	t.mu.Lock()
@@ -643,9 +655,13 @@ type turnStartObservation struct {
 	confirmedID func() string
 	// terminal signals the exact native turn's terminal notification.
 	terminal <-chan struct{}
+	// capture gives the operation owner access to unmatched early completions for this request.
+	capture func(*completionCapture)
+	// completion returns the immutable terminal payload held by the operation owner.
+	completion func() *protocol.TurnCompletedNotification
 }
 
-// RunTurn 在 turn/start 前安装 completion 捕获，并等待精确 thread/turn 完成。
+// RunTurn captures native completion before submission and waits for the exact turn.
 func (c *appServerClient) RunTurn(
 	ctx context.Context,
 	params protocol.TurnStartParams,
@@ -659,6 +675,9 @@ func (c *appServerClient) RunTurn(
 	observation := turnStartObservation{confirmedID: func() string { return "" }}
 	if len(observed) != 0 {
 		observation = observed[0]
+	}
+	if observation.capture != nil {
+		observation.capture(capture)
 	}
 	provenID := observation.confirmedID
 	var response protocol.TurnStartResponse
@@ -684,6 +703,17 @@ func (c *appServerClient) RunTurn(
 		}
 		return c.rpc.Call(ackCtx, buildRequest, &response)
 	})
+	if observation.completion != nil {
+		if completion := observation.completion(); completion != nil {
+			c.completions.releaseCapture(params.ThreadID, capture)
+			return *completion, nil
+		}
+	}
+	if err == nil && !responseObserved {
+		if id := provenID(); id != "" && id != response.Turn.ID {
+			err = errors.New("Codex turn/start ACK conflicts with the submitted user-message identity")
+		}
+	}
 	if err != nil {
 		if id := provenID(); id != "" {
 			completion, waitErr := c.completions.waitAfterStart(ctx, params.ThreadID, id, capture)

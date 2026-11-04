@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/JieWaZi/acp-go/pkg/acpmeta"
-	acp "github.com/JieWaZi/acp-go/sdk"
 	"sync"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
+	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
 var (
@@ -21,6 +21,8 @@ var (
 	ErrSessionOpening = errors.New("codex session is opening")
 	// ErrSessionAlreadyOpen indicates that a native thread already has an installed owner.
 	ErrSessionAlreadyOpen = errors.New("codex session is already open")
+	// ErrThreadManagementActive rejects an operation while an archive change is pending.
+	ErrThreadManagementActive = errors.New("codex thread archive state is changing")
 	// ErrPromptActive rejects concurrent input on an occupied native lane.
 	ErrPromptActive = errors.New("codex session already has an active prompt")
 )
@@ -57,16 +59,42 @@ type sessionState struct {
 	mcpStartupAfterVersion uint64
 }
 
+// sessionOpen owns one open generation's pre-installation observations or archive reservation.
+type sessionOpen struct {
+	// generation identifies the thread reservation.
+	generation uint64
+	// settingsActive accepts settings only after the native open starts.
+	settingsActive bool
+	// settings is the most recent native settings notification for this attempt.
+	settings *protocol.ThreadSettings
+	// settingsUncertain means early settings may have been lost before the thread was known.
+	settingsUncertain bool
+	// management holds the thread until its native archive operation completes.
+	management bool
+}
+
+// unidentifiedOpen observes settings while a new or forked thread has no ID in the adapter.
+type unidentifiedOpen struct {
+	// settings retains at most one receipt per candidate native thread.
+	settings map[string]protocol.ThreadSettings
+	// overflow marks an observation window that could have omitted the resulting thread.
+	overflow bool
+}
+
+const maxUnidentifiedThreadSettings = 16
+
 // sessionStore linearizes native thread admission, installation and release.
 type sessionStore struct {
-	// mu protects mutable thread and invocation state.
+	// mu serializes native thread ownership and pending observations.
 	mu sync.Mutex
 	// sessions holds installed native thread owners.
 	sessions map[string]*sessionState
 	// generations records the monotonically increasing fence for each thread.
 	generations map[string]uint64
-	// opening records the generation reserving a pending native open.
-	opening map[string]uint64
+	// opening holds pending native operations keyed by exact thread ID.
+	opening map[string]sessionOpen
+	// unidentified holds pending new and fork attempts until their native ID is reported.
+	unidentified map[*unidentifiedOpen]struct{}
 	// closing counts active release operations fencing a thread.
 	closing map[string]int
 }
@@ -74,10 +102,11 @@ type sessionStore struct {
 // newSessionStore creates an empty thread registry.
 func newSessionStore() *sessionStore {
 	return &sessionStore{
-		sessions:    make(map[string]*sessionState),
-		generations: make(map[string]uint64),
-		opening:     make(map[string]uint64),
-		closing:     make(map[string]int),
+		sessions:     make(map[string]*sessionState),
+		generations:  make(map[string]uint64),
+		opening:      make(map[string]sessionOpen),
+		unidentified: make(map[*unidentifiedOpen]struct{}),
+		closing:      make(map[string]int),
 	}
 }
 
@@ -85,18 +114,96 @@ func newSessionStore() *sessionStore {
 func (s *sessionStore) beginOpen(sessionID string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.reserveLocked(sessionID, sessionOpen{})
+}
+
+// reserveLocked admits one thread operation under the store lock.
+func (s *sessionStore) reserveLocked(sessionID string, open sessionOpen) (uint64, error) {
 	if s.closing[sessionID] > 0 {
 		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionClosing)
 	}
-	generation := s.generations[sessionID]
 	if s.sessions[sessionID] != nil {
 		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionAlreadyOpen)
 	}
-	if current, opening := s.opening[sessionID]; opening && current == generation {
-		return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionOpening)
+	if current, found := s.opening[sessionID]; found {
+		if current.management {
+			return 0, ErrThreadManagementActive
+		}
+		if current.generation == s.generations[sessionID] || current.settingsActive {
+			return 0, fmt.Errorf("opening session %q: %w", sessionID, ErrSessionOpening)
+		}
 	}
-	s.opening[sessionID] = generation
-	return generation, nil
+	s.generations[sessionID]++
+	open.generation = s.generations[sessionID]
+	s.opening[sessionID] = open
+	return open.generation, nil
+}
+
+// beginArchive reserves a persisted thread until its archive operation terminates.
+func (s *sessionStore) beginArchive(sessionID string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reserveLocked(sessionID, sessionOpen{management: true})
+}
+
+// beginUnidentifiedOpen limits early observation to the lifetime of an actual start or fork.
+func (s *sessionStore) beginUnidentifiedOpen() *unidentifiedOpen {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	open := &unidentifiedOpen{settings: make(map[string]protocol.ThreadSettings)}
+	s.unidentified[open] = struct{}{}
+	return open
+}
+
+// abandonUnidentifiedOpen releases the observation window after an unsuccessful open.
+func (s *sessionStore) abandonUnidentifiedOpen(open *unidentifiedOpen) {
+	s.mu.Lock()
+	delete(s.unidentified, open)
+	s.mu.Unlock()
+}
+
+// identifyOpen atomically transfers observations for the exact native ID to its named reservation.
+func (s *sessionStore) identifyOpen(open *unidentifiedOpen, sessionID string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.unidentified, open)
+	known := sessionOpen{settingsActive: true, settingsUncertain: open.overflow}
+	if settings, ok := open.settings[sessionID]; ok {
+		known.settings = &settings
+		known.settingsUncertain = false
+	}
+	return s.reserveLocked(sessionID, known)
+}
+
+// observeSettings assigns a native settings receipt to the installed or opening owner.
+func (s *sessionStore) observeSettings(sessionID string, settings protocol.ThreadSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing[sessionID] != 0 {
+		return
+	}
+	if state := s.sessions[sessionID]; state != nil {
+		state.mu.Lock()
+		if state.configuration != nil {
+			state.configuration.observeThreadSettings(settings)
+		}
+		state.mu.Unlock()
+		return
+	}
+	if open, found := s.opening[sessionID]; found {
+		if open.settingsActive && open.generation == s.generations[sessionID] {
+			open.settings = &settings
+			s.opening[sessionID] = open
+		}
+		return
+	}
+	for open := range s.unidentified {
+		if _, known := open.settings[sessionID]; known || len(open.settings) < maxUnidentifiedThreadSettings {
+			open.settings[sessionID] = settings
+		} else {
+			open.overflow = true
+		}
+	}
 }
 
 // install commits a session with the given working directory.
@@ -128,9 +235,16 @@ func (s *sessionStore) installWorkspace(
 ) (*sessionState, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	openGeneration, opening := s.opening[sessionID]
-	if s.closing[sessionID] > 0 || s.generations[sessionID] != generation || !opening || openGeneration != generation {
+	open, opening := s.opening[sessionID]
+	if s.closing[sessionID] > 0 || s.generations[sessionID] != generation || !opening || open.generation != generation || open.management {
 		return nil, false
+	}
+	if configuration != nil {
+		if open.settings != nil {
+			configuration.observeThreadSettings(*open.settings)
+		} else if open.settingsUncertain {
+			configuration.observed = ObservedSettings{Source: "open_settings_unconfirmed"}
+		}
 	}
 	state := &sessionState{
 		id:  sessionID,
@@ -162,26 +276,31 @@ func (s *sessionState) workspace() codexWorkspace {
 // abandonOpen releases the matching failed open attempt.
 func (s *sessionStore) abandonOpen(sessionID string, generation uint64) {
 	s.mu.Lock()
-	if openGeneration, opening := s.opening[sessionID]; opening && openGeneration == generation {
+	if open, opening := s.opening[sessionID]; opening && open.generation == generation {
 		delete(s.opening, sessionID)
 	}
 	s.mu.Unlock()
 }
 
-// openCanProceed revalidates the native open reservation after preparation.
-func (s *sessionStore) openCanProceed(sessionID string, generation uint64) bool {
+// beginNativeOpen arms settings observation after local preparation succeeds.
+func (s *sessionStore) beginNativeOpen(sessionID string, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	openGeneration, opening := s.opening[sessionID]
-	return opening && openGeneration == generation && s.closing[sessionID] == 0 && s.generations[sessionID] == generation
+	open, opening := s.opening[sessionID]
+	if !opening || open.generation != generation || s.closing[sessionID] != 0 || s.generations[sessionID] != generation {
+		return false
+	}
+	open.settingsActive = true
+	s.opening[sessionID] = open
+	return true
 }
 
 // beginStaleCleanup grants release authority only to the matching open attempt.
 func (s *sessionStore) beginStaleCleanup(sessionID string, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	openGeneration, opening := s.opening[sessionID]
-	if !opening || openGeneration != generation {
+	open, opening := s.opening[sessionID]
+	if !opening || open.generation != generation || open.management {
 		return false
 	}
 	delete(s.opening, sessionID)
@@ -192,26 +311,22 @@ func (s *sessionStore) beginStaleCleanup(sessionID string, generation uint64) bo
 	return true
 }
 
-// beginClose fences an explicitly addressed ACP session.
-func (s *sessionStore) beginClose(sessionID string) (uint64, *sessionState) {
-	generation, state, _ := s.beginCloseOwned(sessionID, nil)
-	return generation, state
-}
-
 // beginCloseOwned fences cleanup only while the expected state still owns the thread.
 // A nil expected state indicates an explicit ACP close addressed by session ID.
-func (s *sessionStore) beginCloseOwned(sessionID string, expected *sessionState) (uint64, *sessionState, bool) {
+func (s *sessionStore) beginCloseOwned(sessionID string, expected *sessionState) (*sessionState, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if expected != nil && s.sessions[sessionID] != expected {
-		return 0, nil, false
+		return nil, false, nil
+	}
+	if s.opening[sessionID].management {
+		return nil, false, ErrThreadManagementActive
 	}
 	s.generations[sessionID]++
-	generation := s.generations[sessionID]
 	s.closing[sessionID]++
 	state := s.sessions[sessionID]
 	delete(s.sessions, sessionID)
-	return generation, state, true
+	return state, true, nil
 }
 
 // endClose releases one operation’s close fence.
@@ -311,6 +426,8 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	}
 	settings.applyOpenEffort(config)
 	mcpAfterVersion := a.currentMCPStatusVersion()
+	open := a.sessions.beginUnidentifiedOpen()
+	defer a.sessions.abandonUnidentifiedOpen(open)
 	response, err := a.client.ThreadStart(ctx, protocol.ThreadStartParams{
 		Cwd:                   &workspace.CWD,
 		Config:                config,
@@ -324,7 +441,7 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 	if response.Thread.ID == "" {
 		return acp.NewSessionResponse{}, errors.New("starting codex thread: empty thread id")
 	}
-	generation, err := a.sessions.beginOpen(response.Thread.ID)
+	generation, err := a.sessions.identifyOpen(open, response.Thread.ID)
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
@@ -334,10 +451,10 @@ func (a *Agent) NewSession(ctx context.Context, request acp.NewSessionRequest) (
 		return acp.NewSessionResponse{}, err
 	}
 	a.publishKnownMCPStartupFailures(state, mcpNames, mcpAfterVersion)
-	modes, options := sessionConfigurationResponse(state)
+	modes, options, meta := sessionConfigurationResponse(state)
 	return acp.NewSessionResponse{
 		SessionId:     acp.SessionId(response.Thread.ID),
-		Meta:          sessionSettingsMetadata(state),
+		Meta:          meta,
 		Modes:         modes,
 		ConfigOptions: options,
 	}, nil
@@ -360,8 +477,8 @@ func (a *Agent) ResumeSession(
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
 	}
-	modes, options := sessionConfigurationResponse(state)
-	return acp.ResumeSessionResponse{Modes: modes, ConfigOptions: options, Meta: sessionSettingsMetadata(state)}, nil
+	modes, options, meta := sessionConfigurationResponse(state)
+	return acp.ResumeSessionResponse{Modes: modes, ConfigOptions: options, Meta: meta}, nil
 }
 
 // LoadSession restores a thread and reserves it until ACP history replay finishes.
@@ -387,8 +504,8 @@ func (a *Agent) LoadSession(ctx context.Context, request acp.LoadSessionRequest)
 	state.mu.Lock()
 	state.replayingHistory = false
 	state.mu.Unlock()
-	modes, options := sessionConfigurationResponse(state)
-	return acp.LoadSessionResponse{Modes: modes, ConfigOptions: options, Meta: sessionSettingsMetadata(state)}, nil
+	modes, options, meta := sessionConfigurationResponse(state)
+	return acp.LoadSessionResponse{Modes: modes, ConfigOptions: options, Meta: meta}, nil
 }
 
 // openExistingSession reserves, restores and validates a native thread.
@@ -429,10 +546,6 @@ func (a *Agent) openExistingSession(
 		a.sessions.abandonOpen(sessionID, generation)
 		return protocol.Thread{}, nil, err
 	}
-	if !a.sessions.openCanProceed(sessionID, generation) {
-		a.sessions.abandonOpen(sessionID, generation)
-		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, ErrSessionClosing)
-	}
 	settings, err := parseOpenSettings(meta)
 	if err != nil {
 		a.sessions.abandonOpen(sessionID, generation)
@@ -440,6 +553,10 @@ func (a *Agent) openExistingSession(
 	}
 	settings.applyOpenEffort(config)
 	mcpAfterVersion := a.currentMCPStatusVersion()
+	if !a.sessions.beginNativeOpen(sessionID, generation) {
+		a.sessions.abandonOpen(sessionID, generation)
+		return protocol.Thread{}, nil, fmt.Errorf("resuming codex thread %q: %w", sessionID, ErrSessionClosing)
+	}
 	response, err := a.client.ThreadResume(ctx, protocol.ThreadResumeParams{
 		ThreadID:              sessionID,
 		Cwd:                   &workspace.CWD,
@@ -538,7 +655,10 @@ func (a *Agent) CloseSession(ctx context.Context, request acp.CloseSessionReques
 
 // closeThread releases only the identified thread owner.
 func (a *Agent) closeThread(ctx context.Context, sessionID string, expected *sessionState) error {
-	_, state, owned := a.sessions.beginCloseOwned(sessionID, expected)
+	state, owned, err := a.sessions.beginCloseOwned(sessionID, expected)
+	if err != nil {
+		return acp.NewInvalidRequest(err.Error())
+	}
 	if !owned {
 		return nil
 	}
@@ -559,7 +679,7 @@ func (a *Agent) closeThread(ctx context.Context, sessionID string, expected *ses
 			}
 			a.client.ResolveTurnInterrupted(sessionID, turnID)
 		}
-		// TS Promise 无法主动取消 pending turn/start；Go transport 的 context 必须显式解除请求和 goroutine。
+		// Closing the native context also releases any pending start observer.
 		prompt.cancelRun()
 	}
 	for _, prompt := range prompts {
@@ -614,25 +734,51 @@ func (a *Agent) archiveThread(ctx context.Context, raw json.RawMessage, archive 
 	if err := json.Unmarshal(raw, &request); err != nil || request.ThreadID == "" {
 		return ThreadArchiveResponse{}, acp.NewInvalidParams("thread_id is required")
 	}
-	generation, err := a.sessions.beginOpen(request.ThreadID)
+	if err := ctx.Err(); err != nil {
+		return ThreadArchiveResponse{}, acp.NewRequestCancelled(nil)
+	}
+	generation, err := a.sessions.beginArchive(request.ThreadID)
 	if err != nil {
 		return ThreadArchiveResponse{}, acp.NewInvalidRequest(err.Error())
 	}
-	defer a.sessions.abandonOpen(request.ThreadID, generation)
-	if archive {
-		if err := a.client.ThreadArchive(ctx, request.ThreadID); err != nil {
-			return ThreadArchiveResponse{}, codexRequestFailure("thread_archive", err)
-		}
-	} else {
-		response, err := a.client.ThreadUnarchive(ctx, request.ThreadID)
-		if err != nil {
-			return ThreadArchiveResponse{}, codexRequestFailure("thread_unarchive", err)
-		}
-		if response.Thread.ID != request.ThreadID {
-			return ThreadArchiveResponse{}, codexRequestFailure("thread_unarchive", errors.New("Codex returned a different unarchived thread"))
+	phase := "thread_archive"
+	if !archive {
+		phase = "thread_unarchive"
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := a.changeArchiveState(a.runtimeCtx, request.ThreadID, archive)
+		a.sessions.abandonOpen(request.ThreadID, generation)
+		done <- err
+	}()
+	var operationErr error
+	select {
+	case operationErr = <-done:
+	case <-ctx.Done():
+		select {
+		case operationErr = <-done:
+		default:
+			return ThreadArchiveResponse{}, acp.NewRequestCancelled(map[string]any{
+				"phase": phase, "submission": "unknown", "thread_id": request.ThreadID,
+			})
 		}
 	}
+	if operationErr != nil {
+		return ThreadArchiveResponse{}, codexRequestFailure(phase, operationErr)
+	}
 	return ThreadArchiveResponse{ThreadID: request.ThreadID, Archived: archive}, nil
+}
+
+// changeArchiveState waits for the native result while the management lane is reserved.
+func (a *Agent) changeArchiveState(ctx context.Context, threadID string, archive bool) error {
+	if archive {
+		return a.client.ThreadArchive(ctx, threadID)
+	}
+	response, err := a.client.ThreadUnarchive(ctx, threadID)
+	if err == nil && response.Thread.ID != threadID {
+		err = errors.New("Codex returned a different unarchived thread")
+	}
+	return err
 }
 
 // ListSessions reports that this adapter has no ACP history-list mapping.
