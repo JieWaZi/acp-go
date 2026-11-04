@@ -110,7 +110,11 @@ func (a *ACPAgent) Prompt(ctx context.Context, request acp.PromptRequest) (acp.P
 func (a *ACPAgent) reserve(ctx context.Context, request acp.PromptRequest, prepare acp.PromptPreparation) (func() (acp.PromptResponse, error), error) {
 	run, err := a.Client.ReservePrompt(ctx, request, PromptOptions{Prepare: prepare})
 	if err != nil {
-		return nil, err
+		_, publicErr := projectPromptResult(PromptResult{Receipt: PromptReceipt{
+			Input:      PromptSubmission{SessionID: request.SessionId},
+			Submission: SubmissionNotSent, Admission: AdmissionNotAccepted, OperationError: err,
+		}})
+		return nil, publicErr
 	}
 	if run == nil {
 		return nil, acp.NewInternalError(nil)
@@ -159,9 +163,9 @@ func (a *ACPAgent) HandleExtensionMethod(ctx context.Context, method string, par
 	switch method {
 	case "_session/steering":
 		if client, ok := a.Client.(SteeringClient); ok {
-			var request SteerRequest
-			if json.Unmarshal(params, &request) != nil || request.SessionID == "" || request.Prompt == nil {
-				return nil, acp.NewInvalidParams(nil)
+			request, err := decodeSteering(params)
+			if err != nil {
+				return nil, err
 			}
 			return client.Steer(ctx, request)
 		}
@@ -196,6 +200,33 @@ func (a *ACPAgent) HandleExtensionMethod(ctx context.Context, method string, par
 	return nil, acp.NewMethodNotFound(method)
 }
 
+// decodeSteering preserves the established wire policy while the native owner
+// consumes a typed decision. The extension must not invent an idle submission.
+func decodeSteering(params json.RawMessage) (SteerRequest, error) {
+	var wire struct {
+		// SessionID is the existing wire target.
+		SessionID acp.SessionId `json:"sessionId"`
+		// Prompt is the additional native input.
+		Prompt []acp.ContentBlock `json:"prompt"`
+		// Meta holds the established extension's idle policy.
+		Meta struct {
+			// Steering configures whether an idle session requires a normal Prompt.
+			Steering struct {
+				// IdleBehavior accepts only the established explicit policy.
+				IdleBehavior string `json:"idleBehavior"`
+			} `json:"steering"`
+		} `json:"_meta"`
+	}
+	if json.Unmarshal(params, &wire) != nil || wire.SessionID == "" || len(wire.Prompt) == 0 {
+		return SteerRequest{}, acp.NewInvalidParams(nil)
+	}
+	policy := wire.Meta.Steering.IdleBehavior
+	if policy != "" && policy != "promptRequired" {
+		return SteerRequest{}, acp.NewInvalidParams(nil)
+	}
+	return SteerRequest{SessionID: wire.SessionID, Prompt: wire.Prompt, PromptRequired: policy == "promptRequired"}, nil
+}
+
 func projectPromptResult(result PromptResult) (acp.PromptResponse, error) {
 	result = result.Snapshot()
 	meta := map[string]any{
@@ -215,6 +246,7 @@ func projectPromptResult(result PromptResult) (acp.PromptResponse, error) {
 		}
 		if outcome.StopReason != nil {
 			response.StopReason = *outcome.StopReason
+			meta["nativeStopReason"] = string(*outcome.StopReason)
 		}
 		if outcome.DeliveryError != nil {
 			meta["acp-go/delivery-error"] = true
@@ -235,6 +267,9 @@ func projectPromptResult(result PromptResult) (acp.PromptResponse, error) {
 	}
 	if result.Receipt.Admission == AdmissionConfirmed {
 		response.UserMessageId = result.Receipt.Input.NativeInputID
+		if response.UserMessageId != nil {
+			meta["nativeUserMessageId"] = *response.UserMessageId
+		}
 	}
 	response.Meta = meta
 	if failure == nil && response.StopReason != "" {
@@ -249,6 +284,13 @@ func projectPromptResult(result PromptResult) (acp.PromptResponse, error) {
 		wireError.Code, wireError.Message = classified.Code, classified.Message
 		if classified.Data != nil {
 			meta["cause"] = classified.Data
+			if data, ok := classified.Data.(map[string]any); ok {
+				for _, key := range []string{"errorKind", "phase", "admission", "observedOutput", "possibleSideEffects"} {
+					if value, exists := data[key]; exists {
+						meta[key] = value
+					}
+				}
+			}
 		}
 	} else if errors.Is(failure, context.Canceled) {
 		wireError = acp.NewRequestCancelled(meta)
@@ -265,8 +307,26 @@ func projectNativeReceipt(outcome NativeOutcome) acpmeta.NativeTurnReceipt {
 	if outcome.FinalMessage != nil {
 		receipt.ResultText = outcome.FinalMessage.Text
 	}
-	if outcome.NativeFailure != nil || outcome.OperationError != nil || outcome.DeliveryError != nil {
-		receipt.Failure = &acpmeta.NativeTurnFailure{Code: -32603, ObservedOutput: outcome.ObservedOutput, PossibleSideEffects: outcome.PossibleSideEffects}
-	}
+	receipt.Failure = projectNativeFailure(outcome)
 	return receipt
+}
+
+func projectNativeFailure(outcome NativeOutcome) *acpmeta.NativeTurnFailure {
+	err := errors.Join(outcome.NativeFailure, outcome.OperationError, outcome.DeliveryError)
+	if err == nil {
+		return nil
+	}
+	failure := &acpmeta.NativeTurnFailure{Code: -32603, ObservedOutput: outcome.ObservedOutput, PossibleSideEffects: outcome.PossibleSideEffects}
+	var classified *acp.RequestError
+	if errors.As(err, &classified) && classified != nil {
+		failure.Code = classified.Code
+		if data, ok := classified.Data.(map[string]any); ok {
+			failure.Kind, _ = data["errorKind"].(string)
+			failure.Phase, _ = data["phase"].(string)
+			failure.Admission, _ = data["admission"].(string)
+		}
+	} else if errors.Is(err, context.Canceled) {
+		failure.Code = -32800
+	}
+	return failure
 }

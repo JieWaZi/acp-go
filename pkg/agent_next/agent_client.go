@@ -75,7 +75,8 @@ type PromptSubmission struct {
 	HostInvocationID string
 	// InputID identifies the adapter-owned input independently of native support.
 	InputID string
-	// NativeInputID is the actual transmitted, reconcilable native ID when supported.
+	// NativeInputID is selected before the gate and used unchanged on the wire when
+	// supported. Its presence does not prove submission or native acceptance.
 	NativeInputID *string
 }
 
@@ -181,8 +182,8 @@ type SteerRequest struct {
 	SessionID acp.SessionId `json:"sessionId"`
 	// Prompt contains the additional input.
 	Prompt []acp.ContentBlock `json:"prompt"`
-	// PromptRequired forbids silently accepting an input without submitting it.
-	PromptRequired bool `json:"promptRequired,omitempty"`
+	// PromptRequired requires a standard Prompt when idle, rather than starting work through steering.
+	PromptRequired bool `json:"-"`
 }
 
 // SteerResponse reports the native operation rather than an invented new turn.
