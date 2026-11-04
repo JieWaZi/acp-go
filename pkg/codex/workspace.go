@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -129,4 +130,19 @@ func sandboxPolicyWithAdditionalDirectories(
 		policy.WritableRoots = append(policy.WritableRoots, root)
 	}
 	return policy
+}
+
+// refreshSkills 只在工作范围实际存在标准 Skill 目录时请求 app-server 重新扫描。
+func (a *Agent) refreshSkills(ctx context.Context, workspace codexWorkspace) error {
+	hasSkills, err := workspace.hasSkillDirectory()
+	if err != nil {
+		return err
+	}
+	if !hasSkills {
+		return nil
+	}
+	if err = a.client.RefreshSkills(ctx, workspace); err != nil {
+		return fmt.Errorf("refreshing Codex workspace Skills: %w", err)
+	}
+	return nil
 }

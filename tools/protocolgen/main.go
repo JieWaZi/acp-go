@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -193,6 +194,10 @@ func generate(ctx context.Context, cfg generatorConfig) ([]byte, error) {
 		return nil, fmt.Errorf("formatting generated protocol: %w", err)
 	}
 	formatted, err = preserveOptionalNullableFields(formatted)
+	if err != nil {
+		return nil, err
+	}
+	formatted, err = preserveQuotaPercentPresence(formatted)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +414,7 @@ func restrictExperimentalV1Variants(generated []byte) ([]byte, error) {
 	return result, nil
 }
 
-// preserveOptionalNullableFields 对 quicktype 无法表达的两个 V1 三态字段做最薄的确定性适配。
+// preserveOptionalNullableFields restores wire presence where quicktype collapses nullable values.
 func preserveOptionalNullableFields(generated []byte) ([]byte, error) {
 	replacements := []struct {
 		// field 是 quicktype 对 optional+nullable 的固定退化输出。
@@ -439,7 +444,51 @@ func preserveOptionalNullableFields(generated []byte) ([]byte, error) {
 		}
 		result = bytes.Replace(result, oldValue, []byte(replacement.replacement), 1)
 	}
+	// Restrict serviceTier adaptation to the request and response DTOs whose
+	// schema explicitly permits both omission and null.
+	field := regexp.MustCompile("ServiceTier[ \t]+\\*string[ \t]+`json:\"serviceTier,omitempty\"`")
+	for _, name := range []string{
+		"ThreadStartParams", "ThreadResumeParams", "ThreadForkParams", "TurnStartParams",
+		"ThreadStartResponse", "ThreadResumeResponse", "ThreadForkResponse",
+	} {
+		start := bytes.Index(result, []byte("type "+name+" struct {"))
+		if start < 0 {
+			return nil, fmt.Errorf("missing DTO %s", name)
+		}
+		end := bytes.Index(result[start:], []byte("\n}"))
+		if end < 0 {
+			return nil, fmt.Errorf("unterminated DTO %s", name)
+		}
+		end += start
+		section := result[start:end]
+		if len(field.FindAll(section, -1)) != 1 {
+			return nil, fmt.Errorf("expected one serviceTier field in %s", name)
+		}
+		replaced := field.ReplaceAll(section, []byte("ServiceTier OptionalNullable[string] `json:\"serviceTier,omitzero\"`"))
+		result = append(append(append([]byte{}, result[:start]...), replaced...), result[end:]...)
+	}
 	return result, nil
+}
+
+// preserveQuotaPercentPresence keeps an omitted quota percentage distinct from zero.
+func preserveQuotaPercentPresence(generated []byte) ([]byte, error) {
+	const name = "PrimaryClass"
+	start := bytes.Index(generated, []byte("type "+name+" struct {"))
+	if start < 0 {
+		return nil, fmt.Errorf("missing quota window DTO %s", name)
+	}
+	end := bytes.Index(generated[start:], []byte("\n}"))
+	if end < 0 {
+		return nil, fmt.Errorf("unterminated quota window DTO %s", name)
+	}
+	end += start
+	field := regexp.MustCompile("UsedPercent[ \t]+int64[ \t]+`json:\"usedPercent\"`")
+	section := generated[start:end]
+	if len(field.FindAll(section, -1)) != 1 {
+		return nil, fmt.Errorf("expected one quota percentage field in %s", name)
+	}
+	section = field.ReplaceAll(section, []byte("UsedPercent *int64 `json:\"usedPercent,omitempty\"`"))
+	return append(append(append([]byte{}, generated[:start]...), section...), generated[end:]...), nil
 }
 
 // checkFreshness 重新生成到内存，并与目标文件逐字节比较而不修改工作树。

@@ -38,6 +38,7 @@ type Protocol struct {
 	FileChangeRequestApprovalParams         *FileChangeRequestApprovalParams         `json:"fileChangeRequestApprovalParams,omitempty"`
 	FileChangeRequestApprovalResponse       *FileChangeRequestApprovalResponse       `json:"fileChangeRequestApprovalResponse,omitempty"`
 	GetAccountParams                        *GetAccountParams                        `json:"getAccountParams,omitempty"`
+	GetAccountRateLimitsResponse            *GetAccountRateLimitsResponse            `json:"getAccountRateLimitsResponse,omitempty"`
 	GetAccountResponse                      *GetAccountResponse                      `json:"getAccountResponse,omitempty"`
 	InitializeParams                        *InitializeParams                        `json:"initializeParams,omitempty"`
 	InitializeResponse                      *InitializeResponse                      `json:"initializeResponse,omitempty"`
@@ -64,6 +65,8 @@ type Protocol struct {
 	SkillsListParams                        *SkillsListParams                        `json:"skillsListParams,omitempty"`
 	SkillsListResponse                      *SkillsListResponse                      `json:"skillsListResponse,omitempty"`
 	TerminalInteractionNotification         *TerminalInteractionNotification         `json:"terminalInteractionNotification,omitempty"`
+	ThreadCompactStartParams                *ThreadCompactStartParams                `json:"threadCompactStartParams,omitempty"`
+	ThreadCompactStartResponse              map[string]interface{}                   `json:"threadCompactStartResponse,omitempty"`
 	ThreadForkParams                        *ThreadForkParams                        `json:"threadForkParams,omitempty"`
 	ThreadForkResponse                      *ThreadForkResponse                      `json:"threadForkResponse,omitempty"`
 	ThreadReadParams                        *ThreadReadParams                        `json:"threadReadParams,omitempty"`
@@ -423,16 +426,82 @@ type GetAccountParams struct {
 	RefreshToken *bool `json:"refreshToken,omitempty"`
 }
 
+type GetAccountRateLimitsResponse struct {
+	RateLimitResetCredits *RateLimitResetCreditsClass `json:"rateLimitResetCredits,omitempty"`
+	// Backward-compatible single-bucket view; mirrors the historical payload.
+	RateLimits RateLimits `json:"rateLimits"`
+	// Multi-bucket view keyed by metered `limit_id` (for example, `codex`).
+	RateLimitsByLimitID map[string]RateLimits `json:"rateLimitsByLimitId,omitempty"`
+}
+
+type RateLimitResetCreditsClass struct {
+	AvailableCount int64 `json:"availableCount"`
+	// Detail rows for available reset credits, when the backend provides them.
+	//
+	// `null` means only `availableCount` is known, while an empty array means details were
+	// fetched and no available credits were returned. The backend may cap this list, so its
+	// length can be less than `availableCount`.
+	Credits []CreditElement `json:"credits,omitempty"`
+}
+
+type CreditElement struct {
+	// Backend-provided display description for this credit, or `null` when unavailable.
+	Description *string `json:"description,omitempty"`
+	// Unix timestamp in seconds when the credit expires, or `null` if it does not expire.
+	ExpiresAt *int64 `json:"expiresAt,omitempty"`
+	// Unix timestamp in seconds when the credit was granted.
+	GrantedAt int64 `json:"grantedAt"`
+	// Opaque backend identifier for this reset credit.
+	ID        string       `json:"id"`
+	ResetType ResetType    `json:"resetType"`
+	Status    CreditStatus `json:"status"`
+	// Backend-provided display title for this credit, or `null` when unavailable.
+	Title *string `json:"title,omitempty"`
+}
+
+// Backward-compatible single-bucket view; mirrors the historical payload.
+type RateLimits struct {
+	Credits              *CreditsClass             `json:"credits,omitempty"`
+	IndividualLimit      *IndividualLimitClass     `json:"individualLimit,omitempty"`
+	LimitID              *string                   `json:"limitId,omitempty"`
+	LimitName            *string                   `json:"limitName,omitempty"`
+	PlanType             *PlanTypeEnum             `json:"planType,omitempty"`
+	Primary              *PrimaryClass             `json:"primary,omitempty"`
+	RateLimitReachedType *RateLimitReachedTypeEnum `json:"rateLimitReachedType,omitempty"`
+	Secondary            *PrimaryClass             `json:"secondary,omitempty"`
+	// Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.
+	SpendControlReached *bool `json:"spendControlReached,omitempty"`
+}
+
+type CreditsClass struct {
+	Balance    *string `json:"balance,omitempty"`
+	HasCredits bool    `json:"hasCredits"`
+	Unlimited  bool    `json:"unlimited"`
+}
+
+type IndividualLimitClass struct {
+	Limit            string `json:"limit"`
+	RemainingPercent int64  `json:"remainingPercent"`
+	ResetsAt         int64  `json:"resetsAt"`
+	Used             string `json:"used"`
+}
+
+type PrimaryClass struct {
+	ResetsAt           *int64 `json:"resetsAt,omitempty"`
+	UsedPercent        *int64 `json:"usedPercent,omitempty"`
+	WindowDurationMins *int64 `json:"windowDurationMins,omitempty"`
+}
+
 type GetAccountResponse struct {
 	Account            *Account `json:"account,omitempty"`
 	RequiresOpenaiAuth bool     `json:"requiresOpenaiAuth"`
 }
 
 type Account struct {
-	Type                        AccountType `json:"type"`
-	Email                       *string     `json:"email,omitempty"`
-	PlanType                    *PlanType   `json:"planType,omitempty"`
-	UsesCodexManagedCredentials *bool       `json:"usesCodexManagedCredentials,omitempty"`
+	Type                        AccountType   `json:"type"`
+	Email                       *string       `json:"email,omitempty"`
+	PlanType                    *PlanTypeEnum `json:"planType,omitempty"`
+	UsesCodexManagedCredentials *bool         `json:"usesCodexManagedCredentials,omitempty"`
 }
 
 type InitializeParams struct {
@@ -966,6 +1035,10 @@ type TerminalInteractionNotification struct {
 	TurnID    string `json:"turnId"`
 }
 
+type ThreadCompactStartParams struct {
+	ThreadID string `json:"threadId"`
+}
+
 // There are two ways to fork a thread: 1. By thread_id: load the thread from disk by
 // thread_id and fork it into a new thread. 2. By path: load the thread from disk by path
 // and fork it into a new thread.
@@ -990,11 +1063,11 @@ type ThreadForkParams struct {
 	// cannot be in progress.
 	LastTurnID *string `json:"lastTurnId,omitempty"`
 	// Configuration overrides for the forked thread, if any.
-	Model         *string      `json:"model,omitempty"`
-	ModelProvider *string      `json:"modelProvider,omitempty"`
-	Sandbox       *SandboxEnum `json:"sandbox,omitempty"`
-	ServiceTier   *string      `json:"serviceTier,omitempty"`
-	ThreadID      string       `json:"threadId"`
+	Model         *string                  `json:"model,omitempty"`
+	ModelProvider *string                  `json:"modelProvider,omitempty"`
+	Sandbox       *SandboxEnum             `json:"sandbox,omitempty"`
+	ServiceTier   OptionalNullable[string] `json:"serviceTier,omitzero"`
+	ThreadID      string                   `json:"threadId"`
 	// Optional client-supplied analytics source classification for this forked thread.
 	ThreadSource *string `json:"threadSource,omitempty"`
 }
@@ -1011,9 +1084,9 @@ type ThreadForkResponse struct {
 	ReasoningEffort    *string  `json:"reasoningEffort,omitempty"`
 	// Legacy sandbox policy retained for compatibility. Experimental clients should prefer
 	// `activePermissionProfile` for profile provenance.
-	Sandbox     SandboxClass `json:"sandbox"`
-	ServiceTier *string      `json:"serviceTier,omitempty"`
-	Thread      Thread       `json:"thread"`
+	Sandbox     SandboxClass             `json:"sandbox"`
+	ServiceTier OptionalNullable[string] `json:"serviceTier,omitzero"`
+	Thread      Thread                   `json:"thread"`
 }
 
 // Legacy sandbox policy retained for compatibility. Experimental clients should prefer
@@ -1174,12 +1247,12 @@ type ThreadResumeParams struct {
 	Cwd                   *string                    `json:"cwd,omitempty"`
 	DeveloperInstructions *string                    `json:"developerInstructions,omitempty"`
 	// Configuration overrides for the resumed thread, if any.
-	Model         *string          `json:"model,omitempty"`
-	ModelProvider *string          `json:"modelProvider,omitempty"`
-	Personality   *PersonalityEnum `json:"personality,omitempty"`
-	Sandbox       *SandboxEnum     `json:"sandbox,omitempty"`
-	ServiceTier   *string          `json:"serviceTier,omitempty"`
-	ThreadID      string           `json:"threadId"`
+	Model         *string                  `json:"model,omitempty"`
+	ModelProvider *string                  `json:"modelProvider,omitempty"`
+	Personality   *PersonalityEnum         `json:"personality,omitempty"`
+	Sandbox       *SandboxEnum             `json:"sandbox,omitempty"`
+	ServiceTier   OptionalNullable[string] `json:"serviceTier,omitzero"`
+	ThreadID      string                   `json:"threadId"`
 }
 
 type ThreadResumeResponse struct {
@@ -1194,9 +1267,9 @@ type ThreadResumeResponse struct {
 	ReasoningEffort    *string  `json:"reasoningEffort,omitempty"`
 	// Legacy sandbox policy retained for compatibility. Experimental clients should prefer
 	// `activePermissionProfile` for profile provenance.
-	Sandbox     SandboxClass `json:"sandbox"`
-	ServiceTier *string      `json:"serviceTier,omitempty"`
-	Thread      Thread       `json:"thread"`
+	Sandbox     SandboxClass             `json:"sandbox"`
+	ServiceTier OptionalNullable[string] `json:"serviceTier,omitzero"`
+	Thread      Thread                   `json:"thread"`
 }
 
 type ThreadStartParams struct {
@@ -1214,7 +1287,7 @@ type ThreadStartParams struct {
 	Personality           *PersonalityEnum           `json:"personality,omitempty"`
 	Sandbox               *SandboxEnum               `json:"sandbox,omitempty"`
 	ServiceName           *string                    `json:"serviceName,omitempty"`
-	ServiceTier           *string                    `json:"serviceTier,omitempty"`
+	ServiceTier           OptionalNullable[string]   `json:"serviceTier,omitzero"`
 	SessionStartSource    *SessionStartSourceEnum    `json:"sessionStartSource,omitempty"`
 	// Optional client-supplied analytics source classification for this thread.
 	ThreadSource *string `json:"threadSource,omitempty"`
@@ -1232,9 +1305,9 @@ type ThreadStartResponse struct {
 	ReasoningEffort    *string  `json:"reasoningEffort,omitempty"`
 	// Legacy sandbox policy retained for compatibility. Experimental clients should prefer
 	// `activePermissionProfile` for profile provenance.
-	Sandbox     SandboxClass `json:"sandbox"`
-	ServiceTier *string      `json:"serviceTier,omitempty"`
-	Thread      Thread       `json:"thread"`
+	Sandbox     SandboxClass             `json:"sandbox"`
+	ServiceTier OptionalNullable[string] `json:"serviceTier,omitzero"`
+	Thread      Thread                   `json:"thread"`
 }
 
 type ThreadTokenUsageUpdatedNotification struct {
@@ -1353,7 +1426,7 @@ type TurnStartParams struct {
 	// Override the sandbox policy for this turn and subsequent turns.
 	SandboxPolicy *SandboxPolicy `json:"sandboxPolicy,omitempty"`
 	// Override the service tier for this turn and subsequent turns.
-	ServiceTier *string `json:"serviceTier,omitempty"`
+	ServiceTier OptionalNullable[string] `json:"serviceTier,omitzero"`
 	// Override the reasoning summary for this turn and subsequent turns.
 	Summary  *SummaryEnum `json:"summary,omitempty"`
 	ThreadID string       `json:"threadId"`
@@ -1594,24 +1667,50 @@ const (
 	Update PatchChangeKindType = "update"
 )
 
-type PlanType string
+type ResetType string
 
 const (
-	Business                    PlanType = "business"
-	Edu                         PlanType = "edu"
-	Ent26                       PlanType = "ent26"
-	Enterprise                  PlanType = "enterprise"
-	EnterpriseCbpAutomation     PlanType = "enterprise_cbp_automation"
-	EnterpriseCbpUsageBased     PlanType = "enterprise_cbp_usage_based"
-	Free                        PlanType = "free"
-	Go                          PlanType = "go"
-	PlanTypeUnknown             PlanType = "unknown"
-	Plus                        PlanType = "plus"
-	Pro                         PlanType = "pro"
-	Prolite                     PlanType = "prolite"
-	SelfServeBusinessProlite    PlanType = "self_serve_business_prolite"
-	SelfServeBusinessUsageBased PlanType = "self_serve_business_usage_based"
-	Team                        PlanType = "team"
+	CodexRateLimits  ResetType = "codexRateLimits"
+	ResetTypeUnknown ResetType = "unknown"
+)
+
+type CreditStatus string
+
+const (
+	Available     CreditStatus = "available"
+	Redeemed      CreditStatus = "redeemed"
+	Redeeming     CreditStatus = "redeeming"
+	StatusUnknown CreditStatus = "unknown"
+)
+
+type PlanTypeEnum string
+
+const (
+	Business                             PlanTypeEnum = "business"
+	CodexAppServerProtocolSchemasUnknown PlanTypeEnum = "unknown"
+	Edu                                  PlanTypeEnum = "edu"
+	Ent26                                PlanTypeEnum = "ent26"
+	Enterprise                           PlanTypeEnum = "enterprise"
+	EnterpriseCbpAutomation              PlanTypeEnum = "enterprise_cbp_automation"
+	EnterpriseCbpUsageBased              PlanTypeEnum = "enterprise_cbp_usage_based"
+	Free                                 PlanTypeEnum = "free"
+	Go                                   PlanTypeEnum = "go"
+	Plus                                 PlanTypeEnum = "plus"
+	Pro                                  PlanTypeEnum = "pro"
+	Prolite                              PlanTypeEnum = "prolite"
+	SelfServeBusinessProlite             PlanTypeEnum = "self_serve_business_prolite"
+	SelfServeBusinessUsageBased          PlanTypeEnum = "self_serve_business_usage_based"
+	Team                                 PlanTypeEnum = "team"
+)
+
+type RateLimitReachedTypeEnum string
+
+const (
+	RateLimitReached                 RateLimitReachedTypeEnum = "rate_limit_reached"
+	WorkspaceMemberCreditsDepleted   RateLimitReachedTypeEnum = "workspace_member_credits_depleted"
+	WorkspaceMemberUsageLimitReached RateLimitReachedTypeEnum = "workspace_member_usage_limit_reached"
+	WorkspaceOwnerCreditsDepleted    RateLimitReachedTypeEnum = "workspace_owner_credits_depleted"
+	WorkspaceOwnerUsageLimitReached  RateLimitReachedTypeEnum = "workspace_owner_usage_limit_reached"
 )
 
 type AccountType string
@@ -1875,11 +1974,11 @@ const (
 type SourceEnum string
 
 const (
-	AppServer                            SourceEnum = "appServer"
-	CLI                                  SourceEnum = "cli"
-	CodexAppServerProtocolSchemasUnknown SourceEnum = "unknown"
-	Exec                                 SourceEnum = "exec"
-	Vscode                               SourceEnum = "vscode"
+	AppServer     SourceEnum = "appServer"
+	CLI           SourceEnum = "cli"
+	Exec          SourceEnum = "exec"
+	PurpleUnknown SourceEnum = "unknown"
+	Vscode        SourceEnum = "vscode"
 )
 
 type ActiveFlagElement string

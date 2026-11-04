@@ -13,6 +13,7 @@ var ErrInvalidEnvelope = errors.New("invalid Codex protocol envelope")
 const (
 	MethodInitialize                      = "initialize"
 	MethodThreadStart                     = "thread/start"
+	MethodThreadCompactStart              = "thread/compact/start"
 	MethodThreadResume                    = "thread/resume"
 	MethodThreadFork                      = "thread/fork"
 	MethodThreadRead                      = "thread/read"
@@ -25,6 +26,7 @@ const (
 	MethodSkillsExtraRootsSet             = "skills/extraRoots/set"
 	MethodSkillsList                      = "skills/list"
 	MethodAccountRead                     = "account/read"
+	MethodAccountRateLimitsRead           = "account/rateLimits/read"
 	MethodAccountLoginStart               = "account/login/start"
 	MethodAccountLoginCancel              = "account/login/cancel"
 	MethodAccountLogout                   = "account/logout"
@@ -132,6 +134,17 @@ type InitializeRequest struct {
 // NewInitializeRequest 创建 initialize 请求。
 func NewInitializeRequest(id RequestID, params InitializeParams) InitializeRequest {
 	return InitializeRequest{newClientRequest(id, MethodInitialize, params)}
+}
+
+// ThreadCompactStartRequest binds the native compact method to its parameters.
+type ThreadCompactStartRequest struct {
+	// clientRequestEnvelope keeps the method and parameters coupled.
+	clientRequestEnvelope[ThreadCompactStartParams]
+}
+
+// NewThreadCompactStartRequest constructs the native compact request.
+func NewThreadCompactStartRequest(id RequestID, params ThreadCompactStartParams) ThreadCompactStartRequest {
+	return ThreadCompactStartRequest{newClientRequest(id, MethodThreadCompactStart, params)}
 }
 
 // ThreadStartRequest 表示固定 method 为 thread/start 的请求。
@@ -282,6 +295,17 @@ func NewAccountReadRequest(id RequestID, params GetAccountParams) AccountReadReq
 	return AccountReadRequest{newClientRequest(id, MethodAccountRead, params)}
 }
 
+// AccountRateLimitsReadRequest carries the parameterless native quota request.
+type AccountRateLimitsReadRequest struct {
+	// clientRequestEnvelope owns the fixed method and absent parameters.
+	clientRequestEnvelope[struct{}]
+}
+
+// NewAccountRateLimitsReadRequest creates a parameterless quota request.
+func NewAccountRateLimitsReadRequest(id RequestID) AccountRateLimitsReadRequest {
+	return AccountRateLimitsReadRequest{newClientRequestWithoutParams[struct{}](id, MethodAccountRateLimitsRead)}
+}
+
 // AccountLoginStartRequest 表示固定 method 为 account/login/start 的请求。
 type AccountLoginStartRequest struct {
 	// clientRequestEnvelope 提供固定方法和 LoginAccountParams 的耦合。
@@ -335,6 +359,9 @@ func DecodeClientRequest(data []byte) (ClientRequest, error) {
 	case MethodInitialize:
 		request, err := decodeClientRequest[InitializeParams](wire, true)
 		return clientRequestResult(&InitializeRequest{request}, err)
+	case MethodThreadCompactStart:
+		request, err := decodeClientRequest[ThreadCompactStartParams](wire, true)
+		return clientRequestResult(&ThreadCompactStartRequest{request}, err)
 	case MethodThreadStart:
 		request, err := decodeClientRequest[ThreadStartParams](wire, true)
 		return clientRequestResult(&ThreadStartRequest{request}, err)
@@ -374,6 +401,9 @@ func DecodeClientRequest(data []byte) (ClientRequest, error) {
 	case MethodAccountRead:
 		request, err := decodeClientRequest[GetAccountParams](wire, true)
 		return clientRequestResult(&AccountReadRequest{request}, err)
+	case MethodAccountRateLimitsRead:
+		request, err := decodeClientRequest[struct{}](wire, false)
+		return clientRequestResult(&AccountRateLimitsReadRequest{request}, err)
 	case MethodAccountLoginStart:
 		request, err := decodeClientRequest[LoginAccountParams](wire, true)
 		return clientRequestResult(&AccountLoginStartRequest{request}, err)

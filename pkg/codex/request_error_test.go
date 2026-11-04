@@ -68,3 +68,18 @@ func TestCodexProviderErrorContract(t *testing.T) {
 		t.Fatal("无诊断错误没有兜底说明")
 	}
 }
+
+// TestSessionMissingRequiresMatchingResourceIdentity prevents unrelated errors from triggering recovery.
+func TestSessionMissingRequiresMatchingResourceIdentity(t *testing.T) {
+	for _, native := range []*rpcError{
+		{Code: -32002, Message: "resource not found", Data: json.RawMessage(`{"resource":"model","id":"abc"}`)},
+		{Code: -32600, Message: "no rollout found for thread id another"},
+		{Code: -32600, Message: "no rollout found for thread id abc-extra"},
+		{Code: -32600, Message: "no rollout found for thread id ABC"},
+		{Code: -32002, Message: "resource not found", Data: json.RawMessage(`{"resource":"session","id":"other","sessionId":"abc"}`)},
+	} {
+		if got := mapCodexSessionOpenError("abc", native); got != native {
+			t.Fatalf("unrelated error rewritten: %v", got)
+		}
+	}
+}

@@ -215,9 +215,14 @@ func TestRunProductionCompositionSessionFlow(t *testing.T) {
 		len(initialized.AuthMethods) != wantAuthMethods {
 		t.Fatalf("认证能力为 %#v，methods=%#v", initialized.AgentCapabilities.Auth, initialized.AuthMethods)
 	}
-	steering, ok := initialized.Meta["steering"].(map[string]any)
-	if !ok || len(initialized.Meta) != 2 || steering["supported"] != true {
-		t.Fatalf("initialize meta 为 %#v，期望 steering.supported=true 及版本限定的 fork 能力", initialized.Meta)
+	steering, _ := initialized.Meta["steering"].(map[string]any)
+	fork, _ := initialized.Meta["fork"].(map[string]any)
+	instructions, _ := initialized.Meta["developerInstructions"].(map[string]any)
+	management, _ := initialized.Meta["native_management"].(map[string]any)
+	if steering["supported"] != true || fork["mode"] != "unsupported" ||
+		instructions["new"] != true || instructions["resume"] != true || instructions["fork"] != false ||
+		management["account_usage"] != true || management["compact"] != true {
+		t.Fatalf("unexpected Codex initialize capabilities: %#v", initialized.Meta)
 	}
 
 	if _, err = connection.Authenticate(ctx, acp.AuthenticateRequest{

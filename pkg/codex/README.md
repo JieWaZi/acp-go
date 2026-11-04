@@ -24,21 +24,30 @@
 支持的主要能力：
 
 - API Key、ChatGPT 浏览器登录和登出。
-- New、Load、Resume、Close Session 与历史回放。
+- New、Load、Resume、Close Session 与历史回放；经过版本验证的 fork 支持原生 turn 边界。
 - 多轮 Prompt、Text、Image、Embedded Resource 和 Resource Link。
-- Prompt cancel/interrupt 与 `_session/steering`。
+- Prompt cancel/interrupt、`_session/steering` 与 `_session/compact`。
 - Command、Web Search、Image View、MCP Tool、Plan、Reasoning 和 Usage 更新。
 - File Change 的 add、delete、update 和 move 标准 ACP diff；`turn/diff/updated` 作为已知聚合通知识别，不重复生成工具调用。
 - PromptResponse 级 Input/Cache/Output/Thought/Total Usage。
 - additional directories、trusted projects、workspace-write roots 与工作区 Skill 刷新。
 - stdio、Streamable HTTP MCP Server，以及 Form/URL Elicitation。
-- Model、Reasoning Effort 和 `read-only`、`agent`、`agent-full-access` 模式。
+- Model、Reasoning Effort、原生 Service Tier 和 `read-only`、`agent`、`agent-full-access` 模式。
 
 不支持的主要能力：
 
-- `session/list`、fork、archive、delete、rename 和 rollback。
+- `session/list`、archive、delete、rename 和 rollback。
 - Audio、Review、Goal、Realtime、动态客户端工具及生态管理接口。
 - SSE 与 MCP-over-ACP transport。
+
+## 原生管理与配置合同
+
+- `acpmeta.DeveloperInstructionsMetadata` 用于 new、load、resume 和支持的 fork：nil 保持原配置，空字符串显式清除；初始化元数据说明实际支持的入口。该内容只在打开会话时设置，不在每轮重复。
+- 模型参数通过 `acpmeta.ReadModelConfigCatalog` 读取。逐项未知的参数列在 `unknown_config_ids`，与其他已知选项并存。只有全部参数已知时，旧入口 `acpmeta.ModelConfigOptions` 才返回目录。service tier 使用原生 ID，`inherit` 省略字段，`off` 发送 null。原生 thread 回执报告的 tier 与本地请求分别保存。显式空的新版档位列表优先于旧格式。
+- `_account/read` 不启动 Prompt，返回 `acpmeta.AccountInfo`；API key 不推导套餐或账号标识。`_account/usage` 返回 `acpmeta.AccountUsage`，各桶窗口使用浮点百分比、持续时间秒与 Unix 重置秒；nil 表示未知，空列表表示已知空。
+- `_session/compact` 接受 `{"session_id":"..."}`，响应包含原生 `turn_id` 和 `status`。原生 ACK 不包含 turn 身份；Adapter 等待 turn started 和相同 turn 的完成通知，并在此期间占用该 session 的活动槽位。已完成的近期 turn ID 在同一连接内去重。已观察到的压缩消费附在压缩结果或错误中。不确定结果不会自动重试。
+
+上述合同基于已提交的 app-server schema 和合成 RPC 回归；真实 CLI、账号与模型验收另行执行。公开 stderr 日志与退出错误只提供固定脱敏标记、存在性、截断和退出状态，不回显进程原文。
 
 ## 调用链
 
@@ -99,12 +108,12 @@ agent, err := codex.NewAgent(ctx, codex.Config{
 | 路径 | 职责 |
 | --- | --- |
 | `agent.go` | ACP 入口、依赖装配与 Session 生命周期 |
-| `appserver_client.go` | typed 请求、通知与 Turn 完成关联 |
-| `appserver_transport.go` | 有界 NDJSON 读写、请求关联与反向请求 |
-| `session.go`、`prompt.go`、`steering.go` | Session generation、Prompt 与 steering 状态机 |
+| `app_server_client.go` | typed 请求、通知与 Turn 完成关联 |
+| `app_server_transport.go` | 有界 NDJSON 读写、请求关联与反向请求 |
+| `session.go`、`turn.go`、`steering.go` | Session generation、Prompt 与 steering 状态机 |
 | `event_handler.go`、`tool_mapper.go`、`file_diff.go` | 消息、工具、文件 diff、计划和 Usage 映射 |
 | `approval.go`、`elicitation.go` | 权限与用户交互 |
-| `auth.go`、`config.go`、`mcp_config.go` | 认证、Session 配置与 MCP 转换 |
+| `auth.go`、`session_configuration.go`、`mcp_config.go` | 认证、Session 配置与 MCP 转换 |
 | [`protocol`](protocol) | Schema、生成 DTO、Envelope 与生成入口 |
 | [`UPSTREAM.md`](UPSTREAM.md) | 固定版本、追溯映射、差异与升级流程 |
 

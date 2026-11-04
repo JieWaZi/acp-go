@@ -29,6 +29,9 @@ func TestForkUsesNativeTurnBoundaryAndColdReceipt(t *testing.T) {
 			if err := json.Unmarshal(raw, &wire); err != nil {
 				return err
 			}
+			if wire.Params.DeveloperInstructions == nil || *wire.Params.DeveloperInstructions != "" {
+				return fmt.Errorf("explicit empty instructions lost: %s", raw)
+			}
 			if wire.Params.ThreadID != "parent" || wire.Params.LastTurnID == nil || *wire.Params.LastTurnID != "turn-before" || wire.Params.Cwd == nil || *wire.Params.Cwd != cwd {
 				return fmt.Errorf("wrong fork request: %s", raw)
 			}
@@ -43,6 +46,7 @@ func TestForkUsesNativeTurnBoundaryAndColdReceipt(t *testing.T) {
 	agent := newRuntimeTestAgent(t, rpc)
 	request := acp.UnstableForkSessionRequest{SessionId: "parent", Cwd: cwd, Meta: acpmeta.PositionMetadata("turn-before")}
 	request.Meta["forkReceiptDirectory"] = t.TempDir()
+	request.Meta["developerInstructions"] = ""
 	response, err := agent.UnstableForkSession(context.Background(), request)
 	if err != nil || response.SessionId != "child" {
 		t.Fatalf("%+v %v", response, err)

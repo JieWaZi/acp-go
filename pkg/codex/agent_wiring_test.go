@@ -282,7 +282,7 @@ func TestAgentSessionConfigurationFlowsIntoTurnStart(t *testing.T) {
 		t.Fatalf("Prompt Usage = %#v", response.Usage)
 	}
 	if turnParams.Model == nil || *turnParams.Model != "slow-model" ||
-		turnParams.Effort == nil || *turnParams.Effort != "medium" ||
+		turnParams.Effort != nil ||
 		turnParams.ApprovalPolicy == nil || turnParams.ApprovalPolicy.Enum == nil ||
 		*turnParams.ApprovalPolicy.Enum != protocol.Never ||
 		turnParams.SandboxPolicy == nil || turnParams.SandboxPolicy.Type != protocol.SandboxPolicyTypeDangerFullAccess {

@@ -47,8 +47,10 @@ func TestAgentInitializeAdvertisesRuntimeCapabilities(t *testing.T) {
 		t.Fatalf("认证方法为 %#v，期望仅 API Key 与 ChatGPT", response.AuthMethods)
 	}
 	wantMeta := map[string]any{
-		"steering": map[string]any{"supported": true},
-		"fork":     map[string]any{"mode": "unsupported"},
+		"developerInstructions": map[string]any{"metadataKey": "developerInstructions", "new": true, "resume": true, "load": true, "fork": false},
+		"steering":              map[string]any{"supported": true},
+		"native_management":     map[string]any{"account_read": true, "account_usage": true, "compact": true, "schema_version": "0.148.0", "provider_support": "unknown"},
+		"fork":                  map[string]any{"mode": "unsupported"},
 	}
 	if !reflect.DeepEqual(response.Meta, wantMeta) {
 		t.Fatalf("initialize meta 为 %#v，期望 %#v", response.Meta, wantMeta)

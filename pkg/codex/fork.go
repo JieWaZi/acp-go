@@ -22,6 +22,10 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 	if err := a.checkAuthorization(ctx); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
+	instructions, err := acpmeta.DeveloperInstructions(request.Meta)
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
+	}
 	workspace, err := normalizeCodexWorkspace(request.Cwd, request.AdditionalDirectories)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{"error": err.Error()})
@@ -42,10 +46,11 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 	}
 	mcpAfterVersion := a.currentMCPStatusVersion()
 	response, err := a.client.ThreadFork(ctx, protocol.ThreadForkParams{
-		ThreadID:   string(request.SessionId),
-		LastTurnID: optionalForkPosition(request.Meta),
-		Cwd:        &workspace.CWD,
-		Config:     config,
+		ThreadID:              string(request.SessionId),
+		LastTurnID:            optionalForkPosition(request.Meta),
+		DeveloperInstructions: instructions,
+		Cwd:                   &workspace.CWD,
+		Config:                config,
 	})
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, fmt.Errorf("starting codex thread: %w", err)
@@ -67,6 +72,7 @@ func (a *Agent) UnstableForkSession(ctx context.Context, request acp.UnstableFor
 			errors.Join(err, unsubscribeErr),
 		)
 	}
+	configuration.observedServiceTier = response.ServiceTier
 	generation, err := a.sessions.beginOpen(response.Thread.ID)
 	if err != nil {
 		cleanupCtx, cancelCleanup := newAppServerCleanupContext(ctx)

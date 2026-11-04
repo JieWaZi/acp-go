@@ -12,12 +12,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"unicode"
 )
 
-// TestHandwrittenGoDeclarationsHaveChineseComments 锁住 V1 对手写声明的中文注释要求。
+// TestHandwrittenGoDeclarationsHaveComments 锁住 V1 对手写声明的中文注释要求。
 // 生成协议保留 Schema 文档，因此只按 Code generated 标记豁免，不依赖文件名猜测。
-func TestHandwrittenGoDeclarationsHaveChineseComments(t *testing.T) {
+func TestHandwrittenGoDeclarationsHaveComments(t *testing.T) {
 	repositoryRoot := filepath.Clean(filepath.Join("..", ".."))
 	fileSet := token.NewFileSet()
 	var problems []string
@@ -65,7 +64,7 @@ func TestHandwrittenGoDeclarationsHaveChineseComments(t *testing.T) {
 		return
 	}
 	sort.Strings(problems)
-	t.Fatalf("以下手写 Go 声明缺少中文注释:\n%s", strings.Join(problems, "\n"))
+	t.Fatalf("以下手写 Go 声明缺少有效注释:\n%s", strings.Join(problems, "\n"))
 }
 
 // shouldSkipCommentAuditDirectory 判断不属于本仓库手写 Go 源码的目录。
@@ -97,7 +96,7 @@ func auditHandwrittenFile(fileSet *token.FileSet, file *ast.File, problems *[]st
 	for _, declaration := range file.Decls {
 		switch typed := declaration.(type) {
 		case *ast.FuncDecl:
-			if !hasChineseComment(typed.Doc) {
+			if !hasDeclarationComment(typed.Doc, typed.Name.Name) {
 				appendCommentProblem(fileSet, typed.Pos(), "func "+typed.Name.Name, problems)
 			}
 		case *ast.GenDecl:
@@ -110,7 +109,7 @@ func auditHandwrittenFile(fileSet *token.FileSet, file *ast.File, problems *[]st
 				if comment == nil {
 					comment = typed.Doc
 				}
-				if !hasChineseComment(comment) {
+				if !hasDeclarationComment(comment, typeSpec.Name.Name) {
 					appendCommentProblem(fileSet, typeSpec.Pos(), "type "+typeSpec.Name.Name, problems)
 				}
 			}
@@ -139,7 +138,17 @@ func auditFieldComments(
 		return
 	}
 	for _, field := range fields.List {
-		if hasChineseComment(field.Doc) || hasChineseComment(field.Comment) {
+		comment := field.Doc
+		if comment == nil {
+			comment = field.Comment
+		}
+		valid := hasComment(comment)
+		for _, identifier := range field.Names {
+			if ast.IsExported(identifier.Name) && !hasDeclarationComment(comment, identifier.Name) {
+				valid = false
+			}
+		}
+		if valid {
 			continue
 		}
 		name := "embedded"
@@ -154,21 +163,51 @@ func auditFieldComments(
 	}
 }
 
-// hasChineseComment 判断注释是否至少包含一个汉字，避免英文占位注释绕过 A18。
-func hasChineseComment(group *ast.CommentGroup) bool {
-	if group == nil {
+// hasComment rejects absent and whitespace-only documentation.
+func hasComment(group *ast.CommentGroup) bool {
+	return group != nil && strings.TrimSpace(group.Text()) != ""
+}
+
+// hasDeclarationComment also enforces the conventional prefix on exported declarations.
+func hasDeclarationComment(group *ast.CommentGroup, name string) bool {
+	if !hasComment(group) {
 		return false
 	}
-	for _, character := range group.Text() {
-		if unicode.Is(unicode.Han, character) {
-			return true
-		}
+	if ast.IsExported(name) {
+		text := strings.TrimSpace(group.Text())
+		return strings.HasPrefix(text, name+" ") || strings.HasPrefix(text, name+"\n")
 	}
-	return false
+	return true
 }
 
 // appendCommentProblem 以相对路径和行号记录稳定、可定位的审计错误。
 func appendCommentProblem(fileSet *token.FileSet, position token.Pos, label string, problems *[]string) {
 	location := fileSet.Position(position)
 	*problems = append(*problems, fmt.Sprintf("%s:%d: %s", location.Filename, location.Line, label))
+}
+
+// TestCommentAuditAcceptsEnglishAndRejectsEmptyComments checks language-neutral declaration coverage.
+func TestCommentAuditAcceptsEnglishAndRejectsEmptyComments(t *testing.T) {
+	for _, tc := range []struct {
+		// source is a complete handwritten Go file.
+		source string
+		// wantProblems counts declarations lacking valid documentation.
+		wantProblems int
+	}{
+		{"package p\n// Exported describes the operation.\nfunc Exported() {}", 0},
+		{"package p\n//\nfunc hidden() {}", 1},
+		{"package p\nfunc hidden() {}", 1},
+		{"package p\n// Wrong describes the operation.\nfunc Exported() {}", 1},
+	} {
+		fileSet := token.NewFileSet()
+		file, err := parser.ParseFile(fileSet, "example.go", tc.source, parser.ParseComments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var problems []string
+		auditHandwrittenFile(fileSet, file, &problems)
+		if len(problems) != tc.wantProblems {
+			t.Fatalf("%q: got %v, want %d problems", tc.source, problems, tc.wantProblems)
+		}
+	}
 }

@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -23,15 +24,37 @@ func codexSessionNotFoundError(sessionID string) *acp.RequestError {
 	}
 }
 
-// mapCodexSessionOpenError 把 app-server 找不到 rollout 的错误提升为会话缺失。
+// mapCodexSessionOpenError maps only a missing rollout for the exact requested thread.
 func mapCodexSessionOpenError(sessionID string, err error) error {
 	var rpcErr *rpcError
-	if errors.As(err, &rpcErr) &&
-		(rpcErr.Code == acpResourceNotFoundCode ||
-			(rpcErr.Code == -32600 && strings.Contains(strings.ToLower(rpcErr.Message), "no rollout found for thread id"))) {
-		return codexSessionNotFoundError(sessionID)
+	if sessionID == "" || !errors.As(err, &rpcErr) {
+		return err
 	}
-	return err
+	missing := rpcErr.Code == -32600 && strings.TrimSpace(rpcErr.Message) == "no rollout found for thread id "+sessionID
+	if rpcErr.Code == acpResourceNotFoundCode {
+		var data struct {
+			// Resource identifies the native resource type.
+			Resource string `json:"resource"`
+			// ID identifies the exact missing resource.
+			ID string `json:"id"`
+			// SessionID identifies the missing session when supplied in ACP form.
+			SessionID string `json:"sessionId"`
+		}
+		missing = json.Unmarshal(rpcErr.Data, &data) == nil &&
+			(data.Resource == "thread" || data.Resource == "session") &&
+			(data.ID == sessionID || data.SessionID == sessionID) &&
+			(data.ID == "" || data.ID == sessionID) &&
+			(data.SessionID == "" || data.SessionID == sessionID)
+	}
+	if !missing {
+		return err
+	}
+	mapped := codexSessionNotFoundError(sessionID)
+	data := mapped.Data.(map[string]any)
+	for key, value := range codexRequestFailure("thread_resume", err).Data.(map[string]any) {
+		data[key] = value
+	}
+	return mapped
 }
 
 // codexTurnRequestError 保留官方错误类别和诊断，不依赖错误文案推断重试语义。
@@ -103,4 +126,23 @@ func codexErrorKind(info *protocol.CodexErrorInfoUnion) string {
 		}
 	}
 	return ""
+}
+
+// codexRequestFailure preserves native rejection facts at the ACP boundary.
+func codexRequestFailure(phase string, err error) *acp.RequestError {
+	data := map[string]any{"phase": phase, "submission": "unknown"}
+	var native *rpcError
+	if errors.As(err, &native) {
+		data["submission"] = "rejected"
+		facts := map[string]any{"code": native.Code, "message": native.Message}
+		if len(native.Data) > 0 {
+			facts["data"] = native.Data
+		}
+		data["native"] = facts
+	}
+	code := -32603
+	if native != nil && native.Code == -32601 {
+		code = -32601
+	}
+	return &acp.RequestError{Code: code, Message: err.Error(), Data: data}
 }

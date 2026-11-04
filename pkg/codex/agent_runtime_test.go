@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
@@ -304,6 +305,13 @@ func TestAgentCancelBeforeTurnStartInterruptsLateTurnOnce(t *testing.T) {
 	if response := <-promptResult; response.StopReason != acp.StopReasonCancelled {
 		t.Fatalf("取消 prompt 响应为 %#v", response)
 	}
+	compactCtx, stopCompact := context.WithTimeout(context.Background(), time.Second)
+	defer stopCompact()
+	_, err := agent.HandleExtensionMethod(compactCtx, acpmeta.CompactMethod, json.RawMessage(`{"session_id":"thread-1"}`))
+	if !errors.Is(err, ErrPromptActive) {
+		t.Fatalf("compact overlapped a prior unresolved turn/start: %v", err)
+	}
+
 	select {
 	case <-interruptCalled:
 		t.Fatal("turn/start 返回前不应发送 interrupt")
@@ -1217,5 +1225,733 @@ func TestAgentApprovalFailsClosedWhenTurnGenerationChanges(t *testing.T) {
 	}
 	if response := <-secondResponse; response.StopReason != acp.StopReasonEndTurn {
 		t.Fatalf("第二轮 prompt 响应为 %#v", response)
+	}
+}
+
+// TestSessionDeveloperInstructions preserves omitted and explicitly empty instructions on native open.
+func TestSessionDeveloperInstructions(t *testing.T) {
+	for _, value := range []*string{nil, new(string), stringPointer("project guidance")} {
+		for _, resume := range []bool{false, true} {
+			rpc := newFakeAppServerRPC()
+			var got *string
+			rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+				switch request.Method() {
+				case protocol.MethodInitialize:
+				case protocol.MethodThreadStart:
+					got = request.(protocol.ThreadStartRequest).Params.DeveloperInstructions
+					result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+				case protocol.MethodThreadResume:
+					got = request.(protocol.ThreadResumeRequest).Params.DeveloperInstructions
+					result.(*protocol.ThreadResumeResponse).Thread.ID = "thread"
+				default:
+					return errors.New("unexpected call: " + request.Method())
+				}
+				return nil
+			}
+			agent := newRuntimeTestAgent(t, rpc)
+			var meta map[string]any
+			if value != nil {
+				meta = map[string]any{"developerInstructions": *value}
+			}
+			var err error
+			if resume {
+				_, err = agent.ResumeSession(context.Background(), acp.ResumeSessionRequest{Cwd: t.TempDir(), SessionId: "thread", Meta: meta})
+			} else {
+				_, err = agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir(), Meta: meta})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got == nil) != (value == nil) || (got != nil && *got != *value) {
+				t.Fatalf("instructions = %v, want %v", got, value)
+			}
+		}
+	}
+}
+
+// TestAccountUsageReadsAllNativeBucketsWithoutPrompt checks normalized units and zero presence.
+func TestAccountUsageReadsAllNativeBucketsWithoutPrompt(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case "account/rateLimits/read":
+			return json.Unmarshal([]byte(`{"rateLimits":{},"rateLimitsByLimitId":{"a":{"limitName":"A","primary":{"usedPercent":0,"windowDurationMins":60,"resetsAt":1700000000}},"b":{"secondary":{"usedPercent":40}}}}`), result)
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	result, err := agent.HandleExtensionMethod(context.Background(), "_account/usage", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		// Buckets are independently metered quotas.
+		Buckets []struct {
+			// ID identifies one native quota bucket.
+			ID string `json:"id"`
+			// Windows contain all observed windows.
+			Windows []struct {
+				// UsedPercent includes zero and remains absent when unknown.
+				UsedPercent *int64 `json:"used_percent"`
+				// DurationSeconds uses standardized seconds.
+				DurationSeconds *int64 `json:"duration_seconds"`
+				// ResetAtUnixSeconds uses Unix seconds.
+				ResetAtUnixSeconds *int64 `json:"reset_at_unix_seconds"`
+			} `json:"windows"`
+		} `json:"buckets"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Buckets) != 2 {
+		t.Fatalf("buckets = %s", raw)
+	}
+	byID := map[string]int{}
+	for i, b := range got.Buckets {
+		byID[b.ID] = i
+	}
+	a := got.Buckets[byID["a"]]
+	if len(a.Windows) != 1 || a.Windows[0].UsedPercent == nil || *a.Windows[0].UsedPercent != 0 || a.Windows[0].DurationSeconds == nil || *a.Windows[0].DurationSeconds != 3600 || a.Windows[0].ResetAtUnixSeconds == nil || *a.Windows[0].ResetAtUnixSeconds != 1700000000 {
+		t.Fatalf("bucket a = %s", raw)
+	}
+	b := got.Buckets[byID["b"]]
+	if len(b.Windows) != 1 || b.Windows[0].UsedPercent == nil || *b.Windows[0].UsedPercent != 40 || b.Windows[0].DurationSeconds != nil {
+		t.Fatalf("bucket b = %s", raw)
+	}
+}
+
+// TestTierObservationDoesNotChangeRequestedSelection checks native response and local ACK authority.
+func TestTierObservationDoesNotChangeRequestedSelection(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "thread"
+			response.Model = "fast-model"
+			response.ServiceTier = protocol.NewOptionalValue("fast-native")
+		case protocol.MethodModelList:
+			models := testModels()
+			models[0].ServiceTiers = []protocol.ServiceTierElement{{ID: "fast-native", Name: "Fast"}}
+			result.(*protocol.ModelListResponse).Data = models
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent := newAgentWithClient(slog.New(slog.NewTextHandler(io.Discard, nil)), ctx, cancel, newAppServerClient(ctx, rpc))
+	agent.markConnectionReady()
+	if _, err := agent.Initialize(ctx, acp.InitializeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tier := selectOption(t, response.ConfigOptions, "service_tier")
+	if tier.CurrentValue != "inherit" || tier.Meta["observed_service_tier"] != "fast-native" {
+		t.Fatalf("tier = %#v", tier)
+	}
+	state, _ := agent.sessions.get("thread")
+	state.mu.Lock()
+	err = state.configuration.Select("service_tier", "off")
+	state.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, options := sessionConfigurationResponse(state)
+	tier = selectOption(t, options, "service_tier")
+	if tier.Meta["observed_service_tier"] != "fast-native" {
+		t.Fatalf("local ACK changed observation: %#v", tier.Meta)
+	}
+}
+
+// TestCompactPreservesNativeTurnWhenCompletionPrecedesAck checks the separate native turn identity.
+func TestCompactPreservesNativeTurnWhenCompletionPrecedesAck(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			agent.client.HandleNotification(context.Background(), decodeTestNotification(t, "turn/started", map[string]any{"threadId": "thread", "turn": map[string]any{"id": "compact-turn", "status": "inProgress", "items": []any{}}}))
+			agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "compact-turn", protocol.FluffyCompleted))
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := agent.HandleExtensionMethod(context.Background(), "_session/compact", json.RawMessage(`{"session_id":"thread"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err = json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["turn_id"] != "compact-turn" || wire["status"] != "completed" {
+		t.Fatalf("compact result: %s", raw)
+	}
+}
+
+// TestCompactHoldsSessionUntilNativeCompletion prevents a rival prompt after a bare ACK.
+func TestCompactHoldsSessionUntilNativeCompletion(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	entered := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			close(entered)
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := agent.HandleExtensionMethod(context.Background(), "_session/compact", json.RawMessage(`{"session_id":"thread"}`))
+		done <- err
+	}()
+	<-entered
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread", Prompt: []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}}})
+	if !errors.Is(err, ErrPromptActive) {
+		t.Fatalf("rival prompt: %v", err)
+	}
+	agent.client.HandleNotification(context.Background(), decodeTestNotification(t, "turn/started", map[string]any{"threadId": "thread", "turn": map[string]any{"id": "compact-turn", "status": "inProgress", "items": []any{}}}))
+	agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "compact-turn", protocol.FluffyCompleted))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("compact did not complete")
+	}
+}
+
+// TestResumeRejectsMismatchedNativeIdentity prevents a different thread being installed as the requested session.
+func TestResumeRejectsMismatchedNativeIdentity(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadResume:
+			result.(*protocol.ThreadResumeResponse).Thread.ID = "different"
+		case protocol.MethodThreadUnsubscribe:
+			return nil
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	_, err := agent.ResumeSession(context.Background(), acp.ResumeSessionRequest{Cwd: t.TempDir(), SessionId: "expected"})
+	if err == nil {
+		t.Fatal("mismatched native thread accepted")
+	}
+	if _, ok := agent.sessions.get("expected"); ok {
+		t.Fatal("mismatched thread installed")
+	}
+}
+
+// TestCompactTerminalOutranksLateRequestError protects the observed native outcome.
+func TestCompactTerminalOutranksLateRequestError(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			agent.client.HandleNotification(context.Background(), decodeTestNotification(t, "turn/started", map[string]any{"threadId": "thread", "turn": map[string]any{"id": "compact-turn", "status": "inProgress", "items": []any{}}}))
+			agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "compact-turn", protocol.FluffyCompleted))
+			return errors.New("response lost")
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := agent.HandleExtensionMethod(context.Background(), "_session/compact", json.RawMessage(`{"session_id":"thread"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(result)
+	var wire map[string]any
+	_ = json.Unmarshal(raw, &wire)
+	if wire["turn_id"] != "compact-turn" || wire["status"] != "completed" {
+		t.Fatalf("compact result: %s", raw)
+	}
+}
+
+// TestEmptyModelCatalogDoesNotEraseObservedSession verifies that a successful empty list is not a transport failure.
+func TestEmptyModelCatalogDoesNotEraseObservedSession(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			response := result.(*protocol.ThreadStartResponse)
+			response.Thread.ID = "thread"
+			response.Model = "custom"
+		case protocol.MethodModelList:
+			result.(*protocol.ModelListResponse).Data = []protocol.ModelListResponseDatum{}
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent := newAgentWithClient(slog.New(slog.NewTextHandler(io.Discard, nil)), ctx, cancel, newAppServerClient(ctx, rpc))
+	agent.markConnectionReady()
+	if _, err := agent.Initialize(ctx, acp.InitializeRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := selectOption(t, response.ConfigOptions, modelConfigID)
+	if model.CurrentValue != "custom" {
+		t.Fatalf("observed model lost: %#v", model)
+	}
+}
+
+// TestPromptPreservesNativeRejectionFacts verifies the ACP boundary retains native error data.
+func TestPromptPreservesNativeRejectionFacts(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodTurnStart:
+			return &rpcError{Code: -32015, Message: "native rejected", Data: json.RawMessage(`{"reason":"limit","reset":0}`)}
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread", Prompt: []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}}})
+	var requestErr *acp.RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("no structured error: %v", err)
+	}
+	wire, marshalErr := json.Marshal(requestErr.Data)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	var data map[string]any
+	if err = json.Unmarshal(wire, &data); err != nil {
+		t.Fatal(err)
+	}
+	native, _ := data["native"].(map[string]any)
+	if data["phase"] != "turn_start" || data["submission"] != "rejected" || native["code"] != float64(-32015) {
+		t.Fatalf("native error data: %s", wire)
+	}
+	details, _ := native["data"].(map[string]any)
+	if details["reason"] != "limit" || details["reset"] != float64(0) {
+		t.Fatalf("native details: %s", wire)
+	}
+}
+
+// TestAccountReadDoesNotInventSubscriptionForAPIKey checks the management account facts.
+func TestAccountReadDoesNotInventSubscriptionForAPIKey(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case protocol.MethodAccountRead:
+			return json.Unmarshal([]byte(`{"account":{"type":"apiKey"},"requiresOpenaiAuth":false}`), result)
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	result, err := agent.HandleExtensionMethod(context.Background(), "_account/read", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err = json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	account, _ := wire["account"].(map[string]any)
+	if account["kind"] != "api_key" {
+		t.Fatalf("account: %s", raw)
+	}
+	if _, known := account["plan"]; known {
+		t.Fatalf("invented plan: %s", raw)
+	}
+}
+
+// TestAccountUsageRejectsDurationOverflow avoids publishing a wrapped reset window.
+func TestAccountUsageRejectsDurationOverflow(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+			return nil
+		case "account/rateLimits/read":
+			return json.Unmarshal([]byte(`{"rateLimits":{"primary":{"usedPercent":0,"windowDurationMins":9223372036854775807}}}`), result)
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.HandleExtensionMethod(context.Background(), "_account/usage", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("overflowed duration accepted")
+	}
+}
+
+// TestAccountUsagePreservesNativeError exposes quota read failures without inventing empty results.
+func TestAccountUsagePreservesNativeError(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if request.Method() == protocol.MethodInitialize {
+			return nil
+		}
+		if request.Method() == "account/rateLimits/read" {
+			return &rpcError{Code: -32005, Message: "unavailable", Data: json.RawMessage(`{"retry":false}`)}
+		}
+		return errors.New("unexpected call: " + request.Method())
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	_, err := agent.HandleExtensionMethod(context.Background(), "_account/usage", json.RawMessage(`{}`))
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("missing structured error: %v", err)
+	}
+	data, _ := failure.Data.(map[string]any)
+	if data["phase"] != "account_usage" || data["submission"] != "rejected" {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
+// TestAccountUsageKeepsUnknownAndKnownEmptyBucketsDistinct protects omitted quota observations.
+func TestAccountUsageKeepsUnknownAndKnownEmptyBucketsDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		// input is the native quota snapshot.
+		input string
+		// want is the normalized bucket JSON value.
+		want string
+	}{{`{}`, `null`}, {`{"rateLimits":{},"rateLimitsByLimitId":{}}`, `[]`}} {
+		rpc := newFakeAppServerRPC()
+		rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+			if request.Method() == protocol.MethodInitialize {
+				return nil
+			}
+			if request.Method() == "account/rateLimits/read" {
+				return json.Unmarshal([]byte(tc.input), result)
+			}
+			return errors.New("unexpected call: " + request.Method())
+		}
+		agent := newRuntimeTestAgent(t, rpc)
+		result, err := agent.HandleExtensionMethod(context.Background(), "_account/usage", json.RawMessage(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(result)
+		var wire map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &wire)
+		if string(wire["buckets"]) != tc.want {
+			t.Fatalf("input %s: got %s, want %s", tc.input, raw, tc.want)
+		}
+	}
+}
+
+// TestCompactCancelBeforeIdentityInterruptsLateNativeTurn retains the lane until real termination.
+func TestCompactCancelBeforeIdentityInterruptsLateNativeTurn(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	entered := make(chan struct{})
+	interrupted := make(chan protocol.TurnInterruptParams, 1)
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			close(entered)
+		case protocol.MethodTurnInterrupt:
+			interrupted <- request.(protocol.TurnInterruptRequest).Params
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := agent.HandleExtensionMethod(ctx, "_session/compact", json.RawMessage(`{"session_id":"thread"}`))
+		done <- err
+	}()
+	<-entered
+	cancel()
+	cancelErr := <-done
+	var failure *acp.RequestError
+	if !errors.As(cancelErr, &failure) || failure.Code != acp.NewRequestCancelled(nil).Code {
+		t.Fatalf("compact cancellation: %v", cancelErr)
+	}
+	_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread", Prompt: []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}}})
+	if !errors.Is(err, ErrPromptActive) {
+		t.Fatalf("lane released before native identity: %v", err)
+	}
+	agent.client.HandleNotification(context.Background(), decodeTestNotification(t, "turn/started", map[string]any{"threadId": "thread", "turn": map[string]any{"id": "compact-turn", "status": "inProgress", "items": []any{}}}))
+	select {
+	case got := <-interrupted:
+		if got.ThreadID != "thread" || got.TurnID != "compact-turn" {
+			t.Fatalf("wrong interrupt: %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing late interrupt")
+	}
+	agent.client.HandleNotification(context.Background(), completeNotification(t, "thread", "compact-turn", protocol.FluffyInterrupted))
+}
+
+// TestCompactMethodNotFoundReleasesLaneAndReportsUnsupported distinguishes explicit rejection from unknown submission.
+func TestCompactMethodNotFoundReleasesLaneAndReportsUnsupported(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			return &rpcError{Code: -32601, Message: "method not found"}
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := agent.HandleExtensionMethod(context.Background(), "_session/compact", json.RawMessage(`{"session_id":"thread"}`))
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) || failure.Code != -32601 {
+		t.Fatalf("unsupported: %v", err)
+	}
+	state, _ := agent.sessions.get("thread")
+	state.mu.Lock()
+	active := state.activePrompt
+	state.mu.Unlock()
+	if active != nil {
+		t.Fatal("explicit rejection retained the session lane")
+	}
+}
+
+// TestFailedTurnPreservesObservedUsageInFinalError prevents consumed tokens disappearing on failure.
+func TestFailedTurnPreservesObservedUsageInFinalError(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	started := make(chan struct{})
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case protocol.MethodTurnStart:
+			result.(*protocol.TurnStartResponse).Turn = protocol.TurnElement{ID: "turn", Items: []protocol.ThreadItem{}, Status: protocol.PurpleInProgress}
+			close(started)
+		default:
+			return errors.New("unexpected call: " + request.Method())
+		}
+		return nil
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	agent.connectionMu.Lock()
+	agent.sessionUpdater = &recordingSessionUpdater{}
+	agent.connectionMu.Unlock()
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := agent.Prompt(context.Background(), acp.PromptRequest{SessionId: "thread", Prompt: []acp.ContentBlock{{Text: &acp.ContentBlockText{Type: "text", Text: "hello"}}}})
+		done <- err
+	}()
+	<-started
+	state, _ := agent.sessions.get("thread")
+	state.mu.Lock()
+	prompt := state.activePrompt
+	state.mu.Unlock()
+	<-prompt.turnStarted
+	usage := usageSample(12, 3, 12, 3)
+	usage.ThreadID = "thread"
+	usage.TurnID = "turn"
+	agent.client.HandleNotification(context.Background(), decodeTestNotification(t, "thread/tokenUsage/updated", usage))
+	terminal := completeNotification(t, "thread", "turn", protocol.Failed).(*protocol.TurnCompletedEnvelope)
+	terminal.Params.Turn.Error = &protocol.Error{Message: "failure"}
+	agent.client.HandleNotification(context.Background(), terminal)
+	var failure *acp.RequestError
+	if err := <-done; !errors.As(err, &failure) {
+		t.Fatalf("failure: %v", err)
+	}
+	data, _ := failure.Data.(map[string]any)
+	observed, ok := acpmeta.ReadTurnUsage(data)
+	if !ok || observed.InputTokens == nil || *observed.InputTokens != 12 || observed.OutputTokens == nil || *observed.OutputTokens != 3 || observed.Complete {
+		t.Fatalf("usage lost: %#v", data)
+	}
+}
+
+// TestAccountUsageDoesNotInventZeroForMissingPercent preserves an unknown window percentage.
+func TestAccountUsageDoesNotInventZeroForMissingPercent(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+		if request.Method() == protocol.MethodInitialize {
+			return nil
+		}
+		if request.Method() == "account/rateLimits/read" {
+			return json.Unmarshal([]byte(`{"rateLimits":{"primary":{"windowDurationMins":60}}}`), result)
+		}
+		return errors.New("unexpected call: " + request.Method())
+	}
+	agent := newRuntimeTestAgent(t, rpc)
+	result, err := agent.HandleExtensionMethod(context.Background(), "_account/usage", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(result)
+	var wire map[string]any
+	_ = json.Unmarshal(raw, &wire)
+	window := wire["buckets"].([]any)[0].(map[string]any)["windows"].([]any)[0].(map[string]any)
+	if _, reported := window["used_percent"]; reported {
+		t.Fatalf("missing value became zero: %s", raw)
+	}
+}
+
+// TestCompactIgnoresCompletedTurnReplay prevents a prior compact from claiming a new lane.
+func TestCompactIgnoresCompletedTurnReplay(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	compacts := 0
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			compacts++
+			send := func(id string) {
+				agent.client.HandleNotification(ctx, decodeTestNotification(t, "turn/started", map[string]any{
+					"threadId": "thread", "turn": map[string]any{"id": id, "status": "inProgress", "items": []any{}},
+				}))
+				agent.client.HandleNotification(ctx, completeNotification(t, "thread", id, protocol.FluffyCompleted))
+			}
+			send("first")
+			if compacts == 2 {
+				send("second")
+			}
+		default:
+			return fmt.Errorf("unexpected call: %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"first", "second"} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		result, err := agent.HandleExtensionMethod(ctx, acpmeta.CompactMethod, json.RawMessage(`{"session_id":"thread"}`))
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.(acpmeta.CompactResponse).TurnID; got != want {
+			t.Fatalf("compact turn = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestCompactFailureRetainsItsOwnUsage verifies the native compact turn is accounted separately.
+func TestCompactFailureRetainsItsOwnUsage(t *testing.T) {
+	rpc := newFakeAppServerRPC()
+	var agent *Agent
+	rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+		switch request.Method() {
+		case protocol.MethodInitialize:
+		case protocol.MethodThreadStart:
+			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+		case "thread/compact/start":
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, "turn/started", map[string]any{
+				"threadId": "thread", "turn": map[string]any{"id": "compact", "status": "inProgress", "items": []any{}},
+			}))
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, "thread/tokenUsage/updated", map[string]any{
+				"threadId": "thread", "turnId": "compact", "tokenUsage": map[string]any{
+					"last":  map[string]any{"inputTokens": 8, "outputTokens": 2, "totalTokens": 10},
+					"total": map[string]any{"inputTokens": 8, "outputTokens": 2, "totalTokens": 10},
+				},
+			}))
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, "turn/completed", map[string]any{
+				"threadId": "thread", "turn": map[string]any{"id": "compact", "status": "failed", "items": []any{},
+					"error": map[string]any{"message": "native compact failure"}},
+			}))
+		default:
+			return fmt.Errorf("unexpected call: %s", request.Method())
+		}
+		return nil
+	}
+	agent = newRuntimeTestAgent(t, rpc)
+	if _, err := agent.NewSession(context.Background(), acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := agent.HandleExtensionMethod(ctx, acpmeta.CompactMethod, json.RawMessage(`{"session_id":"thread"}`))
+	var failure *acp.RequestError
+	if !errors.As(err, &failure) {
+		t.Fatalf("compact error = %v", err)
+	}
+	data, _ := failure.Data.(map[string]any)
+	usage, ok := acpmeta.ReadTurnUsage(data)
+	if !ok || usage.InputTokens == nil || *usage.InputTokens != 8 || usage.Complete ||
+		data["turn_id"] != "compact" || data["phase"] != "compact_completion" || data["submission"] != "accepted" {
+		t.Fatalf("compact failure facts = %#v", data)
 	}
 }

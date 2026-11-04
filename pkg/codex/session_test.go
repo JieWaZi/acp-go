@@ -78,3 +78,18 @@ func TestSessionStoreWithCurrentLinearizesConfigurationAndClose(t *testing.T) {
 		t.Fatalf("close 后配置错误为 %v，期望 ErrSessionNotFound", err)
 	}
 }
+
+// TestSessionStoreRejectsConcurrentOpen prevents two attempts from owning one native subscription.
+func TestSessionStoreRejectsConcurrentOpen(t *testing.T) {
+	store := newSessionStore()
+	generation, err := store.beginOpen("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.beginOpen("thread"); err == nil {
+		t.Fatal("concurrent open admitted")
+	}
+	if !store.openCanProceed("thread", generation) {
+		t.Fatal("concurrent open invalidated the first subscription")
+	}
+}

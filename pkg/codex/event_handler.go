@@ -433,6 +433,15 @@ func mapPlanStatus(status protocol.PlanStatus) (acp.PlanEntryStatus, error) {
 
 // handleTokenUsage 按线程累计字段差分并发布可替换的消费快照，上下文仍使用最近请求。
 func (h *eventHandler) handleTokenUsage(ctx context.Context, params protocol.ThreadTokenUsageUpdatedNotification) error {
+	if err := h.recordTokenUsage(params); err != nil {
+		return err
+	}
+	usage, _ := h.Usage()
+	return h.emitUsage(ctx, usage)
+}
+
+// recordTokenUsage retains counters independently of the availability of a live ACP subscriber.
+func (h *eventHandler) recordTokenUsage(params protocol.ThreadTokenUsageUpdatedNotification) error {
 	last, err := turnUsageFromTokenUsage(params.TokenUsage)
 	if err != nil {
 		h.invalidateUsageCheckpoint()
@@ -472,9 +481,8 @@ func (h *eventHandler) handleTokenUsage(ctx context.Context, params protocol.Thr
 	if h.checkpoint != nil && !h.counterInvalid {
 		h.checkpoint(&total)
 	}
-	snapshot := *h.usage
 	h.usageMu.Unlock()
-	return h.emitUsage(ctx, snapshot)
+	return nil
 }
 
 // invalidateUsageCheckpoint 保留已观测消费，但异常后不能声明覆盖整轮或复用旧基线。
@@ -628,6 +636,9 @@ func (h *eventHandler) emitAgentMessage(
 
 // emit 在唯一边界包装 ACP session 标识并传播 SDK 发送错误。
 func (h *eventHandler) emit(ctx context.Context, update acp.SessionUpdate) error {
+	if h.updater == nil {
+		return nil
+	}
 	if err := h.updater.SessionUpdate(ctx, acp.SessionNotification{
 		SessionId: h.sessionID,
 		Update:    update,

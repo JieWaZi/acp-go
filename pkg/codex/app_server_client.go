@@ -146,6 +146,14 @@ type completionCapture struct {
 	events []protocol.TurnCompletedNotification
 }
 
+// completedTurn identifies a retired native turn on this app-server connection.
+type completedTurn struct {
+	// threadID scopes the native turn ID.
+	threadID string
+	// turnID is the native identity used by start and completion notifications.
+	turnID string
+}
+
 // completionTracker 关联 Turn 启动响应、提前到达的完成通知与活动等待方。
 // 同一互斥锁原子完成“检查提前结果→安装 waiter”，避免两个阶段之间丢失通知。
 type completionTracker struct {
@@ -157,6 +165,10 @@ type completionTracker struct {
 	waiters map[string]map[string]chan completionResult
 	// fatalErr 是解除所有当前及后续等待者的稳定错误。
 	fatalErr error
+	// recent bounds duplicate detection across session close and reopen.
+	recent [256]completedTurn
+	// next is the slot replaced by the next unique completion.
+	next int
 }
 
 // newCompletionTracker 创建空的完成路由器。
@@ -193,18 +205,18 @@ func (t *completionTracker) waitAfterStart(
 ) (protocol.TurnCompletedNotification, error) {
 	channel := make(chan completionResult, 1)
 	t.mu.Lock()
-	if t.fatalErr != nil {
-		err := t.fatalErr
-		t.releaseCaptureLocked(threadID, capture)
-		t.mu.Unlock()
-		return protocol.TurnCompletedNotification{}, err
-	}
 	for _, event := range capture.events {
 		if event.Turn.ID == turnID {
 			t.releaseCaptureLocked(threadID, capture)
 			t.mu.Unlock()
 			return event, nil
 		}
+	}
+	if t.fatalErr != nil {
+		err := t.fatalErr
+		t.releaseCaptureLocked(threadID, capture)
+		t.mu.Unlock()
+		return protocol.TurnCompletedNotification{}, err
 	}
 	t.releaseCaptureLocked(threadID, capture)
 	threadWaiters := t.waiters[threadID]
@@ -224,17 +236,34 @@ func (t *completionTracker) waitAfterStart(
 	}
 }
 
+// hasCompleted rejects a replayed start before an identity-less compact can claim it.
+func (t *completionTracker) hasCompleted(threadID, turnID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Contains(t.recent[:], completedTurn{threadID: threadID, turnID: turnID})
+}
+
 // record 先完成精确 waiter；若 turn ID 尚未知则广播给同 thread 捕获窗口。
 func (t *completionTracker) record(event protocol.TurnCompletedNotification) {
+	if event.ThreadID == "" || event.Turn.ID == "" {
+		return
+	}
 	t.mu.Lock()
+	key := completedTurn{threadID: event.ThreadID, turnID: event.Turn.ID}
+	if slices.Contains(t.recent[:], key) {
+		t.mu.Unlock()
+		return
+	}
+	t.recent[t.next] = key
+	t.next = (t.next + 1) % len(t.recent)
 	threadWaiters := t.waiters[event.ThreadID]
 	if channel := threadWaiters[event.Turn.ID]; channel != nil {
 		delete(threadWaiters, event.Turn.ID)
 		if len(threadWaiters) == 0 {
 			delete(t.waiters, event.ThreadID)
 		}
-		t.mu.Unlock()
 		channel <- completionResult{notification: event}
+		t.mu.Unlock()
 		return
 	}
 	for capture := range t.captures[event.ThreadID] {
@@ -385,6 +414,14 @@ func (c *appServerClient) ThreadStart(ctx context.Context, params protocol.Threa
 	return response, err
 }
 
+// ThreadCompactStart submits a native compaction request; identity arrives in notifications.
+func (c *appServerClient) ThreadCompactStart(ctx context.Context, params protocol.ThreadCompactStartParams) error {
+	var response map[string]json.RawMessage
+	return c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewThreadCompactStartRequest(id, params)
+	}, &response)
+}
+
 // ThreadFork 分叉并订阅一个独立 Codex thread。
 func (c *appServerClient) ThreadFork(ctx context.Context, params protocol.ThreadForkParams) (protocol.ThreadForkResponse, error) {
 	var response protocol.ThreadForkResponse
@@ -506,6 +543,27 @@ func (c *appServerClient) AccountRead(
 		return protocol.NewAccountReadRequest(id, params)
 	}, &response)
 	return response, err
+}
+
+// AccountRateLimitsRead requests the native read-only quota snapshot.
+func (c *appServerClient) AccountRateLimitsRead(ctx context.Context) (protocol.GetAccountRateLimitsResponse, bool, error) {
+	var raw json.RawMessage
+	err := c.rpc.Call(ctx, func(id protocol.RequestID) protocol.ClientRequest {
+		return protocol.NewAccountRateLimitsReadRequest(id)
+	}, &raw)
+	if err != nil {
+		return protocol.GetAccountRateLimitsResponse{}, false, err
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		return protocol.GetAccountRateLimitsResponse{}, false, err
+	}
+	var response protocol.GetAccountRateLimitsResponse
+	if err = json.Unmarshal(raw, &response); err != nil {
+		return response, false, err
+	}
+	isPresent := func(key string) bool { value, ok := fields[key]; return ok && string(value) != "null" }
+	return response, isPresent("rateLimitsByLimitId") || isPresent("rateLimits"), nil
 }
 
 // AccountLogin 直接发送生成协议的 account/login/start 请求。

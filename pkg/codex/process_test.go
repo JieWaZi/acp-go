@@ -181,7 +181,7 @@ exit 7
 	if !errors.Is(err, ErrAppServerExited) {
 		t.Fatalf("退出错误为 %v", err)
 	}
-	if !strings.Contains(err.Error(), "7") || !strings.Contains(err.Error(), "diagnostic") {
+	if !strings.Contains(err.Error(), "7") || !strings.Contains(err.Error(), "stderr=redacted") || !strings.Contains(err.Error(), "truncated=true") {
 		t.Fatalf("退出错误未保留 exit/stderr 尾部: %v", err)
 	}
 	if strings.Contains(err.Error(), "very-important") {
@@ -216,7 +216,7 @@ cat >/dev/null
 
 	record := waitForProcessLog(t, handler)
 	stderr := processLogStderr(record)
-	if record.Message != "Codex app-server stderr" || stderr != "running diagnostic" {
+	if record.Message != "Codex app-server stderr" || stderr != "redacted" {
 		t.Fatalf("运行中 stderr 日志为 message=%q stderr=%q", record.Message, stderr)
 	}
 	if strings.Contains(record.Message+stderr, "stdout-secret") {
@@ -245,7 +245,7 @@ exit 0
 	t.Cleanup(func() { _ = agent.Close(context.Background()) })
 
 	record := waitForProcessLog(t, handler)
-	if stderr := processLogStderr(record); record.Message != "Codex app-server stderr" || stderr != "clean-exit diagnostic" {
+	if stderr := processLogStderr(record); record.Message != "Codex app-server stderr" || stderr != "redacted" {
 		t.Fatalf("干净退出 stderr 日志为 message=%q stderr=%q", record.Message, stderr)
 	}
 	<-agent.process.Done()
@@ -257,6 +257,7 @@ exit 0
 // TestAgentFailsClosedEarlyApprovalWithoutConnection 验证组合根已安装 server request handler，连接尚未绑定时仍返回拒绝结果。
 func TestAgentFailsClosedEarlyApprovalWithoutConnection(t *testing.T) {
 	t.Parallel()
+	resultPath := filepath.Join(t.TempDir(), "approval-response.json")
 	path := writeExecutableScript(t, `
 if [ "$1" = "--version" ]; then
   echo "codex-cli 0.148.0"
@@ -264,12 +265,13 @@ if [ "$1" = "--version" ]; then
 fi
 echo '{"id":"approval-early","method":"item/commandExecution/requestApproval","params":{"command":"pwd","cwd":"/tmp","itemId":"item-1","startedAtMs":1,"threadId":"thread-1","turnId":"turn-1"}}'
 IFS= read -r response
-echo "$response" >&2
+printf '%s' "$response" > "$CODEX_TEST_APPROVAL_RESULT"
+echo "approval captured" >&2
 cat >/dev/null
 `)
 	handler := newProcessLogHandler()
 	agent, err := newProcessTestAgent(context.Background(), Config{
-		Logger: slog.New(handler), CodexPath: path,
+		Logger: slog.New(handler), CodexPath: path, Environment: append(os.Environ(), "CODEX_TEST_APPROVAL_RESULT="+resultPath),
 	})
 	if err != nil {
 		t.Fatalf("创建 Agent 失败: %v", err)
@@ -280,7 +282,11 @@ cat >/dev/null
 		_ = agent.Close(closeCtx)
 	})
 
-	record := waitForProcessLog(t, handler)
+	_ = waitForProcessLog(t, handler)
+	wire, readErr := os.ReadFile(resultPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
 	var response struct {
 		// ID 是 app-server 原始审批请求标识。
 		ID string `json:"id"`
@@ -289,7 +295,7 @@ cat >/dev/null
 		// Error 表示 transport 错误响应，正确接线时必须为空。
 		Error *rpcError `json:"error"`
 	}
-	if err = json.Unmarshal([]byte(processLogStderr(record)), &response); err != nil {
+	if err = json.Unmarshal(wire, &response); err != nil {
 		t.Fatalf("解析 approval 响应失败: %v", err)
 	}
 	if response.ID != "approval-early" || response.Error != nil || response.Result.Decision == nil ||
@@ -349,7 +355,7 @@ exit 7
 	if !errors.Is(err, ErrAppServerExited) {
 		t.Fatalf("initialize 错误丢失进程退出根因: %v", err)
 	}
-	if !strings.Contains(err.Error(), "code 7") || !strings.Contains(err.Error(), "fatal app-server fixture") {
+	if !strings.Contains(err.Error(), "code 7") || !strings.Contains(err.Error(), "stderr=redacted") {
 		t.Fatalf("process fatal 未保留退出诊断: %v", err)
 	}
 	_ = agent.Close(context.Background())
@@ -379,5 +385,24 @@ cat >/dev/null
 	// fake shell 的调度/回收可能受并行测试宿主拥塞影响；go test -timeout 统一提供死锁保护。
 	if err = agent.Close(context.Background()); err != nil {
 		t.Fatalf("显式关闭 Agent 失败: %v", err)
+	}
+}
+
+// TestStderrSecretsNeverReachLogsOrExitErrors checks split writes and long unbroken output.
+func TestStderrSecretsNeverReachLogsOrExitErrors(t *testing.T) {
+	path := writeExecutableScript(t, `{ printf 'credential-very-'; printf 'secret-value'; printf '%04096d' 0; } >&2; exit 7`)
+	handler := newProcessLogHandler()
+	process, err := startAppServer(context.Background(), path, processOptions{MaxStderrBytes: 32, Logger: slog.New(handler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-process.Done()
+	result := process.Err()
+	if result == nil || strings.Contains(result.Error(), "secret") || strings.Contains(result.Error(), strings.Repeat("0", 32)) {
+		t.Fatalf("stderr leaked into error: %v", result)
+	}
+	record := waitForProcessLog(t, handler)
+	if field := processLogStderr(record); field != "redacted" {
+		t.Fatalf("stderr log contains raw data: %q", field)
 	}
 }

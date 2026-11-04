@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"log/slog"
+	"math"
+	"sort"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 
@@ -231,4 +234,154 @@ func apiKeyFromMeta(meta map[string]any) string {
 	default:
 		return ""
 	}
+}
+
+// AccountUsage reads and normalizes quota without starting a session or prompt.
+func (a *Agent) AccountUsage(ctx context.Context) (acpmeta.AccountUsage, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acpmeta.AccountUsage{}, err
+	}
+	response, known, err := a.client.AccountRateLimitsRead(ctx)
+	if err != nil {
+		return acpmeta.AccountUsage{}, codexRequestFailure("account_usage", err)
+	}
+	result := acpmeta.AccountUsage{}
+	if !known {
+		return result, nil
+	}
+	result.Buckets = []acpmeta.AccountUsageBucket{}
+	appendBucket := func(id string, native protocol.RateLimits) error {
+		bucket := acpmeta.AccountUsageBucket{ID: id, Name: native.LimitName}
+		if native.Credits != nil {
+			bucket.HasCredits = &native.Credits.HasCredits
+			bucket.Unlimited = &native.Credits.Unlimited
+			bucket.Balance = native.Credits.Balance
+		}
+		for _, window := range []struct {
+			// kind identifies the reported window.
+			kind string
+			// value contains the native window facts.
+			value *protocol.PrimaryClass
+		}{{"primary", native.Primary}, {"secondary", native.Secondary}} {
+			if window.value == nil {
+				continue
+			}
+			item := acpmeta.AccountUsageWindow{Kind: window.kind, ResetAtUnixSeconds: window.value.ResetsAt}
+			if window.value.UsedPercent != nil {
+				value := *window.value.UsedPercent
+				if value > 1<<53 || value < -(1<<53) {
+					return fmt.Errorf("native quota percentage exceeds exact numeric range")
+				}
+				percentage := float64(value)
+				item.UsedPercent = &percentage
+			}
+			if window.value.WindowDurationMins != nil {
+				minutes := *window.value.WindowDurationMins
+				if minutes > math.MaxInt64/60 || minutes < math.MinInt64/60 {
+					return fmt.Errorf("native quota duration exceeds numeric range")
+				}
+				seconds := minutes * 60
+				item.DurationSeconds = &seconds
+			}
+			bucket.Windows = append(bucket.Windows, item)
+		}
+		result.Buckets = append(result.Buckets, bucket)
+		return nil
+	}
+	if response.RateLimitsByLimitID != nil {
+		ids := make([]string, 0, len(response.RateLimitsByLimitID))
+		for id := range response.RateLimitsByLimitID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			if err := appendBucket(id, response.RateLimitsByLimitID[id]); err != nil {
+				return acpmeta.AccountUsage{}, err
+			}
+		}
+	} else {
+		id := "codex"
+		if response.RateLimits.LimitID != nil {
+			id = *response.RateLimits.LimitID
+		}
+		if err := appendBucket(id, response.RateLimits); err != nil {
+			return acpmeta.AccountUsage{}, err
+		}
+	}
+	return result, nil
+}
+
+// Authenticate 把 ACP 认证请求交给现有 authenticator，不在 Agent 重写登录状态机。
+func (a *Agent) Authenticate(
+	ctx context.Context,
+	request acp.AuthenticateRequest,
+) (acp.AuthenticateResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acp.AuthenticateResponse{}, err
+	}
+	if a.auth == nil {
+		return acp.AuthenticateResponse{}, errors.New("codex authenticator is unavailable")
+	}
+	if err := a.auth.Authenticate(ctx, request); err != nil {
+		return acp.AuthenticateResponse{}, err
+	}
+	return acp.AuthenticateResponse{}, nil
+}
+
+// checkAuthorization 在创建或恢复 Session 前复用 app-server 的无刷新账号检查。
+func (a *Agent) checkAuthorization(ctx context.Context) error {
+	refresh := false
+	account, err := a.client.AccountRead(ctx, protocol.GetAccountParams{RefreshToken: &refresh})
+	if err != nil {
+		return fmt.Errorf("checking Codex authentication: %w", err)
+	}
+	if account.RequiresOpenaiAuth && account.Account == nil {
+		return acp.NewAuthRequired(nil)
+	}
+	return nil
+}
+
+// Logout 先订阅账号更新，再发送登出请求并等待通知，避免丢失快速响应。
+func (a *Agent) Logout(ctx context.Context, _ acp.LogoutRequest) (acp.LogoutResponse, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acp.LogoutResponse{}, err
+	}
+	subscription := a.client.SubscribeAccountUpdated()
+	defer subscription.Close()
+	if err := a.client.AccountLogout(ctx); err != nil {
+		return acp.LogoutResponse{}, fmt.Errorf("logging out Codex account: %w", err)
+	}
+	if err := subscription.Wait(ctx); err != nil {
+		return acp.LogoutResponse{}, fmt.Errorf("waiting for Codex account update: %w", err)
+	}
+	return acp.LogoutResponse{}, nil
+}
+
+// AccountInfo reads the native account and normalizes only reported identity facts.
+func (a *Agent) AccountInfo(ctx context.Context) (acpmeta.AccountInfo, error) {
+	if err := a.requireInitialized(); err != nil {
+		return acpmeta.AccountInfo{}, err
+	}
+	refresh := false
+	native, err := a.client.AccountRead(ctx, protocol.GetAccountParams{RefreshToken: &refresh})
+	if err != nil {
+		return acpmeta.AccountInfo{}, codexRequestFailure("account_read", err)
+	}
+	result := acpmeta.AccountInfo{RequiresAuthentication: native.RequiresOpenaiAuth}
+	if native.Account == nil {
+		return result, nil
+	}
+	account := &acpmeta.AccountIdentity{Kind: "unknown", Label: native.Account.Email}
+	switch native.Account.Type {
+	case protocol.AccountTypeAPIKey:
+		account.Kind = "api_key"
+	case protocol.AccountTypeChatgpt:
+		account.Kind = "account"
+	}
+	if native.Account.PlanType != nil {
+		plan := string(*native.Account.PlanType)
+		account.Plan = &plan
+	}
+	result.Account = account
+	return result, nil
 }

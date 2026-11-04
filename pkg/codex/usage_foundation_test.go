@@ -155,3 +155,33 @@ func TestUsageFoundationCodexCombinedOverflow(t *testing.T) {
 		t.Fatal("combined input/output overflow accepted")
 	}
 }
+
+// TestUnownedUsageInvalidatesTheNextPromptBaseline prevents background work from being charged to a new prompt.
+func TestUnownedUsageInvalidatesTheNextPromptBaseline(t *testing.T) {
+	store := newSessionStore()
+	generation, err := store.beginOpen("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, ok := store.install("thread", "/tmp", generation, nil, terminalOutputModeDelta)
+	if !ok {
+		t.Fatal("install session")
+	}
+	state.usageTotal = &turnUsage{InputTokens: 100, TurnTokens: 100}
+	agent := &Agent{sessions: store}
+	background := usageSample(30, 0, 130, 0)
+	background.ThreadID, background.TurnID = "thread", "unowned"
+	agent.handleNotification(context.Background(), decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, background))
+	prompt := newActivePrompt(context.Background(), 1)
+	defer prompt.cancelRun()
+	state.activePrompt = prompt
+	agent.onTurnStarted(state, prompt, "prompt")
+	if err := prompt.currentEventRouter().handler.recordTokenUsage(usageSample(10, 0, 140, 0)); err != nil {
+		t.Fatal(err)
+	}
+	response := codexPromptResponse(prompt, acp.StopReasonEndTurn, nil)
+	reported, ok := acpmeta.ReadTurnUsage(response.Meta)
+	if !ok || reported.InputTokens == nil || *reported.InputTokens != 10 || reported.Complete {
+		t.Fatalf("unowned usage contaminated the next prompt: %#v", reported)
+	}
+}

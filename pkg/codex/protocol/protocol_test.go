@@ -533,3 +533,39 @@ func TestCoreOpenJSONUsesRawMessage(t *testing.T) {
 		t.Fatal("thread config 未保留原始 JSON")
 	}
 }
+
+// TestServiceTierPreservesPresence checks each native request and response boundary.
+func TestServiceTierPreservesPresence(t *testing.T) {
+	for name, makeValue := range map[string]func() any{
+		"start request":   func() any { return &ThreadStartParams{} },
+		"resume request":  func() any { return &ThreadResumeParams{} },
+		"fork request":    func() any { return &ThreadForkParams{} },
+		"turn request":    func() any { return &TurnStartParams{} },
+		"start response":  func() any { return &ThreadStartResponse{} },
+		"resume response": func() any { return &ThreadResumeResponse{} },
+		"fork response":   func() any { return &ThreadForkResponse{} },
+	} {
+		for _, input := range []string{`{}`, `{"serviceTier":null}`, `{"serviceTier":"fast-id"}`} {
+			t.Run(name+input, func(t *testing.T) {
+				value := makeValue()
+				if err := json.Unmarshal([]byte(input), value); err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got, want map[string]json.RawMessage
+				if err := json.Unmarshal(encoded, &got); err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal([]byte(input), &want); err != nil {
+					t.Fatal(err)
+				}
+				if string(got["serviceTier"]) != string(want["serviceTier"]) {
+					t.Fatalf("serviceTier: got %s, want %s", got["serviceTier"], want["serviceTier"])
+				}
+			})
+		}
+	}
+}
