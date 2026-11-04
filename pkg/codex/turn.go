@@ -39,11 +39,13 @@ type nativeTurn struct {
 	// completionCapture holds unmatched completions received before this invocation binds.
 	completionCapture *completionCapture
 	// earlyEvents holds frames that cannot be published until the native identity is proven.
-	earlyEvents []protocol.ServerNotification
-	// earlyOverflow means an unknown-identity frame exceeded the bounded buffer.
-	earlyOverflow bool
+	earlyEvents []turnFrame
+	// firstDroppedFrame locates overflow relative to the native terminal.
+	firstDroppedFrame uint64
+	// lastDroppedUsage tracks loss of thread counters even after this invocation ends.
+	lastDroppedUsage uint64
 	// terminal stores the exact native completion independently of buffered display frames.
-	terminal *protocol.TurnCompletedNotification
+	terminal *receivedCompletion
 	// terminalSignal closes when this exact native turn reaches a terminal notification.
 	terminalSignal chan struct{}
 	// observed collects positive native output, effect and retry evidence.
@@ -98,15 +100,18 @@ type turnObservation struct {
 	reroutes []modelReroute
 }
 
-// recordCompletedItem retains native completion evidence independently of ACP display.
-func (o *turnObservation) recordCompletedItem(item protocol.ThreadItem) {
+// recordItem distinguishes native tool completion from evidence of a file effect.
+func (o *turnObservation) recordItem(item protocol.ThreadItem, completionFrame bool) {
+	status := stringValue(item.Status)
+	finished := status == "completed" || status == "failed"
 	switch item.Type {
 	case protocol.AgentMessage:
 		o.output = o.output || stringValue(item.Text) != ""
 	case protocol.FileChange:
-		o.fileChange = o.fileChange || stringValue(item.Status) == "completed" && len(item.Changes) > 0
+		o.toolCompletion = o.toolCompletion || finished
+		o.fileChange = o.fileChange || status == "completed" && len(item.Changes) > 0
 	case protocol.CommandExecution, protocol.MCPToolCall, protocol.DynamicToolCall, protocol.CollabAgentToolCall, protocol.WebSearch:
-		o.toolCompletion = o.toolCompletion || stringValue(item.Status) != "declined"
+		o.toolCompletion = o.toolCompletion || finished || completionFrame && status == ""
 	}
 }
 
@@ -692,25 +697,38 @@ func (a *Agent) bindTurnLocked(state *sessionState, prompt *nativeTurn, turnID s
 		updater = a.currentSessionUpdater()
 	}
 	a.attachTurnEvents(state, prompt, turnID, updater)
-	for _, notification := range prompt.earlyEvents {
-		_, id := notificationRouting(notification)
-		a.routeBoundTurnLocked(prompt.runCtx, state, prompt, turnID, id, notification)
+	a.replayEarlyTurnLocked(state, prompt, turnID)
+	prompt.signalTurnStarted()
+	if late {
+		a.requestTurnInterrupt(state, prompt, turnID, false)
+	}
+}
+
+// replayEarlyTurnLocked seals the proven turn at its native receive boundary.
+func (a *Agent) replayEarlyTurnLocked(state *sessionState, prompt *nativeTurn, turnID string) {
+	var completion *receivedCompletion
+	if prompt.completionCapture != nil {
+		completion = a.client.completions.capturedCompletion(prompt.completionCapture, turnID)
+	}
+	for _, frame := range prompt.earlyEvents {
+		if completion != nil && completion.position < frame.position {
+			prompt.recordTerminalLocked(*completion)
+			completion = nil
+		}
+		a.routeBoundTurnLocked(prompt.runCtx, state, prompt, turnID, frame)
 	}
 	prompt.earlyEvents = nil
-	if prompt.earlyOverflow {
+	if dropped := prompt.firstDroppedFrame; dropped != 0 && prompt.terminal == nil && (completion == nil || dropped < completion.position) {
 		if prompt.eventFailure == nil {
 			prompt.eventFailure = errEventDeliveryBackpressure
 		}
 		prompt.currentEventRouter().handler.breakUsageContinuity()
 	}
-	if prompt.completionCapture != nil {
-		if completion := a.client.completions.capturedCompletion(prompt.completionCapture, turnID); completion != nil {
-			prompt.recordTerminalLocked(*completion)
-		}
+	if completion != nil {
+		prompt.recordTerminalLocked(*completion)
 	}
-	prompt.signalTurnStarted()
-	if late {
-		a.requestTurnInterrupt(state, prompt, turnID, false)
+	if prompt.terminal != nil && prompt.lastDroppedUsage > prompt.terminal.position {
+		state.invalidateUsageCheckpoint()
 	}
 }
 
@@ -735,27 +753,19 @@ func (p *nativeTurn) setCompletionCapture(capture *completionCapture) {
 func (p *nativeTurn) observedCompletion() *protocol.TurnCompletedNotification {
 	select {
 	case <-p.terminalSignal:
-		return p.terminal
+		return &p.terminal.notification
 	default:
 		return nil
 	}
 }
 
 // recordTerminalLocked seals the owner after retaining the provider's terminal payload.
-func (p *nativeTurn) recordTerminalLocked(completion protocol.TurnCompletedNotification) {
+func (p *nativeTurn) recordTerminalLocked(completion receivedCompletion) {
 	if p.terminal != nil {
 		return
 	}
-	for _, item := range completion.Turn.Items {
-		switch item.Type {
-		case protocol.AgentMessage:
-			p.observed.recordCompletedItem(item)
-		default:
-			switch stringValue(item.Status) {
-			case "completed", "failed":
-				p.observed.recordCompletedItem(item)
-			}
-		}
+	for _, item := range completion.notification.Turn.Items {
+		p.observed.recordItem(item, false)
 	}
 	p.terminal = &completion
 	close(p.terminalSignal)

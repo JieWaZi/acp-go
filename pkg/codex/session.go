@@ -273,6 +273,13 @@ func (s *sessionState) workspace() codexWorkspace {
 	}
 }
 
+// invalidateUsageCheckpoint discards this subscription's next baseline after late usage.
+func (s *sessionState) invalidateUsageCheckpoint() {
+	s.mu.Lock()
+	s.usageTotal = nil
+	s.mu.Unlock()
+}
+
 // abandonOpen releases the matching failed open attempt.
 func (s *sessionStore) abandonOpen(sessionID string, generation uint64) {
 	s.mu.Lock()

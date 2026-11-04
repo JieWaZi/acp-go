@@ -140,10 +140,28 @@ func (s *accountUpdateSubscription) Close() {
 	})
 }
 
-// completionCapture 保存 turn/start 响应前同 thread 到达的有界 completion。
+// receivedCompletion preserves a terminal's position on the native notification stream.
+type receivedCompletion struct {
+	// notification is the exact native terminal payload.
+	notification protocol.TurnCompletedNotification
+	// position orders native frames. Zero identifies a synthetic release.
+	position uint64
+}
+
+// completionCapture keeps bounded terminal candidates until a native ID is known.
 type completionCapture struct {
-	// events 按到达顺序保存捕获窗口内的完成通知。
-	events []protocol.TurnCompletedNotification
+	// events contains terminals observed during this request's capture window.
+	events []receivedCompletion
+}
+
+// findLocked selects a terminal for the requested turn under the tracker lock.
+func (c *completionCapture) findLocked(turnID string) *receivedCompletion {
+	for _, event := range c.events {
+		if event.notification.Turn.ID == turnID {
+			return &event
+		}
+	}
+	return nil
 }
 
 // completedTurn identifies a retired native turn on this app-server connection.
@@ -196,7 +214,7 @@ func (t *completionTracker) beginCapture(threadID string) (*completionCapture, e
 	return capture, nil
 }
 
-// waitAfterStart 原子查找 early completion 或把捕获窗口转换为精确 turn waiter。
+// waitAfterStart atomically consumes a captured terminal or installs the exact waiter.
 func (t *completionTracker) waitAfterStart(
 	ctx context.Context,
 	threadID string,
@@ -205,12 +223,10 @@ func (t *completionTracker) waitAfterStart(
 ) (protocol.TurnCompletedNotification, error) {
 	channel := make(chan completionResult, 1)
 	t.mu.Lock()
-	for _, event := range capture.events {
-		if event.Turn.ID == turnID {
-			t.releaseCaptureLocked(threadID, capture)
-			t.mu.Unlock()
-			return event, nil
-		}
+	if event := capture.findLocked(turnID); event != nil {
+		t.releaseCaptureLocked(threadID, capture)
+		t.mu.Unlock()
+		return event.notification, nil
 	}
 	if t.fatalErr != nil {
 		err := t.fatalErr
@@ -236,14 +252,15 @@ func (t *completionTracker) waitAfterStart(
 	}
 }
 
-// capturedCompletion returns an unmatched terminal retained while identity was unknown.
-func (t *completionTracker) capturedCompletion(capture *completionCapture, turnID string) *protocol.TurnCompletedNotification {
+// capturedCompletion returns a native terminal received before identity was proven.
+func (t *completionTracker) capturedCompletion(capture *completionCapture, turnID string) *receivedCompletion {
+	if capture == nil {
+		return nil
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for _, event := range capture.events {
-		if event.Turn.ID == turnID {
-			return &event
-		}
+	if event := capture.findLocked(turnID); event != nil && event.position != 0 {
+		return event
 	}
 	return nil
 }
@@ -255,8 +272,9 @@ func (t *completionTracker) hasCompleted(threadID, turnID string) bool {
 	return slices.Contains(t.recent[:], completedTurn{threadID: threadID, turnID: turnID})
 }
 
-// record 先完成精确 waiter；若 turn ID 尚未知则广播给同 thread 捕获窗口。
-func (t *completionTracker) record(event protocol.TurnCompletedNotification) {
+// record releases an exact waiter or saves a candidate in the thread's open captures.
+func (t *completionTracker) record(completion receivedCompletion) {
+	event := completion.notification
 	if event.ThreadID == "" || event.Turn.ID == "" {
 		return
 	}
@@ -283,7 +301,7 @@ func (t *completionTracker) record(event protocol.TurnCompletedNotification) {
 			copy(capture.events, capture.events[1:])
 			capture.events = capture.events[:len(capture.events)-1]
 		}
-		capture.events = append(capture.events, event)
+		capture.events = append(capture.events, completion)
 	}
 	t.mu.Unlock()
 }
@@ -352,11 +370,13 @@ type appServerClient struct {
 	initializeResponse protocol.InitializeResponse
 	// initializeErr 保存首次握手失败供并发调用复用。
 	initializeErr error
-	// handlerMu 保护通知消费方和 stale 集合。
+	// handlerMu protects notification order, the consumer, and stale turn identities.
 	handlerMu sync.Mutex
-	// handler 接收 completion 记录与 stale 过滤之后的通知。
-	handler notificationHandler
-	// staleTurns 按 thread/turn 标记取消后只用于清理、不再路由的旧 turn。
+	// notificationPosition is the current position on the connection's receive stream.
+	notificationPosition uint64
+	// handler consumes a decoded frame together with its native receive position.
+	handler func(context.Context, uint64, protocol.ServerNotification)
+	// staleTurns identifies retired turns whose content must not reach a new invocation.
 	staleTurns map[string]map[string]struct{}
 	// authMu 保护登录与 logout 的共享单次通知状态。
 	authMu sync.Mutex
@@ -755,8 +775,8 @@ func (c *appServerClient) TurnSteer(
 	return response, err
 }
 
-// SetNotificationHandler 安装 session/event 薄路由消费方。
-func (c *appServerClient) SetNotificationHandler(handler notificationHandler) {
+// SetNotificationHandler installs the ordered session notification consumer.
+func (c *appServerClient) SetNotificationHandler(handler func(context.Context, uint64, protocol.ServerNotification)) {
 	c.handlerMu.Lock()
 	c.handler = handler
 	c.handlerMu.Unlock()
@@ -774,21 +794,21 @@ func (c *appServerClient) MarkTurnStale(threadID, turnID string) {
 	c.handlerMu.Unlock()
 }
 
-// ResolveTurnInterrupted 在 close 或进程清理无法依赖真实通知时解除精确 completion waiter。
+// ResolveTurnInterrupted releases the exact waiter during cancellation cleanup.
 func (c *appServerClient) ResolveTurnInterrupted(threadID, turnID string) {
-	// 合成 completion 是该 stale turn 的终止边界；真实 completion 已提前到达时不能等待不存在的第二条通知清理标记。
+	// Clear the stale marker even when a native completion already retired the turn.
 	c.handlerMu.Lock()
 	c.clearTurnStaleLocked(threadID, turnID)
 	c.handlerMu.Unlock()
-	c.completions.record(protocol.TurnCompletedNotification{
+	c.completions.record(receivedCompletion{notification: protocol.TurnCompletedNotification{
 		ThreadID: threadID,
 		Turn: protocol.TurnElement{
 			ID: turnID, Items: []protocol.ThreadItem{}, Status: protocol.FluffyInterrupted,
 		},
-	})
+	}})
 }
 
-// HandleNotification 先记录 completion，再过滤 stale，避免提前完成通知丢失。
+// HandleNotification assigns receive order before routing frames and releasing completion waiters.
 func (c *appServerClient) HandleNotification(ctx context.Context, notification protocol.ServerNotification) {
 	if completed, ok := notification.(*protocol.AccountLoginCompletedEnvelope); ok {
 		c.completeLoginSubscription(completed.Params)
@@ -800,21 +820,24 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 	}
 
 	threadID, turnID := notificationRouting(notification)
-	if completed, ok := notification.(*protocol.TurnCompletedEnvelope); ok {
-		defer c.completions.record(completed.Params)
-	}
-
 	c.handlerMu.Lock()
+	c.notificationPosition++
+	position := c.notificationPosition
 	_, stale := c.staleTurns[threadID][turnID]
 	if stale && notification.Method() == protocol.MethodTurnCompleted {
 		c.clearTurnStaleLocked(threadID, turnID)
 	}
 	handler := c.handler
 	c.handlerMu.Unlock()
-	if stale || handler == nil {
-		return
+	if completed, ok := notification.(*protocol.TurnCompletedEnvelope); ok {
+		defer c.completions.record(receivedCompletion{notification: completed.Params, position: position})
 	}
-	handler(ctx, notification)
+	// A retired turn's display can be discarded. Its usage still changes the
+	// thread-wide counter shared with any current invocation.
+	_, usage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
+	if handler != nil && (!stale || usage) {
+		handler(ctx, position, notification)
+	}
 }
 
 // completeLoginSubscription buffers native identities without satisfying unrelated logins.

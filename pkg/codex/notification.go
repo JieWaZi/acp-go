@@ -8,8 +8,18 @@ import (
 
 const maxEarlyTurnEvents = 32
 
+// turnFrame retains the receive position needed to replay around a captured terminal.
+type turnFrame struct {
+	// position orders this frame relative to native terminal notifications.
+	position uint64
+	// turnID is the native identity extracted when the frame arrived.
+	turnID string
+	// notification retains the decoded frame until native identity is proven.
+	notification protocol.ServerNotification
+}
+
 // handleNotification assigns native frames to the current thread owner and turn.
-func (a *Agent) handleNotification(ctx context.Context, notification protocol.ServerNotification) {
+func (a *Agent) handleNotification(ctx context.Context, position uint64, notification protocol.ServerNotification) {
 	if changed, ok := notification.(*protocol.ThreadSettingsUpdatedEnvelope); ok {
 		a.sessions.observeSettings(changed.Params.ThreadID, changed.Params.ThreadSettings)
 		return
@@ -47,37 +57,46 @@ func (a *Agent) handleNotification(ctx context.Context, notification protocol.Se
 	if turnID == "" {
 		return
 	}
+	frame := turnFrame{position: position, turnID: turnID, notification: notification}
 	prompt.eventsMu.Lock()
 	defer prompt.eventsMu.Unlock()
 	activeTurnID := prompt.confirmedTurnID()
 	if activeTurnID != "" {
-		a.routeBoundTurnLocked(ctx, state, prompt, activeTurnID, turnID, notification)
+		a.routeBoundTurnLocked(ctx, state, prompt, activeTurnID, frame)
 		return
 	}
 	alreadyCompleted := a.client.completions.hasCompleted(threadID, turnID)
+	_, usage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
 	if prompt.kind == compactionTurn {
 		if _, started := notification.(*protocol.TurnStartedEnvelope); started && !alreadyCompleted {
 			a.bindTurnLocked(state, prompt, turnID)
 		}
-		return
+		if !usage {
+			return
+		}
 	}
 	if prompt.clientMessageID != "" && notificationConfirmsUserMessage(notification, prompt.clientMessageID) {
-		if alreadyCompleted && (prompt.completionCapture == nil || a.client.completions.capturedCompletion(prompt.completionCapture, turnID) == nil) {
+		if alreadyCompleted && a.client.completions.capturedCompletion(prompt.completionCapture, turnID) == nil {
 			return
 		}
 		a.bindTurnLocked(state, prompt, turnID)
-		a.routeBoundTurnLocked(ctx, state, prompt, turnID, turnID, notification)
+		a.routeBoundTurnLocked(ctx, state, prompt, turnID, frame)
 		return
 	}
-	// The protocol tracker retains unmatched terminals. Only display and
-	// observation frames compete for this pre-identity buffer.
-	if _, terminal := notification.(*protocol.TurnCompletedEnvelope); terminal || alreadyCompleted {
+	// The tracker retains terminals separately. Retired display is redundant,
+	// while late usage remains evidence about the shared thread counter.
+	if _, terminal := notification.(*protocol.TurnCompletedEnvelope); terminal || alreadyCompleted && !usage {
 		return
 	}
 	if len(prompt.earlyEvents) < maxEarlyTurnEvents {
-		prompt.earlyEvents = append(prompt.earlyEvents, notification)
-	} else {
-		prompt.earlyOverflow = true
+		prompt.earlyEvents = append(prompt.earlyEvents, frame)
+		return
+	}
+	if prompt.firstDroppedFrame == 0 {
+		prompt.firstDroppedFrame = position
+	}
+	if usage {
+		prompt.lastDroppedUsage = position
 	}
 }
 
@@ -108,7 +127,8 @@ func notificationConfirmsUserMessage(notification protocol.ServerNotification, m
 }
 
 // routeBoundTurnLocked maps a proven turn's frames and handles interruptions of usage continuity.
-func (a *Agent) routeBoundTurnLocked(ctx context.Context, state *sessionState, prompt *nativeTurn, activeID, eventID string, notification protocol.ServerNotification) {
+func (a *Agent) routeBoundTurnLocked(ctx context.Context, state *sessionState, prompt *nativeTurn, activeID string, frame turnFrame) {
+	notification := frame.notification
 	router := prompt.currentEventRouter()
 	if router == nil {
 		return
@@ -118,29 +138,25 @@ func (a *Agent) routeBoundTurnLocked(ctx context.Context, state *sessionState, p
 		if hasUsage {
 			// The earlier terminal is already immutable. A late sample only affects
 			// whether the next invocation can safely use the thread checkpoint.
-			state.mu.Lock()
-			if state.activeTurn == prompt {
-				state.usageTotal = nil
-			}
-			state.mu.Unlock()
+			state.invalidateUsageCheckpoint()
 		}
 		return
 	}
-	if eventID != activeID {
+	if frame.turnID != activeID {
 		if hasUsage {
 			router.handler.breakUsageContinuity()
 		}
 		return
 	}
 	if terminal, ok := notification.(*protocol.TurnCompletedEnvelope); ok {
-		prompt.recordTerminalLocked(terminal.Params)
+		prompt.recordTerminalLocked(receivedCompletion{notification: terminal.Params, position: frame.position})
 		return
 	}
 	switch event := notification.(type) {
 	case *protocol.AgentMessageDeltaEnvelope:
 		prompt.observed.output = prompt.observed.output || event.Params.Delta != ""
 	case *protocol.ItemCompletedEnvelope:
-		prompt.observed.recordCompletedItem(event.Params.Item)
+		prompt.observed.recordItem(event.Params.Item, true)
 	case *protocol.ErrorEnvelope:
 		native := event.Params
 		prompt.observed.lastError = &native

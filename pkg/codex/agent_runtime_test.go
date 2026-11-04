@@ -1929,13 +1929,17 @@ func TestCompactFailureRetainsItsOwnUsage(t *testing.T) {
 		case protocol.MethodThreadStart:
 			result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
 		case "thread/compact/start":
+			agent.client.HandleNotification(ctx, completeNotification(t, "thread", "other", protocol.FluffyCompleted))
+			foreign := usageSample(5, 0, 5, 0)
+			foreign.ThreadID, foreign.TurnID = "thread", "other"
+			agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, foreign))
 			agent.client.HandleNotification(ctx, decodeTestNotification(t, "turn/started", map[string]any{
 				"threadId": "thread", "turn": map[string]any{"id": "compact", "status": "inProgress", "items": []any{}},
 			}))
 			agent.client.HandleNotification(ctx, decodeTestNotification(t, "thread/tokenUsage/updated", map[string]any{
 				"threadId": "thread", "turnId": "compact", "tokenUsage": map[string]any{
 					"last":  map[string]any{"inputTokens": 8, "outputTokens": 2, "totalTokens": 10},
-					"total": map[string]any{"inputTokens": 8, "outputTokens": 2, "totalTokens": 10},
+					"total": map[string]any{"inputTokens": 13, "outputTokens": 2, "totalTokens": 15},
 				},
 			}))
 			agent.client.HandleNotification(ctx, decodeTestNotification(t, "turn/completed", map[string]any{
@@ -2237,7 +2241,7 @@ func TestFailedTurnPreservesObservedOutputAndRetry(t *testing.T) {
 	}
 	data, _ := failure.Data.(map[string]any)
 	wire, _ := json.Marshal(data)
-	for _, want := range []string{`"output_observed":true`, `"file_change_observed":true`, `"will_retry":true`, `"temporary native connection loss"`, `"to":"new-model"`} {
+	for _, want := range []string{`"output_observed":true`, `"tool_completion_observed":true`, `"file_change_observed":true`, `"will_retry":true`, `"temporary native connection loss"`, `"to":"new-model"`} {
 		if !strings.Contains(string(wire), want) {
 			t.Fatalf("failure lost %s: %s", want, wire)
 		}
@@ -2620,7 +2624,7 @@ func TestProofBearingTerminalSurvivesPreAckOverflow(t *testing.T) {
 					t.Fatal("fixture lost active turn before returning result")
 				}
 				prompt.eventsMu.Lock()
-				id, terminal, overflow := prompt.confirmedTurnID(), prompt.terminal != nil, prompt.earlyOverflow
+				id, terminal, overflow := prompt.confirmedTurnID(), prompt.terminal != nil, prompt.firstDroppedFrame != 0
 				prompt.eventsMu.Unlock()
 				t.Fatalf("proof-bearing completed was received, but Prompt still waits for missing ACK; bound=%q terminal=%t overflow=%t", id, terminal, overflow)
 			}
@@ -2915,5 +2919,178 @@ func TestThreadArchiveReservationOutlivesCaller(t *testing.T) {
 			t.Fatalf("archive never released its lane: %v", err)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestPreAckTerminalSealsUsageAtReceiveBoundary verifies both the sealed result and the next baseline.
+func TestPreAckTerminalSealsUsageAtReceiveBoundary(t *testing.T) {
+	for _, name := range []string{"retained_late_sample", "dropped_late_sample"} {
+		t.Run(name, func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			var agent *Agent
+			starts := 0
+			rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+				switch request := request.(type) {
+				case protocol.InitializeRequest:
+				case protocol.ThreadStartRequest:
+					result.(*protocol.ThreadStartResponse).Thread.ID = "thread"
+				case protocol.TurnStartRequest:
+					starts++
+					send := func(id string, last, total int64) {
+						sample := usageSample(last, 0, total, 0)
+						sample.ThreadID, sample.TurnID = "thread", id
+						agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, sample))
+					}
+					if starts == 2 {
+						send("next", 7, 22)
+						agent.client.HandleNotification(ctx, completeNotification(t, "thread", "next", protocol.FluffyCompleted))
+						result.(*protocol.TurnStartResponse).Turn.ID = "next"
+						break
+					}
+					send("turn", 10, 10)
+					agent.client.HandleNotification(ctx, completeNotification(t, "thread", "turn", protocol.FluffyCompleted))
+					if name == "dropped_late_sample" {
+						for range maxEarlyTurnEvents - 1 {
+							agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodAgentMessageDelta,
+								map[string]any{"threadId": "thread", "turnId": "other", "itemId": "foreign", "delta": "x"}))
+						}
+					}
+					send("other", 5, 15)
+					result.(*protocol.TurnStartResponse).Turn.ID = "turn"
+				default:
+					return fmt.Errorf("unexpected method %s", request.Method())
+				}
+				return nil
+			}
+			agent = newRuntimeTestAgent(t, rpc)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+				t.Fatal(err)
+			}
+			checkUsage := func(want int64, complete bool) {
+				t.Helper()
+				response, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: "thread"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				usage, ok := acpmeta.ReadTurnUsage(response.Meta)
+				if !ok || usage.InputTokens == nil || *usage.InputTokens != want || usage.Complete != complete {
+					t.Fatalf("got %+v, want %d input, complete=%t", usage, want, complete)
+				}
+			}
+			checkUsage(10, true)
+			checkUsage(7, false)
+		})
+	}
+}
+
+// TestPreAckRetiredForeignUsageBreaksContinuity keeps late shared-counter evidence.
+func TestPreAckRetiredForeignUsageBreaksContinuity(t *testing.T) {
+	for _, name := range []string{"retired", "stale"} {
+		t.Run(name, func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			var agent *Agent
+			rpc.handleCall = func(ctx context.Context, request protocol.ClientRequest, result any) error {
+				switch request := request.(type) {
+				case protocol.InitializeRequest:
+				case protocol.ThreadStartRequest:
+					result.(*protocol.ThreadStartResponse).Thread.ID = "s"
+				case protocol.TurnStartRequest:
+					send := func(id string, last, total int64) {
+						sample := usageSample(last, 0, total, 0)
+						sample.ThreadID, sample.TurnID = "s", id
+						agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, sample))
+					}
+					send("turn", 10, 10)
+					if name == "retired" {
+						agent.client.HandleNotification(ctx, completeNotification(t, "s", "other", protocol.FluffyCompleted))
+					} else {
+						agent.client.MarkTurnStale("s", "other")
+					}
+					send("other", 5, 15)
+					send("turn", 7, 22)
+					agent.client.HandleNotification(ctx, completeNotification(t, "s", "turn", protocol.FluffyCompleted))
+					result.(*protocol.TurnStartResponse).Turn.ID = "turn"
+				default:
+					return fmt.Errorf("unexpected method %s", request.Method())
+				}
+				return nil
+			}
+			agent = newRuntimeTestAgent(t, rpc)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+				t.Fatal(err)
+			}
+			response, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: "s"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			usage, ok := acpmeta.ReadTurnUsage(response.Meta)
+			if !ok || usage.InputTokens == nil {
+				t.Fatalf("missing usage: %+v", usage)
+			}
+			if *usage.InputTokens != 17 || usage.Complete {
+				t.Fatalf("retired foreign frame polluted own usage: input=%d complete=%t, want 17 partial", *usage.InputTokens, usage.Complete)
+			}
+		})
+	}
+}
+
+// TestFailedPatchReportsToolCompletionWithoutEffect distinguishes a terminal attempt from a proven file change.
+func TestFailedPatchReportsToolCompletionWithoutEffect(t *testing.T) {
+	for _, source := range []string{"item_completed", "terminal_snapshot"} {
+		t.Run(source, func(t *testing.T) {
+			rpc := newFakeAppServerRPC()
+			rpc.handleCall = func(_ context.Context, request protocol.ClientRequest, result any) error {
+				switch request.Method() {
+				case protocol.MethodInitialize:
+				case protocol.MethodThreadStart:
+					result.(*protocol.ThreadStartResponse).Thread.ID = "s"
+				case protocol.MethodTurnStart:
+					result.(*protocol.TurnStartResponse).Turn.ID = "turn"
+				default:
+					return fmt.Errorf("unexpected method %s", request.Method())
+				}
+				return nil
+			}
+			agent := newRuntimeTestAgent(t, rpc)
+			rpc.afterObserved = func() {
+				ctx := context.Background()
+				item := map[string]any{"type": "fileChange", "id": "patch", "status": "failed",
+					"changes": []any{map[string]any{"path": "example.txt", "diff": "-old\n+new", "kind": map[string]any{"type": "update"}}}}
+				terminal := completeNotification(t, "s", "turn", protocol.Failed).(*protocol.TurnCompletedEnvelope)
+				if source == "terminal_snapshot" {
+					itemJSON, err := json.Marshal(item)
+					if err != nil {
+						t.Error(err)
+					}
+					var patch protocol.ThreadItem
+					if err := json.Unmarshal(itemJSON, &patch); err != nil {
+						t.Error(err)
+					}
+					terminal.Params.Turn.Items = []protocol.ThreadItem{patch}
+				} else {
+					agent.client.HandleNotification(ctx, decodeTestNotification(t, protocol.MethodItemCompleted,
+						map[string]any{"threadId": "s", "turnId": "turn", "item": item}))
+				}
+				agent.client.HandleNotification(ctx, terminal)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := agent.NewSession(ctx, acp.NewSessionRequest{Cwd: t.TempDir()}); err != nil {
+				t.Fatal(err)
+			}
+			_, err := agent.Prompt(ctx, acp.PromptRequest{SessionId: "s"})
+			var failure *acp.RequestError
+			if !errors.As(err, &failure) {
+				t.Fatalf("expected native turn failure, got %v", err)
+			}
+			facts := failure.Data.(map[string]any)
+			if facts["tool_completion_observed"] != true || facts["file_change_observed"] != nil {
+				t.Fatalf("expected terminal patch attempt without proven file effect, got %+v", facts)
+			}
+		})
 	}
 }
