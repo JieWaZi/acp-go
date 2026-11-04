@@ -151,6 +151,41 @@ func TestACPProjectionPreservesKnownOutcomeInError(t *testing.T) {
 	}
 }
 
+func TestACPProjectionKeepsNativePositionAndRiskEvidence(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "failure"}[failed], func(t *testing.T) {
+			stop := acp.StopReasonEndTurn
+			outcome := &NativeOutcome{
+				Turn:       acpmeta.NativeTurn{InvocationID: "native", Origin: acpmeta.NativeTurnOriginHost, Status: acpmeta.NativeTurnCompleted},
+				StopReason: &stop, ForkPosition: "native-position",
+				ObservedOutput: true, PossibleSideEffects: true,
+			}
+			if failed {
+				outcome.DeliveryError = acp.NewInternalError(map[string]any{"observedOutput": false, "possibleSideEffects": false})
+			}
+			peer := newProjectionPeer(t, &wireResultClient{result: PromptResult{
+				Receipt: PromptReceipt{Submission: SubmissionSent, Admission: AdmissionConfirmed}, Outcome: outcome,
+			}})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			response, err := peer.Prompt(ctx, acp.PromptRequest{SessionId: "session", Prompt: []acp.ContentBlock{acp.TextBlock("hello")}})
+			meta := response.Meta
+			if failed {
+				var classified *acp.RequestError
+				if !errors.As(err, &classified) {
+					t.Fatalf("missing wire failure: %v", err)
+				}
+				meta, _ = classified.Data.(map[string]any)
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if acpmeta.ForkPosition(meta) != "native-position" || meta["observedOutput"] != true || meta["possibleSideEffects"] != true {
+				t.Fatalf("canonical native evidence was lost or overwritten by delivery classification: %#v", meta)
+			}
+		})
+	}
+}
+
 func newProjectionPeer(t *testing.T, client Client) *acp.ClientSideConnection {
 	t.Helper()
 	agent, err := NewACPAgent(func(HostCallbacks) (Client, error) { return client, nil })

@@ -241,6 +241,11 @@ func projectPromptResult(result PromptResult) (acp.PromptResponse, error) {
 	failure := result.Receipt.OperationError
 	if outcome := result.Outcome; outcome != nil {
 		meta = acpmeta.WithNativeTurn(meta, outcome.Turn)
+		for key, value := range acpmeta.PositionMetadata(outcome.ForkPosition) {
+			meta[key] = value
+		}
+		meta["observedOutput"] = outcome.ObservedOutput
+		meta["possibleSideEffects"] = outcome.PossibleSideEffects
 		if outcome.Turn.Usage != nil {
 			meta = acpmeta.WithTurnUsage(meta, *outcome.Turn.Usage)
 		}
@@ -286,6 +291,11 @@ func projectPromptResult(result PromptResult) (acp.PromptResponse, error) {
 			meta["cause"] = classified.Data
 			if data, ok := classified.Data.(map[string]any); ok {
 				for _, key := range []string{"errorKind", "phase", "admission", "observedOutput", "possibleSideEffects"} {
+					// Delivery classification cannot overwrite facts already frozen
+					// by the native owner. Keep its original detail under cause.
+					if result.Outcome != nil && (key == "observedOutput" || key == "possibleSideEffects") {
+						continue
+					}
 					if value, exists := data[key]; exists {
 						meta[key] = value
 					}
