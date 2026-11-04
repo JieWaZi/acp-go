@@ -171,7 +171,7 @@ func TestUnownedUsageInvalidatesTheNextPromptBaseline(t *testing.T) {
 	agent := &Agent{sessions: store}
 	background := usageSample(30, 0, 130, 0)
 	background.ThreadID, background.TurnID = "thread", "unowned"
-	agent.handleNotification(context.Background(), 0, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, background))
+	agent.handleNotification(context.Background(), 0, false, decodeTestNotification(t, protocol.MethodThreadTokenUsageUpdated, background))
 	prompt := newNativeTurn(context.Background(), 1)
 	defer prompt.cancelRun()
 	state.activeTurn = prompt

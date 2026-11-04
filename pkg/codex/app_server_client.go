@@ -374,8 +374,8 @@ type appServerClient struct {
 	handlerMu sync.Mutex
 	// notificationPosition is the current position on the connection's receive stream.
 	notificationPosition uint64
-	// handler consumes a decoded frame together with its native receive position.
-	handler func(context.Context, uint64, protocol.ServerNotification)
+	// handler consumes an ordered frame and its stale status.
+	handler func(context.Context, uint64, bool, protocol.ServerNotification)
 	// staleTurns identifies retired turns whose content must not reach a new invocation.
 	staleTurns map[string]map[string]struct{}
 	// authMu 保护登录与 logout 的共享单次通知状态。
@@ -776,7 +776,7 @@ func (c *appServerClient) TurnSteer(
 }
 
 // SetNotificationHandler installs the ordered session notification consumer.
-func (c *appServerClient) SetNotificationHandler(handler func(context.Context, uint64, protocol.ServerNotification)) {
+func (c *appServerClient) SetNotificationHandler(handler func(context.Context, uint64, bool, protocol.ServerNotification)) {
 	c.handlerMu.Lock()
 	c.handler = handler
 	c.handlerMu.Unlock()
@@ -836,7 +836,7 @@ func (c *appServerClient) HandleNotification(ctx context.Context, notification p
 	// thread-wide counter shared with any current invocation.
 	_, usage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
 	if handler != nil && (!stale || usage) {
-		handler(ctx, position, notification)
+		handler(ctx, position, stale, notification)
 	}
 }
 

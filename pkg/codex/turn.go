@@ -38,12 +38,8 @@ type nativeTurn struct {
 	eventsMu sync.Mutex
 	// completionCapture holds unmatched completions received before this invocation binds.
 	completionCapture *completionCapture
-	// earlyEvents holds frames that cannot be published until the native identity is proven.
-	earlyEvents []turnFrame
-	// firstDroppedFrame locates overflow relative to the native terminal.
-	firstDroppedFrame uint64
-	// lastDroppedUsage tracks loss of thread counters even after this invocation ends.
-	lastDroppedUsage uint64
+	// early keeps bounded updates and usage evidence before native identity is proven.
+	early earlyTurn
 	// terminal stores the exact native completion independently of buffered display frames.
 	terminal *receivedCompletion
 	// terminalSignal closes when this exact native turn reaches a terminal notification.
@@ -710,26 +706,20 @@ func (a *Agent) replayEarlyTurnLocked(state *sessionState, prompt *nativeTurn, t
 	if prompt.completionCapture != nil {
 		completion = a.client.completions.capturedCompletion(prompt.completionCapture, turnID)
 	}
-	for _, frame := range prompt.earlyEvents {
+	for _, frame := range prompt.early.frames {
 		if completion != nil && completion.position < frame.position {
 			prompt.recordTerminalLocked(*completion)
 			completion = nil
 		}
 		a.routeBoundTurnLocked(prompt.runCtx, state, prompt, turnID, frame)
 	}
-	prompt.earlyEvents = nil
-	if dropped := prompt.firstDroppedFrame; dropped != 0 && prompt.terminal == nil && (completion == nil || dropped < completion.position) {
-		if prompt.eventFailure == nil {
-			prompt.eventFailure = errEventDeliveryBackpressure
-		}
-		prompt.currentEventRouter().handler.breakUsageContinuity()
-	}
 	if completion != nil {
 		prompt.recordTerminalLocked(*completion)
 	}
-	if prompt.terminal != nil && prompt.lastDroppedUsage > prompt.terminal.position {
-		state.invalidateUsageCheckpoint()
+	if prompt.eventFailure == nil {
+		prompt.eventFailure = prompt.early.deliveryFailure(turnID, prompt.terminal)
 	}
+	prompt.early = earlyTurn{}
 }
 
 // startObservation connects protocol ACK waiting to this turn's native evidence.

@@ -169,7 +169,7 @@ func TestMCPServerElicitationUsesACPAndCompletesURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解码 serverRequest/resolved 失败: %v", err)
 	}
-	agent.handleNotification(context.Background(), 0, resolved)
+	agent.handleNotification(context.Background(), 0, false, resolved)
 	drained := make(chan struct{})
 	if err := agent.delivery.enqueue(func() { close(drained) }); err != nil {
 		t.Fatal(err)

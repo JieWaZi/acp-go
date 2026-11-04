@@ -2,11 +2,18 @@ package codex
 
 import (
 	"context"
+	"errors"
 
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 )
 
-const maxEarlyTurnEvents = 32
+const (
+	maxEarlyTurnUpdates    = 32
+	maxEarlyUsageSamples   = 32
+	maxEarlyDroppedTurnIDs = 32
+)
+
+var errEarlyUpdateOwnershipUnknown = errors.New("could not establish Codex pre-acknowledgment delivery completeness")
 
 // turnFrame retains the receive position needed to replay around a captured terminal.
 type turnFrame struct {
@@ -14,12 +21,114 @@ type turnFrame struct {
 	position uint64
 	// turnID is the native identity extracted when the frame arrived.
 	turnID string
-	// notification retains the decoded frame until native identity is proven.
+	// notification retains the decoded frame. Nil marks a break in usage continuity.
 	notification protocol.ServerNotification
 }
 
+// earlyTurn holds the unbound turn's ordered updates and accounting evidence.
+type earlyTurn struct {
+	// frames holds at most 64 full frames and 65 coalesced usage gaps.
+	frames []turnFrame
+	// updates counts retained frames that can contribute turn updates or terminal facts.
+	updates int
+	// usageSamples counts retained native samples whose ownership is still possible.
+	usageSamples int
+	// droppedUpdates keeps the first lost update position for up to 32 native IDs.
+	droppedUpdates map[string]uint64
+	// unattributedUpdateLoss is the first loss whose ID did not fit the bounded index.
+	unattributedUpdateLoss uint64
+}
+
+// retain separates replaceable usage samples from candidate updates.
+func (e *earlyTurn) retain(frame turnFrame, retired bool) {
+	if _, usage := frame.notification.(*protocol.ThreadTokenUsageUpdatedEnvelope); usage {
+		if retired || e.usageSamples == maxEarlyUsageSamples {
+			e.noteUsageGap(frame.position)
+			return
+		}
+		e.usageSamples++
+		e.frames = append(e.frames, frame)
+		return
+	}
+	if retired || !carriesTurnUpdate(frame.notification) {
+		return
+	}
+	if e.updates < maxEarlyTurnUpdates {
+		e.updates++
+		e.frames = append(e.frames, frame)
+		return
+	}
+	if _, recorded := e.droppedUpdates[frame.turnID]; recorded {
+		return
+	}
+	if len(e.droppedUpdates) == maxEarlyDroppedTurnIDs {
+		if e.unattributedUpdateLoss == 0 {
+			e.unattributedUpdateLoss = frame.position
+		}
+		return
+	}
+	if e.droppedUpdates == nil {
+		e.droppedUpdates = make(map[string]uint64)
+	}
+	e.droppedUpdates[frame.turnID] = frame.position
+}
+
+// noteUsageGap keeps the earliest accounting break between retained frames.
+// An open gap already clears the next baseline, even if it straddles the terminal.
+func (e *earlyTurn) noteUsageGap(position uint64) {
+	if n := len(e.frames); n == 0 || e.frames[n-1].notification != nil {
+		e.frames = append(e.frames, turnFrame{position: position})
+	}
+}
+
+// deliveryFailure identifies known or unresolved update loss before the exact terminal.
+func (e *earlyTurn) deliveryFailure(turnID string, terminal *receivedCompletion) error {
+	beforeTerminal := func(position uint64) bool {
+		return position != 0 && (terminal == nil || position < terminal.position)
+	}
+	if position, recorded := e.droppedUpdates[turnID]; recorded {
+		if beforeTerminal(position) {
+			return errEventDeliveryBackpressure
+		}
+		return nil
+	}
+	if beforeTerminal(e.unattributedUpdateLoss) {
+		return errEarlyUpdateOwnershipUnknown
+	}
+	return nil
+}
+
+// carriesTurnUpdate recognizes frames that can change ACP output or terminal facts.
+func carriesTurnUpdate(notification protocol.ServerNotification) bool {
+	switch frame := notification.(type) {
+	case *protocol.ItemStartedEnvelope:
+		switch frame.Params.Item.Type {
+		case protocol.AgentMessage:
+			return frame.Params.Item.Phase != nil
+		case protocol.CommandExecution, protocol.FileChange, protocol.MCPToolCall, protocol.WebSearch, protocol.ImageView:
+			return true
+		default:
+			return false
+		}
+	case *protocol.ItemCompletedEnvelope:
+		switch frame.Params.Item.Type {
+		case protocol.AgentMessage, protocol.Reasoning, protocol.ThreadItemType("plan"),
+			protocol.CommandExecution, protocol.FileChange, protocol.MCPToolCall, protocol.WebSearch, protocol.ImageView,
+			protocol.DynamicToolCall, protocol.CollabAgentToolCall:
+			return true
+		default:
+			return false
+		}
+	case *protocol.TurnDiffUpdatedEnvelope, *protocol.ThreadTokenUsageUpdatedEnvelope:
+		return false
+	default:
+		_, _, scoped := notificationScope(notification)
+		return scoped
+	}
+}
+
 // handleNotification assigns native frames to the current thread owner and turn.
-func (a *Agent) handleNotification(ctx context.Context, position uint64, notification protocol.ServerNotification) {
+func (a *Agent) handleNotification(ctx context.Context, position uint64, stale bool, notification protocol.ServerNotification) {
 	if changed, ok := notification.(*protocol.ThreadSettingsUpdatedEnvelope); ok {
 		a.sessions.observeSettings(changed.Params.ThreadID, changed.Params.ThreadSettings)
 		return
@@ -44,29 +153,33 @@ func (a *Agent) handleNotification(ctx context.Context, position uint64, notific
 	if !ok || !a.sessions.isCurrent(state) {
 		return
 	}
+	_, usage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
 	state.mu.Lock()
 	prompt := state.activeTurn
 	if prompt == nil {
-		if _, usage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope); usage {
+		if usage {
 			state.usageTotal = nil
 		}
 		state.mu.Unlock()
 		return
 	}
 	state.mu.Unlock()
-	if turnID == "" {
+	if turnID == "" && !usage {
 		return
 	}
+	accountingOnly := stale || turnID == ""
 	frame := turnFrame{position: position, turnID: turnID, notification: notification}
 	prompt.eventsMu.Lock()
 	defer prompt.eventsMu.Unlock()
 	activeTurnID := prompt.confirmedTurnID()
 	if activeTurnID != "" {
+		if accountingOnly {
+			frame.notification = nil
+		}
 		a.routeBoundTurnLocked(ctx, state, prompt, activeTurnID, frame)
 		return
 	}
 	alreadyCompleted := a.client.completions.hasCompleted(threadID, turnID)
-	_, usage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
 	if prompt.kind == compactionTurn {
 		if _, started := notification.(*protocol.TurnStartedEnvelope); started && !alreadyCompleted {
 			a.bindTurnLocked(state, prompt, turnID)
@@ -83,21 +196,8 @@ func (a *Agent) handleNotification(ctx context.Context, position uint64, notific
 		a.routeBoundTurnLocked(ctx, state, prompt, turnID, frame)
 		return
 	}
-	// The tracker retains terminals separately. Retired display is redundant,
-	// while late usage remains evidence about the shared thread counter.
-	if _, terminal := notification.(*protocol.TurnCompletedEnvelope); terminal || alreadyCompleted && !usage {
-		return
-	}
-	if len(prompt.earlyEvents) < maxEarlyTurnEvents {
-		prompt.earlyEvents = append(prompt.earlyEvents, frame)
-		return
-	}
-	if prompt.firstDroppedFrame == 0 {
-		prompt.firstDroppedFrame = position
-	}
-	if usage {
-		prompt.lastDroppedUsage = position
-	}
+	// Proof and terminal candidates are handled separately from retained updates.
+	prompt.early.retain(frame, accountingOnly || alreadyCompleted)
 }
 
 // notificationConfirmsUserMessage checks the client identity on native user-message items.
@@ -134,16 +234,17 @@ func (a *Agent) routeBoundTurnLocked(ctx context.Context, state *sessionState, p
 		return
 	}
 	usage, hasUsage := notification.(*protocol.ThreadTokenUsageUpdatedEnvelope)
+	usageGap := notification == nil
 	if prompt.terminal != nil {
-		if hasUsage {
+		if hasUsage || usageGap {
 			// The earlier terminal is already immutable. A late sample only affects
 			// whether the next invocation can safely use the thread checkpoint.
 			state.invalidateUsageCheckpoint()
 		}
 		return
 	}
-	if frame.turnID != activeID {
-		if hasUsage {
+	if frame.turnID != activeID || usageGap {
+		if hasUsage || usageGap {
 			router.handler.breakUsageContinuity()
 		}
 		return
