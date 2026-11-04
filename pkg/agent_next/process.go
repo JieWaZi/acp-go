@@ -550,8 +550,6 @@ type processRecords struct {
 	inspect bool
 	// inspectLine defers the continuation decision until the next byte arrives.
 	inspectLine bool
-	// jsonRecord limits JSON strings to their actual double-quote delimiter.
-	jsonRecord bool
 	// quote tracks a string delimiter inside a structured record.
 	quote byte
 	// backslash tracks escaping within a quoted string.
@@ -652,7 +650,7 @@ func (r *processRecords) add(b byte) {
 		r.ambiguous = false
 		switch {
 		case b == '"' || b == '{' || b == '[':
-			r.depth, r.jsonRecord = 1, true
+			r.depth = 1
 		case r.indentation && b != '}' && b != ']':
 			r.depth, r.inspect = 1, true
 		case !r.nextLine && b != '}' && b != ']':
@@ -679,14 +677,17 @@ func (r *processRecords) add(b byte) {
 			} else if b == r.quote {
 				r.quote = 0
 			}
-		case b == '"' || (!r.jsonRecord && (b == '\'' || b == '`')):
+		case b == '"' || b == '\'' || b == '`':
+			// An object or array opener does not prove JSON: nested inspect
+			// values may use any of these delimiters. Keep their braces inside
+			// strings. Valid JSON's other quotes are already inside a string.
 			r.quote = b
 		case b == '{' || b == '[':
 			r.depth++
 		case b == '}' || b == ']':
 			r.depth--
 			if r.depth == 0 {
-				r.inspect, r.jsonRecord = false, false
+				r.inspect = false
 			}
 		}
 	} else {
@@ -748,7 +749,7 @@ func (r *processRecords) publish() {
 	r.beginMatch, r.endMatch = 0, 0
 	r.sawBegin, r.sawEnd = false, false
 	r.depth, r.quote = 0, 0
-	r.inspect, r.inspectLine, r.jsonRecord, r.backslash = false, false, false, false
+	r.inspect, r.inspectLine, r.backslash = false, false, false
 	r.ambiguous, r.nextLine, r.indentation = false, false, false
 	r.boundary = 0
 }

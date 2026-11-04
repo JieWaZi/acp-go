@@ -61,6 +61,9 @@ func TestProcessChild(t *testing.T) {
 	case "broken-inspect":
 		fmt.Fprint(os.Stderr, "broken inspect {\n  token: 'synthetic',\nFATAL ERROR: actionable crash\nlatest safe tail\n")
 		os.Exit(17)
+	case "nested-inspect":
+		fmt.Fprint(os.Stderr, os.Getenv("AGENT_NEXT_TEST_DIAGNOSTIC"))
+		os.Exit(18)
 	case "diagnostic":
 		fmt.Fprint(os.Stderr, "FATAL ERROR: startup failed\n")
 		fmt.Fprint(os.Stderr, "fixture {\n  token: '\x1b[31mse")
@@ -494,5 +497,35 @@ func TestProcessDiagnosticRecordRecoveryAcrossChunks(t *testing.T) {
 	parser.finish()
 	if len(records) != 2 || records[0] != jsonRecord || records[1] != "last" {
 		t.Fatalf("unindented JSON was incorrectly split as inspect: %q", records)
+	}
+}
+
+func TestProcessKeepsNestedInspectAsOneCredentialRecord(t *testing.T) {
+	for _, quote := range []string{"'", "`"} {
+		body := "[\n  {\n    token: " + quote + "synthetic-}}-key" + quote + ",\n    refresh: " + quote + "private-probe-marker" + quote
+		complete := body + "\n  }\n]"
+		for _, value := range []string{body, complete} {
+			ctx := processTestContext(t)
+			spec := processFixture(t, "nested-inspect")
+			spec.Env = append(os.Environ(), "AGENT_NEXT_TEST_DIAGNOSTIC="+value)
+			spec.Redact = RedactProcessDiagnostic
+			p := startProcessFixture(t, ctx, spec)
+			exit, err := p.Wait(ctx)
+			if err != nil || exit.Code != 18 || exit.Tail != "" || exit.Diagnostic != "" {
+				t.Fatalf("nested structure leaked a fragment before redaction: %+v, %v", exit, err)
+			}
+		}
+		for _, stride := range []int{1, 7, len(complete)} {
+			var records []string
+			parser := processRecords{emit: func(record string) { records = append(records, record) }}
+			input := complete + "\nsafe tail"
+			for i := 0; i < len(input); i += stride {
+				_, _ = parser.Write([]byte(input[i:min(i+stride, len(input))]))
+			}
+			parser.finish()
+			if len(records) != 2 || records[0] != complete || records[1] != "safe tail" {
+				t.Fatalf("stride %d split a nested record before redaction: %q", stride, records)
+			}
+		}
 	}
 }
