@@ -145,6 +145,16 @@ func (a *ACPAgent) UnstableForkSession(ctx context.Context, request acp.Unstable
 	return acp.UnstableForkSessionResponse{}, acp.NewMethodNotFound("session/fork")
 }
 
+// UnstableDeleteSession forwards native history deletion to the same owner.
+func (a *ACPAgent) UnstableDeleteSession(ctx context.Context, request acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error) {
+	if client, ok := a.Client.(interface {
+		UnstableDeleteSession(context.Context, acp.UnstableDeleteSessionRequest) (acp.UnstableDeleteSessionResponse, error)
+	}); ok {
+		return client.UnstableDeleteSession(ctx, request)
+	}
+	return acp.UnstableDeleteSessionResponse{}, acp.NewMethodNotFound("session/delete")
+}
+
 // ProvidesUserInput prevents installing a second tool over a native input facility.
 func (a *ACPAgent) ProvidesUserInput() bool {
 	client, ok := a.Client.(interface{ ProvidesUserInput() bool })
