@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"unicode"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
@@ -20,6 +21,10 @@ type LoginStatus struct {
 	AuthSource string `json:"auth_source"`
 	// AccountType identifies the native account class.
 	AccountType string `json:"account_type"`
+	// PrincipalID is the native service account identifier, when reported.
+	PrincipalID string `json:"principal_id,omitempty"`
+	// OrganizationID is the native organization identifier for a service account.
+	OrganizationID string `json:"org_id,omitempty"`
 	// LoginMethod identifies the native sign-in method.
 	LoginMethod string `json:"login_method"`
 	// Username is the optional local display label.
@@ -101,11 +106,20 @@ func (m *management) readLoginStatus(ctx context.Context) (LoginStatus, error) {
 		}
 		if *response.LoggedIn {
 			status = response.LoginStatus
+			if status.AccountType == "service_account" &&
+				(!validStatusID(status.PrincipalID) || status.OrganizationID != "" && !validStatusID(status.OrganizationID)) {
+				status = LoginStatus{}
+				return errors.New("Qoder CLI service account status is invalid")
+			}
 			status.Authenticated = true
 		}
 		return nil
 	})
 	return status, err
+}
+
+func validStatusID(id string) bool {
+	return id != "" && len(id) <= 512 && strings.TrimSpace(id) == id && strings.IndexFunc(id, unicode.IsControl) == -1
 }
 
 func (m *management) readNativeIdentity(ctx context.Context) (NativeIdentity, error) {

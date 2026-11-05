@@ -264,6 +264,54 @@ func TestWorkBuddyWireQuestion(t *testing.T) {
 	}
 }
 
+func TestWorkBuddyCatalogKeepsOpeningReceiptWithoutModelWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	trace := filepath.Join(cwd, "trace.jsonl")
+	client, err := workbuddy.NewClient(ctx, workbuddy.Options{
+		Executable: executable, PrefixArgs: []string{"-test.run=^TestNativeWorkBuddy$", "--"},
+		Environment:      append(os.Environ(), "WORKBUDDY_FIXTURE=catalog", "WORKBUDDY_TRACE="+trace),
+		WorkingDirectory: cwd,
+	}, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(ctx)
+	if _, err = client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := client.ReadModels(ctx)
+	wire, readErr := os.ReadFile(trace)
+	if readErr != nil || strings.Contains(string(wire), `"method":"session/set_`) {
+		t.Fatalf("model discovery sent a setter: %v %s", readErr, wire)
+	}
+	if err != nil || catalog.DefaultID == nil || *catalog.DefaultID != "fast-model" || catalog.Options.Ungrouped == nil || len(*catalog.Options.Ungrouped) != 2 {
+		t.Fatalf("native catalog: %+v %v", catalog, err)
+	}
+	if len(catalog.Modes) != 2 || catalog.Modes[0].Id != "default" || catalog.Modes[1].Id != "auto" {
+		t.Fatalf("modern permission modes lost: %+v", catalog.Modes)
+	}
+	for _, row := range *catalog.Options.Ungrouped {
+		config, ok := acpmeta.ReadModelConfigCatalog(row.Meta)
+		if !ok || (row.Value == "fast-model" && (len(config.Options) != 2 || config.Options[0].Select == nil || config.Options[0].Select.CurrentValue != "low" || len(config.UnknownConfigIDs) != 0)) ||
+			(row.Value == "DeepSeek-V4.1-Flash" && (len(config.Options) != 0 || len(config.UnknownConfigIDs) == 0)) {
+			t.Fatalf("incorrect model configuration for %q: %+v", row.Value, config)
+		}
+	}
+	opened, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+	if err != nil || opened.Modes == nil || opened.Modes.CurrentModeId != "default" {
+		t.Fatalf("native mode on open: %+v %v", opened.Modes, err)
+	}
+	if _, err := client.SetSessionMode(ctx, acp.SetSessionModeRequest{SessionId: opened.SessionId, ModeId: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNativeWorkBuddy(t *testing.T) {
 	scenario := os.Getenv("WORKBUDDY_FIXTURE")
 	if scenario == "" {
@@ -310,6 +358,14 @@ func TestNativeWorkBuddy(t *testing.T) {
 		case "initialize":
 			reply(frame.ID, map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true}})
 		case "session/new":
+			if scenario == "catalog" {
+				reply(frame.ID, map[string]any{"sessionId": "workbuddy-probe", "configOptions": []any{
+					map[string]any{"type": "select", "id": "model", "category": "model", "name": "Model", "currentValue": "fast-model", "options": []map[string]string{{"value": "fast-model", "name": "Fast"}, {"value": "DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash"}}},
+					map[string]any{"type": "select", "id": "thought_level", "category": "thought_level", "name": "Reasoning", "currentValue": "low", "options": []map[string]string{{"value": "low", "name": "Low"}}},
+					modeOption("default"),
+				}})
+				continue
+			}
 			reply(frame.ID, map[string]any{"sessionId": "workbuddy-session"})
 		case "session/load":
 			if frame.Params["sessionId"] == "workbuddy-session" {

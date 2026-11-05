@@ -46,6 +46,8 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			CwdBoundProcess: true, RequireLoadEvidence: true, ModeOption: "mode", BlockUntypedExtensions: true,
 			ReadPromptEvidence: readPromptEvidence, NormalizeUsage: normalizeUsage,
 			ExecutionOption: executionOption, Authentication: acpclient.Authentication{Disabled: options.ExplicitCredential},
+			// CodeBuddy's model setter also writes the user's selected model.
+			ReadOnlyModelCatalog: true,
 		},
 	}
 	client, err := acpclient.NewClient(ctx, launch, host)

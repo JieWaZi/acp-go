@@ -75,6 +75,8 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			NormalizeOption: normalizeOption,
 			SessionMissing:  sessionMissing,
 			Authentication:  acpclient.Authentication{Disabled: token != ""},
+			// Both editions use the persistent native setter for ACP model changes.
+			ReadOnlyModelCatalog: true,
 		},
 	}, host)
 	if err != nil {

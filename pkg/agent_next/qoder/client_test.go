@@ -220,6 +220,76 @@ func TestQoderStatusReadsOnlyNativeAuthenticationFacts(t *testing.T) {
 	}
 }
 
+func TestQoderStatusPreservesNativeServiceAccountIdentity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	options, _ := fixtureOptions(t, false)
+	for _, tc := range []struct {
+		// raw is the CLI's native status output.
+		raw string
+		// principal is the expected native service account identifier.
+		principal string
+		// organization is the optional native service account organization.
+		organization string
+		// invalid indicates that the status claims an unusable service account identity.
+		invalid bool
+	}{
+		{raw: `{"logged_in":true,"account_type":"service_account","principal_id":"principal-1","org_id":"org-1"}`, principal: "principal-1", organization: "org-1"},
+		{raw: `{"logged_in":true,"account_type":"service_account","principal_id":"principal-2"}`, principal: "principal-2"},
+		{raw: `{"logged_in":true,"account_type":"service_account"}`, invalid: true},
+		{raw: `{"logged_in":true,"account_type":"service_account","principal_id":"principal-1\n"}`, invalid: true},
+		{raw: `{"logged_in":true,"account_type":"service_account","principal_id":"principal-1","org_id":" org"}`, invalid: true},
+		{raw: `{"logged_in":false,"account_type":"service_account","principal_id":"stale","org_id":"stale"}`},
+	} {
+		options.Environment = append(options.Environment, "ACP_FAMILY_QODER_STATUS="+tc.raw)
+		status, err := qoder.ReadLoginStatus(ctx, options)
+		if tc.invalid {
+			if err == nil || status.Authenticated {
+				t.Fatalf("accepted unusable status: %+v %v", status, err)
+			}
+			continue
+		}
+		if err != nil || status.PrincipalID != tc.principal || status.OrganizationID != tc.organization ||
+			status.Authenticated != (tc.principal != "") || status.Authenticated && status.AccountType != "service_account" {
+			t.Fatalf("incorrect native service account evidence: %+v %v", status, err)
+		}
+	}
+}
+
+func TestQoderCatalogKeepsOpeningReceiptWithoutModelWrites(t *testing.T) {
+	for _, edition := range []string{"qoder", "qoder-cn"} {
+		t.Run(edition, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			options, trace := fixtureOptions(t, false)
+			options.RuntimeID = edition
+			client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close(ctx)
+			if _, err = client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+				t.Fatal(err)
+			}
+			catalog, err := client.ReadModels(ctx)
+			wire, readErr := os.ReadFile(trace)
+			if readErr != nil || strings.Contains(string(wire), `"method":"session/set_`) {
+				t.Fatalf("model discovery sent a setter: %v %s", readErr, wire)
+			}
+			if err != nil || catalog.DefaultID == nil || *catalog.DefaultID != "standard" || catalog.Options.Ungrouped == nil || len(*catalog.Options.Ungrouped) != 2 {
+				t.Fatalf("native catalog: %+v %v", catalog, err)
+			}
+			for _, row := range *catalog.Options.Ungrouped {
+				config, ok := acpmeta.ReadModelConfigCatalog(row.Meta)
+				if !ok || (row.Value == "standard" && (len(config.Options) != 1 || config.Options[0].Select == nil || config.Options[0].Select.CurrentValue != "native-low" || len(config.UnknownConfigIDs) != 0)) ||
+					(row.Value == "other" && (len(config.Options) != 0 || len(config.UnknownConfigIDs) == 0)) {
+					t.Fatalf("incorrect model configuration for %q: %+v", row.Value, config)
+				}
+			}
+		})
+	}
+}
+
 func TestQoderPATSelectsTheRegionalNativeCredential(t *testing.T) {
 	for runtime, key := range map[string]string{"qoder": "QODER_PERSONAL_ACCESS_TOKEN", "qoder-cn": "QODERCN_PERSONAL_ACCESS_TOKEN"} {
 		t.Run(runtime, func(t *testing.T) {

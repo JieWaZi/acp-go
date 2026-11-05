@@ -585,15 +585,15 @@ func (c *Client) discoverModels(ctx context.Context, conn *acp.ClientSideConnect
 		}
 	}()
 	probe := &session{}
-	if err = c.applyConfigurationLocked(probe, r.Result.ConfigOptions, r.Result.Models, r.Sequence); err != nil {
+	if err = c.applySetupLocked(probe, r.Result, r.Sequence); err != nil {
 		return catalog, err
 	}
 	model := modelOption(probe.config.options)
 	if model == nil {
 		return catalog, acp.NewMethodNotFound(acpmeta.ModelCatalogMethod)
 	}
-	if r.Result.Modes != nil {
-		catalog.Modes = slices.Clone(r.Result.Modes.AvailableModes)
+	if modes, _ := c.sessionModeState(probe); modes != nil {
+		catalog.Modes = slices.Clone(modes.AvailableModes)
 	}
 	catalog.Options, err = clone(model.Options)
 	if err != nil {
@@ -677,7 +677,7 @@ func (c *Client) discoverModels(ctx context.Context, conn *acp.ClientSideConnect
 			options := probe.config.options
 			if row.Value != opening {
 				options = nil
-				if !uncertain && time.Now().Before(deadline) {
+				if !c.opts.Protocol.ReadOnlyModelCatalog && !uncertain && time.Now().Before(deadline) {
 					until := time.Now().Add(time.Second)
 					if deadline.Before(until) {
 						until = deadline

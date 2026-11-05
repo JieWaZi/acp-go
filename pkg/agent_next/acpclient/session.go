@@ -296,7 +296,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 		response.SessionId = p.session.id
 		if p.err == nil && receiptErr == nil && modeErr == nil && !p.overflow && !c.closed {
 			response.ConfigOptions = p.session.config.options
-			response.Modes = p.session.modes
+			response.Modes, _ = c.sessionModeState(p.session)
 			response.Meta = mcpMetadata(receipt.Result.Meta, len(request.servers))
 			c.sessions[p.session.id] = p.session
 			c.rememberMCPDirectory(p.session)
@@ -480,15 +480,16 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 	defer c.end()
 	c.mu.Lock()
 	s := c.sessions[request.SessionId]
-	valid := s != nil && hasMode(s.modes, request.ModeId)
+	modes, optionID := c.sessionModeState(s)
+	valid := hasMode(modes, request.ModeId)
 	c.mu.Unlock()
 	if !valid {
 		return acp.SetSessionModeResponse{}, invalid("ACP agent did not advertise the requested mode")
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
-	if id := c.opts.Protocol.ModeOption; id != "" {
-		wanted := setting{id: id, value: acp.SessionConfigValueId(request.ModeId)}
+	if optionID != "" {
+		wanted := setting{id: optionID, value: acp.SessionConfigValueId(request.ModeId)}
 		params := acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
 			SessionId: s.id, ConfigId: wanted.id, Value: wanted.value,
 		}}
@@ -496,6 +497,58 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 		return acp.SetSessionModeResponse{Meta: result.Meta}, err
 	}
 	return c.setNativeMode(op, conn, s, request)
+}
+
+// sessionModeState projects a modern mode option only when the peer did not
+// supply its legacy mode menu. The returned option ID selects the setter.
+func (c *Client) sessionModeState(s *session) (*acp.SessionModeState, acp.SessionConfigId) {
+	if s == nil {
+		return nil, ""
+	}
+	id := c.opts.Protocol.ModeOption
+	if s.modes != nil && len(s.modes.AvailableModes) != 0 {
+		return s.modes, id
+	}
+	var mode *acp.SessionConfigOptionSelect
+	for _, option := range s.config.options {
+		selectOption := option.Select
+		if selectOption == nil || selectOption.Category == nil || *selectOption.Category != acp.SessionConfigOptionCategoryMode ||
+			id != "" && selectOption.Id != id {
+			continue
+		}
+		if mode != nil {
+			return s.modes, id
+		}
+		mode = selectOption
+	}
+	if mode == nil {
+		return s.modes, id
+	}
+	state := &acp.SessionModeState{}
+	appendModes := func(choices []acp.SessionConfigSelectOption) {
+		for _, choice := range choices {
+			if choice.Value != "" {
+				state.AvailableModes = append(state.AvailableModes, acp.SessionMode{
+					Id: acp.SessionModeId(choice.Value), Name: choice.Name, Description: choice.Description,
+				})
+			}
+		}
+	}
+	if mode.Options.Ungrouped != nil {
+		appendModes(*mode.Options.Ungrouped)
+	}
+	if mode.Options.Grouped != nil {
+		for _, group := range *mode.Options.Grouped {
+			appendModes(group.Options)
+		}
+	}
+	if len(state.AvailableModes) == 0 {
+		return s.modes, id
+	}
+	if current := acp.SessionModeId(mode.CurrentValue); s.config.currentAt[mode.Id] != 0 && hasMode(state, current) {
+		state.CurrentModeId = current
+	}
+	return state, mode.Id
 }
 
 func hasMode(state *acp.SessionModeState, id acp.SessionModeId) bool {

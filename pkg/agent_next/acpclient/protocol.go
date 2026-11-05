@@ -52,6 +52,8 @@ type Protocol struct {
 	NormalizeOption func(acp.SessionConfigOption) acp.SessionConfigOption
 	// ReadModelConfig reads model-scoped settings carried in native model rows.
 	ReadModelConfig func(map[string]any) (acpmeta.ModelConfigCatalog, bool)
+	// ReadOnlyModelCatalog disables discovery setters that can persist native defaults.
+	ReadOnlyModelCatalog bool
 	// ExecutionOption identifies additional native parameters frozen with each prompt.
 	ExecutionOption func(acp.SessionConfigOptionCategory) bool
 	// SessionMissing classifies a provider-specific error for the exact requested ID.
