@@ -185,6 +185,133 @@ func TestStandardACPRestoreDistinguishesMissingResources(t *testing.T) {
 	}
 }
 
+func TestGeminiDefaultedZeroQuotaRemainsUnknown(t *testing.T) {
+	t.Setenv("STANDARD_ACP_GEMINI_ZERO_QUOTA", "1")
+	cwd := t.TempDir()
+	client, ctx := newFixtureClient(t, standardacp.Gemini, cwd, agentclient.HostCallbacks{})
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		SessionId: session.SessionId, ConfigId: "model", Value: "fixture/alternate",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	result := reserve(t, ctx, client, session.SessionId, "defaulted-zero")()
+	if result.Outcome == nil || result.Outcome.Turn.Usage == nil || result.Outcome.Turn.Usage.OutputTokens != nil {
+		t.Fatalf("Gemini's defaulted zero must not become measured output: %#v", result.Outcome)
+	}
+}
+
+func TestOpenCodeRestoreRecovery(t *testing.T) {
+	for _, mode := range []string{"startup", "listed", "missing", "incomplete"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("STANDARD_ACP_OPENCODE_RESTORE", mode)
+			cwd := t.TempDir()
+			client, ctx := newFixtureClient(t, standardacp.OpenCode, cwd, agentclient.HostCallbacks{})
+			if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+				t.Fatal(err)
+			}
+			result, err := client.ResumeSession(ctx, acp.ResumeSessionRequest{SessionId: "recover", Cwd: cwd})
+			if mode == "missing" {
+				var native *acp.RequestError
+				if !errors.As(err, &native) {
+					t.Fatalf("missing error: %v", err)
+				}
+				data, _ := native.Data.(map[string]any)
+				if data["classification"] != "session_missing" {
+					t.Fatalf("missing proof: %v", err)
+				}
+			} else if err != nil || len(result.ConfigOptions) != 1 {
+				t.Fatalf("restored session: %#v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestOpenCodeMCPDirectoryKeepsOneOwnerPerProcess(t *testing.T) {
+	cwd := t.TempDir()
+	server := func(token string) []acp.McpServer {
+		var servers []acp.McpServer
+		raw, _ := json.Marshal([]map[string]any{{"type": "http", "name": "managed", "url": "http://127.0.0.1:1/mcp",
+			"headers": []map[string]string{{"name": "Authorization", "value": token}}}})
+		if err := json.Unmarshal(raw, &servers); err != nil {
+			t.Fatal(err)
+		}
+		return servers
+	}
+	first, firstCtx := newFixtureClient(t, standardacp.OpenCode, cwd, agentclient.HostCallbacks{})
+	second, secondCtx := newFixtureClient(t, standardacp.OpenCode, cwd, agentclient.HostCallbacks{})
+	for _, initialize := range []func() error{
+		func() error {
+			_, err := first.Initialize(firstCtx, acp.InitializeRequest{ProtocolVersion: 1})
+			return err
+		},
+		func() error {
+			_, err := second.Initialize(secondCtx, acp.InitializeRequest{ProtocolVersion: 1})
+			return err
+		},
+	} {
+		if err := initialize(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session, err := first.NewSession(firstCtx, acp.NewSessionRequest{Cwd: cwd, McpServers: server("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.NewSession(secondCtx, acp.NewSessionRequest{Cwd: cwd, McpServers: server("second")}); err != nil {
+		t.Fatalf("process-private MCP namespace: %v", err)
+	}
+	assertConflict := func(servers []acp.McpServer) {
+		t.Helper()
+		_, err := first.NewSession(firstCtx, acp.NewSessionRequest{Cwd: cwd, McpServers: servers})
+		var native *acp.RequestError
+		if !errors.As(err, &native) || native.Code != -32602 {
+			t.Fatalf("directory MCP namespace reused by another native session: %v", err)
+		}
+	}
+	assertConflict(server("second"))
+	if _, err := first.LoadSession(firstCtx, acp.LoadSessionRequest{SessionId: session.SessionId, Cwd: cwd, McpServers: server("first")}); err != nil {
+		t.Fatalf("same session and unchanged MCP route: %v", err)
+	}
+	if _, err := first.CloseSession(firstCtx, acp.CloseSessionRequest{SessionId: session.SessionId}); err != nil {
+		t.Fatal(err)
+	}
+	assertConflict(nil)
+}
+
+func TestOpenCodeEmptyAnswer(t *testing.T) {
+	cwd := t.TempDir()
+	client, ctx := newFixtureClient(t, standardacp.OpenCode, cwd, agentclient.HostCallbacks{})
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		SessionId: session.SessionId, ConfigId: "model", Value: "fixture/alternate",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, prompt := range []string{"empty-answer", "thought-only", "/compact"} {
+		result := reserve(t, ctx, client, session.SessionId, prompt)()
+		if result.Outcome == nil || result.Outcome.OperationError != nil ||
+			(result.Outcome.NativeFailure == nil) != (prompt == "/compact") {
+			t.Fatalf("%s: %#v", prompt, result)
+		}
+		if prompt != "/compact" && result.Outcome.Turn.Status != acpmeta.NativeTurnFailed {
+			t.Fatalf("%s published a successful native turn: %#v", prompt, result.Outcome)
+		}
+	}
+}
+
 func TestKimiNativeJournalAndOpeningMode(t *testing.T) {
 	for _, mode := range []string{"failed", "unverified"} {
 		t.Run(mode, func(t *testing.T) { checkKimiNativeJournal(t, mode) })
@@ -288,10 +415,16 @@ func TestStandardACPProcess(t *testing.T) {
 		return
 	}
 	journalMode := os.Getenv("STANDARD_ACP_KIMI_JOURNAL")
+	restoreMode := os.Getenv("STANDARD_ACP_OPENCODE_RESTORE")
 	journal := journalMode != ""
 	version := "1.2.3"
 	if provider == "opencode" {
 		version = "1.18.34"
+		if restoreMode == "startup" {
+			version = "2.1.1"
+		} else if restoreMode != "" {
+			version = "1.19.3"
+		}
 	}
 	if journal {
 		version = "2.0.2"
@@ -312,6 +445,7 @@ func TestStandardACPProcess(t *testing.T) {
 	model := "fixture/default"
 	var pending json.RawMessage
 	nextSession := 0
+	restoreCalls := 0
 	mode := "default"
 	var wire string
 	authenticated := provider != "grok"
@@ -346,7 +480,8 @@ func TestStandardACPProcess(t *testing.T) {
 		switch request.Method {
 		case "initialize":
 			result = jsonObject{"protocolVersion": 1, "agentCapabilities": jsonObject{"loadSession": true,
-				"sessionCapabilities": jsonObject{"close": jsonObject{}}},
+				"sessionCapabilities": jsonObject{"close": jsonObject{}, "list": jsonObject{}, "resume": jsonObject{}},
+				"mcpCapabilities":     jsonObject{"http": true}},
 			}
 			if provider == "grok" {
 				result["_meta"] = jsonObject{"grokShell": true, "agentVersion": version, "defaultAuthMethodId": "xai.api_key"}
@@ -359,7 +494,35 @@ func TestStandardACPProcess(t *testing.T) {
 				os.Exit(48)
 			}
 			authenticated = true
-		case "session/new", "session/load":
+		case "session/list":
+			switch restoreMode {
+			case "listed":
+				if request.Params["cursor"] == nil {
+					result["sessions"], result["nextCursor"] = []any{}, "second"
+				} else {
+					result["sessions"] = []any{jsonObject{"sessionId": "recover", "cwd": request.Params["cwd"]}}
+				}
+			case "missing":
+				result["sessions"] = []any{}
+			case "incomplete":
+				result["nextCursor"] = "untrustworthy"
+			default:
+				os.Exit(54)
+			}
+		case "session/new", "session/load", "session/resume":
+			if request.Method == "session/resume" && restoreMode != "" {
+				restoreCalls++
+				if restoreCalls == 1 {
+					if restoreMode == "startup" {
+						response["error"] = jsonObject{"code": -32603, "message": "Internal error: Internal service failure",
+							"data": jsonObject{"errorName": "ServiceUnavailableError"}}
+					} else {
+						response["error"] = jsonObject{"code": -32603, "message": "Internal error: OpenCode service failure"}
+					}
+					_ = out.Encode(response)
+					continue
+				}
+			}
 			switch request.Params["sessionId"] {
 			case "gone":
 				response["error"] = jsonObject{"code": -32602, "message": "Invalid params: session not found: gone",
@@ -447,10 +610,17 @@ func TestStandardACPProcess(t *testing.T) {
 			} else if model != "fixture/alternate" {
 				os.Exit(45)
 			}
-			_ = out.Encode(jsonObject{"jsonrpc": "2.0", "method": "session/update", "params": jsonObject{
-				"sessionId": request.Params["sessionId"], "update": jsonObject{"sessionUpdate": "agent_message_chunk",
-					"content": jsonObject{"type": "text", "text": "fixture answer"}},
-			}})
+			line := s.Text()
+			if !strings.Contains(line, `"text":"empty-answer"`) && !strings.Contains(line, `"text":"/compact"`) {
+				kind := "agent_message_chunk"
+				if strings.Contains(line, `"text":"thought-only"`) {
+					kind = "agent_thought_chunk"
+				}
+				_ = out.Encode(jsonObject{"jsonrpc": "2.0", "method": "session/update", "params": jsonObject{
+					"sessionId": request.Params["sessionId"], "update": jsonObject{"sessionUpdate": kind,
+						"content": jsonObject{"type": "text", "text": "fixture answer"}},
+				}})
+			}
 			if strings.Contains(s.Text(), `"text":"cancel"`) {
 				pending = slices.Clone(request.ID)
 				continue
@@ -461,7 +631,11 @@ func TestStandardACPProcess(t *testing.T) {
 					"cacheCreationTokens": 2, "reasoningTokens": 3, "modelCalls": 1}}
 			}
 			if provider == "gemini" {
-				result["_meta"] = jsonObject{"quota": jsonObject{"token_count": jsonObject{"input_tokens": 23, "output_tokens": 6}}}
+				input, output := 23, 6
+				if os.Getenv("STANDARD_ACP_GEMINI_ZERO_QUOTA") != "" {
+					input, output = 0, 0
+				}
+				result["_meta"] = jsonObject{"quota": jsonObject{"token_count": jsonObject{"input_tokens": input, "output_tokens": output}}}
 			}
 		case "session/cancel":
 			if pending == nil {

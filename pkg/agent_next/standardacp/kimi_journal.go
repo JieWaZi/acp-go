@@ -57,7 +57,7 @@ func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope,
 	if relative == "" {
 		return nil
 	}
-	file, err := root.Open(relative)
+	file, err := openKimiJournalFile(root, relative)
 	var baseline os.FileInfo
 	var offset int64
 	switch {
@@ -83,7 +83,7 @@ func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope,
 }
 
 func kimiJournalPath(ctx context.Context, root *os.Root, home string, scope acpclient.PromptJournalScope) string {
-	file, err := root.Open("session_index.jsonl")
+	file, err := openKimiJournalFile(root, "session_index.jsonl")
 	if err != nil {
 		return ""
 	}
@@ -198,7 +198,7 @@ type kimiWireEvent struct {
 
 func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseline os.FileInfo, offset int64) (acpclient.PromptJournalEvidence, bool, bool) {
 	var evidence acpclient.PromptJournalEvidence
-	file, err := root.Open(relative)
+	file, err := openKimiJournalFile(root, relative)
 	if err != nil {
 		return evidence, false, false
 	}
@@ -242,6 +242,17 @@ func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseli
 		}
 	}
 	return evidence, turn != nil, false
+}
+
+func openKimiJournalFile(root *os.Root, name string) (*os.File, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("Kimi journal entry is not a regular file")
+	}
+	return root.Open(name)
 }
 
 func addKimiUsage(report *acpmeta.TurnUsage, value kimiWireCounters, first bool) {

@@ -90,23 +90,35 @@ func geminiPromptUsage(meta map[string]any) *acpmeta.TurnUsage {
 			Counts geminiCounts `json:"token_count"`
 		} `json:"model_usage"`
 	}
-	if !decodeMetadata(meta["quota"], &quota) || !exactCounter(quota.Counts.Output) {
+	if !decodeMetadata(meta["quota"], &quota) {
 		return nil
 	}
-	report := &acpmeta.TurnUsage{Source: "gemini.prompt.quota", Coverage: "observed_requests", OutputTokens: quota.Counts.Output}
-	if exactCounter(quota.Counts.Input) {
+	report := &acpmeta.TurnUsage{Source: "gemini.prompt.quota", Coverage: "observed_requests"}
+	// Gemini defaults absent metadata to zero, and reports candidate output
+	// without reasoning. Only positive counters prove measured consumption.
+	if exactCounter(quota.Counts.Output) && *quota.Counts.Output > 0 {
+		report.OutputTokens = quota.Counts.Output
+	}
+	if exactCounter(quota.Counts.Input) && *quota.Counts.Input > 0 {
 		report.Observations = []acpmeta.UsageObservation{{Source: report.Source, Coverage: "provider_input_total",
 			InputTotalTokens: quota.Counts.Input}}
 	}
-	if len(quota.Models) > 0 && len(quota.Models) <= 128 {
+	if report.OutputTokens == nil && len(report.Observations) == 0 {
+		return nil
+	}
+	if report.OutputTokens != nil && len(quota.Models) > 0 && len(quota.Models) <= 128 {
 		models := make(map[string]acpmeta.ModelUsage, len(quota.Models))
 		for _, row := range quota.Models {
 			if _, duplicate := models[row.ID]; row.ID == "" || duplicate || !exactCounter(row.Counts.Output) {
 				return report
 			}
-			models[row.ID] = acpmeta.ModelUsage{OutputTokens: row.Counts.Output}
+			if *row.Counts.Output > 0 {
+				models[row.ID] = acpmeta.ModelUsage{OutputTokens: row.Counts.Output}
+			}
 		}
-		report.Models = models
+		if len(models) > 0 {
+			report.Models = models
+		}
 	}
 	return report
 }

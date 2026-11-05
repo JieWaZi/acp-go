@@ -57,6 +57,12 @@ type turn struct {
 	terminal bool
 	// observedOutput records a matched execution frame, independent of delivery.
 	observedOutput bool
+	// expectsAnswer excludes native slash commands from empty-answer correction.
+	expectsAnswer bool
+	// answered accepts visible answer content or a native tool action.
+	answered bool
+	// reasoned records a native thought that did not itself answer the prompt.
+	reasoned bool
 	// inputAccepted records explicit input admission on peers that report it.
 	inputAccepted bool
 	// associated records an explicit turn-scoped native update.
@@ -130,6 +136,9 @@ func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, o
 		received: make(chan struct{}), settled: make(chan struct{}),
 		scope: agentclient.Scope{SessionID: s.id, HostInvocationID: options.HostInvocationID, NativeInvocationID: newID()},
 		input: agentclient.PromptSubmission{SessionID: s.id, HostInvocationID: options.HostInvocationID, InputID: inputID}}
+	if c.opts.Protocol.EmptyAnswerFailure != nil {
+		t.expectsAnswer = promptExpectsAnswer(frozen.Prompt)
+	}
 	// The supported native launch profiles have no proven messageId contract.
 	frozen.MessageId = nil
 	c.busy, c.turn = true, t
@@ -432,6 +441,12 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 		outcome.NativeFailure = freezeProtocolError(c.safeSessionPeerError(peer, acp.AgentMethodSessionPrompt, t.session.id))
 		outcome.Turn.Status = acpmeta.NativeTurnFailed
 	}
+	if fail := c.opts.Protocol.EmptyAnswerFailure; fail != nil && response != nil &&
+		response.StopReason == acp.StopReasonEndTurn && outcome.NativeFailure == nil &&
+		t.expectsAnswer && !t.answered && !t.cancelled && t.delivery.err == nil {
+		outcome.NativeFailure = freezeProtocolError(fail(t.reasoned))
+		outcome.Turn.Status = acpmeta.NativeTurnFailed
+	}
 	if outcome.StopReason == nil && !t.associated && !t.authLost && outcome.Turn.Usage == nil {
 		return nil
 	}
@@ -441,6 +456,17 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 		outcome.Turn.Usage = &usage
 	}
 	return outcome
+}
+
+func promptExpectsAnswer(blocks []acp.ContentBlock) bool {
+	for _, block := range blocks {
+		if block.Text != nil {
+			if text := strings.TrimSpace(block.Text.Text); text != "" {
+				return !strings.HasPrefix(text, "/")
+			}
+		}
+	}
+	return true
 }
 
 func promptOperationError(c *Client, r acp.RequestReceipt[promptResponse], id acp.SessionId) error {

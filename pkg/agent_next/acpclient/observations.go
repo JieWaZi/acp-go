@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
@@ -260,6 +261,15 @@ func (c *Client) foldTurnUpdateLocked(t *turn, update receivedUpdate) {
 	if u.ToolCall != nil && !rememberTool(t, u.ToolCall.ToolCallId) ||
 		u.ToolCallUpdate != nil && !rememberTool(t, u.ToolCallUpdate.ToolCallId) {
 		return
+	}
+	if t.expectsAnswer {
+		if u.ToolCall != nil || u.ToolCallUpdate != nil ||
+			u.AgentMessageChunk != nil && (u.AgentMessageChunk.Content.Text == nil || strings.TrimSpace(u.AgentMessageChunk.Content.Text.Text) != "") {
+			t.answered = true
+		}
+		if u.AgentThoughtChunk != nil && u.AgentThoughtChunk.Content.Text != nil && strings.TrimSpace(u.AgentThoughtChunk.Content.Text.Text) != "" {
+			t.reasoned = true
+		}
 	}
 	if u.AgentMessageChunk != nil || u.AgentThoughtChunk != nil || u.ToolCall != nil || u.ToolCallUpdate != nil ||
 		u.Plan != nil || u.PlanUpdate != nil || u.PlanRemoved != nil {

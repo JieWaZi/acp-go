@@ -136,6 +136,9 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		// The advertised ACP method is a terminal redirect or a no-op.
 		protocol.Authentication.Disabled = true
 		protocol.SessionMissing = openCodeSessionMissing
+		protocol.RecoverRestore = openCodeRestoreRecovery
+		protocol.EmptyAnswerFailure = openCodeEmptyAnswer
+		protocol.DirectoryScopedMCP = true
 		protocol.ReadPromptUsage = openCodePromptUsage
 	default:
 		return nil, errors.New("unknown standard ACP provider")

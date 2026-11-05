@@ -33,6 +33,8 @@ type session struct {
 	usedInputIDs map[string]struct{}
 	// mcpIDs identifies ACP-transport MCP servers explicitly declared on open.
 	mcpIDs []acp.UnstableMcpServerAcpId
+	// mcpDirectory tracks process-local directory exposure when required by the provider.
+	mcpDirectory *mcpDirectory
 	// plan retains the native plan entries across incremental updates.
 	plan []PlanItem
 	// modes is the last advertised native mode state.
@@ -201,6 +203,10 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	if err := c.validateSetup(request); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	mcpDirectory, err := c.prepareMCPDirectory(request)
+	if err != nil {
+		return acp.NewSessionResponse{}, err
+	}
 	instructions, err := acpmeta.DeveloperInstructions(request.meta)
 	if err != nil || instructions != nil && len(*instructions) > 1<<20 {
 		return acp.NewSessionResponse{}, invalid("invalid ACP agent developer instructions")
@@ -209,6 +215,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	defer cancel()
 	p := &opening{session: &session{id: request.id, cwd: request.cwd, usage: usageCounter{fresh: request.method == acp.AgentMethodSessionNew}}, source: request.source, replay: request.method == acp.AgentMethodSessionLoad,
 		delivery: newDelivery(op)}
+	p.session.mcpDirectory = mcpDirectory
 	c.mu.Lock()
 	p.previous = c.sessions[request.id]
 	for _, server := range request.servers {
@@ -246,16 +253,23 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 			return acp.NewSessionResponse{}, err
 		}
 	}
-	receipt := acp.SendClientRequestWithReceipt[setupResult](conn, op, request.method, request.params,
-		boundedWrite(op, conn, func() error {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			if c.closed || c.opening != p {
-				return ErrRestartRequired
-			}
-			p.started = true
-			return nil
-		}), func(r acp.RequestReceipt[setupResult]) { c.bindOpening(p, r) })
+	restore := func() acp.RequestReceipt[setupResult] {
+		return acp.SendClientRequestWithReceipt[setupResult](conn, op, request.method, request.params,
+			boundedWrite(op, conn, func() error {
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				if c.closed || c.opening != p {
+					return ErrRestartRequired
+				}
+				p.started = true
+				return nil
+			}), func(r acp.RequestReceipt[setupResult]) { c.bindOpening(p, r) })
+	}
+	receipt := restore()
+	retry, recoveryErr := c.recoverRestore(op, conn, p, request, receipt.PeerErr)
+	if retry {
+		receipt = restore()
+	}
 	var receiptErr error
 	if request.afterBind != nil && p.matched {
 		// The receive hook already bound the ID. Keep admission while the host's
@@ -275,6 +289,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 			response.Modes = p.session.modes
 			response.Meta = mcpMetadata(receipt.Result.Meta, len(request.servers))
 			c.sessions[p.session.id] = p.session
+			c.rememberMCPDirectory(p.session)
 			// Opening can change the process's active model. Only an
 			// acknowledged model set can establish the process-wide value.
 			if model := modelOption(p.session.config.options); c.opts.Protocol.ModelScope == ModelPerProcess && model != nil && model.CurrentValue != c.processModel {
@@ -296,7 +311,8 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	if c.closed {
 		normalizeErr = errors.Join(normalizeErr, ErrRestartRequired)
 	}
-	if normalizeErr != nil || !p.matched && receipt.PeerErr == nil && receipt.Write.BytesWritten != 0 {
+	if normalizeErr != nil || !p.matched && receipt.Write.BytesWritten != 0 &&
+		(receipt.PeerErr == nil || mcpDirectory != nil && mcpDirectory.hasRoutes) {
 		c.unusable = true
 	}
 	c.mu.Unlock()
@@ -306,6 +322,9 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	}
 	response = projected
 	operationErr := sessionReceiptFailure(c, receipt, request.method, request.id)
+	if recoveryErr != nil {
+		operationErr = recoveryErr
+	}
 	if operationErr != nil || normalizeErr != nil || receiptErr != nil {
 		return response, errors.Join(operationErr, normalizeErr, receiptErr)
 	}

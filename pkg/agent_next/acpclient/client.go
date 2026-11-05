@@ -98,6 +98,8 @@ type Client struct {
 	reverseBytes int
 	// mcpConnections maps explicitly opened wire MCP channels.
 	mcpConnections map[acp.UnstableMcpConnectionId]struct{}
+	// directoryMCP retains provider directory registrations until process exit.
+	directoryMCP []directoryMCP
 	// version is published with the native connection and used by text classification.
 	version string
 	// clientCaps are the capabilities actually advertised to the peer.

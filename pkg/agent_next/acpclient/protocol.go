@@ -52,6 +52,12 @@ type Protocol struct {
 	SessionMissing func(*acp.RequestError, acp.SessionId) bool
 	// RequireExactMissing lets the profile distinguish resource and session failures.
 	RequireExactMissing bool
+	// RecoverRestore recognizes a native failure safe to check or retry once.
+	RecoverRestore func(string, *acp.RequestError) RestoreRecovery
+	// EmptyAnswerFailure corrects an end_turn that omitted the expected output.
+	EmptyAnswerFailure func(reasoned bool) *acp.RequestError
+	// DirectoryScopedMCP keeps one native MCP namespace per directory per process.
+	DirectoryScopedMCP bool
 	// ClassifyText classifies one complete native text chunk for the running version.
 	ClassifyText func(version, text string) TextClass
 	// Private decodes known reverse method data without performing I/O.
@@ -124,6 +130,15 @@ const (
 	TextAnswer TextClass = iota
 	TextNoise
 	TextAuthenticationLost
+)
+
+// RestoreRecovery describes the safe next step after a recognized peer refusal.
+type RestoreRecovery uint8
+
+const (
+	RestoreNoRecovery RestoreRecovery = iota
+	RestoreRetryAfterStartup
+	RestoreCheckListing
 )
 
 // Authentication describes native login availability for a frozen credential.
