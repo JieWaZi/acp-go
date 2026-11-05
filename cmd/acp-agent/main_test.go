@@ -261,6 +261,9 @@ func TestRunProductionCompositionSessionFlow(t *testing.T) {
 	if err != nil || prompt.StopReason != acp.StopReasonEndTurn {
 		t.Fatalf("production Prompt 响应为 %#v, %v", prompt, err)
 	}
+	if receipt, ok := prompt.Meta["acp-go/prompt-receipt"].(map[string]any); !ok || receipt["admission"] != "confirmed" {
+		t.Fatalf("wire prompt omitted the native admission receipt: %#v", prompt.Meta)
+	}
 	updates := client.snapshotUpdates()
 	assertProductionV1Updates(t, updates)
 	if _, err = connection.Logout(ctx, acp.LogoutRequest{}); err != nil {
@@ -601,7 +604,7 @@ func runFakeCodexProcess(args []string, input io.Reader, output io.Writer) int {
 		}
 		return 0
 	}
-	if len(args) != 1 || args[0] != "app-server" {
+	if len(args) != 3 || args[0] != "app-server" || args[1] != "--listen" || args[2] != "stdio://" {
 		return 2
 	}
 
@@ -649,7 +652,15 @@ func handleFakeCodexRequest(
 	case codexprotocol.MethodAccountRead:
 		return writeFakeResult(encoder, id, `{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}`)
 	case codexprotocol.MethodThreadStart:
-		return writeFakeResult(encoder, id, `{"approvalPolicy":"on-request","approvalsReviewer":"user","cwd":"/workspace","model":"fast-model","modelProvider":"openai","reasoningEffort":"medium","sandbox":{"type":"workspaceWrite"},"thread":{"cliVersion":"0.148.0","createdAt":1,"cwd":"/workspace","ephemeral":false,"id":"e2e-thread","modelProvider":"openai","preview":"","sessionId":"e2e-session","source":{},"status":{"type":"idle"},"turns":[],"updatedAt":1}}`)
+		var request codexprotocol.ThreadStartParams
+		if err := json.Unmarshal(params, &request); err != nil {
+			return err
+		}
+		cwd, err := json.Marshal(request.Cwd)
+		if err != nil {
+			return err
+		}
+		return writeFakeResult(encoder, id, fmt.Sprintf(`{"approvalPolicy":"on-request","approvalsReviewer":"user","cwd":%s,"model":"fast-model","modelProvider":"openai","reasoningEffort":"medium","sandbox":{"type":"workspaceWrite"},"thread":{"cliVersion":"0.148.0","createdAt":1,"cwd":%s,"ephemeral":false,"id":"e2e-thread","modelProvider":"openai","preview":"","sessionId":"e2e-session","source":{},"status":{"type":"idle"},"turns":[],"updatedAt":1}}`, cwd, cwd))
 	case codexprotocol.MethodModelList:
 		return writeFakeResult(encoder, id, `{"data":[{"defaultReasoningEffort":"medium","description":"Fast","displayName":"Fast model","hidden":false,"id":"fast-model","isDefault":true,"model":"fast-model","supportedReasoningEfforts":[{"reasoningEffort":"medium","description":"Balanced"}]},{"defaultReasoningEffort":"low","description":"Slow","displayName":"Slow model","hidden":false,"id":"slow-model","isDefault":false,"model":"slow-model","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"medium","description":"Balanced"}]}]}`)
 	case codexprotocol.MethodTurnStart:
@@ -733,9 +744,9 @@ func writeFakeError(encoder *json.Encoder, id json.RawMessage, code int, message
 	})
 }
 
-// TestRegistryIncludesNativePublicAdapters 验证三种公开 Adapter 可被选择，路径错误不会回退或写 stdout。
+// TestRegistryIncludesNativePublicAdapters checks that each explicit executable is selected without fallback.
 func TestRegistryIncludesNativePublicAdapters(t *testing.T) {
-	for _, name := range []string{"opencode", "gemini", "grok", "workbuddy"} {
+	for _, name := range []string{"cursor", "pi", "workbuddy", "kimi", "opencode", "gemini", "grok"} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "missing-"+name)
 			t.Setenv(strings.ToUpper(name)+"_PATH", path)

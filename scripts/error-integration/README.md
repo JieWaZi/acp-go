@@ -21,9 +21,9 @@ ACP_ERROR_CLIS=kimi,pi ACP_ERROR_SCENARIOS=rate ACP_ERROR_RECOVER=1 \
   node scripts/error-integration/run.mjs /tmp/acp-error-probe
 ```
 
-2026-09-23 实测版本：Codex 0.155.1、Claude 2.1.159、Cursor 2026.09.18-9a7762b、Kimi 2.0.2、Pi 0.85.1。
+2026-09-23 旧适配器实测版本：Codex 0.155.1、Claude 2.1.159、Cursor 2026.09.18-9a7762b、Kimi 2.0.2、Pi 0.85.1。
 
-## 覆盖边界与发现
+## 历史覆盖边界与发现
 
 - Codex、Claude、Kimi、Pi：创建真实会话后，在模型 HTTP 请求中注入认证失败、限流和服务不可用。测试配置关闭或压缩 CLI 内部自动重试，只影响临时配置。
 - Cursor：故障注入发生在 `session/new` 的认证交换和配置请求阶段；它只返回 `Failed to initialize session services`，丢失具体 HTTP 分类。只能确认初始化失败不会变成正常回复，不能将这三项算作模型回合覆盖，也不能凭 fixture 的已知 HTTP 状态给产品硬编码分类。

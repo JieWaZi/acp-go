@@ -1,368 +1,240 @@
 package cursor
 
 import (
-	"context"
 	"encoding/json"
+	"slices"
 	"strings"
-	"sync"
 
-	"github.com/JieWaZi/acp-go/pkg/nativeacp"
+	"github.com/JieWaZi/acp-go/pkg/acpclient"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// cursorCallbacks 拥有 Cursor 私有反向请求及其计划合并状态。
-type cursorCallbacks struct {
-	// mutex 保护多个会话并发更新的计划状态。
-	mutex sync.Mutex
-	// todos 按会话保存 Cursor 计划条目的权威顺序。
-	todos map[acp.SessionId][]cursorTodo
-}
+type privateProtocol struct{}
 
-// cursorInteractionRequest 保留 Cursor 文档定义的交互字段。
-type cursorInteractionRequest struct {
-	// SessionID 是部分实现附加的会话标识。
-	SessionID string `json:"sessionId"`
-	// ToolCallID 将交互关联到此前的工具更新。
-	ToolCallID string `json:"toolCallId"`
-	// Title 是问答标题。
-	Title string `json:"title"`
-	// Questions 是按原始顺序展示的问题。
-	Questions []cursorCallbackQuestion `json:"questions"`
-	// Name 是计划名称。
-	Name string `json:"name"`
-	// Plan 是需要用户明确批准的完整计划。
-	Plan string `json:"plan"`
-}
+const (
+	askQuestion   = "cursor/ask_question"
+	createPlan    = "cursor/create_plan"
+	updateTodos   = "cursor/update_todos"
+	updateTask    = "cursor/task"
+	generateImage = "cursor/generate_image"
+)
 
-// cursorCallbackQuestion 表达一个私有回调中的单选或多选问题。
-type cursorCallbackQuestion struct {
-	// ID 是返回答案时的原始问题标识。
+type questionOption struct {
+	// ID is the exact Cursor choice returned with the answer.
 	ID string `json:"id"`
-	// Prompt 是问题正文。
-	Prompt string `json:"prompt"`
-	// Options 是上游公开的选项。
-	Options []cursorCallbackOption `json:"options"`
-	// AllowMultiple 表示是否允许选择多个答案。
-	AllowMultiple bool `json:"allowMultiple"`
-}
-
-// cursorCallbackOption 是私有回调问题选项的身份和展示标签。
-type cursorCallbackOption struct {
-	// ID 是回传给 Cursor 的选项标识。
-	ID string `json:"id"`
-	// Label 是用户可读的选项名称。
+	// Label is the provider's display text.
 	Label string `json:"label"`
 }
 
-// cursorTodo 保存 Cursor 计划条目的身份、内容和原始状态。
-type cursorTodo struct {
-	// ID 是 merge 时匹配已有条目的稳定标识。
+type question struct {
+	// ID is the provider identity returned in questionId.
 	ID string `json:"id"`
-	// Content 是用户可见的工作说明。
-	Content string `json:"content"`
-	// Status 是 Cursor 提供的状态。
-	Status string `json:"status"`
+	// Prompt is the provider question text.
+	Prompt string `json:"prompt"`
+	// Options is the ordered native choice list.
+	Options []questionOption `json:"options"`
+	// Multiple permits more than one selected ID.
+	Multiple bool `json:"allowMultiple"`
 }
 
-// cursorNotificationRequest 是三个通知共用的标准文档字段集合。
-type cursorNotificationRequest struct {
-	// SessionID 是上游可选的精确会话归属。
-	SessionID string `json:"sessionId"`
-	// ToolCallID 关联标准工具消息。
-	ToolCallID string `json:"toolCallId"`
-	// Todos 是需要更新的计划条目。
-	Todos []cursorTodo `json:"todos"`
-	// Merge 指定合并或整体替换计划。
-	Merge bool `json:"merge"`
-	// Description 是子任务或图片说明。
-	Description string `json:"description"`
-	// FilePath 是图片通知提供的目标路径，不表示文件一定已生成。
-	FilePath string `json:"filePath"`
+type privateInteraction struct {
+	// Title and Questions describe the native form.
+	Title     string     `json:"title"`
+	Questions []question `json:"questions"`
+	// Name and Plan describe native plan approval.
+	Name string `json:"name"`
+	Plan string `json:"plan"`
 }
 
-// newCursorCallbacks 创建不共享会话状态的 Cursor 私有协议适配器。
-func newCursorCallbacks() *cursorCallbacks {
-	return &cursorCallbacks{todos: make(map[acp.SessionId][]cursorTodo)}
-}
-
-// NewCallbackAdapter 创建 Cursor 私有反向请求适配器，供标准 stdio 传输组合使用。
-func NewCallbackAdapter() nativeacp.CallbackAdapter {
-	return newCursorCallbacks()
-}
-
-// PrepareInitialize 声明 Cursor 参数化模型目录需要的客户端能力。
-func (*cursorCallbacks) PrepareInitialize(request *acp.InitializeRequest) {
-	meta := make(map[string]any, len(request.ClientCapabilities.Meta)+1)
-	for key, value := range request.ClientCapabilities.Meta {
-		meta[key] = value
+func (privateProtocol) DecodeInteraction(method string, raw json.RawMessage) (acpclient.Interaction, error, bool) {
+	if method != askQuestion && method != createPlan {
+		return acpclient.Interaction{}, nil, false
 	}
-	meta["parameterizedModelPicker"] = true
-	request.ClientCapabilities.Meta = meta
-}
-
-// HandleCallback 只识别 Cursor 私有方法，其余方法交回 nativeacp 标准分发。
-func (adapter *cursorCallbacks) HandleCallback(
-	ctx context.Context,
-	bridge nativeacp.CallbackBridge,
-	method string,
-	params json.RawMessage,
-) (any, bool, error) {
-	switch method {
-	case "cursor/ask_question", "cursor/create_plan":
-		result, err := adapter.interaction(ctx, bridge, method, params)
-		return result, true, err
-	case "cursor/update_todos", "cursor/task", "cursor/generate_image":
-		return nil, true, adapter.notification(ctx, bridge, method, params)
-	default:
-		return nil, false, nil
+	identity, valid := acpclient.DecodeCallbackIdentity(raw)
+	var request privateInteraction
+	if !valid || json.Unmarshal(raw, &request) != nil {
+		return acpclient.Interaction{}, acp.NewInvalidParams(nil), true
 	}
-}
-
-// interaction 把 Cursor 阻塞请求接到现有 ACP 表单与审批接口。
-func (*cursorCallbacks) interaction(
-	ctx context.Context,
-	bridge nativeacp.CallbackBridge,
-	method string,
-	params json.RawMessage,
-) (any, error) {
-	var request cursorInteractionRequest
-	if json.Unmarshal(params, &request) != nil {
-		return nil, acp.NewInvalidParams(nil)
-	}
-	sessionID := bridge.ResolveInteractionSession(request.ToolCallID, request.SessionID)
-	if sessionID == "" {
-		return cursorOutcome("cancelled"), nil
-	}
-	if method == "cursor/create_plan" {
-		title := cursorMessage(request.Name, "Review plan")
-		response, err := bridge.RequestPermission(ctx, acp.RequestPermissionRequest{
-			SessionId: sessionID,
-			ToolCall: acp.ToolCallUpdate{
-				ToolCallId: acp.ToolCallId(request.ToolCallID),
-				Title:      &title,
-				Content:    []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(request.Plan))},
-			},
+	result := acpclient.Interaction{Identity: identity}
+	if method == createPlan {
+		title := request.Name
+		if strings.TrimSpace(title) == "" {
+			title = "Review plan"
+		}
+		result.Permission = &acp.RequestPermissionRequest{
+			ToolCall: acp.ToolCallUpdate{ToolCallId: identity.ToolID, Title: &title, Content: []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(request.Plan))}},
 			Options: []acp.PermissionOption{
 				{OptionId: "accept", Name: "Accept plan", Kind: acp.PermissionOptionKindAllowOnce},
 				{OptionId: "reject", Name: "Reject plan", Kind: acp.PermissionOptionKindRejectOnce},
 			},
-		})
+		}
+		result.Reply = planReply{}
+	} else {
+		form, err := questionForm(identity.ToolID, request)
 		if err != nil {
-			return nil, err
+			return acpclient.Interaction{}, err, true
 		}
-		if response.Outcome.Selected == nil {
-			return cursorOutcome("cancelled"), nil
-		}
-		if response.Outcome.Selected.OptionId == "accept" {
-			return cursorOutcome("accepted"), nil
-		}
-		return cursorOutcome("rejected"), nil
+		result.Elicitation = form
+		result.Reply = questionReply(request.Questions)
 	}
-	if len(request.Questions) == 0 {
+	return result, nil, true
+}
+
+type planReply struct{}
+
+func (planReply) EncodeReply(reply acpclient.InteractionReply) (any, error) {
+	if reply.Permission != nil && reply.Permission.Outcome.Selected != nil {
+		switch reply.Permission.Outcome.Selected.OptionId {
+		case "accept":
+			return cursorDecision("accepted"), nil
+		case "reject":
+			return cursorDecision("rejected"), nil
+		}
+	}
+	return cursorDecision("cancelled"), nil
+}
+
+func questionForm(toolID acp.ToolCallId, request privateInteraction) (*acp.UnstableCreateElicitationRequest, error) {
+	if len(request.Questions) == 0 || len(request.Questions) > 64 {
 		return nil, acp.NewInvalidParams(nil)
 	}
 	properties := make(map[string]any, len(request.Questions))
 	required := make([]string, 0, len(request.Questions))
-	for _, question := range request.Questions {
-		if question.ID == "" || len(question.Options) == 0 {
+	for _, q := range request.Questions {
+		if q.ID == "" || len(q.Options) == 0 || len(q.Options) > 128 || properties[q.ID] != nil {
 			return nil, acp.NewInvalidParams(nil)
 		}
-		if _, exists := properties[question.ID]; exists {
-			return nil, acp.NewInvalidParams(nil)
-		}
-		ids := make([]string, 0, len(question.Options))
-		names := make([]string, 0, len(question.Options))
-		for _, option := range question.Options {
-			ids = append(ids, option.ID)
-			names = append(names, option.Label)
-		}
-		property := map[string]any{
-			"type":      "string",
-			"title":     question.Prompt,
-			"enum":      ids,
-			"enumNames": names,
-		}
-		if question.AllowMultiple {
-			property = map[string]any{
-				"type":  "array",
-				"title": question.Prompt,
-				"items": map[string]any{
-					"type":      "string",
-					"enum":      ids,
-					"enumNames": names,
-				},
-				"minItems":    1,
-				"uniqueItems": true,
+		ids, labels := make([]string, 0, len(q.Options)), make([]string, 0, len(q.Options))
+		for _, option := range q.Options {
+			if option.ID == "" || slices.Contains(ids, option.ID) {
+				return nil, acp.NewInvalidParams(nil)
 			}
+			ids, labels = append(ids, option.ID), append(labels, option.Label)
 		}
-		properties[question.ID] = property
-		required = append(required, question.ID)
+		choices := map[string]any{"type": "string", "enum": ids, "enumNames": labels, "title": q.Prompt}
+		if q.Multiple {
+			choices = map[string]any{"type": "array", "title": q.Prompt, "items": choices, "minItems": 1, "uniqueItems": true}
+		}
+		properties[q.ID] = choices
+		required = append(required, q.ID)
 	}
-	response, err := bridge.CreateElicitation(ctx, acp.UnstableCreateElicitationRequest{
-		Form: &acp.UnstableCreateElicitationForm{
-			Mode:            "form",
-			Message:         cursorMessage(request.Title),
-			Meta:            map[string]any{"sessionId": sessionID},
-			RequestedSchema: acp.UnstableElicitationSchema{Properties: properties, Required: required},
-		},
-	})
-	if err != nil {
-		return nil, err
+	title := request.Title
+	if strings.TrimSpace(title) == "" {
+		title = "Input requested"
+	}
+	return &acp.UnstableCreateElicitationRequest{Form: &acp.UnstableCreateElicitationForm{
+		Mode: "form", Message: title, Meta: map[string]any{"toolCallId": string(toolID)},
+		RequestedSchema: acp.UnstableElicitationSchema{Properties: properties, Required: required},
+	}}, nil
+}
+
+type questionReply []question
+
+func (questions questionReply) EncodeReply(reply acpclient.InteractionReply) (any, error) {
+	response := reply.Elicitation
+	if response == nil {
+		return cursorDecision("cancelled"), nil
 	}
 	if response.Decline != nil {
-		return cursorOutcome("skipped"), nil
+		return cursorDecision("skipped"), nil
 	}
 	if response.Accept == nil {
-		return cursorOutcome("cancelled"), nil
+		return cursorDecision("cancelled"), nil
 	}
-	answers := make([]map[string]any, 0, len(request.Questions))
-	for _, question := range request.Questions {
-		values := cursorAnswerValues(response.Accept.Content[question.ID])
-		invalidCount := len(values) == 0 || (!question.AllowMultiple && len(values) != 1)
-		if invalidCount || !cursorAnswersValid(question.Options, values) {
-			return cursorOutcome("cancelled"), nil
+	answers := make([]map[string]any, 0, len(questions))
+	for _, q := range questions {
+		values := selectedAnswers(response.Accept.Content[q.ID])
+		if len(values) == 0 || !q.Multiple && len(values) != 1 {
+			return cursorDecision("cancelled"), nil
 		}
-		answers = append(answers, map[string]any{"questionId": question.ID, "selectedOptionIds": values})
+		seen := make(map[string]bool, len(values))
+		for _, id := range values {
+			if seen[id] || !slices.ContainsFunc(q.Options, func(option questionOption) bool { return option.ID == id }) {
+				return cursorDecision("cancelled"), nil
+			}
+			seen[id] = true
+		}
+		answers = append(answers, map[string]any{"questionId": q.ID, "selectedOptionIds": values})
 	}
 	return map[string]any{"outcome": map[string]any{"outcome": "answered", "answers": answers}}, nil
 }
 
-// notification 将 Cursor 可展示通知投影为 ACP Plan 或工具内容，不伪造工具终态。
-func (adapter *cursorCallbacks) notification(
-	ctx context.Context,
-	bridge nativeacp.CallbackBridge,
-	method string,
-	params json.RawMessage,
-) error {
-	var request cursorNotificationRequest
-	if json.Unmarshal(params, &request) != nil {
-		return acp.NewInvalidParams(nil)
-	}
-	sessionID := bridge.ResolveInteractionSession(request.ToolCallID, request.SessionID)
-	if sessionID == "" {
-		return nil
-	}
-	if method == "cursor/update_todos" {
-		entries := adapter.planEntries(sessionID, request)
-		return bridge.UpdateSession(ctx, acp.SessionNotification{
-			SessionId: sessionID,
-			Update:    acp.UpdatePlan(entries...),
-		})
-	}
-	if request.ToolCallID == "" {
-		return nil
-	}
-	update := acp.ToolCallUpdate{
-		ToolCallId: acp.ToolCallId(request.ToolCallID),
-		Content:    []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(request.Description))},
-	}
-	if request.FilePath != "" {
-		update.Locations = []acp.ToolCallLocation{{Path: request.FilePath}}
-	}
-	return bridge.UpdateSession(ctx, acp.SessionNotification{
-		SessionId: sessionID,
-		Update: acp.UpdateToolCall(
-			update.ToolCallId,
-			acp.WithUpdateContent(update.Content),
-			acp.WithUpdateLocations(update.Locations),
-		),
-	})
-}
-
-// planEntries 合并 Cursor todo 并生成标准计划快照。
-func (adapter *cursorCallbacks) planEntries(
-	sessionID acp.SessionId,
-	request cursorNotificationRequest,
-) []acp.PlanEntry {
-	adapter.mutex.Lock()
-	defer adapter.mutex.Unlock()
-	if !request.Merge {
-		adapter.todos[sessionID] = nil
-	}
-	for _, todo := range request.Todos {
-		if todo.ID == "" {
-			continue
-		}
-		found := false
-		for index := range adapter.todos[sessionID] {
-			if adapter.todos[sessionID][index].ID == todo.ID {
-				adapter.todos[sessionID][index] = todo
-				found = true
-				break
+func selectedAnswers(value any) []string {
+	switch v := value.(type) {
+	case string:
+		return []string{v}
+	case []string:
+		return v
+	case []any:
+		values := make([]string, 0, len(v))
+		for _, item := range v {
+			text, ok := item.(string)
+			if !ok {
+				return nil
 			}
+			values = append(values, text)
 		}
-		if !found {
-			adapter.todos[sessionID] = append(adapter.todos[sessionID], todo)
-		}
+		return values
+	default:
+		return nil
 	}
-	entries := make([]acp.PlanEntry, 0, len(adapter.todos[sessionID]))
-	for _, todo := range adapter.todos[sessionID] {
-		status := acp.PlanEntryStatus(todo.Status)
-		content := todo.Content
-		if todo.Status == "cancelled" {
-			status = acp.PlanEntryStatusCompleted
-			content = "[Cancelled] " + content
-		}
-		validStatus := status == acp.PlanEntryStatusPending ||
-			status == acp.PlanEntryStatusInProgress ||
-			status == acp.PlanEntryStatusCompleted
-		if validStatus {
-			entries = append(entries, acp.PlanEntry{
-				Content:  content,
-				Priority: acp.PlanEntryPriorityMedium,
-				Status:   status,
-			})
-		}
-	}
-	return entries
 }
 
-// cursorOutcome 构造 Cursor 文档规定的嵌套交互结果。
-func cursorOutcome(value string) map[string]any {
+func cursorDecision(value string) map[string]any {
 	return map[string]any{"outcome": map[string]any{"outcome": value}}
 }
 
-// cursorMessage 返回首个非空文本，避免空标题破坏宿主展示。
-func cursorMessage(parts ...string) string {
-	for _, part := range parts {
-		if value := strings.TrimSpace(part); value != "" {
-			return value
-		}
-	}
-	return "Interaction"
+type todoEntry struct {
+	// ID is the native merge key.
+	ID string `json:"id"`
+	// Text is the task description.
+	Text string `json:"content"`
+	// Status is the native task state.
+	Status string `json:"status"`
 }
 
-// cursorAnswerValues 把单选和多选响应统一成有序字符串列表。
-func cursorAnswerValues(value any) []string {
-	values := []string{}
-	switch typed := value.(type) {
-	case string:
-		values = append(values, typed)
-	case []any:
-		for _, item := range typed {
-			if id, ok := item.(string); ok {
-				values = append(values, id)
-			}
-		}
-	case []string:
-		values = append(values, typed...)
-	}
-	return values
+type privateProgress struct {
+	// Todos and Merge represent a snapshot or incremental update.
+	Todos []todoEntry `json:"todos"`
+	Merge bool        `json:"merge"`
+	// Description and FilePath describe a task or image.
+	Description string `json:"description"`
+	FilePath    string `json:"filePath"`
 }
 
-// cursorAnswersValid 验证所有回传标识都来自当前问题的官方选项。
-func cursorAnswersValid(options []cursorCallbackOption, values []string) bool {
-	for _, value := range values {
-		valid := false
-		for _, option := range options {
-			if option.ID == value {
-				valid = true
-				break
-			}
-		}
-		if !valid {
-			return false
-		}
+func (privateProtocol) DecodeProgress(method string, raw json.RawMessage) (acpclient.Progress, error, bool) {
+	if method != updateTodos && method != updateTask && method != generateImage {
+		return acpclient.Progress{}, nil, false
 	}
-	return true
+	identity, valid := acpclient.DecodeCallbackIdentity(raw)
+	var wire privateProgress
+	if !valid || json.Unmarshal(raw, &wire) != nil {
+		return acpclient.Progress{}, acp.NewInvalidParams(nil), true
+	}
+	result := acpclient.Progress{Identity: identity}
+	if method == updateTodos {
+		limit := min(len(wire.Todos), acpclient.MaxPlanEntries+1)
+		plan := &acpclient.PlanProgress{Merge: wire.Merge, Entries: make([]acpclient.PlanItem, 0, limit)}
+		for _, todo := range wire.Todos[:limit] {
+			status, text := acp.PlanEntryStatus(todo.Status), todo.Text
+			if todo.Status == "cancelled" {
+				status, text = acp.PlanEntryStatusCompleted, "[Cancelled] "+text
+			}
+			item := acpclient.PlanItem{ID: todo.ID}
+			switch status {
+			case acp.PlanEntryStatusPending, acp.PlanEntryStatusInProgress, acp.PlanEntryStatusCompleted:
+				item.Entry = &acp.PlanEntry{Status: status, Content: text, Priority: acp.PlanEntryPriorityMedium}
+			}
+			plan.Entries = append(plan.Entries, item)
+		}
+		result.Plan = plan
+	} else if identity.ToolID != "" {
+		var locations []acp.ToolCallLocation
+		if wire.FilePath != "" {
+			locations = []acp.ToolCallLocation{{Path: wire.FilePath}}
+		}
+		update := acp.UpdateToolCall(identity.ToolID, acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(wire.Description))}), acp.WithUpdateLocations(locations))
+		result.Update = &update
+	}
+	return result, nil, true
 }

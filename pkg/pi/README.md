@@ -10,11 +10,11 @@ pi
 PI_PATH=/absolute/path/to/pi PI_MCP_MODULE_PATH=/absolute/path/to/bridge.mjs acp-agent --adapter pi
 ```
 
-`PI_PATH` / `pi.Config.PiPath` 可省略，默认从完整环境 PATH 发现 `pi`。Ally 的可执行文件填写 `pi` 或其绝对路径。`PrefixArgs` 放在固定 RPC 参数之前；`Environment` 是完整子进程环境，nil 继承宿主。不自动安装或登录。
+`PI_PATH` / `pi.Options.Executable` 可省略，默认从完整环境 PATH 发现 `pi`。Ally 的可执行文件填写 `pi` 或其绝对路径。`PrefixArgs` 放在固定 RPC 参数之前；`Environment` 是完整子进程环境，nil 继承宿主。不自动安装或登录。
 
-宿主必须为 `pi.Config.MCPModulePath` 提供一个可读取的绝对文件路径；独立运行 `acp-agent` 时使用 `PI_MCP_MODULE_PATH=/absolute/path/to/bridge.mjs`。缺失、相对路径或文件不存在会在构造 Agent 时明确失败；导入或注册失败会在会话启动时明确失败，不接受 Pi 单独返回的 `get_state` 成功作为扩展就绪证据。bridge 是供 Pi 官方扩展加载器导入的单文件模块，必须导出 `createMcpAdapter`、`classifyAction`、`createReviewSubject` 和 `completeSimple`。所有权限档和无用户 MCP 的会话都要求它，因为权限审查与受管问答也使用这份组合入口。宿主负责固定 bridge 与 Pi 的兼容版本；Ally 在 `desktop/pi-bridge` 固定依赖并随安装包提供模块，其他宿主需自行提供等价文件。
+使用自动审批或托管 MCP 时，宿主为 `pi.Options.MCPModulePath` 提供可读取的绝对文件路径。独立命令读取 `PI_MCP_MODULE_PATH`。bridge 由 Pi 官方扩展加载器导入，提供 `createMcpAdapter`、`classifyAction`、`createReviewSubject` 和 `completeSimple`。宿主负责固定 bridge 与 Pi 的兼容版本。
 
-协议能力包括文本/思考流、图片/嵌入上下文、工具状态、文件差异、Bash 终端输出/退出码、取消、会话 new/load/resume/list/close/delete、真实模型与思考配置。历史直接使用 Pi 原生 JSONL；load 回放消息，resume 不回放。每个活跃会话拥有独立 Pi 进程和 MCP 快照，恢复先关闭旧进程，支持更新凭据。`agent_settled` 才结束提示；中间 `agent_end` 不结束重试或自动压缩。排队请求可取消。
+协议能力包括文本/思考流、图片/嵌入上下文、工具状态、文件差异、Bash 终端输出/退出码、取消、会话 new/load/resume/list/close/delete、真实模型与思考配置。历史直接使用 Pi 原生 JSONL；load 回放消息，resume 不回放。每个活跃会话拥有独立 Pi 进程和 MCP 快照，恢复先关闭旧进程，支持更新凭据。`agent_settled` 才结束提示；中间 `agent_end` 不结束重试或自动压缩。执行和取消由对应原生会话处理。
 
 对照 pi-acp 提供 `/compact`、`/autocompact`、`/export`、`/session`、`/name`、`/steering`、`/follow-up`、`/changelog`，技能和提示模板交给 Pi 原生加载。与参考版本一致，命令目录不发布依赖交互终端的扩展 slash 命令。Pi 的项目资源信任规则仍由 Pi 管理；不要假定未信任工作区会自动加载扩展。
 

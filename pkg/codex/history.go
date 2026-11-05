@@ -2,119 +2,152 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
+	"slices"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	agentclient "github.com/JieWaZi/acp-go/pkg/agentclient"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
-
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// replayThreadHistory 按 Thread 中的 Turn 与 Item 顺序重放历史。
-// 已有 eventHandler/toolMapper 负责完成项映射；这里只补历史 userMessage 的反向内容转换。
-func (a *Agent) replayThreadHistory(ctx context.Context, state *sessionState, thread protocol.Thread) error {
-	if len(thread.Turns) == 0 {
+func (c *Client) replayHistory(ctx context.Context, s *session, inline []protocol.TurnElement) error {
+	if c.host.Observe == nil {
 		return nil
 	}
-	updater := a.currentSessionUpdater()
-	if updater == nil {
-		return ErrConnectionNotReady
-	}
-	handler := newEventHandler(updater, acp.SessionId(state.id), a.logger, state.terminalOutputMode)
-	seenUserMessages := make(map[string]struct{})
-	for _, turn := range thread.Turns {
-		for _, item := range turn.Items {
-			if !a.sessions.isCurrent(state) {
-				return ErrSessionClosing
-			}
-			var err error
-			if item.Type == protocol.UserMessage {
-				if _, seen := seenUserMessages[item.ID]; seen {
+	emit := func(item protocol.ThreadItem) error {
+		var updates []acp.SessionUpdate
+		switch item.Type {
+		case "userMessage":
+			for _, part := range item.Content {
+				if part.String != nil {
+					updates = append(updates, acp.UpdateUserMessageText(*part.String))
 					continue
 				}
-				seenUserMessages[item.ID] = struct{}{}
-				err = a.replayUserMessage(ctx, state, handler, item)
-			} else {
-				err = handler.handleHistoryItem(ctx, protocol.ItemCompletedNotification{
-					ThreadID: thread.ID,
-					TurnID:   turn.ID,
-					Item:     item,
-				})
+				if input := part.UserInput; input != nil {
+					switch input.Type {
+					case protocol.UserInputTypeText:
+						if input.Text != nil {
+							updates = append(updates, acp.UpdateUserMessageText(*input.Text))
+						}
+					case protocol.UserInputTypeImage:
+						if input.URL != nil {
+							updates = append(updates, acp.UpdateUserMessage(acp.ResourceLinkBlock("image", *input.URL)))
+						}
+					case protocol.LocalImage:
+						if input.Path != nil {
+							updates = append(updates, acp.UpdateUserMessage(acp.ResourceLinkBlock("image", "file://"+*input.Path)))
+						}
+					case protocol.Skill:
+						if input.Name != nil && input.Path != nil {
+							updates = append(updates, acp.UpdateUserMessageText(fmt.Sprintf("skill:%s (%s)", *input.Name, *input.Path)))
+						}
+					}
+				}
 			}
-			if err != nil {
+		case "agentMessage":
+			if item.Text != nil {
+				updates = append(updates, agentMessage(item.ID, *item.Text, acpmeta.MessagePhaseUnknown, true, nil))
+			}
+		case "reasoning":
+			for _, text := range item.Summary {
+				updates = append(updates, acp.UpdateAgentThoughtText(text))
+			}
+		}
+		for _, update := range updates {
+			notification := acp.SessionNotification{SessionId: s.id, Update: update, Meta: messageMeta(item.ID, acpmeta.MessagePhaseUnknown, true, nil)}
+			if err := c.host.Observe(ctx, agentclient.Scope{SessionID: s.id}, notification); err != nil {
 				return err
 			}
-			// 外部 SDK callback 返回后再次校验，避免后续历史继续写入已关闭 generation。
-			if !a.sessions.isCurrent(state) {
-				return ErrSessionClosing
+		}
+		return nil
+	}
+	emitTurns := func(turns []protocol.TurnElement) error {
+		for _, turn := range turns {
+			for _, item := range turn.Items {
+				if err := emit(item); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
 	}
-	return nil
-}
-
-// replayUserMessage 把一个历史 userMessage 的内容按原顺序发送为 ACP chunks。
-// 每个外部 SDK callback 前后都重新检查 session generation，防止 close 后继续回放多块消息。
-func (a *Agent) replayUserMessage(
-	ctx context.Context,
-	state *sessionState,
-	handler *eventHandler,
-	item protocol.ThreadItem,
-) error {
-	for _, content := range item.Content {
-		blocks := historyContentBlocks(content)
-		for _, block := range blocks {
-			if !a.sessions.isCurrent(state) {
-				return ErrSessionClosing
+	if len(inline) > 0 {
+		return emitTurns(inline)
+	}
+	params := map[string]any{"threadId": s.id, "limit": 100, "sortDirection": "asc", "itemsView": "notLoaded"}
+	cursors := make(map[string]bool)
+	for page := 0; page < 1000; page++ {
+		var reply struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+			Next *string `json:"nextCursor"`
+		}
+		if err := c.request(ctx, "thread/turns/list", params, &reply); err != nil {
+			var rpc *acp.RequestError
+			if page == 0 && errors.As(err, &rpc) && rpc.Code == -32601 {
+				var legacy protocol.ThreadReadResponse
+				if err := c.request(ctx, "thread/read", protocol.ThreadReadParams{ThreadID: string(s.id), IncludeTurns: pointer(true)}, &legacy); err != nil {
+					return err
+				}
+				return emitTurns(legacy.Thread.Turns)
 			}
-			update := acp.UpdateUserMessage(block)
-			update.UserMessageChunk.MessageId = &item.ID
-			if err := handler.emit(ctx, update); err != nil {
+			return err
+		}
+		for _, turn := range reply.Data {
+			if turn.ID == "" {
+				return errors.New("Codex history contains an empty turn ID")
+			}
+			if err := c.replayHistoryItems(ctx, s.id, turn.ID, emit); err != nil {
 				return err
 			}
-			if !a.sessions.isCurrent(state) {
-				return ErrSessionClosing
-			}
 		}
+		next := value(reply.Next)
+		if next == "" {
+			return nil
+		}
+		if cursors[next] {
+			return errors.New("Codex repeated a turn history cursor")
+		}
+		cursors[next] = true
+		params["cursor"] = next
 	}
-	return nil
+	return errors.New("Codex turn history exceeded page limit")
 }
 
-// historyContentBlocks 把可识别的历史输入转换为 ACP 内容块。
-func historyContentBlocks(content protocol.ContentElement) []acp.ContentBlock {
-	if content.String != nil && *content.String != "" {
-		return []acp.ContentBlock{acp.TextBlock(*content.String)}
+func (c *Client) replayHistoryItems(ctx context.Context, id acp.SessionId, turnID string, emit func(protocol.ThreadItem) error) error {
+	params := map[string]any{"threadId": id, "turnId": turnID, "limit": 100, "sortDirection": "asc"}
+	var cursors []string
+	for page := 0; page < 1000; page++ {
+		var reply struct {
+			Data []struct {
+				TurnID string              `json:"turnId"`
+				Item   protocol.ThreadItem `json:"item"`
+			} `json:"data"`
+			Next *string `json:"nextCursor"`
+		}
+		if err := c.request(ctx, "thread/items/list", params, &reply); err != nil {
+			return err
+		}
+		for _, entry := range reply.Data {
+			if entry.TurnID != turnID {
+				return errors.New("Codex history item belongs to another turn")
+			}
+			if err := emit(entry.Item); err != nil {
+				return err
+			}
+		}
+		next := value(reply.Next)
+		if next == "" {
+			return nil
+		}
+		if slices.Contains(cursors, next) {
+			return errors.New("Codex repeated an item history cursor")
+		}
+		cursors = append(cursors, next)
+		params["cursor"] = next
 	}
-	if content.UserInput == nil {
-		return []acp.ContentBlock{}
-	}
-	input := content.UserInput
-	switch input.Type {
-	case protocol.UserInputTypeText:
-		if input.Text == nil || *input.Text == "" {
-			return []acp.ContentBlock{}
-		}
-		return []acp.ContentBlock{acp.TextBlock(*input.Text)}
-	case protocol.UserInputTypeImage:
-		if input.URL == nil || *input.URL == "" {
-			return []acp.ContentBlock{}
-		}
-		return []acp.ContentBlock{acp.TextBlock(formatResourceLink("image", *input.URL))}
-	case protocol.LocalImage:
-		if input.Path == nil || *input.Path == "" {
-			return []acp.ContentBlock{}
-		}
-		uri := *input.Path
-		if !strings.HasPrefix(uri, "file://") {
-			uri = "file://" + uri
-		}
-		return []acp.ContentBlock{acp.TextBlock(formatResourceLink("", uri))}
-	case protocol.Skill:
-		if input.Name == nil || input.Path == nil {
-			return []acp.ContentBlock{}
-		}
-		return []acp.ContentBlock{acp.TextBlock(fmt.Sprintf("skill:%s (%s)", *input.Name, *input.Path))}
-	default:
-		return []acp.ContentBlock{}
-	}
+	return errors.New("Codex item history exceeded page limit")
 }

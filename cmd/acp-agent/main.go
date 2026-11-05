@@ -13,14 +13,12 @@ import (
 	"syscall"
 
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
+	"github.com/JieWaZi/acp-go/pkg/agentclient"
 	"github.com/JieWaZi/acp-go/pkg/claude"
 	"github.com/JieWaZi/acp-go/pkg/codex"
 	"github.com/JieWaZi/acp-go/pkg/cursor"
-	"github.com/JieWaZi/acp-go/pkg/gemini"
-	"github.com/JieWaZi/acp-go/pkg/grok"
-	"github.com/JieWaZi/acp-go/pkg/kimi"
-	"github.com/JieWaZi/acp-go/pkg/opencode"
 	"github.com/JieWaZi/acp-go/pkg/pi"
+	"github.com/JieWaZi/acp-go/pkg/standardacp"
 	"github.com/JieWaZi/acp-go/pkg/workbuddy"
 
 	acp "github.com/JieWaZi/acp-go/sdk"
@@ -121,88 +119,61 @@ func parseOptions(args []string) (commandOptions, error) {
 	return commandOptions{adapter: *adapter}, nil
 }
 
-// newRegistry 显式组装进程支持的 Adapter，避免 init 注册或全局 service locator。
+// newRegistry selects one native owner and projects it onto the public ACP connection.
 func newRegistry(logger *slog.Logger) (*acpserver.Registry, error) {
 	registry, err := acpserver.NewRegistry(codexAdapterName)
 	if err != nil {
 		return nil, err
 	}
 
-	err = registry.Register(acpserver.Registration{
-		Name: codexAdapterName,
-		Factory: func(ctx context.Context) (acp.Agent, error) {
-			agent, factoryErr := codex.NewAgent(ctx, codex.Config{
-				Logger:    logger,
-				CodexPath: os.Getenv("CODEX_PATH"),
-			})
-			if factoryErr != nil {
-				return nil, factoryErr
-			}
-			return agent, nil
-		},
-	})
-	if err != nil {
-		return nil, err
+	standard := func(provider standardacp.Provider) nativeFactory {
+		return func(ctx context.Context, executable string, host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return standardacp.NewClient(ctx, standardacp.Options{Provider: provider, Executable: executable, Logger: logger}, host)
+		}
 	}
-	err = registry.Register(acpserver.Registration{
-		Name: claudeAdapterName,
-		Factory: func(ctx context.Context) (acp.Agent, error) {
-			agent, factoryErr := claude.NewAgent(ctx, claude.Config{
-				Logger: logger, ClaudePath: os.Getenv("CLAUDE_CODE_EXECUTABLE"),
-			})
-			if factoryErr != nil {
-				return nil, factoryErr
-			}
-			return agent, nil
-		},
-	})
-	if err != nil {
-		return nil, err
+	registrations := []acpserver.Registration{
+		nativeRegistration(codexAdapterName, "CODEX_PATH", func(ctx context.Context, executable string, host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return codex.NewClient(ctx, codex.Options{Executable: executable, Logger: logger}, host)
+		}),
+		nativeRegistration(claudeAdapterName, "CLAUDE_CODE_EXECUTABLE", func(ctx context.Context, executable string, host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return claude.NewClient(ctx, claude.Options{Executable: executable, Logger: logger}, host)
+		}),
+		nativeRegistration("cursor", "CURSOR_PATH", func(ctx context.Context, executable string, host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return cursor.NewClient(ctx, cursor.Options{Executable: executable, Logger: logger}, host)
+		}),
+		nativeRegistration("pi", "PI_PATH", func(ctx context.Context, executable string, host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return pi.NewClient(ctx, pi.Options{Executable: executable, Logger: logger, MCPModulePath: os.Getenv("PI_MCP_MODULE_PATH")}, host)
+		}),
+		nativeRegistration("workbuddy", "WORKBUDDY_PATH", func(ctx context.Context, executable string, host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return workbuddy.NewClient(ctx, workbuddy.Options{Executable: executable, Logger: logger}, host)
+		}),
+		nativeRegistration("kimi", "KIMI_PATH", standard(standardacp.Kimi)),
+		nativeRegistration("opencode", "OPENCODE_PATH", standard(standardacp.OpenCode)),
+		nativeRegistration("gemini", "GEMINI_PATH", standard(standardacp.Gemini)),
+		nativeRegistration("grok", "GROK_PATH", standard(standardacp.Grok)),
 	}
-	if err := registry.Register(acpserver.Registration{Name: "kimi", Factory: func(ctx context.Context) (acp.Agent, error) {
-		return kimi.NewAgent(ctx, kimi.Config{Logger: logger, KimiPath: os.Getenv("KIMI_PATH")})
-	}}); err != nil {
-		return nil, err
-	}
-
-	if err := registry.Register(acpserver.Registration{Name: "cursor", Factory: func(ctx context.Context) (acp.Agent, error) {
-		return cursor.NewAgent(ctx, cursor.Config{Logger: logger, CursorPath: os.Getenv("CURSOR_PATH")})
-	}}); err != nil {
-		return nil, err
-	}
-
-	if err := registry.Register(acpserver.Registration{Name: "pi", Factory: func(ctx context.Context) (acp.Agent, error) {
-		return pi.NewAgent(ctx, pi.Config{Logger: logger, PiPath: os.Getenv("PI_PATH"), MCPModulePath: os.Getenv("PI_MCP_MODULE_PATH")})
-	}}); err != nil {
-		return nil, err
-	}
-
-	if err := registry.Register(acpserver.Registration{
-		Name: "opencode", Factory: func(ctx context.Context) (acp.Agent, error) {
-			return opencode.NewAgent(ctx, opencode.Config{Logger: logger, OpenCodePath: os.Getenv("OPENCODE_PATH")})
-		},
-	}); err != nil {
-		return nil, err
-	}
-	if err := registry.Register(acpserver.Registration{
-		Name: "gemini", Factory: func(ctx context.Context) (acp.Agent, error) {
-			return gemini.NewAgent(ctx, gemini.Config{Logger: logger, GeminiPath: os.Getenv("GEMINI_PATH")})
-		},
-	}); err != nil {
-		return nil, err
-	}
-	if err := registry.Register(acpserver.Registration{
-		Name: "grok", Factory: func(ctx context.Context) (acp.Agent, error) {
-			return grok.NewAgent(ctx, grok.Config{Logger: logger, GrokPath: os.Getenv("GROK_PATH")})
-		},
-	}); err != nil {
-		return nil, err
-	}
-
-	if err := registry.Register(acpserver.Registration{Name: "workbuddy", Factory: func(ctx context.Context) (acp.Agent, error) {
-		return workbuddy.NewAgent(ctx, workbuddy.Config{Logger: logger, WorkBuddyPath: os.Getenv("WORKBUDDY_PATH")})
-	}}); err != nil {
-		return nil, err
+	for _, registration := range registrations {
+		if err := registry.Register(registration); err != nil {
+			return nil, err
+		}
 	}
 	return registry, nil
+}
+
+type nativeFactory func(context.Context, string, agentclient.HostCallbacks) (agentclient.Client, error)
+
+func nativeRegistration(name, executableEnv string, create nativeFactory) acpserver.Registration {
+	return acpserver.Registration{Name: name, Factory: func(ctx context.Context) (acp.Agent, error) {
+		executable := os.Getenv(executableEnv)
+		agent, err := agentclient.NewACPAgent(func(host agentclient.HostCallbacks) (agentclient.Client, error) {
+			return create(ctx, executable, host)
+		})
+		if err != nil && executable != "" {
+			return nil, fmt.Errorf("%s=%q: %w", executableEnv, executable, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return agent, nil
+	}}
 }

@@ -2,309 +2,480 @@ package pi
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	agentclient "github.com/JieWaZi/acp-go/pkg/agentclient"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// Prompt 对照 pi-acp 串行执行提示，等待整轮 settled 而非中间 agent_end。
-func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response acp.PromptResponse, promptErr error) {
-	s, err := a.get(request.SessionId)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
-	s.mutex.Lock()
-	generation := s.generation
-	s.mutex.Unlock()
-	if err := s.operation.Lock(ctx); err != nil {
-		return acp.PromptResponse{}, err
-	}
-	defer s.operation.Unlock()
-	if err = ctx.Err(); err != nil {
-		return acp.PromptResponse{}, err
-	}
-	s.mutex.Lock()
-	cancelled := generation != s.generation
-	s.mutex.Unlock()
-	if cancelled {
-		return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
-	}
-	message, images, err := promptContent(request.Prompt)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
+type invocation struct {
+	// scope freezes the identities carried by observations and interactions.
+	scope agentclient.Scope
+	// ctx is the prompt lifetime shared by preparation and dialogs.
+	ctx context.Context
+	// cancel captures the first cause that interrupts this prompt.
+	cancel context.CancelCauseFunc
+	// eventQueue holds native records awaiting ordered settlement.
+	eventQueue chan []byte
+	// uiQueue holds interactive requests that can precede the prompt acknowledgment.
+	uiQueue chan uiRequest
 
-	turnCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	turn := make(chan acp.StopReason, 1)
-	s.mutex.Lock()
-	if generation != s.generation {
-		s.mutex.Unlock()
-		return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
+	// mu guards the queue budget, send boundary, and captured cancellation.
+	mu sync.Mutex
+	// queuedBytes counts pending native events and dialogs.
+	queuedBytes int
+	// submitted marks that the prompt passed its final write gate.
+	submitted bool
+	// sealed prevents further records from joining the settled prompt.
+	sealed bool
+	// controlDone joins the single cancellation task before session reuse.
+	controlDone chan struct{}
+}
+
+func (t *invocation) enqueueEvent(line []byte) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.submitted || t.sealed {
+		return true
 	}
-	s.turn = turn
-	s.turnContext = turnCtx
-	s.cancelTurn = cancel
-	s.cancelled = false
-	s.failure = nil
-	s.modelFailure = nil
-	s.usage = nil
-	s.reportedUsage = nil
-	s.mutex.Unlock()
-	defer func() {
-		s.mutex.Lock()
-		if s.turn == turn {
-			if s.reportedUsage != nil {
-				response.Usage = s.usage
-				response.Meta = acpmeta.WithTurnUsage(response.Meta, *s.reportedUsage)
-			}
-			s.turn = nil
-		}
-		s.mutex.Unlock()
-	}()
-	if handled, err := a.slash(ctx, s, message, len(images) > 0); handled {
-		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, err
+	if t.queuedBytes+len(line) > maxRecord || len(t.eventQueue) == cap(t.eventQueue) {
+		return false
 	}
-	s.mutex.Lock()
-	call, err := s.process.begin(turnCtx, "prompt", map[string]any{"message": message, "images": images})
-	s.mutex.Unlock()
-	if err == nil {
-		err = call.wait(turnCtx, nil)
+	t.queuedBytes += len(line)
+	t.eventQueue <- append([]byte(nil), line...)
+	return true
+}
+
+func (t *invocation) enqueueUI(ui uiRequest, bytes int) (queued, withinBudget bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.submitted || t.sealed {
+		return false, true
 	}
+	if t.queuedBytes+bytes > maxRecord || len(t.uiQueue) == cap(t.uiQueue) {
+		return false, false
+	}
+	ui.bytes = bytes
+	t.queuedBytes += bytes
+	t.uiQueue <- ui
+	return true, true
+}
+
+func (c *Client) ReservePrompt(ctx context.Context, r acp.PromptRequest, options agentclient.PromptOptions) (func() agentclient.PromptResult, error) {
+	message, images, err := promptContent(r.Prompt)
 	if err != nil {
-		a.abortTurn(s, turn)
-		return acp.PromptResponse{}, err
+		return nil, err
 	}
-	select {
-	case reason := <-turn:
-		// settled 与上下文结束可能同时就绪，期限或取消仍须返回原始原因。
-		if err := ctx.Err(); err != nil {
-			return acp.PromptResponse{}, err
+	s, err := c.session(r.SessionId)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.busy || s.closing || s.rpc.err() != nil {
+		return nil, errors.New("Pi session cannot accept another prompt")
+	}
+	c.mu.Lock()
+	ledger := c.ledger[r.SessionId]
+	if c.closing || ledger == nil || len(ledger.outcomes)+ledger.producers >= 32 || c.retainedOutcomes >= 128 {
+		c.mu.Unlock()
+		return nil, errors.New("Pi session is closing or its native outcome budget is exhausted")
+	}
+	ledger.producers++
+	c.retainedOutcomes++
+	retain := c.foregroundReceipts
+	signalLedger(ledger)
+	c.mu.Unlock()
+	if options.HostInvocationID == "" {
+		options.HostInvocationID = newID()
+	}
+	input := agentclient.PromptSubmission{SessionID: r.SessionId, HostInvocationID: options.HostInvocationID, InputID: newID()}
+	lifetime, cancel := context.WithCancelCause(ctx)
+	t := &invocation{
+		scope: agentclient.Scope{SessionID: r.SessionId, HostInvocationID: options.HostInvocationID, NativeInvocationID: newID()},
+		ctx:   lifetime, cancel: cancel, eventQueue: make(chan []byte, maxQueued), uiQueue: make(chan uiRequest, 8),
+	}
+	s.busy, s.turn = true, t
+	stop := context.AfterFunc(lifetime, func() { s.interrupt(t) })
+	var continued atomic.Bool
+	return func() agentclient.PromptResult {
+		if !continued.CompareAndSwap(false, true) {
+			return agentclient.PromptResult{Receipt: agentclient.PromptReceipt{
+				Input: input, Submission: agentclient.SubmissionNotSent, Admission: agentclient.AdmissionNotAccepted,
+				OperationError: errors.New("Pi prompt continuation was already consumed"),
+			}}
 		}
-		s.mutex.Lock()
-		failure, usage := errors.Join(s.failure, s.modelFailure), s.usage
-		meta := map[string]any(nil)
-		if s.reportedUsage != nil {
-			meta = acpmeta.WithTurnUsage(nil, *s.reportedUsage)
+		defer stop()
+		defer cancel(context.Canceled)
+		result := s.prompt(t, input, options, message, images)
+		c.mu.Lock()
+		ledger.producers--
+		if result.Outcome != nil && (retain || t.ctx.Err() != nil || result.Outcome.DeliveryError != nil || result.Outcome.OperationError != nil) {
+			ledger.outcomes = append(ledger.outcomes, result.Outcome.Snapshot())
+		} else {
+			c.retainedOutcomes--
 		}
-		s.mutex.Unlock()
-		return acp.PromptResponse{StopReason: reason, Usage: usage, Meta: meta}, failure
-	case <-ctx.Done():
-		a.abortTurn(s, turn)
-		return acp.PromptResponse{}, ctx.Err()
+		if ledger.producers == 0 && len(ledger.outcomes) == 0 && c.sessions[r.SessionId] == nil {
+			delete(c.ledger, r.SessionId)
+		}
+		signalLedger(ledger)
+		c.mu.Unlock()
+		s.mu.Lock()
+		s.turn, s.busy = nil, false
+		s.mu.Unlock()
+		return result
+	}, nil
+}
+
+func signalLedger(l *outcomeLedger) {
+	close(l.changed)
+	l.changed = make(chan struct{})
+}
+
+func (c *Client) ReadNativeOutcomes(ctx context.Context, r acpmeta.NativeTurnReceiptsRequest, wait bool) (agentclient.NativeOutcomePage, error) {
+	if r.SessionID == "" || len(r.AckInvocationIDs) > 128 {
+		return agentclient.NativeOutcomePage{}, acp.NewInvalidParams(nil)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return agentclient.NativeOutcomePage{}, err
+	}
+	acked := make(map[string]bool, len(r.AckInvocationIDs))
+	for _, id := range r.AckInvocationIDs {
+		acked[id] = true
+	}
+	for {
+		c.mu.Lock()
+		ledger := c.ledger[acp.SessionId(r.SessionID)]
+		if ledger == nil {
+			c.mu.Unlock()
+			return agentclient.NativeOutcomePage{}, nil
+		}
+		remaining := ledger.outcomes[:0]
+		for _, outcome := range ledger.outcomes {
+			if !acked[outcome.Turn.InvocationID] {
+				remaining = append(remaining, outcome)
+			}
+		}
+		c.retainedOutcomes -= len(ledger.outcomes) - len(remaining)
+		clear(ledger.outcomes[len(remaining):])
+		ledger.outcomes = remaining
+		var nativeDone <-chan struct{}
+		if opened := c.sessions[acp.SessionId(r.SessionID)]; opened != nil && !c.closing {
+			select {
+			case <-opened.rpc.done:
+			default:
+				nativeDone = opened.rpc.done
+			}
+		}
+		if len(remaining) > 0 || !wait || ledger.producers == 0 && nativeDone == nil {
+			page := agentclient.NativeOutcomePage{More: len(remaining) > 16}
+			for _, outcome := range remaining[:min(16, len(remaining))] {
+				page.Outcomes = append(page.Outcomes, outcome.Snapshot())
+			}
+			if ledger.producers == 0 && len(remaining) == 0 && c.sessions[acp.SessionId(r.SessionID)] == nil {
+				delete(c.ledger, acp.SessionId(r.SessionID))
+			}
+			c.mu.Unlock()
+			return page, nil
+		}
+		changed := ledger.changed
+		c.mu.Unlock()
+		select {
+		case <-changed:
+		case <-nativeDone:
+		case <-ctx.Done():
+			return agentclient.NativeOutcomePage{}, context.Cause(ctx)
+		}
 	}
 }
 
-// promptContent 移植 pi-acp 的文本、图片、链接及嵌入上下文转换。
-func promptContent(blocks []acp.ContentBlock) (string, []any, error) {
-	values, err := convert[[]map[string]any](blocks)
+func (c *Client) Cancel(n acp.CancelNotification) error {
+	s, err := c.session(n.SessionId)
 	if err != nil {
-		return "", nil, err
+		return err
 	}
-	var message strings.Builder
-	images := []any{}
-	for _, block := range values {
-		switch block["type"] {
-		case "text":
-			message.WriteString(text(block["text"]))
-		case "image":
-			images = append(images, map[string]any{"type": "image", "data": block["data"], "mimeType": block["mimeType"]})
-		case "resource_link":
-			fmt.Fprintf(&message, "\n[Context] %s", text(block["uri"]))
-		case "resource":
-			resource := object(block["resource"])
-			uri := text(resource["uri"])
-			switch {
-			case resource["text"] != nil:
-				mimeType := text(resource["mimeType"])
-				if mimeType == "" {
-					mimeType = "text/plain"
-				}
-				fmt.Fprintf(&message, "\n[Embedded Context] %s (%s)\n%s", uri, mimeType, text(resource["text"]))
-			case resource["blob"] != nil:
-				mimeType := text(resource["mimeType"])
-				if mimeType == "" {
-					mimeType = "application/octet-stream"
-				}
-				decoded, decodeErr := base64.StdEncoding.DecodeString(text(resource["blob"]))
-				if decodeErr != nil {
-					return "", nil, acp.NewInvalidParams(map[string]any{"message": "invalid embedded resource blob"})
-				}
-				fmt.Fprintf(&message, "\n[Embedded Context] %s (%s, %d bytes)", uri, mimeType, len(decoded))
-			default:
-				fmt.Fprintf(&message, "\n[Embedded Context] %s", uri)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turn != nil {
+		s.turn.cancel(context.Canceled)
+		s.interrupt(s.turn)
+	}
+	return nil
+}
+
+func (s *session) interrupt(t *invocation) {
+	t.mu.Lock()
+	if !t.submitted || t.sealed || t.controlDone != nil {
+		t.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	t.controlDone = done
+	t.mu.Unlock()
+	go func() {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+		defer cancel()
+		if err := s.rpc.call(ctx, "clear_queue", nil, nil); err == nil {
+			if err := s.rpc.call(ctx, "abort", nil, nil); err == nil {
+				return
 			}
-		case "audio":
-			return "", nil, acp.NewInvalidParams(map[string]any{"message": "Pi does not support audio"})
+		}
+		// Older Pi versions lack clear_queue. Restarting from the same
+		// history is the only safe way to discard an unverified queue.
+		s.poison(errors.New("Pi cancellation could not confirm native queue cleanup"))
+	}()
+}
+
+func (s *session) poison(err error) {
+	s.rpc.fail(err)
+	ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+	defer cancel()
+	_ = s.rpc.process.Close(ctx)
+}
+
+func (s *session) prompt(t *invocation, input agentclient.PromptSubmission, options agentclient.PromptOptions, message string, images []any) (result agentclient.PromptResult) {
+	result.Receipt = agentclient.PromptReceipt{Input: input, Submission: agentclient.SubmissionNotSent, Admission: agentclient.AdmissionNotAccepted}
+	cleanup, err := options.PrepareSubmission(t.ctx, input)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		result.Receipt.OperationError = err
+		return result
+	}
+	interactiveDone := make(chan struct{})
+	uiCtx, cancelUI := context.WithCancel(t.ctx)
+	go func() {
+		defer close(interactiveDone)
+		for {
+			select {
+			case <-uiCtx.Done():
+				return
+			case ui := <-t.uiQueue:
+				s.handleUI(uiCtx, t.scope, ui)
+				t.mu.Lock()
+				t.queuedBytes -= ui.bytes
+				t.mu.Unlock()
+			}
+		}
+	}()
+	s.rpc.mu.Lock()
+	s.rpc.active = t
+	s.rpc.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.sealed = true
+		control := t.controlDone
+		t.mu.Unlock()
+		s.rpc.mu.Lock()
+		if s.rpc.active == t {
+			s.rpc.active = nil
+		}
+		s.rpc.mu.Unlock()
+		cancelUI()
+		deadline := time.NewTimer(controlTimeout + time.Second)
+		defer deadline.Stop()
+		if control != nil {
+			select {
+			case <-control:
+			case <-deadline.C:
+				s.poison(errors.New("Pi cancellation control did not finish"))
+				return
+			}
+		}
+		select {
+		case <-interactiveDone:
+		case <-deadline.C:
+			s.poison(errors.New("Pi dialog delivery did not finish"))
+		}
+	}()
+
+	args := map[string]any{"message": message}
+	if len(images) > 0 {
+		args["images"] = images
+	}
+	var ack struct {
+		// Disposition distinguishes started, queued, and handled prompts when supplied.
+		Disposition string
+	}
+	// Context cancellation independently starts clear_queue/abort. Continue
+	// collecting the response and native terminal through that control task.
+	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(t.ctx), 20*time.Second)
+	sent, err := s.rpc.request(ackCtx, s.rpc.nextID(), "prompt", args, &ack, func() bool {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.ctx.Err() != nil {
+			return false
+		}
+		t.submitted = true
+		return true
+	})
+	cancelAck()
+	result.Receipt.Submission = sent
+	if err != nil {
+		var rejection *rpcRejection
+		switch {
+		case errors.As(err, &rejection):
+			result.Receipt.OperationError = nativeFailure(rejection.detail)
+		case sent == agentclient.SubmissionNotSent:
+			result.Receipt.OperationError = err
+		default:
+			result.Receipt.Admission = agentclient.AdmissionUnknown
+			result.Receipt.OperationError = err
+			s.rpc.fail(err)
+		}
+		if result.Receipt.Admission != agentclient.AdmissionUnknown {
+			return result
+		}
+		defer s.poison(err)
+	} else {
+		result.Receipt.Admission = agentclient.AdmissionConfirmed
+	}
+	if err == nil && ack.Disposition == "handled" {
+		result.Outcome = &agentclient.NativeOutcome{
+			Turn: acpmeta.NativeTurn{
+				InvocationID: t.scope.NativeInvocationID, Origin: acpmeta.NativeTurnOriginHost,
+				ConsumedInputIDs: []string{input.InputID}, Status: acpmeta.NativeTurnCompleted,
+			},
+			StopReason: pointer(acp.StopReasonEndTurn), PossibleSideEffects: true,
+		}
+		return result
+	}
+
+	o := &agentclient.NativeOutcome{
+		Turn:                acpmeta.NativeTurn{InvocationID: t.scope.NativeInvocationID, Origin: acpmeta.NativeTurnOriginUnknown},
+		PossibleSideEffects: true,
+	}
+	result.Outcome = o
+	stream := newTurnEvents(s, t, o, input.InputID)
+	waiting := t.ctx.Done()
+	var cancelTimer *time.Timer
+	var forced <-chan time.Time
+	defer func() {
+		if cancelTimer != nil {
+			cancelTimer.Stop()
+		}
+	}()
+	apply := func(line []byte) bool {
+		t.mu.Lock()
+		t.queuedBytes -= len(line)
+		t.mu.Unlock()
+		return stream.apply(line)
+	}
+	defer func() {
+		stream.finish()
+		if stream.started {
+			result.Receipt.Admission = agentclient.AdmissionConfirmed
+			if o.Turn.Status != "" {
+				// The native terminal subsumes an ACK lost to disconnect.
+				result.Receipt.OperationError = nil
+			}
+		} else if result.Receipt.Admission == agentclient.AdmissionUnknown {
+			result.Outcome = nil
+		}
+	}()
+	for {
+		select {
+		case line := <-t.eventQueue:
+			if apply(line) {
+				return result
+			}
+		case <-s.rpc.done:
+			// The pipe reader publishes every complete record before its EOF.
+			for {
+				select {
+				case line := <-t.eventQueue:
+					if apply(line) {
+						return result
+					}
+				default:
+					o.OperationError = s.rpc.err()
+					return result
+				}
+			}
+		case <-waiting:
+			waiting = nil
+			cancelTimer = time.NewTimer(controlTimeout + time.Second)
+			forced = cancelTimer.C
+		case <-forced:
+			o.OperationError = context.Cause(t.ctx)
+			s.poison(o.OperationError)
+			return result
+		}
+	}
+}
+
+func newID() string {
+	var raw [16]byte
+	rand.Read(raw[:])
+	raw[6] = raw[6]&0x0f | 0x40
+	raw[8] = raw[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[:4], raw[4:6], raw[6:8], raw[8:10], raw[10:])
+}
+
+func promptContent(blocks []acp.ContentBlock) (string, []any, error) {
+	var text strings.Builder
+	var images []any
+	for _, block := range blocks {
+		switch {
+		case block.Text != nil:
+			text.WriteString(block.Text.Text)
+		case block.Image != nil:
+			images = append(images, map[string]any{"type": "image", "data": block.Image.Data, "mimeType": block.Image.MimeType})
+		case block.ResourceLink != nil:
+			fmt.Fprintf(&text, "\n[Context] %s", block.ResourceLink.Uri)
+		case block.Resource != nil:
+			resource := block.Resource.Resource
+			switch {
+			case resource.TextResourceContents != nil:
+				fmt.Fprintf(&text, "\n[Embedded Context] %s\n%s", resource.TextResourceContents.Uri, resource.TextResourceContents.Text)
+			case resource.BlobResourceContents != nil:
+				data, err := base64.StdEncoding.DecodeString(resource.BlobResourceContents.Blob)
+				if err != nil {
+					return "", nil, acp.NewInvalidParams(nil)
+				}
+				fmt.Fprintf(&text, "\n[Embedded Context] %s (%d bytes)", resource.BlobResourceContents.Uri, len(data))
+			default:
+				return "", nil, acp.NewInvalidParams(nil)
+			}
 		default:
 			return "", nil, acp.NewInvalidParams(nil)
 		}
 	}
-	return message.String(), images, nil
+	if text.Len() == 0 && len(images) == 0 {
+		return "", nil, acp.NewInvalidParams(nil)
+	}
+	return text.String(), images, nil
 }
 
-// slash 在 Go 中实现 pi-acp 的内置命令，其余技能与模板交给 Pi 原生解析。
-func (a *Agent) slash(ctx context.Context, s *session, message string, hasImages bool) (bool, error) {
-	message = strings.TrimSpace(message)
-	if hasImages || !strings.HasPrefix(message, "/") {
-		return false, nil
+func (c *Client) Compact(ctx context.Context, r acpmeta.CompactRequest) (acpmeta.CompactResponse, error) {
+	s, err := c.session(acp.SessionId(r.SessionID))
+	if err != nil {
+		return acpmeta.CompactResponse{}, err
 	}
-	name, arg, _ := strings.Cut(message, " ")
-	name = strings.TrimPrefix(name, "/")
-	arg = strings.TrimSpace(arg)
-	command := ""
-	params := map[string]any{}
-	var result map[string]any
-	switch name {
-	case "compact":
-		command = "compact"
-		params["customInstructions"] = arg
-	case "session":
-		command = "get_session_stats"
-	case "name":
-		if arg == "" {
-			return true, acp.NewInvalidParams(nil)
-		}
-		command = "set_session_name"
-		params["name"] = arg
-	case "steering", "follow-up":
-		if arg == "" {
-			command = "get_state"
-		} else {
-			if arg != "all" && arg != "one-at-a-time" {
-				return true, acp.NewInvalidParams(nil)
-			}
-			command = "set_steering_mode"
-			if name == "follow-up" {
-				command = "set_follow_up_mode"
-			}
-			params["mode"] = arg
-		}
-	case "autocompact":
-		if err := s.process.call(ctx, "get_state", nil, &result); err != nil {
-			return true, err
-		}
-		enabled, _ := result["autoCompactionEnabled"].(bool)
-		switch arg {
-		case "on":
-			enabled = true
-		case "off":
-			enabled = false
-		case "", "toggle":
-			enabled = !enabled
-		default:
-			return true, acp.NewInvalidParams(nil)
-		}
-		command = "set_auto_compaction"
-		params["enabled"] = enabled
-	case "export":
-		if _, err := os.Stat(s.file); err != nil {
-			return true, a.emitAgentMessage(ctx, s, map[string]any{
-				"type": "text",
-				"text": "Nothing to export yet.",
-			})
-		}
-		command = "export_html"
-		params["outputPath"] = filepath.Join(s.cwd, "pi-session-"+string(s.id)+".html")
-	case "changelog":
-		executable, err := filepath.EvalSymlinks(a.config.PiPath)
-		if err != nil {
-			return true, err
-		}
-		file := filepath.Join(filepath.Dir(filepath.Dir(executable)), "CHANGELOG.md")
-		data, err := os.ReadFile(file)
-		if err != nil {
-			return true, err
-		}
-		content := []rune(string(data))
-		return true, a.emitAgentMessage(ctx, s, map[string]any{
-			"type": "text",
-			"text": string(content[:min(20000, len(content))]),
-		})
-	default:
-		return false, nil
+	end, err := s.begin()
+	if err != nil {
+		return acpmeta.CompactResponse{}, err
 	}
-	if err := s.process.call(ctx, command, params, &result); err != nil {
-		return true, err
-	}
-	if name == "name" {
-		update := map[string]any{
-			"sessionUpdate": "session_info_update",
-			"title":         arg,
-			"updatedAt":     time.Now().UTC().Format(time.RFC3339),
+	defer end()
+	var raw json.RawMessage
+	sent, err := s.rpc.request(ctx, s.rpc.nextID(), "compact", nil, &raw, nil)
+	if err != nil {
+		var rejected *rpcRejection
+		if sent != agentclient.SubmissionNotSent && !errors.As(err, &rejected) {
+			s.poison(err)
 		}
-		if err := a.emit(ctx, s, update); err != nil {
-			return true, err
-		}
+		return acpmeta.CompactResponse{}, err
 	}
-	if name == "export" {
-		path := text(result["path"])
-		if path == "" {
-			path = text(params["outputPath"])
-		}
-		uri := (&url.URL{Scheme: "file", Path: path}).String()
-		return true, a.emitAgentMessage(ctx, s, map[string]any{
-			"type":     "resource_link",
-			"uri":      uri,
-			"name":     filepath.Base(path),
-			"mimeType": "text/html",
-		})
-	}
-	encoded, _ := json.Marshal(result)
-	switch name {
-	case "name":
-		encoded = []byte("Session name set to: " + arg)
-	case "compact":
-		encoded = []byte(fmt.Sprintf(
-			"Compaction completed. Tokens before: %v\n%s",
-			result["tokensBefore"],
-			text(result["summary"]),
-		))
-	case "steering", "follow-up":
-		value := arg
-		if value == "" {
-			field := "steeringMode"
-			if name == "follow-up" {
-				field = "followUpMode"
-			}
-			value = text(result[field])
-		}
-		encoded = []byte(name + " mode: " + value)
-	case "autocompact":
-		encoded = []byte(fmt.Sprintf("Automatic compaction: %v", params["enabled"]))
-	default:
-		if result == nil {
-			encoded = []byte("Pi /" + name + " complete")
-		}
-	}
-	return true, a.emitAgentMessage(ctx, s, map[string]any{
-		"type": "text",
-		"text": string(encoded),
-	})
-}
-
-// emitAgentMessage 发布一个标准 Agent 消息内容块。
-func (a *Agent) emitAgentMessage(ctx context.Context, s *session, content map[string]any) error {
-	return a.emit(ctx, s, s.messageUpdate(content, true))
-}
-
-// abortTurn 等待被取消的回合清空事件，避免上一轮终态误结束下一轮。
-func (a *Agent) abortTurn(s *session, turn <-chan acp.StopReason) {
-	_ = a.Cancel(context.Background(), acp.CancelNotification{SessionId: s.id})
-	select {
-	case <-turn:
-	case <-time.After(3 * time.Second):
-		cleanup, stop := context.WithTimeout(context.Background(), 3*time.Second)
-		defer stop()
-		_, _ = a.CloseSession(cleanup, acp.CloseSessionRequest{SessionId: s.id})
-	}
+	return acpmeta.CompactResponse{Status: acpmeta.NativeTurnCompleted}, nil
 }

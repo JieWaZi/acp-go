@@ -55,8 +55,7 @@ for (const cli of selected) for (const scenario of scenarios) {
   const env = {
     PATH: process.env.PATH, HOME: home, USERPROFILE: home, TMPDIR: config,
     XDG_CONFIG_HOME: config, XDG_CACHE_HOME: join(config, 'cache'),
-    ACP_ERROR_CLI: cli, ACP_ERROR_CLI_PATH: paths[cli], ACP_ERROR_STATE: join(config, 'state'),
-    CODEX_HOME: config, CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_SIMPLE: '1',
+    ACP_ERROR_CLI: cli, ACP_ERROR_CLI_PATH: paths[cli], CODEX_HOME: config, CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_SIMPLE: '1',
     ANTHROPIC_API_KEY: 'local-fixture-only', ANTHROPIC_BASE_URL: base,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_MAX_RETRIES: '0',
     CURSOR_CONFIG_DIR: config, CURSOR_API_KEY: 'local-fixture-only', CURSOR_API_ENDPOINT: base,

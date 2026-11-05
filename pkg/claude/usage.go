@@ -1,476 +1,455 @@
 package claude
 
 import (
-	"context"
+	"cmp"
+	"encoding/json"
 	"math"
+	"math/big"
 	"strings"
-	"time"
-	"unicode"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
-	acp "github.com/JieWaZi/acp-go/sdk"
+	"github.com/JieWaZi/acp-go/sdk"
 )
 
 const (
-	// defaultClaudeContextWindow 是尚无权威模型证据时的默认窗口。
-	defaultClaudeContextWindow int64 = 200_000
-	// extendedClaudeContextWindow 是模型标识明确声明 1m lane 时的推断窗口。
-	extendedClaudeContextWindow int64 = 1_000_000
+	mainLoopCoverage = "main_loop"
+	queryCoverage    = "query_pipeline"
+	maxUsageRows     = 256
 )
 
-// recordContextUsage 用 assistant 的完整累计快照替换当前上下文用量。
-func recordContextUsage(turn *claudeTurn, usage protocol.Usage, model string) {
-	turn.mu.Lock()
-	if !validClaudeContextUsage(usage) {
-		turn.mu.Unlock()
-		return
-	}
-	turn.contextUsage = usage
-	turn.contextUsageSet = usage.KnownFields == nil || len(usage.KnownFields) == 4
-	if model != "" {
-		turn.assistantModel = model
-	}
-	turn.mu.Unlock()
+type requestUsage struct {
+	model    string
+	counters acpmeta.ModelUsage
 }
 
-// recordContextUsageDelta 合并 Anthropic message_delta 的可空累计字段。
-func recordContextUsageDelta(turn *claudeTurn, delta protocol.UsageDelta) {
-	for _, counter := range []*int64{&delta.OutputTokens, delta.InputTokens, delta.CacheCreationInputTokens, delta.CacheReadInputTokens} {
-		if counter != nil && *counter < 0 {
-			return
-		}
-	}
-
-	turn.mu.Lock()
-	usage := turn.contextUsage
-	if usage.KnownFields != nil {
-		fields := make(map[string]bool, len(usage.KnownFields)+4)
-		for key, value := range usage.KnownFields {
-			fields[key] = value
-		}
-		usage.KnownFields = fields
-	}
-	mark := func(key string) {
-		if usage.KnownFields != nil {
-			usage.KnownFields[key] = true
-		}
-	}
-	mark("output_tokens")
-	if delta.InputTokens != nil {
-		usage.InputTokens = nonNegativeToken(*delta.InputTokens)
-		mark("input_tokens")
-	}
-	usage.OutputTokens = nonNegativeToken(delta.OutputTokens)
-	if delta.CacheCreationInputTokens != nil {
-		usage.CacheCreationInputTokens = nonNegativeToken(*delta.CacheCreationInputTokens)
-		mark("cache_creation_input_tokens")
-	}
-	if delta.CacheReadInputTokens != nil {
-		usage.CacheReadInputTokens = nonNegativeToken(*delta.CacheReadInputTokens)
-		mark("cache_read_input_tokens")
-	}
-	turn.contextUsage = usage
-	turn.contextUsageSet = validClaudeContextUsage(usage) && (usage.KnownFields == nil || len(usage.KnownFields) == 4)
-	turn.mu.Unlock()
+// cumulativeCounter keeps the epoch floor independently of the evidence that
+// the next report can be differenced against it for an individual invocation.
+type cumulativeCounter[T any] struct {
+	high     T
+	known    bool
+	adjacent bool
 }
 
-// sendUsageUpdate 发布当前顶层 assistant 的上下文快照，而不是 result 的 Turn 累计量。
-func (s *claudeSession) sendUsageUpdate(
-	ctx context.Context,
-	turn *claudeTurn,
-	force bool,
-) error {
-	turn.mu.Lock()
-	reported, hasUsage := claudeTurnUsageLocked(turn)
-	used := int64(0)
-	contextKnown := turn.contextUsageSet
-	if contextKnown {
-		used = totalClaudeUsage(turn.contextUsage)
+// advance never lowers the floor. After a gap only a sample at or above the
+// floor establishes an adjacent boundary, and that sample has no turn delta.
+func (c *cumulativeCounter[T]) advance(sample T, compare func(T, T) int) (T, bool) {
+	before := c.high
+	if c.known && compare(sample, before) < 0 {
+		return before, false
 	}
-	turn.mu.Unlock()
-	if !hasUsage && !contextKnown {
+	attributable := c.known && c.adjacent
+	c.high, c.known, c.adjacent = sample, true, true
+	return before, attributable
+}
+
+type modelCounters struct {
+	input, output, read, write, thinking cumulativeCounter[int64]
+	cost                                 cumulativeCounter[*big.Rat]
+	costBasis                            *string
+}
+
+func newModelCounters(fromZero bool) *modelCounters {
+	zero := cumulativeCounter[int64]{known: fromZero, adjacent: fromZero}
+	m := &modelCounters{input: zero, output: zero, read: zero, write: zero, thinking: zero}
+	if fromZero {
+		m.cost = cumulativeCounter[*big.Rat]{high: new(big.Rat), known: true, adjacent: true}
+	}
+	return m
+}
+
+func (m *modelCounters) breakContinuity() {
+	m.input.adjacent, m.output.adjacent = false, false
+	m.read.adjacent, m.write.adjacent = false, false
+	m.thinking.adjacent, m.cost.adjacent = false, false
+}
+
+type queryCounters struct {
+	// Model floors remain present even when a report omits them. A new model
+	// may start at zero only when the preceding model report was observed.
+	models         map[string]*modelCounters
+	modelsAdjacent bool
+	cost           cumulativeCounter[*big.Rat]
+	// Reset identities span all epochs of this native stream.
+	resetEvents        map[string]struct{}
+	resetConversations map[string]struct{}
+}
+
+func newQueryCounters(resume bool) queryCounters {
+	var q queryCounters
+	if !resume {
+		q.startEpoch()
+	}
+	return q
+}
+
+func (q *queryCounters) startEpoch() {
+	q.models = nil
+	q.modelsAdjacent = true
+	q.cost = cumulativeCounter[*big.Rat]{high: new(big.Rat), known: true, adjacent: true}
+}
+
+func (q *queryCounters) breakModelContinuity() {
+	q.modelsAdjacent = false
+	for _, model := range q.models {
+		model.breakContinuity()
+	}
+}
+
+func (q *queryCounters) breakContinuity() {
+	q.breakModelContinuity()
+	q.cost.adjacent = false
+}
+
+// reset applies each validated native boundary once for this stream.
+// It reports exhaustion so the session can fail closed without forgetting IDs.
+func (q *queryCounters) reset(eventID, conversationID string) bool {
+	eventID, conversationID = strings.ToLower(eventID), strings.ToLower(conversationID)
+	_, seenEvent := q.resetEvents[eventID]
+	_, seenConversation := q.resetConversations[conversationID]
+	if seenEvent || seenConversation {
+		return true
+	}
+	if len(q.resetEvents) >= maxRememberedIDs {
+		return false
+	}
+	if q.resetEvents == nil {
+		q.resetEvents = make(map[string]struct{})
+		q.resetConversations = make(map[string]struct{})
+	}
+	q.resetEvents[eventID] = struct{}{}
+	q.resetConversations[conversationID] = struct{}{}
+	q.startEpoch()
+	return true
+}
+
+func nonnegative(value int64) *int64 {
+	if value < 0 {
 		return nil
 	}
-	s.mu.Lock()
-	window := s.contextWindowSize
-	s.mu.Unlock()
-	contextKnown = contextKnown && window > 0
-	reported.ContextKnown = contextKnown
-	if !contextKnown {
-		used = 0
-		window = 0
-	}
-	// 同样的上下文大小可能对应消费累计的变化，不能只按 Used 去重。
-	_ = force
-	meta := map[string]any(nil)
-	if hasUsage {
-		meta = acpmeta.WithTurnUsage(nil, reported)
-	}
-
-	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-	defer cancel()
-	if err := s.agent.sendUpdate(notifyCtx, s.id, acp.SessionUpdate{
-		UsageUpdate: &acp.SessionUsageUpdate{
-			Meta: meta,
-			Used: boundedInt(used),
-			Size: boundedInt(window),
-		},
-	}); err != nil {
-		return err
-	}
-
-	turn.mu.Lock()
-	turn.contextUsagePublished = used
-	turn.contextUsagePublishedSet = true
-	turn.mu.Unlock()
-	return nil
+	return acp.Ptr(value)
 }
 
-// useAssistantModel 让实际 assistant 模型修正初始化别名推断的窗口。
-func (s *claudeSession) useAssistantModel(model string) {
-	if model == "" {
+func reportedUsage(u protocol.Usage) acpmeta.TurnUsage {
+	field := func(key string, value int64) *int64 {
+		if !u.KnownFields[key] {
+			return nil
+		}
+		return nonnegative(value)
+	}
+	return acpmeta.TurnUsage{
+		InputTokens: field("input_tokens", u.InputTokens), OutputTokens: field("output_tokens", u.OutputTokens),
+		CacheReadTokens:  field("cache_read_input_tokens", u.CacheReadInputTokens),
+		CacheWriteTokens: field("cache_creation_input_tokens", u.CacheCreationInputTokens),
+		Source:           "claude.result.usage", Coverage: mainLoopCoverage, Complete: true,
+	}
+}
+
+func knownUsage(u acpmeta.TurnUsage) bool {
+	return u.InputTokens != nil || u.OutputTokens != nil || u.CacheReadTokens != nil || u.CacheWriteTokens != nil
+}
+
+func positiveUsage(u acpmeta.TurnUsage) bool {
+	for _, v := range []*int64{u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens} {
+		if v != nil && *v > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (inv *invocation) recordUsage(key, model string, usage acpmeta.TurnUsage) {
+	if key == "" || !knownUsage(usage) {
 		return
 	}
-	s.mu.Lock()
-	if s.contextWindowModel != model {
-		s.seedContextWindowLocked(model)
-	}
-	s.mu.Unlock()
-}
-
-// updateContextWindowFromResult 使用与当前 assistant 最匹配的 modelUsage 权威窗口。
-func (s *claudeSession) updateContextWindowFromResult(
-	turn *claudeTurn,
-	models map[string]protocol.ModelUsage,
-) {
-	turn.mu.Lock()
-	model := turn.assistantModel
-	turn.mu.Unlock()
-	key, usage, ok := matchingClaudeModelUsage(models, model)
-	if !ok || usage.ContextWindow <= 0 {
+	old, exists := inv.partialUsage[key]
+	if !exists && len(inv.partialUsage) >= maxUsageRows {
 		return
 	}
-
-	s.mu.Lock()
-	s.contextWindowSize = usage.ContextWindow
-	s.contextWindowAuthoritative = true
-	s.contextWindowModel = model
-	s.mu.Unlock()
-	s.agent.cacheContextWindow(usage.ContextWindow, key, model)
-}
-
-// seedContextWindowLocked 从当前 Agent 的权威缓存、模型文本或默认值建立窗口。
-// 调用方必须持有 Session mu。
-func (s *claudeSession) seedContextWindowLocked(model string) {
-	keys, texts := contextWindowEvidence(model, s.configuration.models)
-	if window, ok := s.agent.cachedContextWindow(keys...); ok {
-		s.contextWindowSize = window
-		s.contextWindowAuthoritative = true
-		s.contextWindowModel = model
-		return
+	if model != "" {
+		old.model = model
 	}
-	window := inferClaudeContextWindow(texts...)
-	s.contextWindowSize = window
-	s.contextWindowAuthoritative = false
-	s.contextWindowModel = model
-}
-
-// cachedContextWindow 返回第一个已经由 result.modelUsage 确认的模型窗口。
-func (a *Agent) cachedContextWindow(keys ...string) (int64, bool) {
-	a.contextWindowsMu.RLock()
-	defer a.contextWindowsMu.RUnlock()
-	for _, key := range keys {
-		if key == "" {
-			continue
-		}
-		if window := a.contextWindows[key]; window > 0 {
-			return window, true
-		}
-	}
-	return 0, false
-}
-
-// cacheContextWindow 保存同一模型的 resolved 与消息标识，供后续 Session 直接复用。
-func (a *Agent) cacheContextWindow(window int64, keys ...string) {
-	if window <= 0 {
-		return
-	}
-	a.contextWindowsMu.Lock()
-	if a.contextWindows == nil {
-		a.contextWindows = make(map[string]int64)
-	}
-	for _, key := range keys {
-		if key != "" {
-			a.contextWindows[key] = window
-		}
-	}
-	a.contextWindowsMu.Unlock()
-}
-
-// contextWindowEvidence 返回缓存键和文本推断使用的模型证据。
-func contextWindowEvidence(model string, models []protocol.ModelInfo) ([]string, []string) {
-	keys := []string{model}
-	texts := []string{model}
-	for _, info := range models {
-		if info.Value != model && info.ResolvedModel != model {
-			continue
-		}
-		keys = append(keys, info.ResolvedModel, info.Value)
-		texts = append(texts, info.ResolvedModel, info.DisplayName, info.Description)
-		break
-	}
-	return keys, texts
-}
-
-// inferClaudeContextWindow 识别独立 1m token，否则采用默认窗口。
-func inferClaudeContextWindow(texts ...string) int64 {
-	for _, text := range texts {
-		tokens := strings.FieldsFunc(strings.ToLower(text), func(value rune) bool {
-			return !unicode.IsLetter(value) && !unicode.IsDigit(value)
-		})
-		for _, token := range tokens {
-			if token == "1m" {
-				return extendedClaudeContextWindow
-			}
-		}
-	}
-	return defaultClaudeContextWindow
-}
-
-// matchingClaudeModelUsage 按的最长公共前缀选择 assistant 对应模型。
-func matchingClaudeModelUsage(
-	models map[string]protocol.ModelUsage,
-	model string,
-) (string, protocol.ModelUsage, bool) {
-	bestKey := ""
-	bestLength := 0
-	for key := range models {
-		length := commonPrefixLength(key, model)
-		if length > bestLength {
-			bestKey = key
-			bestLength = length
-		}
-	}
-	if bestKey == "" {
-		return "", protocol.ModelUsage{}, false
-	}
-	return bestKey, models[bestKey], true
-}
-
-// commonPrefixLength 返回两个模型标识从开头连续相同的字节数。
-func commonPrefixLength(left, right string) int {
-	limit := min(len(left), len(right))
-	for index := range limit {
-		if left[index] != right[index] {
-			return index
-		}
-	}
-	return limit
-}
-
-// sanitizeClaudeUsage 把第三方 backend 的负 token 防御性收紧为零。
-func sanitizeClaudeUsage(usage protocol.Usage) protocol.Usage {
-	usage.InputTokens = nonNegativeToken(usage.InputTokens)
-	usage.OutputTokens = nonNegativeToken(usage.OutputTokens)
-	usage.CacheCreationInputTokens = nonNegativeToken(usage.CacheCreationInputTokens)
-	usage.CacheReadInputTokens = nonNegativeToken(usage.CacheReadInputTokens)
-	return usage
-}
-
-// nonNegativeToken 把无效负 token 收紧为零。
-func nonNegativeToken(value int64) int64 {
-	if value < 0 {
-		return 0
-	}
-	return value
-}
-
-// totalClaudeUsage 对四类 token 做饱和求和，避免异常上游值溢出。
-func totalClaudeUsage(usage protocol.Usage) int64 {
-	usage = sanitizeClaudeUsage(usage)
-	values := [...]int64{
-		usage.InputTokens,
-		usage.OutputTokens,
-		usage.CacheCreationInputTokens,
-		usage.CacheReadInputTokens,
-	}
-	var total int64
-	for _, value := range values {
-		if value > math.MaxInt64-total {
-			return math.MaxInt64
-		}
-		total += value
-	}
-	return total
-}
-
-// reportedClaudeUsage 保留上游字段 presence，非法分量不投影成可信零。
-func reportedClaudeUsage(usage protocol.Usage) (acpmeta.TurnUsage, bool) {
-	result := acpmeta.TurnUsage{Source: "claude.usage", Coverage: "main_loop"}
 	fields := []struct {
-		// key 是原生字段名。
-		key string
-		// value 是原生 token 值。
-		value int64
-		// target 是归一化字段地址。
 		target **int64
-	}{{"input_tokens", usage.InputTokens, &result.InputTokens}, {"output_tokens", usage.OutputTokens, &result.OutputTokens}, {"cache_creation_input_tokens", usage.CacheCreationInputTokens, &result.CacheWriteTokens}, {"cache_read_input_tokens", usage.CacheReadInputTokens, &result.CacheReadTokens}}
-	known := false
+		value  *int64
+	}{
+		{&old.counters.InputTokens, usage.InputTokens}, {&old.counters.OutputTokens, usage.OutputTokens},
+		{&old.counters.CacheReadTokens, usage.CacheReadTokens}, {&old.counters.CacheWriteTokens, usage.CacheWriteTokens},
+	}
 	for _, field := range fields {
-		present := usage.KnownFields[field.key]
-		if usage.KnownFields == nil {
-			present = field.value != 0
-		}
-		if present && field.value >= 0 {
-			value := field.value
-			*field.target = &value
-			known = true
+		if field.value != nil && *field.value >= 0 {
+			*field.target = field.value
 		}
 	}
-	return result, known
+	inv.partialUsage[key] = old
 }
 
-// recordClaudeMessageUsage 替换同一原生消息的累计请求用量；无身份时只保留一个部分槽位。
-func recordClaudeMessageUsage(turn *claudeTurn, usage protocol.Usage, id string) {
-	reported, known := reportedClaudeUsage(usage)
-	if !known {
-		return
+func partialSnapshot(inv *invocation) *acpmeta.TurnUsage {
+	if len(inv.partialUsage) == 0 {
+		return nil
 	}
-	turn.mu.Lock()
-	defer turn.mu.Unlock()
-	if id == "" {
-		id = turn.usageMessageID
-	}
-	if id != "" {
-		if _, covered := turn.usageCoveredMessages[id]; covered {
-			return
+	var all []acpmeta.ModelUsage
+	var byModel = make(map[string][]acpmeta.ModelUsage)
+	for _, request := range inv.partialUsage {
+		all = append(all, request.counters)
+		if request.model != "" {
+			byModel[request.model] = append(byModel[request.model], request.counters)
 		}
 	}
-	if turn.usageMessages == nil {
-		turn.usageMessages = make(map[string]acpmeta.TurnUsage)
+	sum := sumCounters(all)
+	u := turnCounters(sum, "claude.assistant.usage", mainLoopCoverage, false)
+	if len(byModel) == 1 && len(byModel[inv.model]) == len(all) {
+		u.Model = inv.model
 	}
-	turn.usageMessages[id] = reported
+	if len(byModel) > 0 {
+		u.Models = make(map[string]acpmeta.ModelUsage, len(byModel))
+		for model, requests := range byModel {
+			u.Models[model] = sumCounters(requests)
+		}
+	}
+	if !knownUsage(u) && len(u.Models) == 0 {
+		return nil
+	}
+	return &u
 }
 
-// recordClaudeResultUsageLocked 以当前 result 替换边界内消息快照，再与已结算边界累计。
-// 调用方持有 turn.mu；没有身份也没有新消息时不猜测另一笔消费。
-func recordClaudeResultUsageLocked(turn *claudeTurn, reported acpmeta.TurnUsage, id string) {
-	if id != "" {
-		if _, seen := turn.usageResultIDs[id]; seen {
-			return
-		}
-	} else if turn.reportedUsage != nil && len(turn.usageMessages) == 0 {
-		return
-	}
-	result := reported
-	if turn.reportedUsage != nil {
-		result = sumClaudeUsageSnapshots([]acpmeta.TurnUsage{*turn.reportedUsage, reported}, "claude.result.usage", turn.assistantModel)
-	}
-	turn.reportedUsage = &result
-	if turn.usageCoveredMessages == nil {
-		turn.usageCoveredMessages = make(map[string]struct{})
-	}
-	for messageID := range turn.usageMessages {
-		if messageID != "" {
-			turn.usageCoveredMessages[messageID] = struct{}{}
-		}
-	}
-	turn.usageMessages = nil
-	turn.usageMessageID = ""
-	if id != "" {
-		if turn.usageResultIDs == nil {
-			turn.usageResultIDs = make(map[string]struct{})
-		}
-		turn.usageResultIDs[id] = struct{}{}
+func turnCounters(value acpmeta.ModelUsage, source, coverage string, complete bool) acpmeta.TurnUsage {
+	return acpmeta.TurnUsage{
+		InputTokens: value.InputTokens, OutputTokens: value.OutputTokens, CacheReadTokens: value.CacheReadTokens,
+		CacheWriteTokens: value.CacheWriteTokens, ReasoningTokens: value.ReasoningTokens,
+		Source: source, Coverage: coverage, Complete: complete,
 	}
 }
 
-// claudeTurnUsageLocked 将已结算的 result 边界与之后尚未结算的请求快照合并。
-// 调用方持有 turn.mu。
-func claudeTurnUsageLocked(turn *claudeTurn) (acpmeta.TurnUsage, bool) {
-	snapshots := make([]acpmeta.TurnUsage, 0, len(turn.usageMessages)+1)
-	source := "claude.assistant.usage"
-	if turn.reportedUsage != nil {
-		snapshots = append(snapshots, *turn.reportedUsage)
-		source = turn.reportedUsage.Source
-	}
-	for _, usage := range turn.usageMessages {
-		snapshots = append(snapshots, usage)
-	}
-	if turn.reportedUsage != nil && len(turn.usageMessages) > 0 {
-		source = "claude.main_loop.usage"
-	}
-	return sumClaudeUsageSnapshots(snapshots, source, turn.assistantModel), len(snapshots) > 0
-}
-
-// sumClaudeUsageSnapshots 累计互不重叠的主循环边界，缺失分类不伪造零。
-func sumClaudeUsageSnapshots(snapshots []acpmeta.TurnUsage, source, model string) acpmeta.TurnUsage {
-	result := acpmeta.TurnUsage{Source: source, Coverage: "main_loop", Model: model}
-	for index, usage := range snapshots {
-		fields := []struct {
-			// target 指向累计字段。
-			target **int64
-			// value 是当前边界的可选计数。
-			value *int64
-		}{{&result.InputTokens, usage.InputTokens}, {&result.OutputTokens, usage.OutputTokens}, {&result.CacheReadTokens, usage.CacheReadTokens}, {&result.CacheWriteTokens, usage.CacheWriteTokens}}
-		for _, field := range fields {
-			if index == 0 {
-				if field.value != nil {
-					value := *field.value
-					*field.target = &value
-				}
-			} else if *field.target != nil {
-				if field.value == nil || *field.value > math.MaxInt64-**field.target {
-					*field.target = nil
-				} else {
-					value := **field.target + *field.value
-					*field.target = &value
-				}
-			}
-		}
-	}
-	return result
-}
-
-// claudePromptUsage 兼容标准 ACP 数值字段，同时用元数据保留未知字段。
-func claudePromptUsage(reported acpmeta.TurnUsage) *acp.Usage {
-	value := &acp.Usage{}
-	if reported.InputTokens != nil {
-		value.InputTokens = boundedInt(*reported.InputTokens)
-	}
-	if reported.OutputTokens != nil {
-		value.OutputTokens = boundedInt(*reported.OutputTokens)
-	}
-	if reported.CacheReadTokens != nil {
-		converted := boundedInt(*reported.CacheReadTokens)
-		value.CachedReadTokens = &converted
-	}
-	if reported.CacheWriteTokens != nil {
-		converted := boundedInt(*reported.CacheWriteTokens)
-		value.CachedWriteTokens = &converted
-	}
-	total := int64(0)
-	for _, counter := range []*int64{reported.InputTokens, reported.OutputTokens, reported.CacheReadTokens, reported.CacheWriteTokens} {
-		if counter != nil {
-			if *counter > int64(math.MaxInt)-total {
+func sumCounters(rows []acpmeta.ModelUsage) acpmeta.ModelUsage {
+	sum := func(get func(acpmeta.ModelUsage) *int64) *int64 {
+		var total int64
+		for _, row := range rows {
+			n := get(row)
+			if n == nil || *n < 0 || *n > math.MaxInt64-total {
 				return nil
 			}
-			total += *counter
+			total += *n
 		}
+		return acp.Ptr(total)
 	}
-	value.TotalTokens = int(total)
-	return value
+	return acpmeta.ModelUsage{
+		InputTokens:      sum(func(r acpmeta.ModelUsage) *int64 { return r.InputTokens }),
+		OutputTokens:     sum(func(r acpmeta.ModelUsage) *int64 { return r.OutputTokens }),
+		CacheReadTokens:  sum(func(r acpmeta.ModelUsage) *int64 { return r.CacheReadTokens }),
+		CacheWriteTokens: sum(func(r acpmeta.ModelUsage) *int64 { return r.CacheWriteTokens }),
+		ReasoningTokens:  sum(func(r acpmeta.ModelUsage) *int64 { return r.ReasoningTokens }),
+	}
 }
 
-// validClaudeContextUsage 拒绝不可靠的上下文总量，避免负数与溢出变为可信零。
-func validClaudeContextUsage(usage protocol.Usage) bool {
-	total := int64(0)
-	for _, value := range []int64{usage.InputTokens, usage.OutputTokens, usage.CacheReadInputTokens, usage.CacheCreationInputTokens} {
-		if value < 0 || value > int64(math.MaxInt)-total {
+func (q *queryCounters) final(inv *invocation, result *protocol.ResultMessage, reported acpmeta.TurnUsage) *acpmeta.TurnUsage {
+	partial := partialSnapshot(inv)
+	unreliableTerminal := nativeFailed(result) || result.TerminalReason == "aborted_streaming" || result.TerminalReason == "aborted_tools"
+	modelReport := result.ModelUsage
+	if len(modelReport) > maxUsageRows || unreliableTerminal && zeroPipeline(modelReport) {
+		modelReport = nil
+	}
+	costReport := result.TotalCostUSD
+	// The query estimate cannot be separated into price bases. If any model
+	// reports an organization rate or a fallback guess, keep only the token
+	// counts and independently supported model estimates.
+	for _, row := range result.ModelUsage {
+		if !listCostBasis(row.CostBasis) {
+			costReport = nil
+			break
+		}
+	}
+	if costReport != nil && unreliableTerminal {
+		if amount, err := costReport.Float64(); err != nil || amount == 0 {
+			costReport = nil
+		}
+	}
+	// A missing or zeroized report breaks adjacency for that counter alone.
+	// The next usable report seeds a new boundary without claiming the gap.
+	models := q.modelDeltas(modelReport)
+	cost := observeCost(&q.cost, costReport)
+
+	var observations []acpmeta.UsageObservation
+	if models != nil {
+		rows := make([]acpmeta.ModelUsage, 0, len(models))
+		for _, row := range models {
+			rows = append(rows, row)
+		}
+		totals := sumCounters(rows)
+		complete := totals.InputTokens != nil && totals.OutputTokens != nil &&
+			totals.CacheReadTokens != nil && totals.CacheWriteTokens != nil
+		summary := turnCounters(totals, "claude.result.modelUsage", queryCoverage, complete)
+		summary.Models = models
+		if len(models) == 1 {
+			for id := range models {
+				summary.Model = id
+			}
+		}
+		// Select one scope for the primary totals. A partial pipeline
+		// cannot replace an independently verified main-loop component.
+		hasEvidence := knownUsage(summary) || totals.ReasoningTokens != nil
+		for _, row := range models {
+			if row.InputTokens != nil || row.OutputTokens != nil || row.CacheReadTokens != nil ||
+				row.CacheWriteTokens != nil || row.ReasoningTokens != nil || row.Cost != nil {
+				hasEvidence = true
+				break
+			}
+		}
+		if complete || !knownUsage(reported) && partial == nil && hasEvidence {
+			reported = summary
+		} else if hasEvidence {
+			observations = append(observations, acpmeta.UsageObservation{
+				Source: summary.Source, Coverage: summary.Coverage, Complete: summary.Complete, Tokens: totals, Models: models,
+			})
+		}
+	}
+	if reported.Coverage == mainLoopCoverage {
+		zeroized := unreliableTerminal && !positiveUsage(reported) && modelReport == nil
+		if !knownUsage(reported) || zeroized {
+			if partial != nil {
+				reported = *partial
+			} else {
+				reported = turnCounters(acpmeta.ModelUsage{}, "claude.result.usage", mainLoopCoverage, false)
+			}
+		} else if partial != nil {
+			reported.Model = partial.Model
+			reported.Models = partial.Models
+		}
+	}
+	reported.Observations = observations
+	reported.Cost = cost
+	reported.ContextKnown = inv.outcome.ContextUsage.UsedTokens != nil && inv.outcome.ContextUsage.WindowTokens != nil
+	if !knownUsage(reported) && len(reported.Models) == 0 && reported.Cost == nil {
+		return nil
+	}
+	return &reported
+}
+
+func zeroPipeline(rows map[string]protocol.ModelUsage) bool {
+	for _, row := range rows {
+		if row.InputTokens > 0 || row.OutputTokens > 0 || row.CacheReadInputTokens > 0 || row.CacheCreationInputTokens > 0 {
 			return false
 		}
-		total += value
 	}
 	return true
+}
+
+func (q *queryCounters) modelDeltas(report map[string]protocol.ModelUsage) map[string]acpmeta.ModelUsage {
+	if report == nil {
+		q.breakModelContinuity()
+		return nil
+	}
+	count := len(q.models)
+	for id := range report {
+		if q.models[id] == nil {
+			count++
+		}
+		if id == "" || count > maxUsageRows {
+			// Preserve the epoch floors even if this frame cannot be
+			// reconciled within the bounded model registry.
+			q.breakModelContinuity()
+			return nil
+		}
+	}
+	rows := make(map[string]acpmeta.ModelUsage, count)
+	for id, model := range q.models {
+		if _, exists := report[id]; !exists {
+			model.breakContinuity()
+			rows[id] = acpmeta.ModelUsage{}
+		}
+	}
+	if q.models == nil && len(report) > 0 {
+		q.models = make(map[string]*modelCounters, len(report))
+	}
+	for id, sample := range report {
+		model := q.models[id]
+		if model == nil {
+			model = newModelCounters(q.modelsAdjacent)
+			q.models[id] = model
+		}
+		rows[id] = model.observe(sample)
+	}
+	wasAdjacent := q.modelsAdjacent
+	q.modelsAdjacent = true
+	if len(rows) == 0 && !wasAdjacent {
+		return nil
+	}
+	return rows
+}
+
+func (m *modelCounters) observe(sample protocol.ModelUsage) acpmeta.ModelUsage {
+	row := acpmeta.ModelUsage{
+		InputTokens:      observeTokens(&m.input, sample.InputTokens, sample.KnownCounters["input"]),
+		OutputTokens:     observeTokens(&m.output, sample.OutputTokens, sample.KnownCounters["output"]),
+		CacheReadTokens:  observeTokens(&m.read, sample.CacheReadInputTokens, sample.KnownCounters["read"]),
+		CacheWriteTokens: observeTokens(&m.write, sample.CacheCreationInputTokens, sample.KnownCounters["write"]),
+	}
+	if sample.ThinkingTokens != nil {
+		reasoning := observeTokens(&m.thinking, *sample.ThinkingTokens, true)
+		if reasoning != nil && row.OutputTokens != nil && *reasoning <= *row.OutputTokens {
+			row.ReasoningTokens = reasoning
+		}
+	} else {
+		m.thinking.adjacent = false
+	}
+	if m.costBasis == nil {
+		m.costBasis = acp.Ptr(sample.CostBasis)
+	} else if *m.costBasis != sample.CostBasis {
+		m.cost.adjacent = false
+		*m.costBasis = sample.CostBasis
+	}
+	cost := sample.CostUSD
+	if !listCostBasis(sample.CostBasis) {
+		cost = nil
+	}
+	row.Cost = observeCost(&m.cost, cost)
+	return row
+}
+
+// listCostBasis accepts the CLI list estimate, including versions that
+// predate costBasis. Managed rates and guesses have no comparable list cost.
+func listCostBasis(basis string) bool {
+	return basis == "" || basis == "list"
+}
+
+func observeTokens(counter *cumulativeCounter[int64], sample int64, present bool) *int64 {
+	if !present || sample < 0 {
+		counter.adjacent = false
+		return nil
+	}
+	before, attributable := counter.advance(sample, cmp.Compare[int64])
+	if !attributable {
+		return nil
+	}
+	return acp.Ptr(sample - before)
+}
+
+func parseCumulativeCost(n *json.Number) *big.Rat {
+	// Bound exponent magnitude before parsing decimal estimates.
+	if n == nil || len(*n) > 32 {
+		return nil
+	}
+	f, err := n.Float64()
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) || f == 0 && strings.ContainsAny(string(*n), "eE") {
+		return nil
+	}
+	r, ok := new(big.Rat).SetString(string(*n))
+	if !ok {
+		return nil
+	}
+	return r
+}
+
+func observeCost(counter *cumulativeCounter[*big.Rat], raw *json.Number) *acpmeta.UsageCost {
+	sample := parseCumulativeCost(raw)
+	if sample == nil {
+		counter.adjacent = false
+		return nil
+	}
+	before, attributable := counter.advance(sample, (*big.Rat).Cmp)
+	if !attributable {
+		return nil
+	}
+	diff := new(big.Rat).Sub(sample, before)
+	return &acpmeta.UsageCost{Amount: json.Number(diff.FloatString(18)), Currency: "USD", Source: "claude.result.cost", Scope: queryCoverage, Aggregation: "turn_delta", Valuation: "estimated"}
 }

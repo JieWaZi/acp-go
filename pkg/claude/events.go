@@ -4,778 +4,580 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
 	"slices"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	agentclient "github.com/JieWaZi/acp-go/pkg/agentclient"
 	"github.com/JieWaZi/acp-go/pkg/claude/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// toolState 保存已发布工具调用的最小生命周期状态。
-type toolState struct {
-	// ID 是 ACP ToolCallID。
-	ID string
-	// Name 是 CLI 工具名称。
-	Name string
-	// Input 是工具原始输入。
-	Input any
-	// Completed 阻止迟到进度重新打开工具调用。
-	Completed bool
-}
-
-// taskState 保存计划更新需要的单个任务快照。
-type taskState struct {
-	// ID 是 Session 内任务标识。
-	ID string
-	// Description 是任务说明。
-	Description string
-	// Status 是 CLI 任务状态。
-	Status string
-}
-
-// handleMessage 按 transport 到达顺序处理一条 CLI 消息。
-func (s *claudeSession) handleMessage(ctx context.Context, message protocol.Message) {
-	var err error
-	switch typed := message.(type) {
-	case *protocol.SystemInitMessage:
-		// 首条 init 也在 prompt 消费期校准状态。
-		err = s.syncSystemInit(ctx, *typed)
-	case *protocol.StreamEventMessage:
-		err = s.handleStreamEvent(ctx, typed)
-	case *protocol.AssistantMessage:
-		err = s.handleAssistant(ctx, typed)
-	case *protocol.UserMessage:
-		err = s.handleUser(ctx, typed)
-	case *protocol.ResultMessage:
-		err = s.handleResult(ctx, typed)
-	case *protocol.ToolProgressMessage:
-		err = s.handleToolProgress(ctx, typed)
-	case *protocol.TaskMessage:
-		err = s.handleTask(ctx, typed)
-	case *protocol.SystemMessage:
-		err = s.handleSystem(ctx, typed)
-	case *protocol.UnknownMessage:
-		s.agent.logger.Debug("Ignoring unknown Claude message", "type", typed.MessageType(), "bytes", len(typed.RawJSON()))
+func (s *session) receive(frame protocol.Message) {
+	var cwdErr error
+	if init, ok := frame.(*protocol.SystemInitMessage); ok && s.launch.workspace != nil {
+		// Native paths are resolved outside the admission lock.
+		cwdErr = s.launch.workspace.verifyNativeDirectory(init.CWD)
 	}
-	if err != nil && !errors.Is(err, ErrClaudeConnectionNotReady) {
-		s.agent.logger.Warn("Failed to handle Claude message", "session_id", s.id, "type", message.MessageType(), "error", err)
-	}
-}
-
-// syncSystemInit 更新 CLI 可自主变化的配置，并在终端命令集合变化时重新发布菜单。
-func (s *claudeSession) syncSystemInit(ctx context.Context, init protocol.SystemInitMessage) error {
 	s.mu.Lock()
-	if init.SessionID != s.id || s.closed {
-		s.mu.Unlock()
-		return nil
+	defer s.mu.Unlock()
+	if s.fault != nil {
+		return
 	}
-	terminalCommandsChanged := init.TerminalSlashCommands != nil &&
-		!slices.Equal(init.TerminalSlashCommands, s.systemInit.TerminalSlashCommands)
-	if init.TerminalSlashCommands == nil {
-		init.TerminalSlashCommands = s.systemInit.TerminalSlashCommands
-	}
-	s.systemInit = init
-	if init.Model != "" {
-		modelChanged := s.configuration.model != init.Model
-		s.configuration.model = init.Model
-		if modelChanged {
-			s.seedContextWindowLocked(init.Model)
+	switch m := frame.(type) {
+	case *protocol.SystemInitMessage:
+		if m.SessionID != "" && m.SessionID != string(s.id) {
+			s.faultAndStopLocked(errors.New("Claude reported a different session ID"))
+			return
 		}
-	}
-	if init.PermissionMode != "" {
-		s.configuration.mode = acp.SessionModeId(init.PermissionMode)
-	}
-	if init.FastModeState != "" {
-		s.configuration.fast = init.FastModeState == "on" || init.FastModeState == "cooldown"
-	}
-	s.mu.Unlock()
-	if terminalCommandsChanged {
-		return s.sendAvailableCommandsUpdate(ctx)
-	}
-	return nil
-}
-
-// handleStreamEvent 映射文本、思考、工具开始和 usage 增量。
-func (s *claudeSession) handleStreamEvent(ctx context.Context, message *protocol.StreamEventMessage) error {
-	turn := s.activeTurn()
-	if turn == nil {
-		return nil
-	}
-	event := message.Event
-	switch event.Type {
-	case "message_start":
-		nativeID := ""
-		if event.Message != nil {
-			nativeID = event.Message.ID
+		if cwdErr != nil {
+			s.faultAndStopLocked(cwdErr)
+			return
 		}
-		identity := s.messageIdentity(turn, message.ParentToolUseID, nativeID, true)
-		if message.ParentToolUseID == nil {
-			turn.mu.Lock()
-			turn.usageMessageID = identity
-			turn.mu.Unlock()
+		s.init = *m
+		if s.open && s.settings.observeInit(*m) {
+			s.announceSettingsLocked()
 		}
-		turn.mu.Lock()
-		delete(turn.streamedBlocks, streamedBlockOwner(message.ParentToolUseID))
-		turn.mu.Unlock()
-		if message.ParentToolUseID != nil || event.Message == nil {
-			return nil
+	case *protocol.SystemMessage:
+		if s.matches(m.SessionID) {
+			s.systemLocked(m)
 		}
-		s.useAssistantModel(event.Message.Model)
-		if event.Message.Usage != nil {
-			recordContextUsage(turn, *event.Message.Usage, event.Message.Model)
-			recordClaudeMessageUsage(turn, *event.Message.Usage, nativeID)
-			return s.sendUsageUpdate(ctx, turn, false)
-		}
-	case "content_block_start":
-		if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
-			return s.startTool(ctx, *event.ContentBlock)
-		}
-	case "content_block_delta":
-		if event.Delta == nil {
-			return nil
-		}
-		if event.Delta.Text != "" {
-			turn.mu.Lock()
-			recordStreamedBlock(
-				turn.streamedBlocks,
-				streamedBlockOwner(message.ParentToolUseID),
-				event.Index,
-				"text",
-				event.Delta.Text,
-			)
-			turn.mu.Unlock()
-			id := s.messageIdentity(turn, message.ParentToolUseID, "", false)
-			return s.sendMessagePart(ctx, id, event.Delta.Text, false, messageInfo(message.ParentToolUseID, false))
-		}
-		if event.Delta.Thinking != "" {
-			turn.mu.Lock()
-			recordStreamedBlock(
-				turn.streamedBlocks,
-				streamedBlockOwner(message.ParentToolUseID),
-				event.Index,
-				"thinking",
-				event.Delta.Thinking,
-			)
-			turn.mu.Unlock()
-			id := s.messageIdentity(turn, message.ParentToolUseID, "", false)
-			return s.sendMessagePart(ctx, id, event.Delta.Thinking, true, messageInfo(message.ParentToolUseID, false))
-		}
-	case "message_delta":
-		if message.ParentToolUseID == nil && event.Usage != nil {
-			recordContextUsageDelta(turn, *event.Usage)
-			turn.mu.Lock()
-			usage := turn.contextUsage
-			turn.mu.Unlock()
-			recordClaudeMessageUsage(turn, usage, "")
-			return s.sendUsageUpdate(ctx, turn, false)
-		}
-	case "message_stop":
-		return s.completeMessage(ctx, turn, message.ParentToolUseID)
-	}
-	return nil
-}
-
-// handleAssistant 发送未被流式 delta 覆盖的尾部，并发布工具开始。
-func (s *claudeSession) handleAssistant(ctx context.Context, message *protocol.AssistantMessage) error {
-	turn := s.activeTurn()
-	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
-		return nil
-	}
-	if message.ParentToolUseID == nil {
-		s.useAssistantModel(message.Message.Model)
-		if message.Message.Usage != nil {
-			recordContextUsage(turn, *message.Message.Usage, message.Message.Model)
-			recordClaudeMessageUsage(turn, *message.Message.Usage, message.Message.ID)
-			if err := s.sendUsageUpdate(ctx, turn, false); err != nil {
-				return err
+	case *protocol.ConversationResetMessage:
+		if m.SessionID == string(s.id) && isUUID(m.UUID) && isUUID(m.NewConversationID) {
+			if !s.counters.reset(m.UUID, m.NewConversationID) {
+				s.faultAndStopLocked(errors.New("Claude native conversation reset capacity exhausted"))
 			}
 		}
+	case *protocol.ResultMessage:
+		if s.matches(m.SessionID) {
+			s.resultLocked(m)
+		}
+	case *protocol.AssistantMessage:
+		if s.matches(m.SessionID) {
+			s.assistantLocked(m)
+		}
+	case *protocol.StreamEventMessage:
+		if s.matches(m.SessionID) {
+			s.streamLocked(m)
+		}
+	case *protocol.UserMessage:
+		if s.matches(m.SessionID) {
+			s.observeLegacyEchoLocked(m)
+			s.toolResultsLocked(m)
+		}
+	case *protocol.ToolProgressMessage:
+		if s.matches(m.SessionID) {
+			s.toolProgressLocked(m)
+		}
+	case *protocol.TaskMessage:
+		if s.matches(m.SessionID) {
+			s.taskUpdateLocked(m)
+		}
+	case *protocol.RateLimitMessage:
+		if s.matches(m.SessionID) {
+			s.rateLimitLocked(m)
+		}
+	case *protocol.ControlRequestMessage:
+		s.interactionLocked(m)
+	case *protocol.ControlCancelRequestMessage:
+		if cancel := s.interactions[m.RequestID]; cancel != nil {
+			cancel()
+		}
 	}
-	if message.Error != "" {
-		var details []string
-		for _, block := range message.Message.Content {
-			if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
-				details = append(details, block.Text)
+}
+
+func (s *session) matches(id string) bool { return id == "" || id == string(s.id) }
+
+func (s *session) systemLocked(m *protocol.SystemMessage) {
+	switch m.Subtype {
+	case "session_state_changed":
+		if m.State == "running" || m.State == "requires_action" {
+			// A state snapshot proves the native boundary, but it carries
+			// no input ID and cannot prove which pending input it consumed.
+			s.observeLivenessLocked()
+		} else if m.State == "idle" && s.current == nil {
+			s.nativeQueued = 0
+			s.signalLocked()
+		}
+	case "background_tasks_changed":
+		if m.BackgroundTasks != nil {
+			s.observeBackgroundLocked(*m.BackgroundTasks)
+			s.sessionUpdateLocked(metaEvent(), acpmeta.WithNativeBackground(nil, acpmeta.NativeBackground{ActiveCount: acp.Ptr(int64(s.background))}))
+			s.signalLocked()
+		}
+	case "commands_changed":
+		s.initialization.Commands = slices.Clone(m.Commands)
+		s.announceCommandsLocked()
+	case "compact_boundary", "status":
+		s.observeCompactionLocked(m)
+	case "thinking_tokens":
+		s.observeMainLocked(m.TurnIdentity)
+	case "api_retry":
+		if inv := s.current; inv != nil {
+			s.sendTurnLocked(inv, metaEvent(), map[string]any{"claude.retry": map[string]any{
+				"attempt": m.RetryAttempt, "max_attempts": m.MaxRetries, "delay_ms": m.RetryDelayMS, "http_status": m.RetryHTTPStatus,
+			}})
+		}
+	case "model_refusal_fallback":
+		if s.current != nil && m.FallbackScope != "local" {
+			s.current.output.evict(m.RetractedMessages)
+		}
+	}
+}
+
+func (s *session) announceCommandsLocked() {
+	commands := make([]acp.AvailableCommand, 0, len(s.initialization.Commands))
+	terminal := s.init.TerminalSlashCommands
+	for _, cmd := range s.initialization.Commands {
+		name := strings.TrimPrefix(cmd.Name, "/")
+		if name == "" || slices.Contains(terminal, name) || slices.Contains(terminal, "/"+name) || name == "exit" || name == "quit" {
+			continue
+		}
+		command := acp.AvailableCommand{Name: name, Description: cmd.Description}
+		switch hint := cmd.ArgumentHint.(type) {
+		case string:
+			if hint != "" {
+				command.Input = &acp.AvailableCommandInput{Unstructured: &acp.UnstructuredCommandInput{Hint: hint}}
+			}
+		case []any:
+			var parts []string
+			for _, value := range hint {
+				if text, ok := value.(string); ok {
+					parts = append(parts, text)
+				}
+			}
+			if len(parts) > 0 {
+				command.Input = &acp.AvailableCommandInput{Unstructured: &acp.UnstructuredCommandInput{Hint: strings.Join(parts, " ")}}
 			}
 		}
-		turn.mu.Lock()
-		if message.ParentToolUseID == nil {
-			turn.assistantError = message.Error
-			turn.assistantErrorMessage = strings.Join(details, "\n")
-		}
-		delete(turn.streamedBlocks, streamedBlockOwner(message.ParentToolUseID))
-		turn.mu.Unlock()
-		// 错误正文不交付；顶层错误由 result 结算，子代理错误由后续 user.tool_result 结算对应工具。
-		return nil
+		commands = append(commands, command)
 	}
+	s.sessionUpdateLocked(acp.SessionUpdate{AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
+		SessionUpdate: "available_commands_update", AvailableCommands: commands,
+	}}, nil)
+}
 
-	owner := streamedBlockOwner(message.ParentToolUseID)
-	id := s.messageIdentity(turn, message.ParentToolUseID, message.Message.ID, false)
-	turn.mu.Lock()
-	streamed := append([]streamedContentBlock(nil), turn.streamedBlocks[owner]...)
-	delete(turn.streamedBlocks, owner)
-	turn.mu.Unlock()
-	streamPosition := 0
-	for _, block := range message.Message.Content {
+func (s *session) rateLimitLocked(m *protocol.RateLimitMessage) {
+	info := m.Info
+	if s.current != nil && info.Status == "rejected" {
+		s.current.rejectedLimit = &info
+	}
+	meta := map[string]any{"claude.rate_limit": info}
+	if s.current != nil {
+		s.sendTurnLocked(s.current, metaEvent(), meta)
+	} else {
+		s.sessionUpdateLocked(metaEvent(), meta)
+	}
+}
+
+func (s *session) resultLocked(m *protocol.ResultMessage) {
+	if startup := decodeOptional[struct {
+		Reason string `json:"startup_failure_reason"`
+	}](m.RawJSON()); startup != nil && startup.Reason != "" {
+		var err error = errors.New("Claude native startup failed")
+		if startup.Reason == "gateway_signin_required" {
+			err = nativeFailure("authentication")
+		}
+		s.faultAndStopLocked(err)
+		return
+	}
+	if m.ResultIndex != nil && (*m.ResultIndex < 0 || s.lastResultSeen && *m.ResultIndex <= s.lastResultIndex) {
+		return
+	}
+	if m.ResultIndex == nil && m.UUID == "" {
+		return
+	}
+	if m.UUID != "" && len(m.UUID) <= 512 {
+		if _, seen := s.terminalIDs[m.UUID]; seen {
+			return
+		}
+	}
+	usage := reportedUsage(m.Usage)
+	// An unnumbered, unconsumed, singular failure key may be an input
+	// delivery error produced by the relay. It cannot retire the native turn.
+	if nativeFailed(m) && m.ResultIndex == nil && m.ResumeReason == "" && m.UserMessageUUID != "" && len(m.UserMessageUUIDs) == 0 && !positiveUsage(usage) {
+		confirmed := s.current != nil && slices.Contains(s.current.outcome.Turn.ConsumedInputIDs, m.UserMessageUUID)
+		if !confirmed {
+			if in := s.sent[m.UserMessageUUID]; in != nil {
+				s.withdrawnInputs[m.UserMessageUUID] = struct{}{}
+				in.admission = agentclient.AdmissionNotAccepted
+				s.finishInputLocked(in, errors.New("Claude rejected native input delivery"))
+			}
+			return
+		}
+	}
+	gap := m.ResultIndex != nil && (s.lastResultSeen && *m.ResultIndex-s.lastResultIndex > 1 || !s.lastResultSeen && *m.ResultIndex > 0)
+	if m.ResultIndex != nil {
+		s.lastResultIndex = *m.ResultIndex
+		s.lastResultSeen = true
+	}
+	if m.UUID != "" && len(m.UUID) <= 512 {
+		if len(s.terminalIDs) >= maxRememberedIDs {
+			s.faultAndStopLocked(errCapacity)
+			return
+		}
+		s.terminalIDs[m.UUID] = struct{}{}
+	}
+	inv, lost := s.associateResultLocked(m.TurnIdentity, gap)
+	if inv == nil {
+		if lost != nil {
+			s.publishAfterDeliveryLocked(lost)
+		}
+		return
+	}
+	if m.UUID != "" && len(m.UUID) <= 512 {
+		inv.outcome.Turn.TerminalEventID = acp.Ptr(m.UUID)
+	}
+	if m.QueuedTurnCount != nil && *m.QueuedTurnCount >= 0 {
+		s.nativeQueued = *m.QueuedTurnCount
+	}
+	if s.settings.observeFast(m.FastModeState, m.FastModeDisabledReason) {
+		s.announceSettingsLocked()
+	}
+	if inv.outcome.ContextUsage.WindowTokens == nil && inv.model != "" && m.ModelUsage[inv.model].ContextWindow > 0 {
+		inv.outcome.ContextUsage.WindowTokens = acp.Ptr(m.ModelUsage[inv.model].ContextWindow)
+	}
+	inv.outcome.Turn.Usage = s.counters.final(inv, m, usage)
+	reason, failure := resultReason(m, inv)
+	inv.outcome.StopReason = reason
+	inv.outcome.NativeFailure = failure
+	switch {
+	case reason != nil && *reason == acp.StopReasonCancelled:
+		inv.outcome.Turn.Status = acpmeta.NativeTurnCancelled
+	case failure != nil || nativeFailed(m) || m.TerminalReason == "max_turns":
+		inv.outcome.Turn.Status = acpmeta.NativeTurnFailed
+	default:
+		inv.outcome.Turn.Status = acpmeta.NativeTurnCompleted
+	}
+	if inv.compact && failure == nil && inv.outcome.Turn.Status == acpmeta.NativeTurnCompleted && (inv.manualCompact == nil || inv.opening.initiator != inv.manualCompact || inv.manualCompact.inv != inv) {
+		inv.outcome.OperationError = errors.New("Claude did not confirm manual compaction")
+	}
+	if failure == nil && m.Subtype == "success" && m.LocalCommand == "" && inv.outcome.Turn.Status != acpmeta.NativeTurnCancelled {
+		if text := firstString(m.Result, inv.output.answerText()); text != "" {
+			id := inv.output.messageID(inv, false)
+			inv.outcome.ObservedOutput = true
+			inv.outcome.FinalMessage = &agentclient.FinalMessage{ID: id, Text: text}
+			if !inv.output.rendered {
+				s.textLocked(inv, id, text, false, true)
+			}
+		} else if inv.output.limited {
+			inv.outcome.Unavailable = append(inv.outcome.Unavailable, acpmeta.ReceiptResultTextUnavailable)
+		}
+	}
+	if lost == nil {
+		s.sealLocked(inv)
+	} else {
+		s.freezeNativeLocked(inv)
+		s.publishAfterDeliveryLocked(lost, inv)
+	}
+	if s.client.usesLegacyReplay() && len(s.sent) != 0 {
+		// Retain the native result and its usage. This stream did not confirm
+		// the host edge, and a later replay cannot be assigned safely.
+		s.faultAndStopLocked(errors.New("Claude did not acknowledge the legacy host input"))
+		return
+	}
+	s.refreshContextLocked()
+}
+
+func nativeFailed(m *protocol.ResultMessage) bool {
+	return m.IsError || m.Subtype != "success"
+}
+
+func resultReason(m *protocol.ResultMessage, inv *invocation) (*acp.StopReason, error) {
+	switch m.TerminalReason {
+	case "aborted_streaming", "aborted_tools":
+		return acp.Ptr(acp.StopReasonCancelled), nil
+	case "max_turns":
+		return acp.Ptr(acp.StopReasonMaxTurnRequests), nil
+	}
+	if m.Subtype == "error_max_turns" {
+		return acp.Ptr(acp.StopReasonMaxTurnRequests), nil
+	}
+	if nativeFailed(m) {
+		if inv.rejectedLimit != nil && inv.rejectedLimit.ErrorCode == "credits_required" {
+			return nil, nativeFailure("billing_error")
+		}
+		if inv.rejectedLimit != nil || m.TerminalReason == "blocking_limit" || m.APIErrorStatus != nil && *m.APIErrorStatus == 429 {
+			return nil, nativeFailure("rate_limit")
+		}
+		if m.APIErrorStatus != nil && (*m.APIErrorStatus == 401 || *m.APIErrorStatus == 403) {
+			return nil, nativeFailure("authentication")
+		}
+		return nil, nativeFailure("native_execution_failed")
+	}
+	if m.StopReason != nil {
+		switch *m.StopReason {
+		case "max_tokens":
+			return acp.Ptr(acp.StopReasonMaxTokens), nil
+		case "refusal":
+			return acp.Ptr(acp.StopReasonRefusal), nil
+		}
+	}
+	return acp.Ptr(acp.StopReasonEndTurn), nil
+}
+
+func (s *session) assistantLocked(m *protocol.AssistantMessage) {
+	if m.ParentToolUseID != nil || m.AgentID != "" {
+		if owner := s.sidechainOwnerLocked(m.AgentID, m.ParentToolUseID); owner.scope.NativeInvocationID != "" {
+			for _, block := range m.Message.Content {
+				if block.Type == "tool_use" || block.Type == "server_tool_use" {
+					s.startToolLocked(owner, block)
+				}
+			}
+		}
+		return
+	}
+	inv := s.observeMainLocked(m.TurnIdentity)
+	if inv == nil {
+		return
+	}
+	inv.model = m.Message.Model
+	if m.Message.Usage != nil {
+		inv.recordUsage(m.Message.ID, m.Message.Model, reportedUsage(*m.Message.Usage))
+	}
+	s.applyContextLocked(inv, m)
+	o := &inv.output
+	frame, accepted := o.acceptFrame(m)
+	if !accepted {
+		return
+	}
+	o.beginRequest(m.Message.ID)
+	o.evict(m.Supersedes)
+	if m.Error != "" && m.Error != "max_output_tokens" {
+		return
+	}
+	for _, block := range m.Message.Content {
 		switch block.Type {
 		case "text":
-			remainder, consumed := streamedBlockRemainder(block.Text, "text", streamed, streamPosition)
-			if consumed {
-				streamPosition++
-			}
-			if remainder != "" {
-				if err := s.sendMessagePart(ctx, id, remainder, false, messageInfo(message.ParentToolUseID, false)); err != nil {
-					return err
-				}
-			}
+			s.completeAssistantBlockLocked(inv, frame, block.Text, false, m.Aborted)
 		case "thinking":
-			remainder, consumed := streamedBlockRemainder(block.Thinking, "thinking", streamed, streamPosition)
-			if consumed {
-				streamPosition++
-			}
-			if remainder != "" {
-				if err := s.sendMessagePart(ctx, id, remainder, true, messageInfo(message.ParentToolUseID, false)); err != nil {
-					return err
-				}
-			}
-		case "tool_use":
-			if err := s.startTool(ctx, block); err != nil {
-				return err
-			}
+			s.completeAssistantBlockLocked(inv, frame, block.Thinking, true, m.Aborted)
+		case "tool_use", "server_tool_use":
+			s.assistantToolLocked(inv, block)
 		}
 	}
-	turn.mu.Lock()
-	state := turn.streamMessages[owner]
-	streaming := state != nil && state.streaming
-	turn.mu.Unlock()
-	// 流式 assistant 可能只聚合一个内容块；后续正文仍属于同一 message_start 身份。
-	if !streaming {
-		if err := s.completeMessage(ctx, turn, message.ParentToolUseID); err != nil {
-			return err
+}
+
+func (s *session) streamLocked(m *protocol.StreamEventMessage) {
+	if m.ParentToolUseID != nil || m.AgentID != "" {
+		block := m.Event.ContentBlock
+		if m.Event.Type == "content_block_start" && block != nil && (block.Type == "tool_use" || block.Type == "server_tool_use") {
+			s.startToolLocked(s.sidechainOwnerLocked(m.AgentID, m.ParentToolUseID), *block)
 		}
-		turn.mu.Lock()
-		delete(turn.streamMessages, owner)
-		turn.mu.Unlock()
-	}
-	return nil
-}
-
-// streamedBlockOwner 把顶层与不同子代理消息映射到互不污染的去重槽位。
-func streamedBlockOwner(parentToolUseID *string) string {
-	if parentToolUseID == nil {
-		return ""
-	}
-	return *parentToolUseID
-}
-
-// recordStreamedBlock 按规则合并同一原始 index/type 的连续增量。
-func recordStreamedBlock(
-	blocks map[string][]streamedContentBlock,
-	owner string,
-	index int,
-	kind string,
-	text string,
-) {
-	if text == "" {
 		return
 	}
-	owned := blocks[owner]
-	if len(owned) > 0 && owned[len(owned)-1].index == index && owned[len(owned)-1].kind == kind {
-		owned[len(owned)-1].text += text
-		blocks[owner] = owned
+	e := m.Event
+	switch e.Type {
+	case "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop":
+	default:
 		return
 	}
-	blocks[owner] = append(owned, streamedContentBlock{index: index, kind: kind, text: text})
-}
-
-// streamedBlockRemainder 按聚合消息的文档顺序匹配流式块，并只返回未发送尾部。
-func streamedBlockRemainder(
-	assembled string,
-	kind string,
-	streamed []streamedContentBlock,
-	position int,
-) (string, bool) {
-	if assembled == "" {
-		return "", false
+	inv := s.observeMainLocked(m.TurnIdentity)
+	if inv == nil {
+		return
 	}
-	if position >= len(streamed) || streamed[position].kind != kind || streamed[position].text == "" {
-		return assembled, false
-	}
-	if !strings.HasPrefix(assembled, streamed[position].text) {
-		return assembled, false
-	}
-	return strings.TrimPrefix(assembled, streamed[position].text), true
-}
-
-// handleUser 匹配 prompt/steering echo，并完成工具结果。
-func (s *claudeSession) handleUser(ctx context.Context, message *protocol.UserMessage) error {
-	turn := s.activeTurn()
-	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
-		return nil
-	}
-	// 工具结果拥有独立 UUID，必须先按 tool_use_id 处理，不能误当成未知 prompt echo 丢弃。
-	toolResultCount := 0
-	for _, block := range message.Message.Content {
-		if block.Type == "tool_result" {
-			toolResultCount++
+	switch e.Type {
+	case "message_start":
+		if e.Message == nil {
+			return
 		}
-	}
-	for _, block := range message.Message.Content {
-		if block.Type == "tool_result" {
-			var toolUseResult json.RawMessage
-			// Claude 的 message-level tool_use_result 不带 tool_use_id，只能归属到唯一结果块。
-			if toolResultCount == 1 {
-				toolUseResult = message.ToolUseResult
-			}
-			if err := s.completeTool(ctx, block, toolUseResult); err != nil {
-				return err
-			}
+		inv.model = e.Message.Model
+		inv.output.beginRequest(e.Message.ID)
+		if e.Message.Usage != nil {
+			inv.recordUsage(e.Message.ID, e.Message.Model, reportedUsage(*e.Message.Usage))
 		}
-	}
-	if message.UUID != "" && message.UUID != turn.id {
-		turn.mu.Lock()
-		_, steering := turn.steeringIDs[message.UUID]
-		if steering {
-			delete(turn.steeringIDs, message.UUID)
+	case "message_delta":
+		if e.Usage == nil {
+			return
 		}
-		turn.mu.Unlock()
-		if !steering {
-			return nil
-		}
-	}
-	return nil
-}
-
-// handleResult 生成 PromptResponse；steering turn 延迟到 idle 再完成。
-func (s *claudeSession) handleResult(ctx context.Context, message *protocol.ResultMessage) error {
-	turn := s.activeTurn()
-	if turn == nil || (message.SessionID != "" && message.SessionID != s.id) {
-		return nil
-	}
-	turn.mu.Lock()
-	assistantError := turn.assistantError
-	assistantErrorMessage := turn.assistantErrorMessage
-	turn.mu.Unlock()
-	if assistantError != "" && assistantErrorMessage != "" && (!message.IsError || strings.TrimSpace(message.Result) == "") {
-		copy := *message
-		copy.Result = assistantErrorMessage
-		message = &copy
-	}
-	response, err := promptResponseFromResult(message, assistantError)
-	reported, known := reportedClaudeUsage(message.Usage)
-	turn.mu.Lock()
-	_, hasObserved := claudeTurnUsageLocked(turn)
-	if known && ((err == nil && !turn.cancelled) || !hasObserved) {
-		reported.Source = "claude.result.usage"
-		reported.Model = turn.assistantModel
-		// result.usage 只覆盖主循环，不能据此声明含子调用的整轮完整。
-		reported.Complete = false
-		recordClaudeResultUsageLocked(turn, reported, message.UUID)
-	}
-	final, hasUsage := claudeTurnUsageLocked(turn)
-	turn.mu.Unlock()
-	s.updateContextWindowFromResult(turn, message.ModelUsage)
-	updateErr := s.sendUsageUpdate(ctx, turn, true)
-	if hasUsage {
-		response.Usage = claudePromptUsage(final)
-		turn.mu.Lock()
-		contextSet := turn.contextUsageSet
-		turn.mu.Unlock()
-		s.mu.Lock()
-		window := s.contextWindowSize
-		s.mu.Unlock()
-		final.ContextKnown = contextSet && window > 0
-		response.Meta = acpmeta.WithTurnUsage(response.Meta, final)
-	}
-	turn.mu.Lock()
-	turn.gotResult = true
-	cancelled := turn.cancelled
-	steered := turn.steered
-	if steered && err == nil {
-		copy := response
-		turn.steeredResult = &copy
-	}
-	turn.mu.Unlock()
-	if !steered {
-		// Claude 的每个非 steering result 后都会发送无 Turn ID 的 idle；先记账，避免它误结算下一轮。
-		s.mu.Lock()
-		s.owedTrailingIdles++
-		s.mu.Unlock()
-	}
-	if cancelled {
-		turn.drain()
-		return updateErr
-	}
-	if err != nil {
-		turn.settle(acp.PromptResponse{}, err)
-		turn.drain()
-		return updateErr
-	}
-
-	if steered {
-		return updateErr
-	}
-	turn.settle(response, nil)
-	turn.drain()
-	return updateErr
-}
-
-// handleSystem 同步动态命令，并使用 idle 作为缺失 result 的终止保护。
-func (s *claudeSession) handleSystem(ctx context.Context, message *protocol.SystemMessage) error {
-	if message.Subtype == "commands_changed" {
-		return s.updateAvailableCommands(ctx, message.Commands)
-	}
-	if message.Subtype != "session_state_changed" || message.State != "idle" {
-		return nil
-	}
-	s.mu.Lock()
-	if s.owedTrailingIdles > 0 {
-		s.owedTrailingIdles--
-		s.mu.Unlock()
-		return nil
-	}
-	s.mu.Unlock()
-	turn := s.activeTurn()
-	if turn == nil {
-		return nil
-	}
-	turn.mu.Lock()
-	gotResult := turn.gotResult
-	cancelled := turn.cancelled
-	steered := turn.steered
-	steeredResult := turn.steeredResult
-	assistantError := turn.assistantError
-	assistantErrorMessage := turn.assistantErrorMessage
-	turn.mu.Unlock()
-	switch {
-	case cancelled:
-		turn.settle(acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil)
-	case assistantError != "":
-		turn.settle(acp.PromptResponse{}, claudeResultRequestError(&protocol.ResultMessage{Result: assistantErrorMessage}, assistantError))
-	case steered && steeredResult != nil:
-		turn.settle(*steeredResult, nil)
-	case !gotResult:
-		turn.settle(acp.PromptResponse{}, ErrClaudeTurnEndedWithoutResult)
-	}
-	turn.drain()
-	return nil
-}
-
-// handleToolProgress 只更新已发布且未完成的工具调用。
-func (s *claudeSession) handleToolProgress(ctx context.Context, message *protocol.ToolProgressMessage) error {
-	s.mu.Lock()
-	tool := s.tools[message.ToolUseID]
-	if tool == nil || tool.Completed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.mu.Unlock()
-	return s.agent.sendUpdate(ctx, s.id, acp.UpdateToolCall(
-		acp.ToolCallId(message.ToolUseID),
-		acp.WithUpdateRawOutput(map[string]any{"elapsedTimeSeconds": message.ElapsedTimeSeconds}),
-	))
-}
-
-// handleTask 更新 Session 任务快照并发布完整 ACP plan。
-func (s *claudeSession) handleTask(ctx context.Context, message *protocol.TaskMessage) error {
-	if message.TaskID == "" {
-		return nil
-	}
-	s.mu.Lock()
-	task := s.tasks[message.TaskID]
-	task.ID = message.TaskID
-	if message.Description != "" {
-		task.Description = message.Description
-	}
-	if message.Summary != "" && task.Description == "" {
-		task.Description = message.Summary
-	}
-	if message.Status != "" {
-		task.Status = message.Status
-	}
-	if message.Subtype == "task_started" && task.Status == "" {
-		task.Status = "in_progress"
-	}
-	if message.Subtype == "task_notification" && task.Status == "" {
-		task.Status = "completed"
-	}
-	s.tasks[message.TaskID] = task
-	tasks := make([]taskState, 0, len(s.tasks))
-	for _, item := range s.tasks {
-		tasks = append(tasks, item)
-	}
-	s.mu.Unlock()
-	sort.Slice(tasks, func(i, j int) bool { return tasks[i].ID < tasks[j].ID })
-	entries := make([]acp.PlanEntry, 0, len(tasks))
-	for _, item := range tasks {
-		entries = append(entries, acp.PlanEntry{
-			Content: item.Description, Priority: acp.PlanEntryPriorityMedium, Status: planStatus(item.Status),
+		inv.recordUsage(inv.output.request, inv.model, acpmeta.TurnUsage{
+			InputTokens: e.Usage.InputTokens, CacheReadTokens: e.Usage.CacheReadInputTokens,
+			CacheWriteTokens: e.Usage.CacheCreationInputTokens, OutputTokens: nonnegative(e.Usage.OutputTokens),
 		})
+	case "content_block_start":
+		if e.ContentBlock == nil {
+			return
+		}
+		switch block := *e.ContentBlock; block.Type {
+		case "tool_use", "server_tool_use":
+			s.assistantToolLocked(inv, block)
+		case "text":
+			s.assistantDeltaLocked(inv, e.Index, block.Text, false)
+		case "thinking":
+			s.assistantDeltaLocked(inv, e.Index, block.Thinking, true)
+		}
+	case "content_block_delta":
+		if e.Delta == nil {
+			return
+		}
+		switch e.Delta.Type {
+		case "text_delta":
+			s.assistantDeltaLocked(inv, e.Index, e.Delta.Text, false)
+		case "thinking_delta":
+			s.assistantDeltaLocked(inv, e.Index, e.Delta.Thinking, true)
+		}
 	}
-	return s.agent.sendUpdate(ctx, s.id, acp.UpdatePlan(entries...))
 }
 
-// activeTurn 返回当前活动 turn 快照。
-func (s *claudeSession) activeTurn() *claudeTurn {
-	s.mu.Lock()
-	turn := s.active
-	s.mu.Unlock()
-	return turn
-}
-
-// sendAgentText 发送一段普通文本或思考文本。
-func (s *claudeSession) sendAgentText(ctx context.Context, messageID, text string, thinking bool) error {
-	return s.sendMessagePart(ctx, messageID, text, thinking, messageInfo(nil, false))
-}
-
-// sendMessagePart 保留统一消息事实与原生消息身份，正文空值由完成边界单独发布。
-func (s *claudeSession) sendMessagePart(ctx context.Context, messageID, text string, thinking bool, info acpmeta.MessageInfo) error {
+func (s *session) textLocked(inv *invocation, id, text string, thinking, complete bool) {
 	if text == "" {
-		return nil
+		return
 	}
-	update := acp.UpdateAgentMessageText(text)
+	inv.outcome.ObservedOutput = true
+	kind := acpmeta.MessagePhaseUnknown
+	if thinking {
+		kind = acpmeta.MessagePhaseCommentary
+	}
+	info := acpmeta.MessageInfo{Phase: kind, Complete: complete, Source: acpmeta.MessageSourceNativeMessage}
+	var update acp.SessionUpdate
 	if thinking {
 		update = acp.UpdateAgentThoughtText(text)
-	}
-	if messageID != "" {
-		if update.AgentMessageChunk != nil {
-			update.AgentMessageChunk.MessageId = &messageID
-			update.AgentMessageChunk.Meta = acpmeta.WithMessageInfo(update.AgentMessageChunk.Meta, info)
-		}
-		if update.AgentThoughtChunk != nil {
-			update.AgentThoughtChunk.MessageId = &messageID
-		}
-	}
-	return s.agent.sendUpdate(ctx, s.id, update)
-}
-
-// startTool 幂等发布工具开始；重复来源只刷新缓存而不重复创建。
-func (s *claudeSession) startTool(ctx context.Context, block protocol.ContentBlock) error {
-	if block.ID == "" {
-		return nil
-	}
-	input := decodeJSONValue(block.Input)
-	s.mu.Lock()
-	if existing := s.tools[block.ID]; existing != nil {
-		if existing.Input == nil && input != nil {
-			existing.Input = input
-		}
-		s.mu.Unlock()
-		return nil
-	}
-	tool := &toolState{ID: block.ID, Name: block.Name, Input: input}
-	s.tools[block.ID] = tool
-	s.mu.Unlock()
-	info := toolInfoFromToolUse(block.Name, input, s.cwd, claudeUserHomeDirectory(s.agent.environment))
-	rawInput := input
-	if info.RawInput != nil {
-		rawInput = info.RawInput
-	}
-	update := acp.StartToolCall(
-		acp.ToolCallId(block.ID), info.Title,
-		acp.WithStartKind(info.Kind), acp.WithStartStatus(acp.ToolCallStatusInProgress),
-		acp.WithStartRawInput(rawInput), acp.WithStartContent(info.Content),
-		acp.WithStartLocations(info.Locations),
-	)
-	update.ToolCall.Meta = info.Meta
-	return s.agent.sendUpdate(ctx, s.id, update)
-}
-
-// completeTool 终止一个已知工具；未知结果先创建 generic 调用再完成。
-func (s *claudeSession) completeTool(
-	ctx context.Context,
-	block protocol.ContentBlock,
-	toolUseResult json.RawMessage,
-) error {
-	if block.ToolUseID == "" {
-		return nil
-	}
-	s.mu.Lock()
-	tool := s.tools[block.ToolUseID]
-	created := tool == nil
-	if tool == nil {
-		tool = &toolState{ID: block.ToolUseID, Name: "Tool"}
-		s.tools[block.ToolUseID] = tool
-	}
-	if tool.Completed {
-		s.mu.Unlock()
-		return nil
-	}
-	tool.Completed = true
-	s.mu.Unlock()
-	if created {
-		// 缺失开始事件时先补一张 generic 工具卡片，保证客户端不会只收到悬空的完成更新。
-		if err := s.agent.sendUpdate(ctx, s.id, acp.StartToolCall(
-			acp.ToolCallId(block.ToolUseID), "Tool",
-			acp.WithStartKind(acp.ToolKindOther), acp.WithStartStatus(acp.ToolCallStatusInProgress),
-		)); err != nil {
-			return err
-		}
-	}
-	status := acp.ToolCallStatusCompleted
-	if block.IsError {
-		status = acp.ToolCallStatusFailed
-	}
-	content, rawOutput := toolResultContent(block)
-	options := []acp.ToolCallUpdateOpt{
-		acp.WithUpdateStatus(status),
-		acp.WithUpdateRawOutput(rawOutput),
-	}
-	if !block.IsError && (tool.Name == "Edit" || tool.Name == "Write") {
-		// 由 PostToolUse structuredPatch 修正乐观 diff；CLI 直接携带同形结果时等价处理。
-		diffContent, locations := toolDiffUpdateFromResult(toolUseResult)
-		if len(diffContent) > 0 {
-			options = append(
-				options,
-				acp.WithUpdateContent(diffContent),
-				acp.WithUpdateLocations(locations),
-			)
-		}
+		update.AgentThoughtChunk.MessageId = &id
+		update.AgentThoughtChunk.Meta = acpmeta.WithMessageInfo(nil, info)
 	} else {
-		options = append(options, acp.WithUpdateContent(content))
+		update = acp.UpdateAgentMessageText(text)
+		update.AgentMessageChunk.MessageId = &id
+		update.AgentMessageChunk.Meta = acpmeta.WithMessageInfo(nil, info)
 	}
-	return s.agent.sendUpdate(
-		ctx,
-		s.id,
-		acp.UpdateToolCall(acp.ToolCallId(block.ToolUseID), options...),
-	)
+	s.sendTurnLocked(inv, update, nil)
 }
 
-// promptResponseFromResult 转换 stop reason 与本轮 token 用量。
-func promptResponseFromResult(
-	message *protocol.ResultMessage,
-	assistantError string,
-) (acp.PromptResponse, error) {
-	if message.IsError || assistantError != "" {
-		return acp.PromptResponse{}, claudeResultRequestError(message, assistantError)
+func (s *session) applyContextLocked(inv *invocation, m protocol.Message) {
+	value := decodeOptional[struct {
+		Context *struct {
+			Used   *int64 `json:"total_tokens"`
+			Window *int64 `json:"raw_max_tokens"`
+		} `json:"context_usage"`
+	}](m.RawJSON())
+	if value == nil || value.Context == nil {
+		return
 	}
-	stopReason := acp.StopReasonEndTurn
-	if message.StopReason != nil {
-		switch *message.StopReason {
-		case "max_tokens":
-			stopReason = acp.StopReasonMaxTokens
-		case "refusal":
-			stopReason = acp.StopReasonRefusal
-		}
+	if value.Context.Used != nil && *value.Context.Used >= 0 {
+		inv.outcome.ContextUsage.UsedTokens = value.Context.Used
 	}
-	if stopReason != acp.StopReasonMaxTokens && stopReason != acp.StopReasonRefusal {
-		if message.Subtype == "success" && strings.HasPrefix(strings.TrimSpace(message.Result), "Not logged in") && strings.Contains(message.Result, "Please run /login") {
-			return acp.PromptResponse{}, acp.NewAuthRequired(claudeErrorKindData("authentication_failed"))
-		}
-		switch message.Subtype {
-		case "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
-			stopReason = acp.StopReasonMaxTurnRequests
-		}
-	}
-	reported, known := reportedClaudeUsage(message.Usage)
-	response := acp.PromptResponse{StopReason: stopReason}
-	if known {
-		reported.Source = "claude.result.usage"
-		reported.Complete = false
-		response.Usage = claudePromptUsage(reported)
-		response.Meta = acpmeta.WithTurnUsage(nil, reported)
-	}
-	return response, nil
-}
-
-// claudeResultRequestError 把 is_error 结果转换为 ACP InternalError。
-func claudeResultRequestError(
-	message *protocol.ResultMessage,
-	assistantError string,
-) *acp.RequestError {
-	detail := strings.TrimSpace(message.Result)
-	if detail == "" {
-		detail = strings.Join(message.Errors, "; ")
-	}
-	if detail == "" {
-		detail = assistantError
-	}
-	if detail == "" {
-		detail = message.Subtype
-	}
-	return &acp.RequestError{
-		Code:    -32603,
-		Message: detail,
-		Data:    claudeErrorKindData(assistantError),
+	if value.Context.Window != nil && *value.Context.Window > 0 {
+		inv.outcome.ContextUsage.WindowTokens = value.Context.Window
 	}
 }
 
-// claudeErrorKindData 复用开放 errorKind 扩展，不引入产品失败码。
-func claudeErrorKindData(errorKind string) any {
-	if errorKind == "" {
-		return nil
+// refreshContextLocked follows Claude's cheap summary control. It publishes
+// session context only while the completed native epoch still owns it.
+func (s *session) refreshContextLocked() {
+	if !s.open || s.client.host.Observe == nil || s.closing || s.nativeQueued > 0 || len(s.sent) > 0 || s.contextReading {
+		return
 	}
-	return map[string]any{"errorKind": errorKind}
-}
-
-// boundedInt 把 wire int64 安全收窄到当前平台 int。
-func boundedInt(value int64) int {
-	if value <= 0 {
-		return 0
-	}
-	if value > int64(math.MaxInt) {
-		return math.MaxInt
-	}
-	return int(value)
-}
-
-// intPointer 把正 token 数转换为可选 ACP 字段。
-func intPointer(value int64) *int {
-	if value <= 0 {
-		return nil
-	}
-	converted := boundedInt(value)
-	return &converted
-}
-
-// decodeJSONValue 把开放 JSON 转成可序列化值，坏值保留安全占位符。
-func decodeJSONValue(raw json.RawMessage) any {
-	if len(raw) == 0 {
-		return nil
-	}
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
-		return map[string]any{"unparsed": true}
-	}
-	return value
-}
-
-// toolResultContent 把文本和图片结果转换为 ACP tool content。
-func toolResultContent(block protocol.ContentBlock) ([]acp.ToolCallContent, any) {
-	rawOutput := decodeJSONValue(block.Content)
-	content := []acp.ToolCallContent{}
-	var text string
-	if json.Unmarshal(block.Content, &text) == nil {
-		content = append(content, acp.ToolContent(acp.TextBlock(text)))
-		return content, rawOutput
-	}
-	var blocks []protocol.ContentBlock
-	if json.Unmarshal(block.Content, &blocks) == nil {
-		for _, item := range blocks {
-			switch item.Type {
-			case "text":
-				content = append(content, acp.ToolContent(acp.TextBlock(item.Text)))
-			case "image":
-				if item.Source != nil && item.Source.Type == "base64" {
-					content = append(content, acp.ToolContent(acp.ImageBlock(item.Source.Data, item.Source.MediaType)))
-				}
+	epoch := s.epoch
+	s.contextReading = true
+	s.taskLocked(func() {
+		defer func() { s.mu.Lock(); s.contextReading = false; s.mu.Unlock() }()
+		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+		defer cancel()
+		request := struct {
+			Subtype string `json:"subtype"`
+			Detail  string `json:"detail"`
+		}{Subtype: "get_context_usage", Detail: "summary"}
+		check := func() error {
+			if err := s.guardSessionLocked(); err != nil {
+				return err
 			}
+			if s.epoch != epoch || s.current != nil || len(s.sent) > 0 {
+				return errStale
+			}
+			return nil
 		}
-	}
-	return content, rawOutput
+		_ = s.wire.call(ctx, request, nil, func() error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return check()
+		}, func(raw json.RawMessage) {
+			value := decodeOptional[struct {
+				Used   *int64 `json:"totalTokens"`
+				Window *int64 `json:"rawMaxTokens"`
+			}](raw)
+			if value == nil {
+				return
+			}
+			if value.Used != nil && *value.Used < 0 {
+				value.Used = nil
+			}
+			if value.Window != nil && *value.Window <= 0 {
+				value.Window = nil
+			}
+			if value.Used == nil && value.Window == nil {
+				return
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if check() != nil {
+				return
+			}
+			snapshot := agentclient.ContextUsage{UsedTokens: value.Used, WindowTokens: value.Window}
+			s.sessionUpdateLocked(usageUpdate(snapshot), map[string]any{"claude.context_usage": snapshot})
+		})
+	})
 }
 
-// planStatus 把开放任务状态收敛到 ACP 三态。
-func planStatus(status string) acp.PlanEntryStatus {
-	switch status {
-	case "completed", "done", "success":
-		return acp.PlanEntryStatusCompleted
-	case "in_progress", "running", "active":
-		return acp.PlanEntryStatusInProgress
-	default:
-		return acp.PlanEntryStatusPending
+func usageUpdate(ctx agentclient.ContextUsage) acp.SessionUpdate {
+	if ctx.UsedTokens == nil || ctx.WindowTokens == nil {
+		return metaEvent()
 	}
+	return acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{SessionUpdate: "usage_update", Used: int(*ctx.UsedTokens), Size: int(*ctx.WindowTokens)}}
+}
+
+func promptContent(prompt []acp.ContentBlock) (json.RawMessage, error) {
+	blocks := make([]protocol.ContentBlock, 0, len(prompt))
+	for _, b := range prompt {
+		switch {
+		case b.Text != nil:
+			if b.Text.Text != "" {
+				blocks = append(blocks, protocol.ContentBlock{Type: "text", Text: b.Text.Text})
+			}
+		case b.Image != nil:
+			switch b.Image.MimeType {
+			case "image/jpeg", "image/png", "image/gif", "image/webp":
+				if b.Image.Data == "" {
+					return nil, errors.New("Claude image content is empty")
+				}
+				blocks = append(blocks, protocol.ContentBlock{Type: "image", Source: &protocol.ImageSource{Type: "base64", MediaType: b.Image.MimeType, Data: b.Image.Data}})
+			default:
+				return nil, errors.New("unsupported Claude image MIME type")
+			}
+		case b.ResourceLink != nil:
+			blocks = append(blocks, protocol.ContentBlock{Type: "text", Text: b.ResourceLink.Name + " (" + b.ResourceLink.Uri + ")"})
+		case b.Resource != nil && b.Resource.Resource.TextResourceContents != nil:
+			resource := b.Resource.Resource.TextResourceContents
+			blocks = append(blocks, protocol.ContentBlock{Type: "text", Text: resource.Uri + "\n" + resource.Text})
+		default:
+			return nil, errors.New("unsupported Claude prompt content")
+		}
+	}
+	if len(blocks) == 0 {
+		return nil, errors.New("Claude prompt is empty")
+	}
+	data, err := json.Marshal(blocks)
+	if len(data) > maxNativeFrame-1024 {
+		return nil, errors.New("Claude prompt exceeds native frame limit")
+	}
+	return data, err
+}
+
+// nativeFailure is immutable. Its ACP projection materializes a fresh public
+// classification so callers cannot mutate a retained provider outcome.
+type nativeFailure string
+
+func (f nativeFailure) Error() string { return "Claude " + string(f) }
+
+func (f nativeFailure) As(target any) bool {
+	wire, ok := target.(**acp.RequestError)
+	if !ok {
+		return false
+	}
+	data := map[string]any{"errorKind": string(f)}
+	if f == "authentication" {
+		*wire = acp.NewAuthRequired(data)
+	} else {
+		*wire = acp.NewInternalError(data)
+	}
+	return true
 }

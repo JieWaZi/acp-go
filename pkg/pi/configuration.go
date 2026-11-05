@@ -2,286 +2,299 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
+	"time"
 
-	"github.com/JieWaZi/acp-go/pkg/nativeacp"
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// configuration 对照 pi-acp 从 Pi 实际状态与已认证模型构建选项。
-func (s *session) configuration(ctx context.Context) (map[string]any, error) {
-	var state, available map[string]any
-	if err := s.process.call(ctx, "get_state", nil, &state); err != nil {
-		return nil, err
+type nativeModel struct {
+	// Provider identifies the native model service.
+	Provider string `json:"provider"`
+	// ID is the exact model identifier passed separately to Pi.
+	ID string `json:"id"`
+	// Name is the native display label.
+	Name string `json:"name"`
+	// Reasoning is the model's reported support for thinking controls.
+	Reasoning *bool `json:"reasoning"`
+}
+
+func (m nativeModel) key() string {
+	if m.Provider == "" || m.ID == "" {
+		return ""
 	}
-	if err := s.process.call(ctx, "get_available_models", nil, &available); err != nil {
-		return nil, err
+	return m.Provider + "/" + m.ID
+}
+
+type nativeState struct {
+	// SessionFile is the path returned by Pi for its active transcript.
+	SessionFile string `json:"sessionFile"`
+	// SessionID is the native identity stored in that transcript header.
+	SessionID string `json:"sessionId"`
+	// Model is the effective model selected by Pi.
+	Model *nativeModel `json:"model"`
+	// ThinkingLevel is the effective thinking level of Model.
+	ThinkingLevel string `json:"thinkingLevel"`
+}
+
+func (s *session) state(ctx context.Context) (nativeState, error) {
+	var state nativeState
+	err := s.rpc.call(ctx, "get_state", nil, &state)
+	return state, err
+}
+
+func (s *session) models(ctx context.Context) ([]nativeModel, error) {
+	var available struct {
+		// Models contains the configured models visible to this process.
+		Models []nativeModel
 	}
-	thinkingLevels, err := s.availableThinkingLevels(ctx)
+	err := s.rpc.call(ctx, "get_available_models", nil, &available)
+	if err == nil && available.Models == nil {
+		err = errors.New("Pi did not return its model catalog")
+	}
+	return available.Models, err
+}
+
+func (s *session) levels(ctx context.Context) ([]string, error) {
+	var available struct {
+		// Levels contains the thinking menu for the selected model.
+		Levels []string
+	}
+	err := s.rpc.call(ctx, "get_available_thinking_levels", nil, &available)
+	if err == nil && len(available.Levels) == 0 {
+		err = errors.New("Pi did not return supported thinking levels")
+	}
+	return available.Levels, err
+}
+
+func selectOption(id, name, category, current string, options []acp.SessionConfigSelectOption) acp.SessionConfigOption {
+	return acp.SessionConfigOption{Select: &acp.SessionConfigOptionSelect{
+		Id: acp.SessionConfigId(id), Name: name, Category: pointer(acp.SessionConfigOptionCategory(category)),
+		CurrentValue: acp.SessionConfigValueId(current), Type: "select",
+		Options: acp.SessionConfigSelectOptions{Ungrouped: pointer(acp.SessionConfigSelectOptionsUngrouped(options))},
+	}}
+}
+
+func thinkingOption(current string, levels []string) acp.SessionConfigOption {
+	options := make([]acp.SessionConfigSelectOption, 0, len(levels))
+	for _, level := range levels {
+		options = append(options, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(level), Name: level})
+	}
+	return selectOption("reasoning", "Thinking", "thought_level", current, options)
+}
+
+func modelOptions(models []nativeModel, state nativeState, levels []string) []acp.SessionConfigSelectOption {
+	rows := make([]acp.SessionConfigSelectOption, 0, len(models))
+	seen := make(map[string]bool)
+	for _, model := range models {
+		key := model.key()
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		name := model.Name
+		if name == "" {
+			name = model.ID
+		}
+		metadata := acpmeta.ModelConfigCatalog{}
+		switch {
+		case state.Model != nil && state.Model.key() == key && len(levels) != 0:
+			metadata.Options = []acp.SessionConfigOption{thinkingOption(state.ThinkingLevel, levels)}
+		case model.Reasoning != nil && !*model.Reasoning:
+			metadata.Options = []acp.SessionConfigOption{thinkingOption("off", []string{"off"})}
+		default:
+			metadata.UnknownConfigIDs = []acp.SessionConfigId{"reasoning"}
+		}
+		rows = append(rows, acp.SessionConfigSelectOption{Value: acp.SessionConfigValueId(key), Name: name, Meta: acpmeta.WithModelConfigCatalog(nil, metadata)})
+	}
+	return rows
+}
+
+func (s *session) configuration(ctx context.Context) ([]acp.SessionConfigOption, error) {
+	state, err := s.state(ctx)
 	if err != nil {
 		return nil, err
 	}
-	models := []any{}
-	preferredProvider := nativeacp.EnvironmentValue(s.process.command.Env, "ACP_GO_PI_PREFERRED_PROVIDER")
-	modelCounts := map[string]int{}
-	for _, entry := range list(available["models"]) {
-		if id := text(object(entry)["id"]); id != "" {
-			modelCounts[id]++
-		}
+	models, err := s.models(ctx)
+	if err != nil {
+		return nil, err
 	}
-	for _, entry := range list(available["models"]) {
-		m := object(entry)
-		provider, id := text(m["provider"]), text(m["id"])
-		if provider == "" || id == "" {
-			continue
-		}
-		name := text(m["name"])
-		if name == "" {
-			name = id
-		}
-		value := id
-		displayName := name
-		if modelCounts[id] > 1 && provider != preferredProvider {
-			value = provider + "/" + id
-			displayName = provider + "/" + name
-		}
-		models = append(models, map[string]any{"value": value, "name": displayName})
+	if len(models) == 0 || state.Model == nil || state.Model.key() == "" {
+		return nil, classified("authentication", "session_open")
 	}
-	if len(models) == 0 {
-		return nil, acp.NewAuthRequired(nil)
+	levels, err := s.levels(ctx)
+	if err != nil {
+		return nil, err
 	}
-	model := object(state["model"])
-	current := text(model["id"])
-	if current != "" && modelCounts[current] > 1 && text(model["provider"]) != preferredProvider {
-		current = text(model["provider"]) + "/" + current
+	if !slices.Contains(levels, state.ThinkingLevel) {
+		return nil, errors.New("Pi effective thinking level is absent from its native menu")
 	}
-	if current == "" {
-		current = text(object(models[0])["value"])
-	}
-	level := text(state["thinkingLevel"])
-	if !contains(thinkingLevels, level) {
-		level = thinkingLevels[0]
-	}
-	thoughts, modes := []any{}, []any{}
-	for _, value := range thinkingLevels {
-		thoughts = append(thoughts, map[string]any{"value": value, "name": value})
-		modes = append(modes, map[string]any{"id": value, "name": "Thinking: " + value})
-	}
-	configOptions := []any{
-		map[string]any{
-			"id":           "model",
-			"category":     "model",
-			"type":         "select",
-			"name":         "Model",
-			"currentValue": current,
-			"options":      models,
-		},
-		map[string]any{
-			"id":           "reasoning",
-			"category":     "thought_level",
-			"type":         "select",
-			"name":         "Thinking",
-			"currentValue": level,
-			"options":      thoughts,
-		},
-	}
-	return map[string]any{
-		"configOptions": configOptions,
-		"modes": map[string]any{
-			"currentModeId":  level,
-			"availableModes": modes,
-		},
+	return []acp.SessionConfigOption{
+		selectOption("model", "Model", "model", state.Model.key(), modelOptions(models, state, levels)),
+		thinkingOption(state.ThinkingLevel, levels),
 	}, nil
 }
 
-// availableThinkingLevels 从当前模型读取 Pi 权威思考等级，并过滤无效值。
-func (s *session) availableThinkingLevels(ctx context.Context) ([]string, error) {
-	var result map[string]any
-	if err := s.process.call(ctx, "get_available_thinking_levels", nil, &result); err != nil {
+func (c *Client) SetSessionConfigOption(ctx context.Context, r acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	if r.ValueId == nil {
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(nil)
+	}
+	value := r.ValueId
+	options, err := c.configure(ctx, value.SessionId, string(value.ConfigId), string(value.Value))
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, err
+}
+
+func (c *Client) configure(ctx context.Context, id acp.SessionId, key, value string) ([]acp.SessionConfigOption, error) {
+	s, err := c.session(id)
+	if err != nil {
 		return nil, err
 	}
-	levels := make([]string, 0, len(list(result["levels"])))
-	for _, entry := range list(result["levels"]) {
-		if level := text(entry); level != "" && !contains(levels, level) {
-			levels = append(levels, level)
-		}
+	end, err := s.begin()
+	if err != nil {
+		return nil, err
 	}
-	if len(levels) == 0 {
-		return nil, errors.New("Pi did not return available thinking levels")
-	}
-	return levels, nil
-}
-
-// contains 判断字符串是否在当前模型返回的有序集合中。
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
+	defer end()
+	ctx, cancel := context.WithTimeout(ctx, controlTimeout)
+	defer cancel()
+	expected := value
+	switch key {
+	case "model":
+		models, err := s.models(ctx)
+		if err != nil {
+			return nil, err
 		}
-	}
-	return false
-}
-
-// setModel 校验模型来自 Pi 实际目录，再向原生 RPC 分别传递 provider 与 modelId。
-func (s *session) setModel(ctx context.Context, value string) error {
-	var available map[string]any
-	if err := s.process.call(ctx, "get_available_models", nil, &available); err != nil {
-		return err
-	}
-	preferredProvider := nativeacp.EnvironmentValue(s.process.command.Env, "ACP_GO_PI_PREFERRED_PROVIDER")
-	var matched map[string]any
-	ambiguous := false
-	// 原始 ID 可能包含斜杠；优先按目录中的完整 ID 解析，不能先被另一个 provider/id 别名截获。
-	for _, entry := range list(available["models"]) {
-		m := object(entry)
-		if text(m["id"]) != value {
-			continue
+		model := c.lookupModel(models, value)
+		if model == nil {
+			return nil, acp.NewInvalidParams(map[string]any{"errorKind": "model_unavailable"})
 		}
-		if text(m["provider"]) == preferredProvider {
-			matched, ambiguous = m, false
-			break
+		expected = model.key()
+		if err := s.rpc.call(ctx, "set_model", map[string]any{"provider": model.Provider, "modelId": model.ID}, nil); err != nil {
+			return nil, err
 		}
-		if matched != nil {
-			ambiguous = true
-			continue
+	case "reasoning":
+		levels, err := s.levels(ctx)
+		if err != nil {
+			return nil, err
 		}
-		matched = m
+		if !slices.Contains(levels, value) {
+			return nil, acp.NewInvalidParams(nil)
+		}
+		if err := s.rpc.call(ctx, "set_thinking_level", map[string]any{"level": value}, nil); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, acp.NewInvalidParams(nil)
 	}
-	// 只有没有原始 ID 匹配时才解释旧的 provider/modelId 选择格式。
-	if matched == nil {
-		for _, entry := range list(available["models"]) {
-			m := object(entry)
-			if text(m["provider"])+"/"+text(m["id"]) == value {
-				matched = m
-				break
+	options, err := s.configuration(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, option := range options {
+		if string(option.Select.Id) == key {
+			if string(option.Select.CurrentValue) != expected {
+				return options, classified("configuration_rejected", "configure")
 			}
 		}
 	}
-	if ambiguous {
-		return acp.NewInvalidParams(map[string]any{"message": "ambiguous Pi model"})
-	}
-	if matched == nil {
-		return acp.NewInvalidParams(map[string]any{"message": "unknown Pi model"})
-	}
-	return s.process.call(ctx, "set_model", map[string]any{
-		"provider": matched["provider"],
-		"modelId":  matched["id"],
-	}, nil)
+	return options, nil
 }
 
-// setThinking 只接受当前模型实时公布的等级，不允许把权限名发给思考配置。
-func (s *session) setThinking(ctx context.Context, value string) error {
-	levels, err := s.availableThinkingLevels(ctx)
-	if err != nil {
-		return err
-	}
-	if contains(levels, value) {
-		params := map[string]any{"level": value}
-		return s.process.call(ctx, "set_thinking_level", params, nil)
-	}
-	return acp.NewInvalidParams(nil)
-}
-
-// configurationUpdate 发布权威配置和思考模式变更。
-func (a *Agent) configurationUpdate(ctx context.Context, s *session) error {
-	options, err := s.configuration(ctx)
-	if err != nil {
-		return err
-	}
-	modeUpdate := map[string]any{
-		"sessionUpdate": "current_mode_update",
-		"currentModeId": object(options["modes"])["currentModeId"],
-	}
-	if err = a.emit(ctx, s, modeUpdate); err != nil {
-		return err
-	}
-	configUpdate := map[string]any{
-		"sessionUpdate": "config_option_update",
-		"configOptions": options["configOptions"],
-	}
-	return a.emit(ctx, s, configUpdate)
-}
-
-// SetSessionConfigOption 切换当前会话模型或思考等级，保留其独立 MCP 配置。
-func (a *Agent) SetSessionConfigOption(
-	ctx context.Context,
-	request acp.SetSessionConfigOptionRequest,
-) (acp.SetSessionConfigOptionResponse, error) {
-	if request.ValueId == nil {
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(nil)
-	}
-	s, err := a.get(request.ValueId.SessionId)
-	if err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-	if err := s.operation.Lock(ctx); err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-	defer s.operation.Unlock()
-	params, _ := convert[map[string]any](request)
-	value := text(params["value"])
-	switch text(params["configId"]) {
-	case "model":
-		err = s.setModel(ctx, value)
-	case "reasoning", "thought_level":
-		err = s.setThinking(ctx, value)
-	default:
-		err = acp.NewInvalidParams(nil)
-	}
-	if err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-	if err = a.configurationUpdate(ctx, s); err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-	options, err := s.configuration(ctx)
-	if err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-	return convert[acp.SetSessionConfigOptionResponse](map[string]any{"configOptions": options["configOptions"]})
-}
-
-// SetSessionMode 保留 pi-acp 将 mode 解释为思考等级的协议语义。
-func (a *Agent) SetSessionMode(ctx context.Context, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	s, err := a.get(request.SessionId)
-	if err != nil {
-		return acp.SetSessionModeResponse{}, err
-	}
-	if err := s.operation.Lock(ctx); err != nil {
-		return acp.SetSessionModeResponse{}, err
-	}
-	defer s.operation.Unlock()
-	if err = s.setThinking(ctx, string(request.ModeId)); err != nil {
-		return acp.SetSessionModeResponse{}, err
-	}
-	return acp.SetSessionModeResponse{}, a.configurationUpdate(ctx, s)
-}
-
-// commands 发布 Pi 原生扩展、技能和模板命令，加上 pi-acp 的适配命令。
-func (a *Agent) commands(ctx context.Context, s *session) error {
-	var result map[string]any
-	if err := s.process.call(ctx, "get_commands", nil, &result); err != nil {
-		return err
-	}
-	commands := []any{}
-	seen := map[string]bool{}
-	for _, name := range []string{"compact", "autocompact", "export", "session", "name", "steering", "follow-up", "changelog"} {
-		seen[name] = true
-		commands = append(commands, map[string]any{"name": name, "description": "Pi /" + name})
-	}
-	for _, entry := range list(result["commands"]) {
-		command := object(entry)
-		name := text(command["name"])
-		if command["source"] == "extension" || name == "" || seen[name] {
+func (c *Client) lookupModel(models []nativeModel, value string) *nativeModel {
+	preferred := c.getenv("ACP_GO_PI_PREFERRED_PROVIDER")
+	var qualified, preferredMatch, legacy *nativeModel
+	legacyCount := 0
+	for _, model := range models {
+		if model.key() == "" {
 			continue
 		}
-		seen[name] = true
-		description := text(command["description"])
-		if strings.TrimSpace(description) == "" {
-			description = name
+		if model.key() == value {
+			qualified = &model
 		}
-		commands = append(commands, map[string]any{"name": name, "description": description})
+		if model.ID == value {
+			if model.Provider == preferred {
+				preferredMatch = &model
+			}
+			legacyCount++
+			legacy = &model
+		}
 	}
-	return a.emit(ctx, s, map[string]any{"sessionUpdate": "available_commands_update", "availableCommands": commands})
+	if qualified != nil {
+		return qualified
+	}
+	if preferredMatch != nil {
+		return preferredMatch
+	}
+	if legacyCount == 1 {
+		return legacy
+	}
+	return nil
+}
+
+func (*Client) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound("session/set_mode")
+}
+
+// ReadModels probes the CLI without opening persistent history or sending a prompt.
+func (c *Client) ReadModels(ctx context.Context) (result acpmeta.ModelCatalog, err error) {
+	unlock, err := c.lockOpen(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	s, err := c.start(ctx, c.options.WorkingDirectory, []string{"--no-session", "--no-tools", "--no-extensions"}, resources{probe: true}, "")
+	if err != nil {
+		return result, err
+	}
+	defer func() { err = errors.Join(err, c.retire(s)) }()
+	state, err := s.state(ctx)
+	if err != nil {
+		return result, err
+	}
+	models, err := s.models(ctx)
+	if err != nil {
+		return result, err
+	}
+	var levels []string
+	if state.Model != nil && state.Model.key() != "" {
+		result.DefaultID = pointer(acp.SessionConfigValueId(state.Model.key()))
+		levels, err = s.levels(ctx)
+		if err != nil {
+			return result, err
+		}
+	}
+	result.Options.Ungrouped = pointer(acp.SessionConfigSelectOptionsUngrouped(modelOptions(models, state, levels)))
+	return result, nil
+}
+
+func (c *Client) HandleExtensionMethod(ctx context.Context, method string, _ json.RawMessage) (any, error) {
+	if method == acpmeta.ModelCatalogMethod {
+		return c.ReadModels(ctx)
+	}
+	return nil, acp.NewMethodNotFound(method)
+}
+
+func nativeFailure(detail string) error {
+	lower := strings.ToLower(detail)
+	kind := "native_execution_failed"
+	switch {
+	case strings.Contains(lower, "invalid api key"), strings.Contains(lower, "unauthorized"), strings.Contains(lower, "authentication"), strings.Contains(lower, "no api key"):
+		return classified("authentication", "prompt")
+	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many requests"):
+		kind = "rate_limit"
+	case strings.Contains(lower, "insufficient_quota"), strings.Contains(lower, "quota exceeded"):
+		kind = "quota_exhausted"
+	case strings.Contains(lower, "insufficient balance"), strings.Contains(lower, "payment required"):
+		kind = "billing_error"
+	case strings.Contains(lower, "context length"), strings.Contains(lower, "context window"):
+		kind = "context_limit"
+	case strings.Contains(lower, "model not found"), strings.Contains(lower, "model unavailable"):
+		kind = "model_unavailable"
+	}
+	return classified(kind, "prompt")
 }

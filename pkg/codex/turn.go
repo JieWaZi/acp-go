@@ -6,899 +6,821 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"sync"
+	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	agentclient "github.com/JieWaZi/acp-go/pkg/agentclient"
 	"github.com/JieWaZi/acp-go/pkg/codex/protocol"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-// turnKind distinguishes native operations with different admission semantics.
-type turnKind uint8
-
 const (
-	promptTurn turnKind = iota
-	steeringTurn
-	compactionTurn
+	maxEarlyBytes     = 4 << 20
+	maxPendingUpdates = 256
 )
 
-// nativeTurn owns the exact submission, native identity, ordered observations and terminal lifecycle.
-type nativeTurn struct {
-	// kind specifies whether the native turn can accept ordinary input.
-	kind turnKind
-	// mu protects the native identity, cancellation state, and delivery binding.
-	mu sync.Mutex
-	// generation is the Agent-wide monotonic invocation identity.
-	generation uint64
-	// eventRouter maps frames only after the native identity is proven.
-	eventRouter *eventRouter
-	// clientMessageID is the unique submitted user-message identity used as pre-ACK evidence.
-	clientMessageID string
-	// eventsMu serializes identity binding, pre-ACK frames, and mapping.
-	eventsMu sync.Mutex
-	// completionCapture holds unmatched completions received before this invocation binds.
-	completionCapture *completionCapture
-	// early keeps bounded updates and usage evidence before native identity is proven.
-	early earlyTurn
-	// terminal stores the exact native completion independently of buffered display frames.
-	terminal *receivedCompletion
-	// terminalSignal closes when this exact native turn reaches a terminal notification.
-	terminalSignal chan struct{}
-	// observed collects positive native output, effect and retry evidence.
-	observed turnObservation
-	// eventFailure records mapping/queue failures independently of the native terminal.
-	eventFailure error
-	// delivery joins queued ACP writes before exposing a terminal result.
-	delivery *turnDelivery
-	// runCtx outlives a locally cancelled caller while a late native identity is still possible.
-	runCtx context.Context
-	// runCancel releases protocol waiters when the thread or connection closes.
-	runCancel context.CancelFunc
-	// turnID is bound by an ACK or a matching native user-message event.
-	turnID string
-	// cancelRequested records the first local cancellation signal.
-	cancelRequested bool
-	// finished fences late identities from a foreground operation that has returned.
-	finished bool
-	// cancelSignal wakes a foreground caller waiting for an unknown turn ID.
-	cancelSignal chan struct{}
-	// cancelOnce publishes cancellation once.
-	cancelOnce sync.Once
-	// interruptOnce prevents duplicate native interrupt requests.
-	interruptOnce sync.Once
-	// interruptDone closes when the native interrupt call returns.
-	interruptDone chan struct{}
-	// turnStarted publishes the bound turn identity and initialized event mapping.
-	turnStarted chan struct{}
-	// turnStartedOnce protects the identity barrier from duplicate evidence.
-	turnStartedOnce sync.Once
-	// foregroundDone signals that ACP response cleanup finished.
-	foregroundDone chan struct{}
-	// foregroundDoneOnce guards the foreground completion signal.
-	foregroundDoneOnce sync.Once
-	// backgroundDone signals native waiter cleanup.
-	backgroundDone chan struct{}
-	// backgroundDoneOnce guards the native cleanup signal.
-	backgroundDoneOnce sync.Once
+var (
+	errStopped           = fmt.Errorf("Codex turn cancelled: %w", context.Canceled)
+	errObservationBudget = errors.New("Codex turn exceeded the observation backlog budget")
+	errUnconfirmed       = errors.New("Codex turn ended without conclusive native evidence")
+	errTerminal          = errors.New("Codex native terminal observed")
+	uuidPattern          = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+)
+
+type turn struct {
+	// session is the exact opened generation that owns this turn.
+	session *session
+	// input is the frozen identity shared between the gate and receipt.
+	input agentclient.PromptSubmission
+	// request contains the native input frozen at reservation.
+	request protocol.TurnStartParams
+	// mode freezes permission behavior for the reserved turn.
+	mode acp.SessionModeId
+	// cleanup releases host preparation before owner release.
+	cleanup func()
+	// options is the host's preparation and business gate.
+	options agentclient.PromptOptions
+	// prepare is cancelled at synchronous ingress or by the caller context.
+	prepare context.Context
+	// stopPrepare also releases preparation context resources.
+	stopPrepare context.CancelCauseFunc
+	// native is independent of the foreground waiter after the write commits.
+	native context.Context
+	// stopNative ends response and observation work after terminal or retirement.
+	stopNative context.CancelCauseFunc
+	// observeCtx is independent of wire acknowledgement and turn cancellation.
+	observeCtx context.Context
+	// stopObserve bounds delivery cleanup.
+	stopObserve context.CancelFunc
+	// ready publishes the first confirmed native turn ID.
+	ready chan struct{}
+	// terminal publishes only actual provider completion evidence.
+	terminal chan struct{}
+	// released publishes release of the owner after preparation and observers.
+	released chan struct{}
+	// updates receives immutable observations after evidence capture.
+	updates chan observation
+	// interactions tracks the native requests captured for this exact turn.
+	interactions sync.WaitGroup
+	// observerDone publishes delivery completion.
+	observerDone chan struct{}
+	// outcomeEntry is the ordered receipt slot opened by the native terminal.
+	outcomeEntry *outcomeEntry
+	// retainOutcome reserves one slot for this turn's canonical outcome.
+	retainOutcome bool
+	// autonomous identifies a native execution with no host input submission.
+	autonomous bool
+	// compact distinguishes native compaction from a user prompt.
+	compact bool
+	// writing is the linearized decision to allow native write.
+	writing bool
+	// tierRevision is the last native tier report when this turn allowed its write.
+	tierRevision uint64
+	// stopped is the synchronous cancellation intent.
+	stopped bool
+	// finishing fences reader updates before observation drains.
+	finishing bool
+	// rejected records a trusted native rejection before any turn was accepted.
+	rejected bool
+	// early holds possible evidence before a native identity is proven.
+	early []earlyFrame
+	// earlyBytes bounds storage across unconfirmed candidate turn IDs.
+	earlyBytes int
+	// admission tracks only correlated native acknowledgement or input evidence.
+	admission agentclient.Admission
+	// outcome is owned by the native reader and the finalization path.
+	outcome agentclient.NativeOutcome
+	// model is the model observed at turn start, possibly superseded by reroute evidence.
+	model string
+	// rerouted records that one model cannot be used for aggregate attribution.
+	rerouted bool
+	// previous is the cumulative floor used for delta accounting.
+	previous *tokenCheckpoint
+	// consumed is the sum of deltas supported by turn attribution.
+	consumed *acpmeta.ModelUsage
+	// usageGap indicates an unscoped observation or a missing start baseline.
+	usageGap bool
+	// usageOnlyLast means the attributed sum is proven to be one request.
+	usageOnlyLast bool
+	// usageHigh keeps the total-token floor if this turn loses its cumulative boundary.
+	usageHigh *int64
+	// nativeStatus retains the actual status for provider-specific controls.
+	nativeStatus string
+	// finalCandidate is a completed legacy message whose phase was not declared.
+	finalCandidate *agentclient.FinalMessage
+	// completedMessages suppresses duplicate native item completion events.
+	completedMessages map[string]struct{}
+	// observationBytes accounts retained wire updates until delivery returns.
+	observationBytes int
+	// earlyEvidenceCount and earlyEvidenceBytes reserve space for technical facts.
+	earlyEvidenceCount, earlyEvidenceBytes int
+	// tools maps native item IDs to their most recent observed tool status.
+	tools map[string]acp.ToolCallStatus
+	// toolOutput holds the accumulated terminal text for snapshot consumers.
+	toolOutput map[string]string
+	// streamed retains bounded prefix evidence for incomplete native messages.
+	streamed map[string]*messagePrefix
+	// steerInputs retains attempted native input identities for this exact turn.
+	steerInputs map[string]struct{}
+	// steerPending counts committed controls awaiting their own native evidence.
+	steerPending int
+	// steerSettled closes when the current set of committed controls has settled.
+	steerSettled chan struct{}
 }
 
-// turnObservation contains provider facts scoped to one proven turn.
-type turnObservation struct {
-	// output records positive evidence of generated assistant text.
-	output bool
-	// fileChange records a native report of completed file changes.
-	fileChange bool
-	// toolCompletion records a native tool reaching its terminal item boundary.
-	toolCompletion bool
-	// lastError retains the last native error notification including willRetry.
-	lastError *protocol.ErrorNotification
-	// reroutes holds a bounded sequence of native model changes for this turn.
-	reroutes []modelReroute
+type earlyFrame struct {
+	// method names the native notification.
+	method string
+	// params is retained only until exact turn identity is available.
+	params json.RawMessage
 }
 
-// recordItem distinguishes native tool completion from evidence of a file effect.
-func (o *turnObservation) recordItem(item protocol.ThreadItem, completionFrame bool) {
-	status := stringValue(item.Status)
-	finished := status == "completed" || status == "failed"
-	switch item.Type {
-	case protocol.AgentMessage:
-		o.output = o.output || stringValue(item.Text) != ""
-	case protocol.FileChange:
-		o.toolCompletion = o.toolCompletion || finished
-		o.fileChange = o.fileChange || status == "completed" && len(item.Changes) > 0
-	case protocol.CommandExecution, protocol.MCPToolCall, protocol.DynamicToolCall, protocol.CollabAgentToolCall, protocol.WebSearch:
-		o.toolCompletion = o.toolCompletion || finished || completionFrame && status == ""
-	}
+func newID() string {
+	var bytes [16]byte
+	_, _ = rand.Read(bytes[:])
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", bytes[:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:])
 }
 
-// modelReroute records a provider-reported change without reallocating token counts.
-type modelReroute struct {
-	// From is the native model before the reported change.
-	From string `json:"from"`
-	// To is the native model named by the provider.
-	To string `json:"to"`
-	// Reason preserves the native reroute reason.
-	Reason string `json:"reason"`
-}
-
-// newNativeTurn creates the admission identity before any native submission.
-func newNativeTurn(parent context.Context, generation uint64) *nativeTurn {
-	runCtx, runCancel := context.WithCancel(parent)
-	return &nativeTurn{
-		kind:           promptTurn,
-		generation:     generation,
-		runCtx:         runCtx,
-		runCancel:      runCancel,
-		cancelSignal:   make(chan struct{}),
-		interruptDone:  make(chan struct{}),
-		turnStarted:    make(chan struct{}),
-		terminalSignal: make(chan struct{}),
-		foregroundDone: make(chan struct{}),
-		backgroundDone: make(chan struct{}),
-	}
-}
-
-// markForegroundDone signals that the foreground caller released its ownership.
-func (p *nativeTurn) markForegroundDone() {
-	p.foregroundDoneOnce.Do(func() { close(p.foregroundDone) })
-}
-
-// cancelRun releases this invocation’s native RPC and completion waits.
-func (p *nativeTurn) cancelRun() {
-	p.runCancel()
-}
-
-// requestCancel records cancellation and returns the current native identity.
-func (p *nativeTurn) requestCancel() string {
-	p.mu.Lock()
-	p.cancelRequested = true
-	turnID := p.turnID
-	p.mu.Unlock()
-	p.cancelOnce.Do(func() { close(p.cancelSignal) })
-	return turnID
-}
-
-// setTurn binds the native identity and reports whether the foreground caller already left.
-func (p *nativeTurn) setTurn(turnID string) bool {
-	p.mu.Lock()
-	p.turnID = turnID
-	late := p.cancelRequested || p.finished
-	p.mu.Unlock()
-	return late
-}
-
-// signalTurnStarted publishes the initialized native turn identity to waiters.
-func (p *nativeTurn) signalTurnStarted() { p.turnStartedOnce.Do(func() { close(p.turnStarted) }) }
-
-// markBackgroundDone signals that no native wait remains.
-func (p *nativeTurn) markBackgroundDone() {
-	p.backgroundDoneOnce.Do(func() { close(p.backgroundDone) })
-}
-
-// currentTurn returns a synchronized snapshot of the identity and cancellation state.
-func (p *nativeTurn) currentTurn() (string, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.turnID, p.cancelRequested
-}
-
-// setEventRouter installs the mapper for the proven native identity.
-func (p *nativeTurn) setEventRouter(router *eventRouter) {
-	p.mu.Lock()
-	p.eventRouter = router
-	p.mu.Unlock()
-}
-
-// currentEventRouter returns the mapper associated with this turn.
-func (p *nativeTurn) currentEventRouter() *eventRouter {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.eventRouter
-}
-
-// markForegroundFinished prevents late identity evidence from publishing to a finished caller.
-func (p *nativeTurn) markForegroundFinished() {
-	p.mu.Lock()
-	p.finished = true
-	p.mu.Unlock()
-}
-
-// compact submits a standalone native turn and holds admission until its terminal notification.
-func (a *Agent) compact(ctx context.Context, raw json.RawMessage) (acpmeta.CompactResponse, error) {
-	var request acpmeta.CompactRequest
-	if err := json.Unmarshal(raw, &request); err != nil || request.SessionID == "" {
-		return acpmeta.CompactResponse{}, acp.NewInvalidParams(map[string]any{"error": "session_id is required"})
-	}
-	if err := a.requireInitialized(); err != nil {
-		return acpmeta.CompactResponse{}, err
-	}
-	state, ok := a.sessions.get(request.SessionID)
-	if !ok {
-		return acpmeta.CompactResponse{}, codexSessionNotFoundError(request.SessionID)
-	}
-	prompt := newNativeTurn(a.runtimeCtx, a.nextTurnGeneration.Add(1))
-	prompt.kind = compactionTurn
-	if err := a.installTurn(state, prompt); err != nil {
-		prompt.cancelRun()
-		return acpmeta.CompactResponse{}, err
-	}
-	capture, err := a.client.completions.beginCapture(state.id)
+// ReservePrompt captures the session and its settings synchronously with no native I/O.
+func (c *Client) ReservePrompt(ctx context.Context, request acp.PromptRequest, options agentclient.PromptOptions) (func() agentclient.PromptResult, error) {
+	input, err := encodePrompt(request.Prompt)
 	if err != nil {
-		a.releaseTurn(state, prompt)
-		prompt.cancelRun()
-		a.finishTurnForeground(prompt)
-		a.finishTurnBackground(prompt)
-		return acpmeta.CompactResponse{}, err
+		return nil, err
 	}
-	prompt.setCompletionCapture(capture)
-	type result struct {
-		// response carries the precise native terminal result.
-		response acpmeta.CompactResponse
-		// err is the request or completion failure.
-		err error
-	}
-	results := make(chan result, 1)
-	go func() {
-		var finished sync.Once
-		finish := func() {
-			finished.Do(func() {
-				prompt.markForegroundFinished()
-				a.releaseTurn(state, prompt)
-				prompt.cancelRun()
-				a.finishTurnBackground(prompt)
-			})
-		}
-		defer finish()
-		err := awaitNativeAcknowledgment(prompt.runCtx, prompt.terminalSignal, func(ctx context.Context) error {
-			return a.client.ThreadCompactStart(ctx, protocol.ThreadCompactStartParams{ThreadID: state.id})
-		})
-		reported := false
-		if err != nil {
-			select {
-			case <-prompt.turnStarted:
-				// An observed native turn outranks the failed request response.
-			default:
-				var rejection *rpcError
-				if errors.As(err, &rejection) {
-					a.client.completions.releaseCapture(state.id, capture)
-					finish()
-					results <- result{err: codexRequestFailure("compact_start", err)}
-					return
-				}
-				results <- result{err: codexRequestFailure("compact_start", err)}
-				reported = true
-			}
-		}
-		select {
-		case <-prompt.turnStarted:
-		case <-a.client.rpc.Done():
-			// Keep an identity/terminal that was already drained before EOF.
-			select {
-			case <-prompt.turnStarted:
-			default:
-				a.client.completions.releaseCapture(state.id, capture)
-				finish()
-				if !reported {
-					err := a.client.rpc.Err()
-					if err == nil {
-						err = ErrAppServerUnavailable
-					}
-					results <- result{err: codexRequestFailure("compact_identity", err)}
-				}
-				return
-			}
-		case <-prompt.runCtx.Done():
-			a.client.completions.releaseCapture(state.id, capture)
-			if !reported {
-				results <- result{err: prompt.runCtx.Err()}
-			}
-			return
-		}
-		turnID, _ := prompt.currentTurn()
-		var completion protocol.TurnCompletedNotification
-		var completionErr error
-		if observed := prompt.observedCompletion(); observed != nil {
-			completion = *observed
-			a.client.completions.releaseCapture(state.id, capture)
-		} else {
-			completion, completionErr = a.client.completions.waitAfterStart(prompt.runCtx, state.id, turnID, capture)
-		}
-		router := prompt.currentEventRouter()
-		usage, observed := router.Usage()
-		if !observed || completionErr != nil || completion.Turn.Status != protocol.FluffyCompleted {
-			state.mu.Lock()
-			state.usageTotal = nil
-			state.mu.Unlock()
-		}
-		if reported {
-			return
-		}
-		if completionErr != nil {
-			finish()
-			results <- result{err: turnFailureWithUsage(prompt, "compact_completion", codexRequestFailure("compact_completion", completionErr))}
-			return
-		}
-		if completion.Turn.Status == protocol.Failed && completion.Turn.Error != nil {
-			finish()
-			results <- result{err: turnFailureWithUsage(prompt, "compact_completion", codexTurnRequestError(completion.Turn.Error))}
-			return
-		}
-		finish()
-		response := acpmeta.CompactResponse{TurnID: turnID, Status: string(completion.Turn.Status)}
-		if observed {
-			response.Meta = acpmeta.WithTurnUsage(nil, usage.Metadata(completion.Turn.Status == protocol.FluffyCompleted))
-		}
-		results <- result{response: response}
-	}()
-	defer a.finishTurnForeground(prompt)
-	select {
-	case result := <-results:
-		return result.response, result.err
-	case <-ctx.Done():
-		turnID := prompt.requestCancel()
-		if turnID != "" {
-			a.requestTurnInterrupt(state, prompt, turnID, false)
-		}
-		select {
-		case result := <-results:
-			return result.response, result.err
-		default:
-		}
-		failure := acp.NewRequestCancelled(map[string]any{"cause": ctx.Err().Error()})
-		return acpmeta.CompactResponse{}, turnFailureWithUsage(prompt, "compact_cancel", failure)
-	case <-a.runtimeCtx.Done():
-		return acpmeta.CompactResponse{}, ErrRuntimeUnavailable
-	}
-}
-
-// Prompt admits one native submission and joins its terminal result with ACP delivery.
-func (a *Agent) Prompt(ctx context.Context, request acp.PromptRequest) (response acp.PromptResponse, promptErr error) {
-	if err := a.requireInitialized(); err != nil {
-		return acp.PromptResponse{}, err
-	}
-	state, ok := a.sessions.get(string(request.SessionId))
-	if !ok {
-		return acp.PromptResponse{}, codexSessionNotFoundError(string(request.SessionId))
-	}
-	if _, err := a.waitConnection(ctx); err != nil {
-		return acp.PromptResponse{}, err
-	}
-	if err := a.refreshSkills(ctx, state.workspace()); err != nil {
-		return acp.PromptResponse{}, err
-	}
-	input, err := buildPromptInput(request.Prompt)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, err := c.idleSessionLocked(request.SessionId)
 	if err != nil {
-		return acp.PromptResponse{}, err
+		return nil, err
 	}
-	prompt := newNativeTurn(a.runtimeCtx, a.nextTurnGeneration.Add(1))
-	prompt.clientMessageID = rand.Text()
-	if request.MessageId != nil && *request.MessageId != "" {
-		prompt.clientMessageID = *request.MessageId
-	}
-	if err := a.installTurn(state, prompt); err != nil {
-		prompt.cancelRun()
-		return acp.PromptResponse{}, fmt.Errorf("prompting session %q: %w", request.SessionId, err)
-	}
-	// Release the foreground lane on return. After early cancellation, the
-	// native observer may still need to interrupt a late start.
-	defer func() {
-		if promptErr != nil || response.StopReason == acp.StopReasonCancelled {
-			// A missing tail after failure or cancellation makes the next baseline uncertain.
-			state.mu.Lock()
-			state.usageTotal = nil
-			state.mu.Unlock()
-		}
-		prompt.markForegroundFinished()
-		a.releaseTurn(state, prompt)
-		a.finishTurnForeground(prompt)
-	}()
-
-	// turnResult transfers one exact native result to the foreground request.
-	type turnResult struct {
-		// completion is the exact native terminal notification.
-		completion protocol.TurnCompletedNotification
-		// err carries native submission and completion failures.
-		err error
-		// deliveryErr carries ACP write failures independently of the native result.
-		deliveryErr error
-	}
-	resultChannel := make(chan turnResult, 1)
-	turnParams, err := turnParamsForSession(state, input, &prompt.clientMessageID)
+	t, err := c.reservePromptLocked(ctx, s, input, request.MessageId, options, c.foregroundReceipts)
 	if err != nil {
-		prompt.cancelRun()
-		a.finishTurnBackground(prompt)
-		return acp.PromptResponse{}, err
+		return nil, err
 	}
-	go func() {
-		defer a.finishTurnBackground(prompt)
-		completion, runErr := a.client.RunTurn(prompt.runCtx, turnParams, func(turnID string) {
-			a.onTurnStarted(state, prompt, turnID)
-		}, prompt.startObservation())
-		deliveryErr := prompt.waitDelivery()
-		prompt.cancelRun()
-		resultChannel <- turnResult{completion: completion, err: runErr, deliveryErr: deliveryErr}
-	}()
+	var once sync.Once
+	var result agentclient.PromptResult
+	return func() agentclient.PromptResult {
+		once.Do(func() { result = c.runPrompt(t) })
+		return result.Snapshot()
+	}, nil
+}
 
-	requestDone := ctx.Done()
-	cancelSignal := prompt.cancelSignal
-	for {
-		select {
-		case result := <-resultChannel:
-			if result.deliveryErr != nil && (result.err != nil || result.completion.Turn.Status != protocol.Failed) {
-				failure := codexRequestFailure("event_delivery", result.deliveryErr)
-				data := failure.Data.(map[string]any)
-				if result.completion.Turn.Status != "" {
-					data["native_status"] = string(result.completion.Turn.Status)
-				}
-				if result.err != nil {
-					data["native_failure"] = codexRequestFailure("turn_completion", result.err).Data
-				}
-				return acp.PromptResponse{}, turnFailureWithUsage(prompt, "event_delivery", failure)
-			}
-			if result.err != nil {
-				if errors.Is(result.err, context.Canceled) {
-					_, cancelled := prompt.currentTurn()
-					if cancelled {
-						return codexPromptResponse(
-							prompt,
-							acp.StopReasonCancelled,
-							request.MessageId,
-						), nil
-					}
-				}
-				phase := "turn_start"
-				if id, _ := prompt.currentTurn(); id != "" {
-					phase = "turn_completion"
-				}
-				return acp.PromptResponse{}, turnFailureWithUsage(prompt, phase, codexRequestFailure(phase, result.err))
-			}
-			switch result.completion.Turn.Status {
-			case protocol.FluffyInterrupted:
-				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
-			case protocol.FluffyCompleted:
-				return codexPromptResponse(prompt, acp.StopReasonEndTurn, request.MessageId), nil
-			case protocol.Failed:
-				failure := &acp.RequestError{Code: -32603, Message: fmt.Sprintf("codex turn %q failed", result.completion.Turn.ID)}
-				if turnError := result.completion.Turn.Error; turnError != nil {
-					failure = codexTurnRequestError(turnError)
-				}
-				failure = turnFailureWithUsage(prompt, "turn_completion", failure)
-				if result.deliveryErr != nil {
-					failure.Data.(map[string]any)["event_delivery_error"] = result.deliveryErr.Error()
-				}
-				return acp.PromptResponse{}, failure
-			default:
-				return acp.PromptResponse{}, fmt.Errorf(
-					"codex turn %q completed with unexpected status %q",
-					result.completion.Turn.ID,
-					result.completion.Turn.Status,
-				)
-			}
-		case <-requestDone:
-			turnID := prompt.requestCancel()
-			if turnID == "" {
-				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
-			}
-			a.requestTurnInterrupt(state, prompt, turnID, false)
-			requestDone = nil
-			cancelSignal = nil
-		case <-cancelSignal:
-			turnID, _ := prompt.currentTurn()
-			if turnID == "" {
-				return codexPromptResponse(prompt, acp.StopReasonCancelled, request.MessageId), nil
-			}
-			a.requestTurnInterrupt(state, prompt, turnID, false)
-			requestDone = nil
-			cancelSignal = nil
-		case <-a.runtimeCtx.Done():
-			return acp.PromptResponse{}, fmt.Errorf("running codex turn: %w", ErrRuntimeUnavailable)
+func (c *Client) reservePromptLocked(ctx context.Context, s *session, input []protocol.InputElement, requestedID *string, options agentclient.PromptOptions, retain bool) (*turn, error) {
+	t, err := c.installTurnLocked(ctx, s, false, retain)
+	if err != nil {
+		return nil, err
+	}
+	t.input = newInputIdentity(s.id, options.HostInvocationID)
+	if requestedID != nil && uuidPattern.MatchString(*requestedID) {
+		if _, used := s.inputs[*requestedID]; !used {
+			t.input.InputID = *requestedID
+			t.input.NativeInputID = pointer(*requestedID)
 		}
 	}
+	t.options = options
+	s.inputs[t.input.InputID] = struct{}{}
+	t.request.Input = input
+	t.request.ClientUserMessageID = pointer(t.input.InputID)
+	return t, nil
 }
 
-// turnFailureWithUsage carries observed consumption across an unsuccessful terminal boundary.
-func turnFailureWithUsage(prompt *nativeTurn, phase string, failure *acp.RequestError) *acp.RequestError {
-	data, _ := failure.Data.(map[string]any)
-	if data == nil {
-		data = map[string]any{}
+func (c *Client) installTurnLocked(ctx context.Context, s *session, compact, retain bool) (*turn, error) {
+	if retain && c.retainedOutcomes == maxRetainedOutcomes {
+		return nil, acp.NewInvalidRequest("Codex native receipts are full")
 	}
-	if _, exists := data["phase"]; !exists {
-		data["phase"] = phase
+	prepare, stopPrepare := context.WithCancelCause(ctx)
+	native, stopNative := context.WithCancelCause(c.life)
+	observeCtx, stopObserve := context.WithCancel(c.life)
+	t := &turn{
+		session: s, compact: compact, mode: s.mode, prepare: prepare, stopPrepare: stopPrepare, native: native, stopNative: stopNative,
+		observeCtx: observeCtx, stopObserve: stopObserve, ready: make(chan struct{}), terminal: make(chan struct{}), released: make(chan struct{}),
+		updates: make(chan observation, maxPendingUpdates), observerDone: make(chan struct{}),
+		admission: agentclient.AdmissionNotAccepted, tools: make(map[string]acp.ToolCallStatus), toolOutput: make(map[string]string), streamed: make(map[string]*messagePrefix),
+		steerInputs: make(map[string]struct{}), completedMessages: make(map[string]struct{}), model: value(s.settings.Observed.Model),
+		previous: s.usageCheckpoint, usageGap: s.usageCheckpoint == nil || s.usageCheckpoint.disputed,
+		outcome: agentclient.NativeOutcome{Turn: acpmeta.NativeTurn{InvocationID: newID(), Origin: acpmeta.NativeTurnOriginHost}},
 	}
-	if turnID, _ := prompt.currentTurn(); turnID != "" {
-		data["turn_id"] = turnID
-		if value, ok := data["submission"]; !ok || value == "unknown" {
-			data["submission"] = "accepted"
-		}
+	if t.previous != nil {
+		t.usageHigh = t.previous.total.Context
 	}
-	if router := prompt.currentEventRouter(); router != nil {
-		if usage, ok := router.Usage(); ok {
-			data = acpmeta.WithTurnUsage(data, usage.Metadata(false))
-		}
+	t.request = s.turnParams()
+	if t.request.Model != nil && *t.request.Model != t.model {
+		t.model = ""
 	}
-	prompt.eventsMu.Lock()
-	observation := prompt.observed
-	reroutes := append([]modelReroute(nil), observation.reroutes...)
-	prompt.eventsMu.Unlock()
-	if observation.output {
-		data["output_observed"] = true
+	if retain {
+		c.retainedOutcomes++
+		t.retainOutcome = true
 	}
-	if observation.fileChange {
-		data["file_change_observed"] = true
-	}
-	if observation.toolCompletion {
-		data["tool_completion_observed"] = true
-	}
-	if observation.lastError != nil {
-		data["native_error_observation"] = map[string]any{
-			"source": "error", "will_retry": observation.lastError.WillRetry, "error": observation.lastError.Error,
-		}
-	}
-	if len(reroutes) > 0 {
-		data["native_model_reroutes"] = reroutes
-	}
-	failure.Data = data
-	return failure
+	s.active = t
+	c.interactions.Add(1)
+	return t, nil
 }
 
-// codexPromptResponse projects the final native counters and user-message confirmation.
-func codexPromptResponse(
-	prompt *nativeTurn,
-	stopReason acp.StopReason,
-	messageID *string,
-) acp.PromptResponse {
-	response := acp.PromptResponse{
-		StopReason:    stopReason,
-		UserMessageId: messageID,
-	}
-	turnID, _ := prompt.currentTurn()
-	response.Meta = acpmeta.PositionMetadata(turnID)
-	prompt.eventsMu.Lock()
-	if len(prompt.observed.reroutes) > 0 {
-		if response.Meta == nil {
-			response.Meta = make(map[string]any)
-		}
-		response.Meta["native_model_reroutes"] = append([]modelReroute(nil), prompt.observed.reroutes...)
-	}
-	prompt.eventsMu.Unlock()
-	router := prompt.currentEventRouter()
-	if router == nil {
-		return response
-	}
-	usage, ok := router.Usage()
-	if ok {
-		response.Usage = usage.PromptUsage()
-		response.Meta = acpmeta.WithTurnUsage(response.Meta, usage.Metadata(stopReason == acp.StopReasonEndTurn))
-	}
-	return response
+func (c *Client) runPrompt(t *turn) (result agentclient.PromptResult) {
+	written, err := c.executeTurn(t)
+	return c.finishTurn(t, written, err)
 }
 
-// installTurn reserves the exact thread and registers the invocation before native I/O.
-func (a *Agent) installTurn(state *sessionState, prompt *nativeTurn) error {
-	a.sessions.mu.Lock()
-	defer a.sessions.mu.Unlock()
-	if a.sessions.sessions[state.id] != state || a.sessions.closing[state.id] > 0 {
-		return ErrSessionClosing
-	}
-	a.turnMu.Lock()
-	defer a.turnMu.Unlock()
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if a.turnsClosing {
-		return ErrRuntimeUnavailable
-	}
-	if state.turnAdmissionClosed {
-		return ErrSessionClosing
-	}
-	if state.replayingHistory {
-		return ErrSessionOpening
-	}
-	if state.activeTurn != nil {
-		return ErrPromptActive
-	}
-	if prompt.kind == compactionTurn {
-		// Compact has no turn ID in its ACK. Do not let an unresolved start from a
-		// prior foreground request provide a candidate identity for this lane.
-		for _, owner := range a.turns {
-			if owner.id == state.id {
-				return ErrPromptActive
-			}
-		}
-	}
-	state.activeTurn = prompt
-	a.turns[prompt] = state
-	return nil
-}
-
-// closeSessionTurns fences admission and returns every invocation owned by the retiring thread.
-func (a *Agent) closeSessionTurns(state *sessionState) []*nativeTurn {
-	if state == nil {
-		return nil
-	}
-	a.turnMu.Lock()
-	defer a.turnMu.Unlock()
-	state.mu.Lock()
-	state.turnAdmissionClosed = true
-	state.mu.Unlock()
-	prompts := make([]*nativeTurn, 0)
-	for prompt, owner := range a.turns {
-		if owner == state {
-			prompts = append(prompts, prompt)
-		}
-	}
-	return prompts
-}
-
-// closeAllTurns fences Agent-wide admission and snapshots unfinished invocations.
-func (a *Agent) closeAllTurns() []*nativeTurn {
-	a.turnMu.Lock()
-	defer a.turnMu.Unlock()
-	a.turnsClosing = true
-	prompts := make([]*nativeTurn, 0, len(a.turns))
-	for prompt := range a.turns {
-		prompts = append(prompts, prompt)
-	}
-	return prompts
-}
-
-// finishTurnForeground releases the foreground half of the invocation.
-func (a *Agent) finishTurnForeground(prompt *nativeTurn) {
-	prompt.markForegroundDone()
-	a.untrackTurnIfDone(prompt)
-}
-
-// finishTurnBackground releases the native waiter half of the invocation.
-func (a *Agent) finishTurnBackground(prompt *nativeTurn) {
-	prompt.markBackgroundDone()
-	a.untrackTurnIfDone(prompt)
-}
-
-// untrackTurnIfDone removes the invocation after both ownership halves have ended.
-func (a *Agent) untrackTurnIfDone(prompt *nativeTurn) {
-	select {
-	case <-prompt.foregroundDone:
-	default:
-		return
-	}
-	select {
-	case <-prompt.backgroundDone:
-	default:
-		return
-	}
-	a.turnMu.Lock()
-	delete(a.turns, prompt)
-	a.turnMu.Unlock()
-}
-
-// onTurnStarted binds the identity in the ACK and drains previously isolated frames.
-func (a *Agent) onTurnStarted(state *sessionState, prompt *nativeTurn, turnID string) {
-	prompt.eventsMu.Lock()
-	defer prompt.eventsMu.Unlock()
-	a.bindTurnLocked(state, prompt, turnID)
-}
-
-// bindTurnLocked publishes an identity proved by an ACK or the submitted user-message ID.
-func (a *Agent) bindTurnLocked(state *sessionState, prompt *nativeTurn, turnID string) {
-	if id := prompt.confirmedTurnID(); id != "" {
-		return
-	}
-	late := prompt.setTurn(turnID) || !a.sessions.isCurrent(state)
-	if late && prompt.kind != compactionTurn {
-		a.requestTurnInterrupt(state, prompt, turnID, true)
-		prompt.signalTurnStarted()
-		return
-	}
-	var updater sessionUpdater
-	if prompt.kind != compactionTurn {
-		updater = a.currentSessionUpdater()
-	}
-	a.attachTurnEvents(state, prompt, turnID, updater)
-	a.replayEarlyTurnLocked(state, prompt, turnID)
-	prompt.signalTurnStarted()
-	if late {
-		a.requestTurnInterrupt(state, prompt, turnID, false)
-	}
-}
-
-// replayEarlyTurnLocked seals the proven turn at its native receive boundary.
-func (a *Agent) replayEarlyTurnLocked(state *sessionState, prompt *nativeTurn, turnID string) {
-	var completion *receivedCompletion
-	if prompt.completionCapture != nil {
-		completion = a.client.completions.capturedCompletion(prompt.completionCapture, turnID)
-	}
-	for _, frame := range prompt.early.frames {
-		if completion != nil && completion.position < frame.position {
-			prompt.recordTerminalLocked(*completion)
-			completion = nil
-		}
-		a.routeBoundTurnLocked(prompt.runCtx, state, prompt, turnID, frame)
-	}
-	if completion != nil {
-		prompt.recordTerminalLocked(*completion)
-	}
-	if prompt.eventFailure == nil {
-		prompt.eventFailure = prompt.early.deliveryFailure(turnID, prompt.terminal)
-	}
-	prompt.early = earlyTurn{}
-}
-
-// startObservation connects protocol ACK waiting to this turn's native evidence.
-func (p *nativeTurn) startObservation() turnStartObservation {
-	return turnStartObservation{
-		confirmedID: p.confirmedTurnID,
-		terminal:    p.terminalSignal,
-		capture:     p.setCompletionCapture,
-		completion:  p.observedCompletion,
-	}
-}
-
-// setCompletionCapture attaches the exact protocol capture before native submission.
-func (p *nativeTurn) setCompletionCapture(capture *completionCapture) {
-	p.eventsMu.Lock()
-	p.completionCapture = capture
-	p.eventsMu.Unlock()
-}
-
-// observedCompletion returns the exact terminal payload once it is immutable.
-func (p *nativeTurn) observedCompletion() *protocol.TurnCompletedNotification {
-	select {
-	case <-p.terminalSignal:
-		return &p.terminal.notification
-	default:
-		return nil
-	}
-}
-
-// recordTerminalLocked seals the owner after retaining the provider's terminal payload.
-func (p *nativeTurn) recordTerminalLocked(completion receivedCompletion) {
-	if p.terminal != nil {
-		return
-	}
-	for _, item := range completion.notification.Turn.Items {
-		p.observed.recordItem(item, false)
-	}
-	p.terminal = &completion
-	close(p.terminalSignal)
-}
-
-var errNativeTerminalObserved = errors.New("native terminal observed before acknowledgment")
-
-// awaitNativeAcknowledgment lets independently proven completion end the ACK wait.
-// The transport keeps its bounded, one-shot response observer after local cancellation.
-func awaitNativeAcknowledgment(ctx context.Context, terminal <-chan struct{}, call func(context.Context) error) error {
-	if terminal == nil {
-		return call(ctx)
-	}
-	ackCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ack := make(chan error, 1)
-	go func() { ack <- call(ackCtx) }()
-	select {
-	case err := <-ack:
-		return err
-	case <-terminal:
-		cancel()
-		<-ack
-		return errNativeTerminalObserved
-	case <-ctx.Done():
-		// Join the locally cancelled request. The protocol transport retains any
-		// detached observer, but the invocation must not leave a waiter behind.
-		err := <-ack
-		select {
-		case <-terminal:
-			return errNativeTerminalObserved
-		default:
-			if err != nil {
-				return err
-			}
-			return ctx.Err()
-		}
-	}
-}
-
-// confirmedTurnID returns a native ID bound to this submission.
-func (p *nativeTurn) confirmedTurnID() string {
-	id, _ := p.currentTurn()
-	return id
-}
-
-// attachTurnEvents binds accounting and event delivery to the admitted native identity.
-func (a *Agent) attachTurnEvents(state *sessionState, prompt *nativeTurn, turnID string, updater sessionUpdater) {
-	if a.delivery != nil && updater != nil {
-		prompt.mu.Lock()
-		prompt.delivery = &turnDelivery{
-			owner: a.delivery, updater: updater, ctx: prompt.runCtx,
-			stillOwned: func() bool {
-				return prompt.runCtx.Err() == nil && a.sessions.isCurrent(state) && sessionActiveTurn(state) == prompt
-			},
-		}
-		updater = prompt.delivery
-		prompt.mu.Unlock()
-	}
-	router := newEventRouter(updater, turnGeneration{
-		SessionID:  acp.SessionId(state.id),
-		ThreadID:   state.id,
-		TurnID:     turnID,
-		Generation: prompt.generation,
-	}, a, a.logger, state.terminalOutputMode)
-	state.mu.Lock()
-	if state.usageTotal != nil {
-		baseline := *state.usageTotal
-		router.handler.previous = &baseline
-		router.handler.baselineKnown = true
-	}
-	state.mu.Unlock()
-	router.handler.checkpoint = func(total *turnUsage) {
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		if state.activeTurn == prompt {
-			state.usageTotal = total
-		}
-	}
-	prompt.setEventRouter(router)
-}
-
-// waitDelivery waits for the ACP updates already mapped from this native turn.
-func (p *nativeTurn) waitDelivery() error {
-	p.eventsMu.Lock()
-	err := p.eventFailure
-	p.eventsMu.Unlock()
-	p.mu.Lock()
-	delivery := p.delivery
-	p.mu.Unlock()
-	if delivery != nil {
-		err = errors.Join(err, delivery.wait(p.runCtx))
-	}
-	return err
-}
-
-// requestTurnInterrupt sends at most one interrupt for a proven native identity.
-func (a *Agent) requestTurnInterrupt(
-	state *sessionState,
-	prompt *nativeTurn,
-	turnID string,
-	resolveInterrupted bool,
-) {
-	if resolveInterrupted {
-		a.client.MarkTurnStale(state.id, turnID)
-	}
-	prompt.interruptOnce.Do(func() {
-		go func() {
-			defer close(prompt.interruptDone)
-			if resolveInterrupted {
-				defer a.client.ResolveTurnInterrupted(state.id, turnID)
-			}
-			if err := a.client.TurnInterrupt(a.runtimeCtx, state.id, turnID); err != nil {
-				a.logger.Warn("Failed to interrupt Codex turn", "thread_id", state.id, "turn_id", turnID, "error", err)
-			}
-		}()
+func (c *Client) executeTurn(t *turn) (frameWrite, error) {
+	stop := context.AfterFunc(t.prepare, func() {
+		c.mu.Lock()
+		c.cancelTurnLocked(t)
+		c.mu.Unlock()
 	})
+	defer stop()
+	c.startTurnObserver(t)
+	cleanup, err := t.options.PrepareSubmission(t.prepare, t.input)
+	t.cleanup = cleanup
+	if err != nil {
+		return frameWrite{}, err
+	}
+	releaseSkills, err := c.claimSkills(t.prepare, append([]string{t.session.cwd}, t.session.roots...))
+	if err != nil {
+		return frameWrite{}, err
+	}
+	defer releaseSkills()
+
+	method := "turn/start"
+	var params any = t.request
+	if t.compact {
+		method = "thread/compact/start"
+		params = protocol.ThreadCompactStartParams{ThreadID: string(t.session.id)}
+	}
+	written, err := c.call(t.native, method, params, nil, func() error {
+		if !c.activeLocked(t) {
+			return errTurnChanged
+		}
+		if cause := context.Cause(t.prepare); cause != nil {
+			return cause
+		}
+		t.writing = true
+		t.tierRevision = t.session.tierRevision
+		t.session.skillRoots = slices.Clone(c.skillRoots)
+		t.admission = agentclient.AdmissionUnknown
+		return nil
+	}, func(frame rpcFrame) {
+		if !c.activeLocked(t) || !t.writing {
+			return
+		}
+		if frame.Error != nil {
+			if t.outcome.Turn.NativeTurnID == nil && knownPreAdmissionRejection(frame.Error) {
+				t.rejected = true
+				t.admission = agentclient.AdmissionNotAccepted
+			}
+			return
+		}
+		if !t.compact {
+			var reply protocol.TurnStartResponse
+			if json.Unmarshal(frame.Result, &reply) == nil && reply.Turn.ID != "" {
+				c.bindTurnLocked(t, reply.Turn.ID)
+				c.captureTerminalLocked(t, reply.Turn)
+			}
+		}
+	})
+	if written.submission() == agentclient.SubmissionNotSent {
+		return written, err
+	}
+	c.mu.Lock()
+	terminal := t.outcome.Turn.Status != ""
+	rejected := t.rejected
+	if !t.compact && !terminal && !rejected && t.admission == agentclient.AdmissionUnknown && err == nil {
+		err = errors.New("Codex turn/start did not identify the accepted turn")
+	}
+	c.mu.Unlock()
+	if terminal || rejected {
+		if errors.Is(err, errTerminal) {
+			err = nil
+		}
+		return written, err
+	}
+	if err != nil {
+		c.mu.Lock()
+		c.cancelTurnLocked(t)
+		c.mu.Unlock()
+	}
+	select {
+	case <-t.terminal:
+		if errors.Is(err, errTerminal) {
+			err = nil
+		}
+		return written, err
+	case <-t.native.Done():
+		cause := context.Cause(t.native)
+		if errors.Is(cause, errTerminal) {
+			return written, err
+		}
+		return written, errors.Join(err, cause)
+	}
 }
 
-// releaseTurn clears the lane only if the exact invocation still owns it.
-func (a *Agent) releaseTurn(state *sessionState, prompt *nativeTurn) {
-	state.mu.Lock()
-	if state.activeTurn == prompt {
-		state.activeTurn = nil
-	}
-	state.mu.Unlock()
+func knownPreAdmissionRejection(err *acp.RequestError) bool {
+	// Invalid request/params and method absence are protocol-level rejection.
+	return err.Code == -32600 || err.Code == -32601 || err.Code == -32602
 }
 
-// Cancel asks the native turn owner to interrupt the current ACP session.
-func (a *Agent) Cancel(_ context.Context, notification acp.CancelNotification) error {
-	state, ok := a.sessions.get(string(notification.SessionId))
-	if !ok {
-		return nil
+func (c *Client) activeLocked(t *turn) bool {
+	return c.sessions[t.session.id] == t.session && t.session.active == t
+}
+
+func (c *Client) ownsTurnLocked(t *turn) bool {
+	if c.sessions[t.session.id] != t.session {
+		return false
 	}
-	state.mu.Lock()
-	prompt := state.activeTurn
-	state.mu.Unlock()
-	if prompt == nil {
-		return nil
+	_, draining := t.session.draining[t]
+	return t.session.active == t || draining
+}
+
+func (c *Client) bindTurnLocked(t *turn, id string) {
+	if t.outcome.Turn.NativeTurnID != nil || id == "" || len(id) > maxNativeIDBytes {
+		return
 	}
-	turnID := prompt.requestCancel()
-	if turnID != "" {
-		a.requestTurnInterrupt(state, prompt, turnID, false)
+	if c.seenTurnLocked(t.session.id, id) {
+		return
+	}
+	c.rememberTurnLocked(t.session.id, id)
+	t.outcome.Turn.NativeTurnID = pointer(id)
+	t.admission = agentclient.AdmissionConfirmed
+	if t.writing && !t.compact {
+		if model := value(t.request.Model); model != "" {
+			t.session.admittedModel = model
+		}
+		if t.request.ServiceTier.IsPresent() && t.tierRevision == t.session.tierRevision {
+			// Admission supplies inheritance evidence only. The effective tier is
+			// still unknown until Codex reports it.
+			t.session.inheritedTier, _ = t.request.ServiceTier.Value()
+		}
+	}
+	if t.input.NativeInputID != nil {
+		t.outcome.Turn.ConsumedInputIDs = append(t.outcome.Turn.ConsumedInputIDs, *t.input.NativeInputID)
+	}
+	close(t.ready)
+	early := t.early
+	t.early = nil
+	t.earlyBytes = 0
+	t.earlyEvidenceBytes = 0
+	t.earlyEvidenceCount = 0
+	for _, frame := range early {
+		c.receiveLocked(frame.method, frame.params)
+	}
+}
+
+func (c *Client) finishTurn(t *turn, written frameWrite, err error) agentclient.PromptResult {
+	t.stopPrepare(err)
+	t.stopNative(err)
+	c.mu.Lock()
+	t.finishing = true
+	steerSettled := t.steerSettled
+	close(t.updates)
+	c.mu.Unlock()
+	if steerSettled != nil {
+		<-steerSettled
+	}
+	drained := make(chan struct{})
+	go func() {
+		<-t.observerDone
+		t.interactions.Wait()
+		close(drained)
+	}()
+	wait := time.NewTimer(controlTimeout)
+	select {
+	case <-drained:
+	case <-wait.C:
+		c.mu.Lock()
+		if t.outcome.DeliveryError == nil {
+			t.outcome.DeliveryError = context.DeadlineExceeded
+		}
+		c.fail(context.DeadlineExceeded)
+		c.mu.Unlock()
+	}
+	wait.Stop()
+	t.stopObserve()
+	if t.cleanup != nil {
+		t.cleanup()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeLocked(t) {
+		t.session.active = nil
+		if t.outcome.Turn.Status == "" || t.consumed == nil && (t.previous == nil || !t.previous.disputed) {
+			t.session.usageCheckpoint = nil
+		}
+	}
+	delete(t.session.draining, t)
+	close(t.released)
+	submission := written.submission()
+	admission := t.admission
+	if submission == agentclient.SubmissionNotSent {
+		admission = agentclient.AdmissionNotAccepted
+	}
+	result := agentclient.PromptResult{Receipt: agentclient.PromptReceipt{Input: t.input, Submission: submission, Admission: admission, OperationError: err}}
+	if (submission != agentclient.SubmissionNotSent || t.autonomous) && t.outcome.Turn.NativeTurnID != nil {
+		t.outcome.PossibleSideEffects = true
+		if t.outcome.Turn.Status == "" {
+			t.outcome.OperationError = err
+			if t.outcome.OperationError == nil {
+				t.outcome.OperationError = errUnconfirmed
+			}
+		}
+		o := t.outcome.Snapshot()
+		if t.retainOutcome {
+			capOutcome(&o)
+		}
+		result.Outcome = &o
+	}
+	c.publishOutcomeLocked(t, result.Outcome)
+	return result
+}
+
+// Cancel synchronously marks the captured owner and schedules bounded native control.
+func (c *Client) Cancel(notification acp.CancelNotification) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s := c.sessions[notification.SessionId]; s != nil && s.active != nil {
+		c.cancelTurnLocked(s.active)
 	}
 	return nil
+}
+
+func (c *Client) cancelTurnLocked(t *turn) {
+	if !c.activeLocked(t) || t.stopped || t.outcome.Turn.Status != "" {
+		return
+	}
+	t.stopped = true
+	t.stopPrepare(errStopped)
+	if !t.writing {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+	go c.interrupt(ctx, cancel, t)
+}
+
+func (c *Client) interrupt(ctx context.Context, cancel context.CancelFunc, t *turn) {
+	defer cancel()
+	select {
+	case <-t.ready:
+	case <-t.native.Done():
+		return
+	case <-ctx.Done():
+		c.expireTurn(t)
+		return
+	}
+	c.mu.Lock()
+	id := value(t.outcome.Turn.NativeTurnID)
+	c.mu.Unlock()
+	_, _ = c.call(ctx, "turn/interrupt", protocol.TurnInterruptParams{ThreadID: string(t.session.id), TurnID: id}, nil, func() error {
+		if !c.activeLocked(t) || t.outcome.Turn.Status != "" || value(t.outcome.Turn.NativeTurnID) != id {
+			return errTurnChanged
+		}
+		return nil
+	}, nil)
+	select {
+	case <-t.native.Done():
+	case <-ctx.Done():
+		c.expireTurn(t)
+	}
+}
+
+func (c *Client) expireTurn(t *turn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeLocked(t) && t.outcome.Turn.Status == "" && !t.rejected {
+		// An unconfirmed write may already have changed the native thread.
+		c.fail(errUnconfirmed)
+	}
+}
+
+func (c *Client) Steer(ctx context.Context, request agentclient.SteerRequest) (agentclient.SteerResponse, error) {
+	input, err := encodePrompt(request.Prompt)
+	if err != nil {
+		return agentclient.SteerResponse{}, err
+	}
+	c.mu.Lock()
+	s, err := c.sessionLocked(request.SessionID)
+	if err != nil {
+		c.mu.Unlock()
+		return agentclient.SteerResponse{}, err
+	}
+	t := s.active
+	exact := request.Target != (agentclient.Scope{})
+	if exact && (t == nil || request.Target != (agentclient.Scope{
+		SessionID: s.id, HostInvocationID: t.input.HostInvocationID, NativeInvocationID: t.outcome.Turn.InvocationID,
+	}) || t.outcome.Turn.NativeTurnID == nil) {
+		c.mu.Unlock()
+		return agentclient.SteerResponse{}, errTurnChanged
+	}
+	if t == nil && len(s.draining) == 0 && !s.busy && !s.closing && !request.PromptRequired {
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return agentclient.SteerResponse{}, err
+		}
+		turnCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+		t, err = c.reservePromptLocked(turnCtx, s, input, nil, request.Options, true)
+		if err != nil {
+			cancel(err)
+			c.mu.Unlock()
+			return agentclient.SteerResponse{}, err
+		}
+		c.mu.Unlock()
+		return c.runIdleSteer(ctx, t, cancel)
+	}
+	if t == nil || t.compact || t.stopped || t.finishing || t.outcome.Turn.Status != "" || s.closing {
+		c.mu.Unlock()
+		return agentclient.SteerResponse{}, errTurnBusy
+	}
+	c.mu.Unlock()
+	select {
+	case <-t.ready:
+	case <-t.released:
+		return agentclient.SteerResponse{}, errTurnChanged
+	case <-ctx.Done():
+		return agentclient.SteerResponse{}, ctx.Err()
+	}
+	c.mu.Lock()
+	nativeID := value(t.outcome.Turn.NativeTurnID)
+	if !c.steerTargetLocked(t, nativeID) {
+		c.mu.Unlock()
+		return agentclient.SteerResponse{}, errTurnChanged
+	}
+	identity := newInputIdentity(s.id, request.Options.HostInvocationID)
+	s.inputs[identity.InputID] = struct{}{}
+	t.interactions.Add(1)
+	c.mu.Unlock()
+	defer t.interactions.Done()
+
+	gateCtx, cancel := context.WithCancelCause(ctx)
+	stopNative := context.AfterFunc(t.native, func() { cancel(errTurnChanged) })
+	stopPrepare := context.AfterFunc(t.prepare, func() { cancel(context.Cause(t.prepare)) })
+	defer func() { stopNative(); stopPrepare(); cancel(nil) }()
+	cleanup, err := request.Options.PrepareSubmission(gateCtx, identity)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return steerReply("", identity, agentclient.SubmissionNotSent, agentclient.AdmissionNotAccepted, err)
+	}
+	params := protocol.TurnSteerParams{ThreadID: string(s.id), ExpectedTurnID: nativeID, Input: input, ClientUserMessageID: pointer(identity.InputID)}
+	result := make(chan agentclient.PromptReceipt, 1)
+	go func() { result <- c.submitSteer(ctx, t, params, identity) }()
+	select {
+	case receipt := <-result:
+		return steerReply("injected", identity, receipt.Submission, receipt.Admission, receipt.OperationError)
+	case <-ctx.Done():
+		// Cancellation can race a committed write. Preserve the canonical
+		// reader's ability to capture native evidence even after we return.
+		select {
+		case receipt := <-result:
+			return steerReply("injected", identity, receipt.Submission, receipt.Admission, receipt.OperationError)
+		default:
+		}
+		c.mu.Lock()
+		submission, admission := agentclient.SubmissionNotSent, agentclient.AdmissionNotAccepted
+		if _, attempted := t.steerInputs[identity.InputID]; attempted {
+			submission, admission = agentclient.SubmissionUnknown, agentclient.AdmissionUnknown
+		}
+		if slices.Contains(t.outcome.Turn.ConsumedInputIDs, identity.InputID) {
+			submission, admission = agentclient.SubmissionSent, agentclient.AdmissionConfirmed
+		}
+		c.mu.Unlock()
+		return steerReply("", identity, submission, admission, ctx.Err())
+	}
+}
+
+func newInputIdentity(sessionID acp.SessionId, hostID string) agentclient.PromptSubmission {
+	id := newID()
+	if hostID == "" {
+		hostID = newID()
+	}
+	return agentclient.PromptSubmission{SessionID: sessionID, HostInvocationID: hostID, InputID: id, NativeInputID: pointer(id)}
+}
+
+func steerReply(outcome string, identity agentclient.PromptSubmission, submission agentclient.Submission, admission agentclient.Admission, err error) (agentclient.SteerResponse, error) {
+	if err != nil {
+		outcome = ""
+	}
+	return agentclient.SteerResponse{Outcome: outcome, Receipt: &agentclient.PromptReceipt{
+		Input: identity.Snapshot(), Submission: submission, Admission: admission, OperationError: err,
+	}}, err
+}
+
+func (c *Client) runIdleSteer(ctx context.Context, t *turn, cancel context.CancelCauseFunc) (agentclient.SteerResponse, error) {
+	results := make(chan agentclient.PromptResult, 1)
+	go func() {
+		defer cancel(nil)
+		results <- c.runPrompt(t)
+	}()
+	select {
+	case <-t.ready:
+		return steerReply("startedNewTurn", t.input, agentclient.SubmissionSent, agentclient.AdmissionConfirmed, nil)
+	case result := <-results:
+		err := result.Receipt.OperationError
+		if result.Receipt.Admission == agentclient.AdmissionConfirmed {
+			err = nil
+		} else if err == nil {
+			err = errUnconfirmed
+		}
+		return steerReply("startedNewTurn", t.input, result.Receipt.Submission, result.Receipt.Admission, err)
+	case <-ctx.Done():
+		cancel(ctx.Err())
+		c.mu.Lock()
+		admission := t.admission
+		submission := agentclient.SubmissionNotSent
+		if t.writing {
+			submission = agentclient.SubmissionUnknown
+		}
+		if admission == agentclient.AdmissionConfirmed {
+			submission = agentclient.SubmissionSent
+		}
+		c.mu.Unlock()
+		return steerReply("", t.input, submission, admission, ctx.Err())
+	}
+}
+
+func (c *Client) steerTargetLocked(t *turn, nativeID string) bool {
+	return nativeID != "" && c.activeLocked(t) && !t.stopped && !t.finishing && t.outcome.Turn.Status == "" &&
+		!t.session.closing && value(t.outcome.Turn.NativeTurnID) == nativeID
+}
+
+// submitSteer owns one independent write-to-ack interval. After the write is
+// committed, foreground cancellation does not discard native input evidence.
+func (c *Client) submitSteer(waiter context.Context, t *turn, params protocol.TurnSteerParams, input agentclient.PromptSubmission) agentclient.PromptReceipt {
+	ctx, cancel := context.WithTimeout(c.life, controlTimeout)
+	defer cancel()
+	id := input.InputID
+	admitted := false
+	admission := agentclient.AdmissionNotAccepted
+	var reply protocol.TurnSteerResponse
+	written, err := c.call(ctx, "turn/steer", params, &reply, func() error {
+		if err := waiter.Err(); err != nil {
+			return err
+		}
+		if !c.steerTargetLocked(t, params.ExpectedTurnID) {
+			return errTurnChanged
+		}
+		if len(t.steerInputs) >= maxPendingUpdates {
+			return acp.NewInvalidRequest("Codex steering input retention is full")
+		}
+		if t.steerPending == 0 {
+			t.steerSettled = make(chan struct{})
+		}
+		t.steerPending++
+		t.steerInputs[id] = struct{}{}
+		admitted = true
+		admission = agentclient.AdmissionUnknown
+		return nil
+	}, func(frame rpcFrame) {
+		if !admitted || !c.ownsTurnLocked(t) {
+			return
+		}
+		var ack protocol.TurnSteerResponse
+		if frame.Error == nil && json.Unmarshal(frame.Result, &ack) == nil && ack.TurnID == params.ExpectedTurnID {
+			consumeInput(t, id)
+		} else if frame.Error != nil && knownPreAdmissionRejection(frame.Error) {
+			admission = agentclient.AdmissionNotAccepted
+		}
+	})
+	if err == nil && reply.TurnID != params.ExpectedTurnID {
+		err = errTurnChanged
+	}
+	submission := written.submission()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if admitted {
+		t.steerPending--
+		if t.steerPending == 0 {
+			close(t.steerSettled)
+		}
+	}
+	if slices.Contains(t.outcome.Turn.ConsumedInputIDs, id) {
+		submission, admission = agentclient.SubmissionSent, agentclient.AdmissionConfirmed
+	} else if submission == agentclient.SubmissionNotSent {
+		admission = agentclient.AdmissionNotAccepted
+	}
+	return agentclient.PromptReceipt{Input: input, Submission: submission, Admission: admission, OperationError: err}
+}
+
+func consumeInput(t *turn, id string) {
+	if !slices.Contains(t.outcome.Turn.ConsumedInputIDs, id) {
+		t.outcome.Turn.ConsumedInputIDs = append(t.outcome.Turn.ConsumedInputIDs, id)
+	}
+}
+
+func (c *Client) Compact(ctx context.Context, request acpmeta.CompactRequest) (acpmeta.CompactResponse, error) {
+	c.mu.Lock()
+	s, err := c.idleSessionLocked(acp.SessionId(request.SessionID))
+	if err != nil {
+		c.mu.Unlock()
+		return acpmeta.CompactResponse{}, err
+	}
+	t, err := c.installTurnLocked(ctx, s, true, false)
+	c.mu.Unlock()
+	if err != nil {
+		return acpmeta.CompactResponse{}, err
+	}
+	written, err := c.executeTurn(t)
+	r := c.finishTurn(t, written, err)
+	if r.Outcome == nil {
+		return acpmeta.CompactResponse{}, r.Receipt.OperationError
+	}
+	o := r.Outcome
+	meta := acpmeta.WithNativeTurn(nil, o.Turn)
+	if o.Turn.Usage != nil {
+		meta = acpmeta.WithTurnUsage(meta, *o.Turn.Usage)
+	}
+	return acpmeta.CompactResponse{TurnID: value(o.Turn.NativeTurnID), Status: t.nativeStatus, Meta: meta}, errors.Join(err, o.NativeFailure, o.OperationError, o.DeliveryError)
+}
+
+func value[T any](v *T) (out T) {
+	if v != nil {
+		return *v
+	}
+	return out
+}
+
+type turnIdentity struct {
+	// thread scopes the native turn to its persisted owner.
+	thread acp.SessionId
+	// turn is the provider-issued ID on that thread.
+	turn string
+}
+
+func (c *Client) seenTurnLocked(thread acp.SessionId, id string) bool {
+	_, seen := c.seenTurns[turnIdentity{thread: thread, turn: id}]
+	return seen
+}
+
+func (c *Client) rememberTurnLocked(thread acp.SessionId, id string) {
+	const retention = 4096
+	key := turnIdentity{thread: thread, turn: id}
+	if len(c.recentTurns) < retention {
+		c.recentTurns = append(c.recentTurns, key)
+	} else {
+		delete(c.seenTurns, c.recentTurns[c.nextRecentTurn])
+		c.recentTurns[c.nextRecentTurn] = key
+		c.nextRecentTurn = (c.nextRecentTurn + 1) % retention
+	}
+	c.seenTurns[key] = struct{}{}
+}
+
+func (c *Client) startTurnObserver(t *turn) {
+	go func() { defer c.interactions.Done(); c.observeTurn(t) }()
+}
+
+func (c *Client) startAutonomousLocked(s *session, event turnEvent) *turn {
+	id := event.Turn.ID
+	if c.closing || c.life.Err() != nil || s.busy || s.closing || id == "" || len(id) > maxNativeIDBytes ||
+		event.Turn.Status != protocol.PurpleInProgress || c.seenTurnLocked(s.id, id) {
+		return nil
+	}
+	previous := s.active
+	if previous != nil {
+		if previous.writing && previous.outcome.Turn.Status == "" {
+			return nil
+		}
+		c.cancelTurnLocked(previous)
+	}
+	t, err := c.installTurnLocked(c.life, s, false, true)
+	if err != nil {
+		c.fail(err)
+		return nil
+	}
+	if previous != nil {
+		if s.draining == nil {
+			s.draining = make(map[*turn]struct{})
+		}
+		s.draining[previous] = struct{}{}
+	}
+	t.autonomous = true
+	t.model = value(s.settings.Observed.Model)
+	t.request.Model = nil
+	t.writing = true
+	t.input.SessionID = s.id
+	t.outcome.Turn.Origin = acpmeta.NativeTurnOriginUnknown
+	if event.Unprompted {
+		t.outcome.Turn.Origin = acpmeta.NativeTurnOriginProvider
+	}
+	c.bindTurnLocked(t, id)
+	lease := !c.skillChanging && slices.Equal(c.skillRoots, s.skillRoots)
+	if lease {
+		c.skillUsers++
+	} else {
+		c.cancelTurnLocked(t)
+	}
+	go func() {
+		c.startTurnObserver(t)
+		<-t.native.Done()
+		cause := context.Cause(t.native)
+		if errors.Is(cause, errTerminal) {
+			cause = nil
+		}
+		if lease {
+			c.releaseSkills()
+		}
+		c.finishTurn(t, frameWrite{}, cause)
+	}()
+	return t
 }

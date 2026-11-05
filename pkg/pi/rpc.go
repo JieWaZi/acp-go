@@ -1,432 +1,285 @@
 package pi
 
-// Pi RPC 进程层对照 svkozak/pi-acp src/pi-rpc/process.ts 移植。
-// MIT Copyright (c) 2025 Sergii Kozak；完整许可见 UPSTREAM-LICENSE。
-// NeuxBot 本地修改：事件队列按条数与字节施加可取消背压，启动片段复用同一资源预算。
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
-	"strconv"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	agentclient "github.com/JieWaZi/acp-go/pkg/agentclient"
 )
 
 const (
-	piEventQueueCapacity = 256
-	piEventQueueBytes    = 16 << 20
-	piRPCFrameBytes      = 16 << 20
+	maxRecord      = 16 << 20
+	maxQueued      = 256
+	controlTimeout = 4 * time.Second
 )
 
-// rpcEvent 保存一条原始 Pi 事件及其等待交付期间占用的帧字节。
-type rpcEvent struct {
-	// data 是尚未归一为 ACP 的完整原生事件。
-	data map[string]any
-	// bytes 是原始 JSON 帧的大小，不计解码对象和当前处理项的额外开销。
-	bytes int
-}
-
-// rpcProcess 拥有一个直接启动的 Pi CLI，不启动 ACP 桥进程。
-type rpcProcess struct {
-	// command 是 Pi 的唯一子进程。
-	command *exec.Cmd
-	// input 发送官方 RPC 命令和扩展 UI 响应。
-	input io.WriteCloser
-	// output 接收 Pi JSON 行与事件。
-	output io.ReadCloser
-	// cancel 回收进程及其后代。
-	cancel context.CancelFunc
-	// mutex 保护请求关联、事件预算与关闭状态。
-	mutex sync.Mutex
-	// writeMutex 保证每个 JSON 命令整体写入。
-	writeMutex sync.Mutex
-	// pending 保存尚未完成的官方 RPC 请求。
-	pending map[string]chan rpcResponse
-	// failure 保存协议、扫描或进程退出的原始诊断。
-	failure error
-	// stderr 保存 CLI 原始诊断尾部。
-	stderr *rpcTail
-	// sequence 为请求分配唯一标识。
-	sequence atomic.Uint64
-	// events 按 Pi 发出顺序交付事件，不静默丢弃。
-	events chan rpcEvent
-	// eventBytes 是仍在事件队列内等待交付的原始帧字节，受 mutex 保护。
-	eventBytes int
-	// eventChanged 在实际出队归还预算后唤醒生产者，受 mutex 保护。
-	eventChanged chan struct{}
-	// consumerStarted 标记常驻事件消费者已取得所有权；此前不能阻塞启动 RPC 的响应读取。
-	consumerStarted bool
-	// ownerDone 复用创建进程的 Context，任何致命取消都能解除队列等待。
-	ownerDone <-chan struct{}
-	// done 在进程完全回收后关闭。
-	done chan struct{}
-	// stop 通知读取循环终止。
-	stop chan struct{}
-	// once 保证关闭幂等。
-	once sync.Once
-}
-
-// rpcResponse 是 Pi 官方 response 信封，不能当作 ACP JSON-RPC。
-type rpcResponse struct {
-	// ID 关联客户端发送的命令。
-	ID string `json:"id"`
-	// Type 区分请求结果和流式事件。
+type record struct {
+	// Type distinguishes RPC responses from session events.
 	Type string `json:"type"`
-	// Success 表示命令是否执行成功。
-	Success bool `json:"success"`
-	// Data 保留官方结果内容。
-	Data json.RawMessage `json:"data"`
-	// Error 是 Pi 返回的错误说明。
+	// ID correlates a response with its request.
+	ID string `json:"id"`
+	// Command echoes the native operation associated with a response.
+	Command string `json:"command"`
+	// Success preserves whether Pi explicitly accepted the command.
+	Success *bool `json:"success"`
+	// Error is native rejection text used for local classification.
 	Error string `json:"error"`
+	// Data holds the operation-specific result.
+	Data json.RawMessage `json:"data"`
 }
 
-// startRPC 按 upstream 的 rpc/no-themes 参数直接启动 Pi。
-func startRPC(config Config, cwd, extension, sessionPath string) (*rpcProcess, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	args := append([]string(nil), config.PrefixArgs...)
-	args = append(args, "--mode", "rpc", "--no-themes", "--extension", extension)
-	if sessionPath != "" {
-		args = append(args, "--session", sessionPath)
-	}
-	cmd := exec.CommandContext(ctx, config.PiPath, args...)
-	prepareProcess(cmd)
-	cmd.Dir, cmd.Env, cmd.WaitDelay = cwd, config.Environment, 2*time.Second
-	stderr := &rpcTail{}
-	cmd.Stderr = stderr
-	input, err := cmd.StdinPipe()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	output, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		_ = input.Close()
-		return nil, err
-	}
-	if err = cmd.Start(); err != nil {
-		cancel()
-		_ = input.Close()
-		_ = output.Close()
-		return nil, err
-	}
-	p := &rpcProcess{command: cmd, input: input, output: output, cancel: cancel, pending: map[string]chan rpcResponse{}, events: make(chan rpcEvent, piEventQueueCapacity), eventChanged: make(chan struct{}), ownerDone: ctx.Done(), done: make(chan struct{}), stop: make(chan struct{}), stderr: stderr}
-	go p.read()
-	return p, nil
+type rpcRejection struct {
+	// command is the locally issued operation that Pi refused.
+	command string
+	// detail is the private native error used to classify the refusal.
+	detail string
 }
 
-// read 关联响应并按序投递事件，退出时解除所有等待。
-func (p *rpcProcess) read() {
+func (e *rpcRejection) Error() string { return "Pi rejected " + e.command }
+
+type rpc struct {
+	// process owns the child process tree and its pipes.
+	process *agentclient.Process
+	// writeGate gives one command exclusive access to the stdin deadline and write.
+	writeGate chan struct{}
+	// dismissGate bounds concurrent replies to dialogs outside a prompt.
+	dismissGate chan struct{}
+	// done closes on the first transport failure or native exit.
+	done chan struct{}
+	// ready closes when the managed extension reports registration.
+	ready chan struct{}
+	// sequence allocates distinct command IDs for this process.
+	sequence atomic.Uint64
+
+	// mu protects pending replies, transport failure, and active event routing.
+	mu sync.Mutex
+	// failure stores the first transport cause.
+	failure error
+	// pending maps command IDs to their response waiters.
+	pending map[string]chan record
+	// active is the prompt eligible to receive session events.
+	active *invocation
+}
+
+func newRPC(p *agentclient.Process) *rpc {
+	return &rpc{process: p, writeGate: make(chan struct{}, 1), dismissGate: make(chan struct{}, 8), done: make(chan struct{}), ready: make(chan struct{}), pending: make(map[string]chan record)}
+}
+
+func (r *rpc) fail(err error) {
+	r.mu.Lock()
+	if r.failure == nil {
+		r.failure = err
+		close(r.done)
+	}
+	r.mu.Unlock()
+}
+
+func (r *rpc) err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.failure
+}
+
+func (r *rpc) read() {
 	defer func() {
-		p.cancel()
-		waitErr := p.command.Wait()
-		p.mutex.Lock()
-		if p.failure == nil {
-			p.failure = waitErr
-		}
-		p.mutex.Unlock()
-		close(p.events)
-		close(p.done)
+		ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+		defer cancel()
+		_ = r.process.Close(ctx)
 	}()
-	scanner := bufio.NewScanner(p.output)
-	scanner.Buffer(make([]byte, 64*1024), piRPCFrameBytes)
-	started := false
+	scanner := bufio.NewScanner(r.process.Stdout())
+	scanner.Buffer(make([]byte, 32<<10), maxRecord)
 	for scanner.Scan() {
-		var response rpcResponse
-		if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
-			if started {
-				p.setFailure(fmt.Errorf("Pi RPC invalid JSON: %w", err))
-				return
-			}
-			continue // Pi 启动前导文本不是协议结果。
-		}
-		if response.Type == "response" && response.ID != "" {
-			started = true
-			p.mutex.Lock()
-			ch := p.pending[response.ID]
-			delete(p.pending, response.ID)
-			p.mutex.Unlock()
-			if ch != nil {
-				ch <- response
-			}
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		var event map[string]any
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			p.setFailure(fmt.Errorf("Pi RPC invalid event: %w", err))
+		var rec record
+		if json.Unmarshal(line, &rec) != nil || rec.Type == "" {
+			r.fail(errors.New("Pi returned invalid RPC JSON"))
 			return
 		}
-		if err := p.enqueueEvent(rpcEvent{data: event, bytes: len(scanner.Bytes())}); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				p.setFailure(err)
+		if rec.Type == "response" {
+			r.mu.Lock()
+			if waiter := r.pending[rec.ID]; waiter != nil {
+				delete(r.pending, rec.ID)
+				waiter <- rec
 			}
+			r.mu.Unlock()
+			continue
+		}
+		r.mu.Lock()
+		active := r.active
+		r.mu.Unlock()
+		if rec.Type == "extension_error" && active == nil {
+			r.fail(classified("extension_error", "session_open"))
+			return
+		}
+		if rec.Type == "extension_ui_request" {
+			var ui uiRequest
+			if json.Unmarshal(line, &ui) == nil {
+				if ui.Method == "setStatus" && ui.StatusKey == "acp-go.extension-ready" && ui.StatusText == "ready" {
+					select {
+					case <-r.ready:
+					default:
+						close(r.ready)
+					}
+				}
+				if ui.ID != "" && ui.interactive() {
+					// Dialogs may be needed before the prompt acknowledgment. They
+					// have their own bounded delivery lane, outside the pipe reader.
+					queued, withinBudget := false, true
+					if active != nil {
+						queued, withinBudget = active.enqueueUI(ui, len(line))
+					}
+					if !withinBudget {
+						r.fail(errors.New("Pi extension dialog budget exhausted"))
+						return
+					}
+					if !queued {
+						select {
+						case r.dismissGate <- struct{}{}:
+							go r.dismiss(ui.ID)
+						default:
+							r.fail(errors.New("Pi idle extension dialog budget exhausted"))
+							return
+						}
+					}
+					continue
+				}
+			}
+		}
+		if active != nil && !active.enqueueEvent(line) {
+			r.fail(errors.New("Pi RPC event budget exhausted"))
 			return
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		p.setFailure(fmt.Errorf("Pi RPC stdout: %w", err))
+	if scanner.Err() != nil {
+		r.fail(errors.New("Pi RPC stdout failed or exceeded its record limit"))
+	} else {
+		r.fail(io.EOF)
 	}
 }
 
-// enqueueEvent 在独立进程所有者仍有效时等待预算，不把正常宿主背压伪装为 Pi 失败。
-func (p *rpcProcess) enqueueEvent(event rpcEvent) error {
-	if event.bytes > piEventQueueBytes {
-		return errors.New("Pi RPC event exceeds 16 MiB queue budget")
+func (r *rpc) dismiss(id string) {
+	defer func() { <-r.dismissGate }()
+	ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
+	defer cancel()
+	_, _ = r.write(ctx, map[string]any{"type": "extension_ui_response", "id": id, "cancelled": true}, nil)
+}
+
+func (r *rpc) nextID() string { return fmt.Sprintf("pi-%d", r.sequence.Add(1)) }
+
+func (r *rpc) call(ctx context.Context, command string, args map[string]any, dst any) error {
+	_, err := r.request(ctx, r.nextID(), command, args, dst, nil)
+	return err
+}
+
+func (r *rpc) request(ctx context.Context, id, command string, args map[string]any, dst any, beforeWrite func() bool) (agentclient.Submission, error) {
+	payload := map[string]any{"id": id, "type": command}
+	maps.Copy(payload, args)
+	response := make(chan record, 1)
+	r.mu.Lock()
+	if r.failure != nil {
+		err := r.failure
+		r.mu.Unlock()
+		return agentclient.SubmissionNotSent, err
 	}
-	for {
+	r.pending[id] = response
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.pending, id)
+		r.mu.Unlock()
+	}()
+	sent, err := r.write(ctx, payload, beforeWrite)
+	if err != nil {
+		return sent, err
+	}
+	var rec record
+	select {
+	case rec = <-response:
+	case <-ctx.Done():
+		return sent, context.Cause(ctx)
+	case <-r.done:
+		// A final response can be read immediately before stdout EOF.
 		select {
-		case <-p.stop:
-			return context.Canceled
-		case <-p.ownerDone:
-			return context.Canceled
+		case rec = <-response:
 		default:
-		}
-		p.mutex.Lock()
-		if p.eventBytes+event.bytes <= piEventQueueBytes {
-			select {
-			case p.events <- event:
-				p.eventBytes += event.bytes
-				p.mutex.Unlock()
-				return nil
-			default:
-			}
-		}
-		changed := p.eventChanged
-		if !p.consumerStarted {
-			p.mutex.Unlock()
-			return errors.New("Pi RPC startup event queue resource budget exceeded (256 items or 16 MiB)")
-		}
-		p.mutex.Unlock()
-		select {
-		case <-changed:
-		case <-p.stop:
-			return context.Canceled
-		case <-p.ownerDone:
-			return context.Canceled
+			return sent, r.err()
 		}
 	}
-}
-
-// startEventConsumer 在真实消费循环接纳队列前切换到可取消背压阶段。
-func (p *rpcProcess) startEventConsumer() {
-	p.mutex.Lock()
-	p.consumerStarted = true
-	p.mutex.Unlock()
-}
-
-// releaseEvent 在实际取走事件后归还等待预算，所有队列所有者都在创建时初始化信用通知。
-func (p *rpcProcess) releaseEvent(event rpcEvent) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.eventBytes -= event.bytes
-	close(p.eventChanged)
-	p.eventChanged = make(chan struct{})
-}
-
-// nextEvent 由事件消费者与管理进程复用，接纳原始事件时立即归还队列预算。
-func (p *rpcProcess) nextEvent() (map[string]any, bool) {
-	event, ok := <-p.events
-	if !ok {
-		return nil, false
+	if rec.Command != command || rec.Success == nil {
+		err := errors.New("Pi returned an invalid RPC response")
+		r.fail(err)
+		return sent, err
 	}
-	p.releaseEvent(event)
-	return event.data, true
-}
-
-// setFailure 保存第一个读取错误，供等待中的请求共享。
-func (p *rpcProcess) setFailure(err error) {
-	p.mutex.Lock()
-	if p.failure == nil {
-		p.failure = err
+	if !*rec.Success {
+		return sent, &rpcRejection{command: command, detail: rec.Error}
 	}
-	p.mutex.Unlock()
-}
-
-// exitError 合并读取或退出错误及 CLI 原始 stderr 尾部。
-func (p *rpcProcess) exitError() error {
-	p.mutex.Lock()
-	err := p.failure
-	p.mutex.Unlock()
-	if err == nil {
-		err = errors.New("Pi process exited")
+	if dst != nil && len(rec.Data) > 0 && json.Unmarshal(rec.Data, dst) != nil {
+		return sent, errors.New("Pi returned an invalid RPC result")
 	}
-	if p.stderr != nil {
-		if detail := p.stderr.String(); detail != "" {
-			return fmt.Errorf("%w: %s", err, detail)
-		}
+	return sent, nil
+}
+
+func (r *rpc) write(ctx context.Context, payload map[string]any, beforeWrite func() bool) (agentclient.Submission, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil || len(encoded) >= maxRecord {
+		return agentclient.SubmissionNotSent, errors.New("Pi RPC command exceeds its encoding budget")
 	}
-	return err
-}
-
-// rpcTail 仅保留最近的原始 stderr，防止长时间运行无限占用内存。
-type rpcTail struct {
-	// mu 保护诊断尾部。
-	mu sync.Mutex
-	// data 保存最近的原始 stderr 字节。
-	data []byte
-}
-
-// Write 保留最近的诊断尾部。
-func (b *rpcTail) Write(data []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	const limit = 64 << 10
-	b.data = append(b.data, data...)
-	if len(b.data) > limit {
-		b.data = append([]byte(nil), b.data[len(b.data)-limit:]...)
-	}
-	return len(data), nil
-}
-
-// String 返回稳定的原始诊断快照。
-func (b *rpcTail) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(b.data)
-}
-
-// write 原子写入一条官方 RPC 消息。
-func (p *rpcProcess) write(value map[string]any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	p.writeMutex.Lock()
-	defer p.writeMutex.Unlock()
-	_, err = p.input.Write(append(data, '\n'))
-	return err
-}
-
-// rpcCall 保存已经写入 Pi 的请求，允许发送顺序与等待响应分离。
-type rpcCall struct {
-	// process 持有响应关联表。
-	process *rpcProcess
-	// id 是本次请求的关联标识。
-	id string
-	// command 用于响应错误说明。
-	command string
-	// response 接收对应请求的唯一结果。
-	response chan rpcResponse
-}
-
-// begin 原子登记并发送命令；调用者可用会话锁保证 prompt/abort 的发送顺序。
-func (p *rpcProcess) begin(ctx context.Context, command string, params map[string]any) (*rpcCall, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	id := strconv.FormatUint(p.sequence.Add(1), 10)
-	request := map[string]any{"id": id, "type": command}
-	for key, value := range params {
-		request[key] = value
-	}
-	call := &rpcCall{process: p, id: id, command: command, response: make(chan rpcResponse, 1)}
-	p.mutex.Lock()
-	p.pending[id] = call.response
-	p.mutex.Unlock()
-	// 管道阻塞时取消可回收失去响应的进程，避免持锁等待不可中断的 Write。
-	stop := context.AfterFunc(ctx, func() { _ = p.input.Close(); p.cancel() })
-	err := p.write(request)
-	stop()
-	if err != nil || ctx.Err() != nil {
-		call.forget()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
-	}
-	return call, nil
-}
-
-// forget 释放已完成或取消请求的关联记录。
-func (call *rpcCall) forget() {
-	call.process.mutex.Lock()
-	delete(call.process.pending, call.id)
-	call.process.mutex.Unlock()
-}
-
-// wait 以调用方 Context 限定响应等待，不阻止其他命令发出。
-func (call *rpcCall) wait(ctx context.Context, output any) error {
-	defer call.forget()
 	select {
-	case response := <-call.response:
-		if !response.Success {
-			return fmt.Errorf("Pi %s failed: %s", call.command, response.Error)
-		}
-		if output != nil && len(response.Data) > 0 {
-			return json.Unmarshal(response.Data, output)
-		}
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
-	case <-call.process.done:
-		return call.process.exitError()
+		return agentclient.SubmissionNotSent, context.Cause(ctx)
+	case <-r.done:
+		return agentclient.SubmissionNotSent, r.err()
+	case r.writeGate <- struct{}{}:
 	}
-}
-
-// call 发送命令并等待对应的官方 RPC 响应。
-func (p *rpcProcess) call(ctx context.Context, command string, params map[string]any, output any) error {
-	call, err := p.begin(ctx, command, params)
-	if err != nil {
-		return err
+	defer func() { <-r.writeGate }()
+	if err = r.err(); err != nil {
+		return agentclient.SubmissionNotSent, err
 	}
-	return call.wait(ctx, output)
-}
-
-// awaitExtensionReady 确认扩展注册成功，并保留此前到达的启动事件供会话按序处理。
-func (p *rpcProcess) awaitExtensionReady(ctx context.Context) ([]map[string]any, error) {
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-	var startupEvents []map[string]any
-	startupBytes := 0
-	for {
-		select {
-		case queued, ok := <-p.events:
-			if !ok {
-				return nil, fmt.Errorf("Pi extension failed to load: %w", p.exitError())
+	if err = context.Cause(ctx); err != nil {
+		return agentclient.SubmissionNotSent, err
+	}
+	if beforeWrite != nil && !beforeWrite() {
+		return agentclient.SubmissionNotSent, context.Canceled
+	}
+	stdin := r.process.Stdin()
+	if stdin == nil {
+		return agentclient.SubmissionNotSent, io.ErrClosedPipe
+	}
+	// The Process stdin is an os.Pipe. Arm cancellation only while holding
+	// the write gate so its deadline cannot interrupt a subsequent command.
+	if pipe, ok := stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		unarmed := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = pipe.SetWriteDeadline(time.Now())
+			close(unarmed)
+		})
+		defer func() {
+			if !stop() {
+				<-unarmed
 			}
-			p.releaseEvent(queued)
-			event := queued.data
-			if event["type"] == "extension_ui_request" && event["method"] == "setStatus" && event["statusKey"] == "acp-go.extension-ready" && event["statusText"] == "ready" {
-				return startupEvents, nil
-			}
-			if event["type"] == "extension_error" {
-				return nil, fmt.Errorf("Pi extension failed to load: %v", event["error"])
-			}
-			if len(startupEvents) >= piEventQueueCapacity || startupBytes+queued.bytes > piEventQueueBytes {
-				return nil, errors.New("Pi extension startup events exceed 256 items or 16 MiB budget")
-			}
-			startupBytes += queued.bytes
-			startupEvents = append(startupEvents, event)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, errors.New("Pi extension did not register within 10s; check MCPModulePath and bridge dependencies")
-		}
+			_ = pipe.SetWriteDeadline(time.Time{})
+		}()
 	}
-}
-
-// close 先结束 stdin，超时后回收整个 Pi 进程组。
-func (p *rpcProcess) close(ctx context.Context) error {
-	p.once.Do(func() { close(p.stop); _ = p.input.Close() })
-	timer := time.NewTimer(500 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-p.done:
-		return nil
-	case <-timer.C:
-	case <-ctx.Done():
+	encoded = append(encoded, '\n')
+	n, err := stdin.Write(encoded)
+	if n == len(encoded) {
+		return agentclient.SubmissionSent, err
 	}
-	p.cancel()
-	_ = p.output.Close()
-	select {
-	case <-p.done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	r.fail(errors.New("Pi RPC stdin write failed"))
+	if n > 0 {
+		return agentclient.SubmissionUnknown, r.err()
 	}
+	return agentclient.SubmissionNotSent, r.err()
 }

@@ -14,11 +14,13 @@ var ErrInvalidMessage = errors.New("invalid Claude protocol message")
 // 顶层消息类型常量集中维护 stream-json 消息与 control envelope 的判别值。
 const (
 	TypeSystem               = "system"
+	TypeConversationReset    = "conversation_reset"
 	TypeAssistant            = "assistant"
 	TypeUser                 = "user"
 	TypeResult               = "result"
 	TypeStreamEvent          = "stream_event"
 	TypeToolProgress         = "tool_progress"
+	TypeRateLimit            = "rate_limit_event"
 	TypeControlRequest       = "control_request"
 	TypeControlResponse      = "control_response"
 	TypeControlCancelRequest = "control_cancel_request"
@@ -132,35 +134,58 @@ type AnthropicMessage struct {
 	Usage *Usage `json:"usage,omitempty"`
 }
 
-// SystemInitMessage 是 CLI 启动后发出的 system/init 消息。
+// UnmarshalJSON accepts the native shorthand text or an Anthropic block array.
+func (m *AnthropicMessage) UnmarshalJSON(data []byte) error {
+	type fields AnthropicMessage
+	wire := struct {
+		*fields
+		Body json.RawMessage `json:"content"`
+	}{fields: (*fields)(m)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if len(wire.Body) == 0 {
+		return nil
+	}
+	var text string
+	if wire.Body[0] == '"' && json.Unmarshal(wire.Body, &text) == nil {
+		m.Content = []ContentBlock{{Type: "text", Text: text}}
+		return nil
+	}
+	return json.Unmarshal(wire.Body, &m.Content)
+}
+
+// SystemInitMessage is the native system/init message.
 type SystemInitMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// Effort is the applied effort when the producer publishes it, including explicit null.
+	Effort json.RawMessage `json:"effort,omitempty"`
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
-	// Subtype 固定为 init。
+	// Subtype is init.
 	Subtype string `json:"subtype"`
-	// SessionID 是 Claude 持久会话标识。
+	// SessionID identifies the persisted Claude session.
 	SessionID string `json:"session_id"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid"`
-	// ClaudeCodeVersion 是子进程报告的 CLI 版本。
+	// ClaudeCodeVersion is the CLI version reported by the process.
 	ClaudeCodeVersion string `json:"claude_code_version"`
-	// CWD 是 CLI 实际工作目录。
+	// CWD is the actual native working directory.
 	CWD string `json:"cwd"`
-	// Model 是当前生效模型。
+	// Model is the model actually in use.
 	Model string `json:"model"`
-	// PermissionMode 是当前工具权限模式。
+	// PermissionMode is the current native tool permission mode.
 	PermissionMode string `json:"permissionMode"`
-	// Tools 是当前会话可用工具名。
+	// Tools lists the tools available to this session.
 	Tools []string `json:"tools"`
-	// TerminalSlashCommands 是只适合 CLI 终端交互、不应出现在 ACP 菜单中的命令名。
+	// TerminalSlashCommands identifies commands available only in the native terminal.
 	TerminalSlashCommands []string `json:"terminal_slash_commands,omitempty"`
-	// MCPServers 是 CLI 报告的 MCP 状态。
+	// MCPServers contains native MCP connection statuses.
 	MCPServers []MCPServerStatus `json:"mcp_servers"`
-	// Capabilities 是 CLI 支持的开放能力标识。
+	// Capabilities lists native capability identifiers.
 	Capabilities []string `json:"capabilities,omitempty"`
-	// FastModeState 是当前快速模式状态。
+	// FastModeState reports the native Fast service state.
 	FastModeState string `json:"fast_mode_state,omitempty"`
-	// FastModeDisabledReason 说明快速模式不可用原因。
+	// FastModeDisabledReason explains why the Fast service is unavailable.
 	FastModeDisabledReason string `json:"fast_mode_disabled_reason,omitempty"`
 }
 
@@ -170,37 +195,79 @@ type MCPServerStatus struct {
 	Name string `json:"name"`
 	// Status 是 CLI 报告的连接状态。
 	Status string `json:"status"`
+	// Source is the native scope or plugin origin of this MCP definition.
+	Source string `json:"source,omitempty"`
 }
 
-// SystemMessage 保存 V1 未专门建模的 system subtype。
-type SystemMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+// ConversationResetMessage identifies a fresh conversation in the native session stream.
+type ConversationResetMessage struct {
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
-	// Subtype 是 system 消息判别值。
+	// SessionID identifies the native session carrying the reset.
+	SessionID string `json:"session_id"`
+	// UUID identifies the reset event.
+	UUID string `json:"uuid"`
+	// NewConversationID identifies the new conversation within that session.
+	NewConversationID string `json:"new_conversation_id"`
+}
+
+// SystemMessage carries native system events without dedicated message types.
+type SystemMessage struct {
+	// RetractedMessages identifies frames removed by native refusal fallback.
+	RetractedMessages []string `json:"retracted_message_uuids,omitempty"`
+	// FallbackScope distinguishes main-session fallback from sidechain fallback.
+	FallbackScope string `json:"scope,omitempty"`
+	// TurnIdentity carries input UUID evidence on native thinking progress.
+	TurnIdentity
+	// BackgroundTasks replaces the prior native snapshot when present.
+	BackgroundTasks *[]BackgroundTask `json:"tasks,omitempty"`
+	// CompactResult is an explicit success or failure from a compaction status frame.
+	CompactResult string `json:"compact_result,omitempty"`
+	// RetryAttempt counts this attempt of a native API retry, when reported.
+	RetryAttempt *int `json:"attempt,omitempty"`
+	// MaxRetries is the CLI's stated retry limit.
+	MaxRetries *int `json:"max_retries,omitempty"`
+	// RetryDelayMS is the native delay before the next attempt.
+	RetryDelayMS *int64 `json:"retry_delay_ms,omitempty"`
+	// RetryHTTPStatus is absent when no HTTP response was observed.
+	RetryHTTPStatus *int `json:"error_status,omitempty"`
+	// NoResponse describes an attempt that did not receive response headers.
+	NoResponse *RetryNoResponse `json:"no_response,omitempty"`
+	// CompactMetadata is the native boundary. Its counts cover transcript messages only.
+	CompactMetadata *CompactMetadata `json:"compact_metadata,omitempty"`
+	// messageBase preserves the top-level discriminator and raw JSON.
+	messageBase
+	// Subtype discriminates the native system event.
 	Subtype string `json:"subtype"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id,omitempty"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid,omitempty"`
-	// Status 保留开放状态值。
+	// Status preserves the provider-specific state value.
 	Status json.RawMessage `json:"status,omitempty"`
-	// State 是 Session 状态变化后的新状态。
+	// State reports the session lifecycle state.
 	State string `json:"state,omitempty"`
-	// Commands 是 commands_changed 携带的完整权威命令列表。
+	// Commands contains the complete command list from commands_changed.
 	Commands []SlashCommand `json:"commands,omitempty"`
-	// Data 保存完整 system 载荷供兼容处理。
+	// Data holds the original event for compatibility.
 	Data json.RawMessage `json:"-"`
 }
 
 // TaskMessage 合并 Task/Todo plan 所需的四类 system task 消息字段。
 type TaskMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// RunID distinguishes resumed runs of the same task.
+	RunID string `json:"run_id,omitempty"`
+	// ParentTaskID identifies a tracked subagent that launched this task.
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Ambient marks housekeeping excluded from user-visible activity.
+	Ambient bool `json:"ambient,omitempty"`
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// Subtype 区分任务创建、进度、更新和通知。
 	Subtype string `json:"subtype"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid"`
 	// TaskID 是任务稳定标识。
 	TaskID string `json:"task_id"`
@@ -220,7 +287,15 @@ type TaskMessage struct {
 
 // AssistantMessage 是完成或组装后的 assistant 消息。
 type AssistantMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// Supersedes identifies earlier native frames retracted by a fallback.
+	Supersedes []string `json:"supersedes,omitempty"`
+	// Aborted reports that the native stream stopped mid-block.
+	Aborted bool `json:"aborted,omitempty"`
+	// AgentID identifies the native subagent task when one owns this frame.
+	AgentID string `json:"agent_id,omitempty"`
+	// TurnIdentity carries native input correlation on this frame.
+	TurnIdentity
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// Message 保存 assistant 消息主体。
 	Message AnthropicMessage `json:"message"`
@@ -228,15 +303,15 @@ type AssistantMessage struct {
 	ParentToolUseID *string `json:"parent_tool_use_id"`
 	// Error 保存可选的消息级错误类别。
 	Error string `json:"error,omitempty"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id"`
 }
 
 // UserMessage 是输入 echo 或工具结果消息。
 type UserMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// Message 保存用户消息或工具结果主体。
 	Message AnthropicMessage `json:"message"`
@@ -248,33 +323,55 @@ type UserMessage struct {
 	Priority string `json:"priority,omitempty"`
 	// UUID 用于匹配 prompt echo。
 	UUID string `json:"uuid,omitempty"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id,omitempty"`
+	// IsReplay identifies the native stream-json acknowledgement of stdin input.
+	IsReplay bool `json:"isReplay,omitempty"`
+	// Origin identifies the source of the replayed user input when supplied.
+	Origin *MessageOrigin `json:"origin,omitempty"`
 }
 
-// ResultMessage 是一个 Claude query turn 的终止结果。
+// ResultMessage is the native query invocation outcome.
 type ResultMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// TurnIdentity carries native input correlation on this frame.
+	TurnIdentity
+	// TerminalReason carries the native stop cause independently of the result subtype.
+	TerminalReason string `json:"terminal_reason,omitempty"`
+	// APIErrorStatus is the HTTP status when the CLI identifies an API error.
+	APIErrorStatus *int `json:"api_error_status,omitempty"`
+	// LocalCommand identifies a CLI slash command that completed locally.
+	LocalCommand string `json:"local_command,omitempty"`
+	// ResultIndex orders results within one process, never across resumes.
+	ResultIndex *int64 `json:"result_index,omitempty"`
+	// TotalCostUSD is the query-pipeline cumulative estimate.
+	TotalCostUSD *json.Number `json:"total_cost_usd,omitempty"`
+	// FastModeState is the native service observation at completion.
+	FastModeState string `json:"fast_mode_state,omitempty"`
+	// FastModeDisabledReason is the native account or service restriction.
+	FastModeDisabledReason string `json:"fast_mode_disabled_reason,omitempty"`
+	// QueuedTurnCount is the count of pending native user sends, when reported.
+	QueuedTurnCount *int `json:"queued_turn_count,omitempty"`
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
-	// Subtype 区分成功与各类执行错误。
+	// Subtype distinguishes native success and execution errors.
 	Subtype string `json:"subtype"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid"`
-	// IsError 表示 turn 是否失败。
+	// IsError indicates a native failure.
 	IsError bool `json:"is_error"`
-	// StopReason 是模型或运行时停止原因。
+	// StopReason reports the model or runtime stop reason.
 	StopReason *string `json:"stop_reason"`
-	// Result 保存成功结果文本。
+	// Result contains the native result text.
 	Result string `json:"result,omitempty"`
-	// Errors 保存执行错误列表。
+	// Errors contains native execution diagnostics.
 	Errors []string `json:"errors,omitempty"`
-	// Usage 是主循环本轮用量。
+	// Usage reports this invocation’s main-loop consumption.
 	Usage Usage `json:"usage"`
-	// ModelUsage 是按模型累计的用量。
+	// ModelUsage reports cumulative pipeline usage by model.
 	ModelUsage map[string]ModelUsage `json:"modelUsage,omitempty"`
-	// PermissionDenials 保存本轮权限拒绝记录。
+	// PermissionDenials contains native permission denials.
 	PermissionDenials []PermissionDenial `json:"permission_denials,omitempty"`
 }
 
@@ -327,6 +424,16 @@ type UsageDelta struct {
 
 // ModelUsage 是 result.modelUsage 中单模型的累计用量。
 type ModelUsage struct {
+	// CompleteCounters records presence of the four query-pipeline token components.
+	CompleteCounters bool `json:"-"`
+	// KnownCounters preserves which individual native token components exist.
+	KnownCounters map[string]bool `json:"-"`
+	// ThinkingTokens is an optional subset of output and may be partial across versions.
+	ThinkingTokens *int64 `json:"thinkingTokens,omitempty"`
+	// CostUSD is the native cumulative model estimate.
+	CostUSD *json.Number `json:"costUSD,omitempty"`
+	// CostBasis identifies the native pricing source when reported.
+	CostBasis string `json:"costBasis,omitempty"`
 	// InputTokens 是该模型普通输入 token 数。
 	InputTokens int64 `json:"inputTokens"`
 	// OutputTokens 是该模型输出 token 数。
@@ -341,6 +448,41 @@ type ModelUsage struct {
 	MaxOutputTokens int64 `json:"maxOutputTokens"`
 }
 
+// UnmarshalJSON verifies core token presence before a row becomes a counter baseline.
+func (m *ModelUsage) UnmarshalJSON(data []byte) error {
+	type modelUsageFields ModelUsage
+	wire := struct {
+		// modelUsageFields decodes the remaining native fields.
+		*modelUsageFields
+		// Input preserves uncached input presence.
+		Input *int64 `json:"inputTokens"`
+		// Output preserves output presence.
+		Output *int64 `json:"outputTokens"`
+		// Read preserves cache-read presence.
+		Read *int64 `json:"cacheReadInputTokens"`
+		// Write preserves cache-write presence.
+		Write *int64 `json:"cacheCreationInputTokens"`
+	}{modelUsageFields: (*modelUsageFields)(m)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	m.CompleteCounters = wire.Input != nil && wire.Output != nil && wire.Read != nil && wire.Write != nil
+	m.KnownCounters = make(map[string]bool, 4)
+	for name, field := range map[string]struct {
+		raw   *int64
+		value *int64
+	}{
+		"input": {wire.Input, &m.InputTokens}, "output": {wire.Output, &m.OutputTokens},
+		"read": {wire.Read, &m.CacheReadInputTokens}, "write": {wire.Write, &m.CacheCreationInputTokens},
+	} {
+		if field.raw != nil {
+			*field.value = *field.raw
+			m.KnownCounters[name] = true
+		}
+	}
+	return nil
+}
+
 // PermissionDenial 是 result 中权限拒绝的权威记录。
 type PermissionDenial struct {
 	// ToolName 是被拒绝的工具名。
@@ -353,15 +495,19 @@ type PermissionDenial struct {
 
 // StreamEventMessage 包装 Anthropic streaming event。
 type StreamEventMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// AgentID identifies the native subagent task when one owns this frame.
+	AgentID string `json:"agent_id,omitempty"`
+	// TurnIdentity carries native input correlation on this frame.
+	TurnIdentity
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// Event 保存 Anthropic streaming event。
 	Event StreamEvent `json:"event"`
 	// ParentToolUseID 标识事件所属的父工具调用。
 	ParentToolUseID *string `json:"parent_tool_use_id"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id"`
 }
 
@@ -383,7 +529,9 @@ type StreamEvent struct {
 
 // ToolProgressMessage 是 Claude 独立 tool progress 消息。
 type ToolProgressMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// TaskID identifies the native task associated with this progress frame.
+	TaskID string `json:"task_id,omitempty"`
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// ToolUseID 关联已发布工具调用。
 	ToolUseID string `json:"tool_use_id"`
@@ -393,15 +541,15 @@ type ToolProgressMessage struct {
 	ParentToolUseID *string `json:"parent_tool_use_id"`
 	// ElapsedTimeSeconds 是已执行秒数。
 	ElapsedTimeSeconds float64 `json:"elapsed_time_seconds"`
-	// UUID 是当前 wire 消息标识。
+	// UUID identifies the native event.
 	UUID string `json:"uuid"`
-	// SessionID 关联当前会话。
+	// SessionID identifies the current native session.
 	SessionID string `json:"session_id"`
 }
 
 // ControlRequestMessage 是 CLI 发给宿主，或宿主发给 CLI 的 control 请求 envelope。
 type ControlRequestMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// RequestID 关联后续 control response。
 	RequestID string `json:"request_id"`
@@ -431,7 +579,7 @@ func (m *ControlRequestMessage) DecodeRequest(target any) error {
 
 // ControlResponseMessage 包装 CLI control response 的内层 response。
 type ControlResponseMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// Response 是嵌套的成功或失败结果。
 	Response ControlResponse `json:"response"`
@@ -451,7 +599,7 @@ type ControlResponse struct {
 
 // ControlCancelRequestMessage 表示 control request 的显式取消。
 type ControlCancelRequestMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 	// RequestID 指定要取消的 control request。
 	RequestID string `json:"request_id"`
@@ -459,7 +607,7 @@ type ControlCancelRequestMessage struct {
 
 // KeepAliveMessage 表示无需业务处理的保活帧。
 type KeepAliveMessage struct {
-	// messageBase 提供顶层类型与原始 JSON。
+	// messageBase preserves the top-level discriminator and raw JSON.
 	messageBase
 }
 
@@ -497,6 +645,8 @@ func DecodeMessage(data []byte) (Message, error) {
 		default:
 			target = &SystemMessage{messageBase: base, Data: raw}
 		}
+	case TypeConversationReset:
+		target = &ConversationResetMessage{messageBase: base}
 	case TypeAssistant:
 		target = &AssistantMessage{messageBase: base}
 	case TypeUser:
@@ -507,6 +657,8 @@ func DecodeMessage(data []byte) (Message, error) {
 		target = &StreamEventMessage{messageBase: base}
 	case TypeToolProgress:
 		target = &ToolProgressMessage{messageBase: base}
+	case TypeRateLimit:
+		target = &RateLimitMessage{messageBase: base}
 	case TypeControlRequest:
 		target = &ControlRequestMessage{messageBase: base}
 	case TypeControlResponse:
@@ -524,25 +676,37 @@ func DecodeMessage(data []byte) (Message, error) {
 	return target, nil
 }
 
-// InitializeControlRequest 是宿主启动 Session 后发送的最小 initialize 请求。
+// InitializeControlRequest configures the native control channel at startup.
 type InitializeControlRequest struct {
-	// Subtype 固定为 initialize。
+	// AppendSystemPrompt modifies the native Claude Code preset, preserving explicit empty.
+	AppendSystemPrompt *string `json:"appendSystemPrompt,omitempty"`
+	// Plugins provides local plugin roots during startup initialize.
+	Plugins []LocalPlugin `json:"plugins,omitempty"`
+	// Hooks registers startup SDK callbacks by native hook event.
+	Hooks map[string][]HookCallbackMatcher `json:"hooks,omitempty"`
+	// SystemPromptSnapshot requests fresh rendering on native implementations that honor it.
+	SystemPromptSnapshot *bool `json:"systemPromptSnapshot,omitempty"`
+	// Subtype is initialize.
 	Subtype string `json:"subtype"`
 }
 
-// InitializeControlResponse 保存 Session 配置选择需要的初始化结果。
+// InitializeControlResponse contains startup capabilities and configuration choices.
 type InitializeControlResponse struct {
-	// Commands 是初始化时 Claude SDK 报告的完整 Slash Command 列表。
+	// HooksApplied confirms that the CLI registered the declared callbacks.
+	HooksApplied *bool `json:"hooks_applied,omitempty"`
+	// PluginsApplied confirms the declared plugin set when the CLI can verify it.
+	PluginsApplied *bool `json:"plugins_applied,omitempty"`
+	// Commands contains the slash commands reported at startup.
 	Commands []SlashCommand `json:"commands"`
-	// Models 是当前账号与设置允许选择的模型。
+	// Models lists the native model choices.
 	Models []ModelInfo `json:"models"`
-	// OutputStyle 是当前输出风格。
+	// OutputStyle reports the current output style.
 	OutputStyle string `json:"output_style,omitempty"`
-	// AvailableOutputStyles 是可选择的输出风格。
+	// AvailableOutputStyles lists selectable output styles.
 	AvailableOutputStyles []string `json:"available_output_styles,omitempty"`
-	// FastModeState 是当前快速模式状态。
+	// FastModeState reports the native Fast service state.
 	FastModeState string `json:"fast_mode_state,omitempty"`
-	// FastModeDisabledReason 说明快速模式不可用原因。
+	// FastModeDisabledReason explains why the Fast service is unavailable.
 	FastModeDisabledReason string `json:"fast_mode_disabled_reason,omitempty"`
 }
 
@@ -556,26 +720,52 @@ type SlashCommand struct {
 	ArgumentHint any `json:"argumentHint,omitempty"`
 	// Aliases 是解析到同一命令的备用名称。
 	Aliases []string `json:"aliases,omitempty"`
+	// Builtin distinguishes Claude Code commands from identically named skills.
+	Builtin bool `json:"builtin,omitempty"`
 }
 
-// ModelInfo 描述 CLI 当前允许选择的一个模型。
+// ModelInfo describes one selectable native model.
 type ModelInfo struct {
-	// Value 是设置模型时使用的标识。
+	// Value is the identifier sent to the native model setter.
 	Value string `json:"value"`
-	// ResolvedModel 是别名解析后的模型标识。
+	// ResolvedModel is the model ID after native alias resolution.
 	ResolvedModel string `json:"resolvedModel,omitempty"`
-	// DisplayName 是客户端展示名称。
+	// DisplayName is the human-readable model name.
 	DisplayName string `json:"displayName"`
-	// Description 是模型能力说明。
+	// Description describes the model capabilities.
 	Description string `json:"description"`
-	// SupportsEffort 表示模型是否支持 effort 配置。
+	// SupportsEffort indicates whether the model accepts effort configuration.
 	SupportsEffort bool `json:"supportsEffort,omitempty"`
-	// SupportedEffortLevels 是模型允许的 effort 值。
+	// EffortSupportReported distinguishes a false capability from an absent capability.
+	EffortSupportReported bool `json:"-"`
+	// SupportedEffortLevels lists the allowed effort values.
 	SupportedEffortLevels []string `json:"supportedEffortLevels,omitempty"`
-	// SupportsFastMode 表示模型是否支持快速模式。
+	// SupportsFastMode indicates whether the model accepts Fast mode.
 	SupportsFastMode bool `json:"supportsFastMode,omitempty"`
-	// SupportsAutoMode 表示模型是否支持自动权限模式。
+	// FastSupportReported distinguishes a false capability from an absent capability.
+	FastSupportReported bool `json:"-"`
+	// SupportsAutoMode indicates whether the model supports automatic permissions.
 	SupportsAutoMode bool `json:"supportsAutoMode,omitempty"`
+}
+
+// UnmarshalJSON preserves optional capability presence alongside the typed values.
+func (m *ModelInfo) UnmarshalJSON(data []byte) error {
+	type modelFields ModelInfo
+	wire := struct {
+		// modelFields decodes the remaining model fields.
+		*modelFields
+		// Effort preserves presence of the effort capability.
+		Effort *bool `json:"supportsEffort"`
+		// Fast preserves presence of the fast capability.
+		Fast *bool `json:"supportsFastMode"`
+	}{modelFields: (*modelFields)(m)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	m.EffortSupportReported, m.FastSupportReported = wire.Effort != nil, wire.Fast != nil
+	m.SupportsEffort = wire.Effort != nil && *wire.Effort
+	m.SupportsFastMode = wire.Fast != nil && *wire.Fast
+	return nil
 }
 
 // InterruptControlRequest 中 cancel_queued 要求支持该 capability 的 CLI 同时清空排队消息。
@@ -622,6 +812,8 @@ type ApplyFlagSettingsControlRequest struct {
 
 // CanUseToolControlRequest 是 CLI 发给宿主的工具权限询问。
 type CanUseToolControlRequest struct {
+	// AgentID identifies the native subagent task when one owns this frame.
+	AgentID string `json:"agent_id,omitempty"`
 	// Subtype 固定为 can_use_tool。
 	Subtype string `json:"subtype"`
 	// ToolName 是申请执行的工具名。
@@ -765,4 +957,247 @@ type UserInputBody struct {
 type UserInputOrigin struct {
 	// Kind 表示输入来源类别。
 	Kind string `json:"kind"`
+}
+
+// GetUsageControlRequest asks the CLI for structured plan usage without a prompt.
+type GetUsageControlRequest struct {
+	// Subtype is get_usage.
+	Subtype string `json:"subtype"`
+	// SkipBehaviors suppresses the local transcript scan.
+	SkipBehaviors bool `json:"skip_behaviors"`
+}
+
+// AccountUsageResponse selects the plan facts and excludes current-session consumption.
+type AccountUsageResponse struct {
+	// Available is absent on older or incompatible responses.
+	Available *bool `json:"rate_limits_available"`
+	// RateLimits preserves names and presence until the adapter classifies each row.
+	RateLimits map[string]json.RawMessage `json:"rate_limits"`
+}
+
+// QuotaWindow describes one native limit window.
+type QuotaWindow struct {
+	// Name is supplied for model-scoped windows.
+	Name string `json:"display_name"`
+	// Utilization is the used percentage, including a reported zero.
+	Utilization *float64 `json:"utilization"`
+	// ResetAt is an optional ISO 8601 timestamp.
+	ResetAt *string `json:"resets_at"`
+}
+
+// ExtraUsage is the overage spending observation, separate from plan windows.
+type ExtraUsage struct {
+	// Enabled reports whether extra usage is enabled.
+	Enabled *bool `json:"is_enabled"`
+	// Used is the native numeric credits usage; the declaration does not specify a unit.
+	Used *json.Number `json:"used_credits"`
+	// Limit is the native monthly allowance; the declaration does not specify a unit.
+	Limit *json.Number `json:"monthly_limit"`
+	// Currency is supplied by Claude when known.
+	Currency *string `json:"currency,omitempty"`
+	// Utilization is the used percentage of this separate allowance.
+	Utilization *float64 `json:"utilization"`
+}
+
+// TurnIdentity is stamped only on native frames with observed input correlation.
+type TurnIdentity struct {
+	// UserMessageUUID is the last native consumed input ID named on this frame.
+	UserMessageUUID string `json:"user_message_uuid,omitempty"`
+	// UserMessageUUIDs enumerates all consumed inputs known at this frame.
+	UserMessageUUIDs []string `json:"user_message_uuids,omitempty"`
+	// ResumeReason marks a provider-initiated continuation of a previous invocation.
+	ResumeReason string `json:"resume_reason,omitempty"`
+	// Origin holds the narrow native provenance discriminator.
+	Origin *MessageOrigin `json:"origin,omitempty"`
+}
+
+// MessageOrigin identifies the kind of source without exposing its payload.
+type MessageOrigin struct {
+	// Kind is the native origin discriminator.
+	Kind string `json:"kind"`
+}
+
+// BackgroundTask is one physical entry in the complete native task snapshot.
+type BackgroundTask struct {
+	// RunID distinguishes resumed runs of the same task.
+	RunID string `json:"run_id,omitempty"`
+	// ParentTaskID identifies a tracked subagent that launched this task.
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Ambient marks housekeeping excluded from user-visible activity.
+	Ambient bool `json:"ambient,omitempty"`
+	// TaskID identifies the native task, including ambient watcher tasks.
+	TaskID string `json:"task_id"`
+}
+
+// LocalPlugin describes an actual local Claude plugin directory.
+type LocalPlugin struct {
+	// Type is local for a plugin launched through an on-disk directory.
+	Type string `json:"type"`
+	// Path is the directory prepared by the host.
+	Path string `json:"path"`
+	// SkipMCPDiscovery prevents the plugin from starting unmanaged MCP servers.
+	SkipMCPDiscovery bool `json:"skipMcpDiscovery,omitempty"`
+}
+
+// MCPStatusRequest reads the current native MCP connection statuses.
+type MCPStatusRequest struct {
+	// Subtype is mcp_status.
+	Subtype string `json:"subtype"`
+}
+
+// MCPStatusResponse selects the safe fields from native status.
+type MCPStatusResponse struct {
+	// Servers are the connections the CLI reported, including failed or pending entries.
+	Servers []MCPServerStatus `json:"mcpServers"`
+}
+
+// CompactMetadata describes a native compaction boundary.
+type CompactMetadata struct {
+	// Trigger distinguishes manual requests from automatic compaction.
+	Trigger string `json:"trigger"`
+}
+
+// RetryNoResponse is the native first-byte timeout observation.
+type RetryNoResponse struct {
+	// WaitedMS is the time spent waiting for the failed attempt.
+	WaitedMS int64 `json:"waited_ms"`
+	// RetryWaitMS is the wait limit the CLI selected for its retry.
+	RetryWaitMS int64 `json:"retry_wait_ms"`
+}
+
+// RateLimitMessage is a live plan-limit observation, not a turn outcome.
+type RateLimitMessage struct {
+	// messageBase carries the envelope type and bytes.
+	messageBase
+	// SessionID associates this update with the native session.
+	SessionID string `json:"session_id"`
+	// Info contains only fields needed to observe policy and explicit errors.
+	Info RateLimitInfo `json:"rate_limit_info"`
+}
+
+// RateLimitInfo describes an observed plan or overage limit.
+type RateLimitInfo struct {
+	// Status identifies the native plan state.
+	Status string `json:"status"`
+	// ResetAt is the native reset time, when supplied.
+	ResetAt *int64 `json:"resetsAt,omitempty"`
+	// RateLimitType identifies the affected window.
+	RateLimitType string `json:"rateLimitType,omitempty"`
+	// Utilization is the native used fraction.
+	Utilization *float64 `json:"utilization,omitempty"`
+	// OverageStatus is separate from the subscription plan.
+	OverageStatus string `json:"overageStatus,omitempty"`
+	// ErrorCode is set when Claude requires credits.
+	ErrorCode string `json:"errorCode,omitempty"`
+}
+
+// HookCallbackMatcher selects the native tool names and the host callback.
+type HookCallbackMatcher struct {
+	// Matcher is Claude's native tool-name expression.
+	Matcher string `json:"matcher"`
+	// CallbackIDs contains the host-owned callback IDs.
+	CallbackIDs []string `json:"hookCallbackIds"`
+}
+
+// HookCallbackRequest invokes a callback registered during initialize.
+type HookCallbackRequest struct {
+	// CallbackID identifies one host callback.
+	CallbackID string `json:"callback_id"`
+	// Input is the native hook event.
+	Input json.RawMessage `json:"input"`
+}
+
+// PreToolUseInput selects the native evidence needed for a write decision.
+type PreToolUseInput struct {
+	// CWD is the native working directory at this tool call.
+	CWD string `json:"cwd"`
+	// ToolUseID identifies the native tool that can later request approval.
+	ToolUseID string `json:"tool_use_id"`
+	// Event must be PreToolUse.
+	Event string `json:"hook_event_name"`
+	// SessionID binds the request to this native generation.
+	SessionID string `json:"session_id"`
+	// Tool is the native file tool name.
+	Tool string `json:"tool_name"`
+	// Input contains the native tool arguments.
+	Input json.RawMessage `json:"tool_input"`
+}
+
+// HookCallbackResult returns a native decision or leaves in-scope work to standard permissions.
+type HookCallbackResult struct {
+	// Output is present only when the hook intervenes.
+	Output *HookSpecificOutput `json:"hookSpecificOutput,omitempty"`
+}
+
+// HookSpecificOutput is the synchronous PreToolUse permission decision.
+type HookSpecificOutput struct {
+	// Event identifies the native hook output variant.
+	Event string `json:"hookEventName"`
+	// Decision is ask or deny for a restricted write.
+	Decision string `json:"permissionDecision"`
+	// Reason gives the policy reason without exposing file content.
+	Reason string `json:"permissionDecisionReason"`
+}
+
+// GetSettingsControlRequest reads effective native settings without submitting a prompt.
+type GetSettingsControlRequest struct {
+	// Subtype is get_settings.
+	Subtype string `json:"subtype"`
+}
+
+// SettingsControlResponse selects effective policy and applied configuration fields.
+type SettingsControlResponse struct {
+	// Effective contains the merged policy observed by the CLI.
+	Effective *EffectiveSettings `json:"effective"`
+	// Applied is the native effective invocation configuration.
+	Applied map[string]json.RawMessage `json:"applied"`
+}
+
+// EffectiveSettings contains the narrow fields required to verify launch policy.
+type EffectiveSettings struct {
+	// Model is the merged model setting before native alias resolution.
+	Model string `json:"model"`
+	// Environment selects model overrides from the native settings environment.
+	Environment struct {
+		// Model overrides the settings model through ANTHROPIC_MODEL.
+		Model string `json:"ANTHROPIC_MODEL"`
+	} `json:"env"`
+	// FastMode is the merged preference, separate from the observed service state.
+	FastMode *bool `json:"fastMode"`
+	// AllowManagedHooksOnly confirms the restricted hook sources.
+	AllowManagedHooksOnly *bool `json:"allowManagedHooksOnly"`
+	// Sandbox reports native Bash restrictions.
+	Sandbox *EffectiveSandbox `json:"sandbox"`
+	// Permissions exposes allow rules which may widen the sandbox.
+	Permissions EffectivePermissions `json:"permissions"`
+}
+
+// EffectivePermissions selects permission rules relevant to sandbox writes.
+type EffectivePermissions struct {
+	// Allow contains native permission selectors.
+	Allow []string `json:"allow"`
+}
+
+// EffectiveSandbox contains the native Bash policy independently from tool hooks.
+type EffectiveSandbox struct {
+	// Enabled confirms that the CLI must sandbox Bash.
+	Enabled *bool `json:"enabled"`
+	// FailIfUnavailable rejects runtime startup when sandboxing cannot work.
+	FailIfUnavailable *bool `json:"failIfUnavailable"`
+	// AllowUnsandboxed permits a native escape only when explicitly true.
+	AllowUnsandboxed *bool `json:"allowUnsandboxedCommands"`
+	// ExcludedCommands lists unsandboxed command exceptions.
+	ExcludedCommands []string `json:"excludedCommands"`
+	// Filesystem reports the effective write policy.
+	Filesystem *EffectiveSandboxFilesystem `json:"filesystem"`
+}
+
+// EffectiveSandboxFilesystem is the native effective path policy.
+type EffectiveSandboxFilesystem struct {
+	// Disabled bypasses filesystem enforcement.
+	Disabled bool `json:"disabled"`
+	// AllowWrite lists writable roots.
+	AllowWrite []string `json:"allowWrite"`
+	// DenyWrite lists protected paths.
+	DenyWrite []string `json:"denyWrite"`
 }

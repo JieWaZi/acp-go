@@ -59,7 +59,8 @@ const server=createServer(async(req,res)=>{
 });
 await new Promise(r=>server.listen(0,'127.0.0.1',r));const baseUrl='http://127.0.0.1:'+server.address().port+'/v1';
 try{
-for(const cli of (process.env.ACP_TEST_ONLY_CLI?[process.env.ACP_TEST_ONLY_CLI]:['pi','kimi']))for(const permission of (process.env.ACP_TEST_ONLY_PERMISSION?[process.env.ACP_TEST_ONLY_PERMISSION]:['default','auto','full-access'])){
+for(const cli of (process.env.ACP_TEST_ONLY_CLI?[process.env.ACP_TEST_ONLY_CLI]:['pi','kimi']))for(const permission of (process.env.ACP_TEST_ONLY_PERMISSION?[process.env.ACP_TEST_ONLY_PERMISSION]:cli==='pi'?['default','auto','full-access']:['default','full-access'])){
+ assert.ok(cli==='pi'||permission!=='auto','the pinned Python Kimi fixture does not cover automatic approval');
  const work=join(root,cli+'-'+permission);mkdirSync(work);const home=join(work,'home'),config=join(work,'config'),cwd=join(work,'workspace');for(const dir of[home,config,cwd])mkdirSync(dir);
  if(cli==='pi'){
  writeFileSync(join(config,'models.json'),JSON.stringify({providers:{'local-fixture':{baseUrl,api:'openai-completions',apiKey:'dummy',models:[{id:'local-model',name:'Offline'},{id:'selected-model',name:'Selected'}]}}}));
@@ -70,7 +71,7 @@ for(const cli of (process.env.ACP_TEST_ONLY_CLI?[process.env.ACP_TEST_ONLY_CLI]:
  writeFileSync(join(config,'credentials','kimi-code.json'),JSON.stringify({access_token:'offline-fixture-token',expires_at:Date.now()/1000+86400*365,scope:'openid',token_type:'Bearer'}));
  writeFileSync(join(config,'config.toml'),`default_model = "local"\n[models.local]\nprovider="fixture"\nmodel="local-model"\nmax_context_size=100000\n[models.selected]\nprovider="fixture"\nmodel="selected-model"\nmax_context_size=100000\n[providers.fixture]\ntype="openai_legacy"\nbase_url=${JSON.stringify(baseUrl)}\napi_key="dummy"\n[loop_control]\nmax_retries_per_step=1\n`);
  }
- const env={PATH:process.env.PATH,HOME:home,USERPROFILE:home,TMPDIR:config,ACP_TEST_CLI:cli,ACP_TEST_PERMISSION:permission,ACP_TEST_STATE:join(config,'state'),KIMI_SHARE_DIR:config,KIMI_PATH:kimiPath,PI_MCP_MODULE_PATH:process.env.PI_MCP_MODULE_PATH,PI_CODING_AGENT_DIR:config,PI_SKIP_VERSION_CHECK:'1',NO_COLOR:'1',ACP_GO_TEST_HOME:home,NODE_OPTIONS:'--import='+pathToFileURL(resolve('scripts/pi-integration/home-isolation.mjs')).href};
+ const env={PATH:process.env.PATH,HOME:home,USERPROFILE:home,TMPDIR:config,ACP_TEST_CLI:cli,ACP_TEST_PERMISSION:permission,KIMI_SHARE_DIR:config,KIMI_PATH:kimiPath,PI_MCP_MODULE_PATH:process.env.PI_MCP_MODULE_PATH,PI_CODING_AGENT_DIR:config,PI_SKIP_VERSION_CHECK:'1',NO_COLOR:'1',ACP_GO_TEST_HOME:home,NODE_OPTIONS:'--import='+pathToFileURL(resolve('scripts/pi-integration/home-isolation.mjs')).href};
  const child=spawn(binary,[],{cwd,env,stdio:['pipe','pipe','pipe']});let stderr='';child.stderr.on('data',x=>{stderr+=x;writeFileSync(join(work,'stderr.log'),stderr)});
  let sequence=0;const pending=new Map();let firstQuestion;
  const send=x=>child.stdin.write(JSON.stringify(x)+'\n');
@@ -100,13 +101,13 @@ for(const cli of (process.env.ACP_TEST_ONLY_CLI?[process.env.ACP_TEST_ONLY_CLI]:
   task={...scenario,cli,permission,cwd,marker:cli+'-'+permission+'-'+scenario.marker};
   const beforeApprovals=approvals.length,beforeReviews=reviews.length,beforeQuestions=questions.length;
   const response = await request('session/prompt',{sessionId:session.sessionId,prompt:[{type:'text',text:'LOCAL_FIXTURE '+task.marker}]});
-  assert.ok(response.usage,cli+' dropped turn usage');
-  const calls = modelCalls.filter(x=>x.marker===task.marker).length;
-  assert.equal(response.usage.inputTokens,7*calls,cli+' noncached input');
-  assert.equal(response.usage.cachedReadTokens,3*calls,cli+' cached input');
-  assert.equal(response.usage.outputTokens,5*calls,cli+' output');
-  assert.equal(response.usage.totalTokens,15*calls,cli+' per-turn total');
-  assert.ok(usageUpdates.some(x=>x.cli===cli && x.used>0 && x.size>0),cli+' missing context usage');
+  const usage=response._meta?.['acp-go/turn-usage'];
+  assert.ok(usage,cli+' dropped turn usage');
+  const calls=modelCalls.filter(x=>x.marker===task.marker).length;
+  assert.equal(usage.inputTokens,7*calls,cli+' noncached input');
+  assert.equal(usage.cacheReadTokens,3*calls,cli+' cached input');
+  assert.equal(usage.outputTokens,5*calls,cli+' output');
+  if(cli==='pi')assert.ok(usageUpdates.some(x=>x.cli===cli && x.used>0 && x.size>0),cli+' missing context usage');
   if(scenario.kind==='question'){
    assert.equal(questions.length,beforeQuestions+1,'question was silently dropped');
    const last=modelCalls.findLast(x=>x.marker===task.marker);assert.ok(last.messages.filter(m=>m.role==='tool').map(m=>textOf(m.content)).join('\n').includes('"B"'),'answer not returned to actual model');

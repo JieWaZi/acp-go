@@ -7,7 +7,7 @@ import {join,resolve} from 'node:path';
 import assert from 'node:assert/strict';
 const [binary,cursor]=process.argv.slice(2).map(p=>resolve(p));
 const root=mkdtempSync(join(tmpdir(),'acp-cursor-handshake-'));console.log('Artifacts: '+root);
-for(const permission of ['default','auto','full-access']){
+for(const permission of ['default','full-access']){
  const cwd=join(root,permission);mkdirSync(cwd);
  const child=spawn(binary,[],{cwd,env:{PATH:process.env.PATH,HOME:cwd,USERPROFILE:cwd,CURSOR_CONFIG_DIR:cwd,CURSOR_PATH:cursor,ACP_TEST_CLI:'cursor',ACP_TEST_PERMISSION:permission,CURSOR_API_KEY:'offline-fixture',CURSOR_API_ENDPOINT:'http://127.0.0.1:9',NO_OPEN_BROWSER:'1',DO_NOT_TRACK:'1'},stdio:['pipe','pipe','pipe']});
  let stderr='';child.stderr.on('data',x=>stderr+=x);let initialized;

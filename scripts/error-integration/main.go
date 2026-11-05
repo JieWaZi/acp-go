@@ -1,4 +1,4 @@
-// Command error-integration 使用真实 CLI 和隔离配置验证故障协议。
+// Command error-integration projects isolated native clients for wire error fixtures.
 package main
 
 import (
@@ -7,18 +7,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/JieWaZi/acp-go/pkg/acpserver"
+	"github.com/JieWaZi/acp-go/pkg/agentclient"
 	"github.com/JieWaZi/acp-go/pkg/claude"
 	"github.com/JieWaZi/acp-go/pkg/codex"
 	"github.com/JieWaZi/acp-go/pkg/cursor"
-	"github.com/JieWaZi/acp-go/pkg/kimi"
 	"github.com/JieWaZi/acp-go/pkg/pi"
-	acp "github.com/JieWaZi/acp-go/sdk"
+	"github.com/JieWaZi/acp-go/pkg/standardacp"
 )
 
-// main 组装五种真实适配器，并在退出时清理本次测试拥有的子进程。
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -28,34 +26,25 @@ func main() {
 		panic(err)
 	}
 	path := os.Getenv("ACP_ERROR_CLI_PATH")
-	var agent acp.Agent
-	switch os.Getenv("ACP_ERROR_CLI") {
-	case "codex":
-		agent, err = codex.NewAgent(ctx, codex.Config{Logger: logger, CodexPath: path})
-	case "claude":
-		agent, err = claude.NewAgent(ctx, claude.Config{Logger: logger, ClaudePath: path, PrefixArgs: []string{"--bare"}})
-	case "cursor":
-		agent, err = cursor.NewAgent(ctx, cursor.Config{Logger: logger, CursorPath: path, WorkingDirectory: cwd, StateDirectory: os.Getenv("ACP_ERROR_STATE")})
-	case "kimi":
-		agent, err = kimi.NewAgent(ctx, kimi.Config{Logger: logger, KimiPath: path, WorkingDirectory: cwd, StateDirectory: os.Getenv("ACP_ERROR_STATE")})
-	case "pi":
-		agent, err = pi.NewAgent(ctx, pi.Config{Logger: logger, PiPath: path, WorkingDirectory: cwd})
-	default:
-		panic("unknown test CLI")
-	}
+	agent, err := agentclient.NewACPAgent(func(host agentclient.HostCallbacks) (agentclient.Client, error) {
+		switch os.Getenv("ACP_ERROR_CLI") {
+		case "codex":
+			return codex.NewClient(ctx, codex.Options{Logger: logger, Executable: path, WorkingDirectory: cwd}, host)
+		case "claude":
+			return claude.NewClient(ctx, claude.Options{Logger: logger, Executable: path, WorkingDirectory: cwd, PrefixArgs: []string{"--bare"}}, host)
+		case "cursor":
+			return cursor.NewClient(ctx, cursor.Options{Logger: logger, Executable: path, WorkingDirectory: cwd}, host)
+		case "kimi":
+			return standardacp.NewClient(ctx, standardacp.Options{Provider: standardacp.Kimi, Logger: logger, Executable: path, WorkingDirectory: cwd}, host)
+		case "pi":
+			return pi.NewClient(ctx, pi.Options{Logger: logger, Executable: path, WorkingDirectory: cwd}, host)
+		default:
+			panic("unknown test CLI")
+		}
+	})
 	if err != nil {
 		panic(err)
 	}
-	defer func() {
-		if closer, ok := agent.(interface {
-			// Close 释放适配器及其 CLI 子进程。
-			Close(context.Context) error
-		}); ok {
-			closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_ = closer.Close(closeCtx)
-		}
-	}()
 	server, err := acpserver.NewWithUserInput(agent, os.Stdin, os.Stdout)
 	if err != nil {
 		panic(err)

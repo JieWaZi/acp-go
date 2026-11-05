@@ -1,269 +1,370 @@
 package claude
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
+	"github.com/JieWaZi/acp-go/pkg/acpmeta"
 	acp "github.com/JieWaZi/acp-go/sdk"
 )
 
-var (
-	// ErrInvalidWorkingDirectory 表示 Session 工作目录不存在、不是目录或不是绝对路径。
-	ErrInvalidWorkingDirectory = errors.New("invalid Claude working directory")
-	// ErrInvalidAdditionalDirectory 表示附加目录无法规范化为可访问目录。
-	ErrInvalidAdditionalDirectory = errors.New("invalid Claude additional directory")
-	// ErrInvalidMCPServer 表示客户端 MCP 定义缺少必填字段或包含不支持的传输。
-	ErrInvalidMCPServer = errors.New("invalid Claude MCP server")
-)
-
-// launchOptions 保存启动一个 Session 进程所需的稳定参数。
-type launchOptions struct {
-	// CWD 是 CLI 工作目录。
-	CWD string
-	// SessionID 是预先分配或待恢复的持久会话标识。
-	SessionID string
-	// Resume 表示恢复已有会话而不是创建新会话。
-	Resume bool
-	// AdditionalDirectories 是已经规范化并去重的附加目录。
-	AdditionalDirectories []string
-	// MCPConfig 是传给 CLI 的 MCP JSON；无 server 时为空。
-	MCPConfig string
-	// PermissionMode 是进程启动时使用的权限模式。
-	PermissionMode string
-	// AllowDangerouslySkipPermissions 允许 Session 进入 bypassPermissions 模式。
-	AllowDangerouslySkipPermissions bool
+// LaunchOptions declares native resources prepared by the host.
+type LaunchOptions struct {
+	// SettingSources selects the native settings scopes. Nil uses standard scopes.
+	SettingSources []string
+	// Tools selects the built-in tools. Nil preserves native defaults.
+	Tools []string
+	// PluginDirectories contains local, physical plugin directories.
+	PluginDirectories []string
+	// SettingsPath points to a native flag settings file supplied by the host.
+	SettingsPath string
+	// WorkspaceOnly requires native Bash sandbox and write-hook verification.
+	WorkspaceOnly bool
+	// ExcludedWriteDirectories are protected even when a permission is approved.
+	ExcludedWriteDirectories []string
 }
 
-// mcpConfigEnvelope 是 CLI 参数接收的 MCP 配置根对象。
-type mcpConfigEnvelope struct {
-	// MCPServers 按名称保存不同传输的 server 配置。
-	MCPServers map[string]any `json:"mcpServers"`
+type launchPlan struct {
+	cwd         string
+	args        []string
+	fingerprint [sha256.Size]byte
+	// instructions preserves nil and explicit empty overrides.
+	instructions  *string
+	snapshotOff   bool
+	mcpConfigured bool
+	// mcpOnlyPrefixes identifies host-configured MCP servers when builtin tools are disabled.
+	mcpOnlyPrefixes []string
+	// initializePlugins is set only when the managed-hook startup barrier owns delivery.
+	initializePlugins []string
+	workspace         *workspacePolicy
 }
 
-// prepareLaunchOptions 在创建任何子进程前验证 Session 定义参数。
-func prepareLaunchOptions(
-	cwd string,
-	sessionID string,
-	resume bool,
-	allowDangerouslySkipPermissions bool,
-	additionalDirectories []string,
-	mcpServers []acp.McpServer,
-) (launchOptions, error) {
-	if err := validateWorkingDirectory(cwd); err != nil {
-		return launchOptions{}, err
-	}
-	if strings.TrimSpace(sessionID) == "" {
-		return launchOptions{}, errors.New("preparing Claude launch: session id is empty")
-	}
-	directories, err := normalizeAdditionalDirectories(cwd, additionalDirectories)
-	if err != nil {
-		return launchOptions{}, err
-	}
-	mcpConfig, err := encodeMCPConfig(mcpServers)
-	if err != nil {
-		return launchOptions{}, err
-	}
-	return launchOptions{
-		CWD:                             cwd,
-		SessionID:                       sessionID,
-		Resume:                          resume,
-		AdditionalDirectories:           directories,
-		MCPConfig:                       mcpConfig,
-		PermissionMode:                  "default",
-		AllowDangerouslySkipPermissions: allowDangerouslySkipPermissions,
-	}, nil
-}
-
-// validateWorkingDirectory 保证 cwd 是本机存在的绝对目录。
-func validateWorkingDirectory(cwd string) error {
-	if !filepath.IsAbs(cwd) {
-		return fmt.Errorf("validating cwd %q: %w: path is not absolute", cwd, ErrInvalidWorkingDirectory)
-	}
-	info, err := os.Stat(cwd)
-	if err != nil {
-		return fmt.Errorf("validating cwd %q: %w: %v", cwd, ErrInvalidWorkingDirectory, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("validating cwd %q: %w: path is not a directory", cwd, ErrInvalidWorkingDirectory)
+func validateLaunchPrefix(args []string) error {
+	for _, arg := range args {
+		// A wrapper can consume its own -- and forward the remaining flags.
+		// The executable itself remains trusted, but its prefix cannot carry
+		// native flags that compete with the adapter's launch inputs.
+		if claudeLaunchOverride(arg) {
+			return errors.New("Claude startup arguments cannot override managed launch settings")
+		}
 	}
 	return nil
 }
 
-// normalizeAdditionalDirectories 按 cwd 解析相对路径，并返回排序稳定的唯一绝对目录。
-func normalizeAdditionalDirectories(cwd string, directories []string) ([]string, error) {
-	unique := make(map[string]struct{}, len(directories))
-	for _, directory := range directories {
-		if strings.TrimSpace(directory) == "" {
-			return nil, fmt.Errorf("normalizing additional directory: %w: path is empty", ErrInvalidAdditionalDirectory)
-		}
-		if !filepath.IsAbs(directory) {
-			directory = filepath.Join(cwd, directory)
-		}
-		absolute, err := filepath.Abs(directory)
-		if err != nil {
-			return nil, fmt.Errorf("normalizing additional directory: %w: %v", ErrInvalidAdditionalDirectory, err)
-		}
-		absolute = filepath.Clean(absolute)
-		info, err := os.Stat(absolute)
-		if err != nil {
-			return nil, fmt.Errorf("normalizing additional directory %q: %w: %v", absolute, ErrInvalidAdditionalDirectory, err)
-		}
-		if !info.IsDir() {
-			return nil, fmt.Errorf("normalizing additional directory %q: %w: path is not a directory", absolute, ErrInvalidAdditionalDirectory)
-		}
-		unique[absolute] = struct{}{}
+func claudeLaunchOverride(arg string) bool {
+	flag, _, _ := strings.Cut(arg, "=")
+	switch flag {
+	case "--settings", "--managed-settings", "--setting-sources", "--client-data-url", "--host-auth-is-org-sign-in",
+		"--bare", "--safe-mode":
+		return true
+	case "--permission-mode", "--inherit-permission-mode", "--permission-prompt-tool", "--permission-prompts",
+		"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--enable-auto-mode", "--restricted",
+		"--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools":
+		return true
+	case "--cwd", "--add-dir", "--project-config-root", "--worktree", "--tmux", "--file", "--debug-file", "--deep-link-cwd-b64",
+		"--mcp-config", "--strict-mcp-config", "--plugin-dir", "--plugin-dir-no-mcp", "--plugin-url",
+		"--channels", "--dangerously-load-development-channels", "--chrome", "--ide":
+		return true
+	case "--model", "--fallback-model", "--allow-other-models", "--include-unsupported-models", "--effort", "--fast-mode",
+		"--agent", "--agents", "--system-prompt", "--system-prompt-file", "--append-system-prompt",
+		"--append-system-prompt-file", "--system-prompt-snapshot":
+		return true
+	case "--continue", "--resume", "--fork-session", "--session-id", "--no-session-persistence", "--from-pr",
+		"--resume-session-at", "--resume-drops-turn", "--reply-on-resume", "--rewind-files",
+		"--bg", "--background", "--remote", "--cloud", "--teleport", "--remote-control", "--rc", "--attach-serve", "--desktop":
+		return true
+	case "--print", "--input-format", "--output-format", "--sdk-url", "--await-initialize", "--await-claim",
+		"--verbose", "--include-partial-messages", "--replay-user-messages", "--init", "--init-only", "--maintenance":
+		return true
 	}
-	result := make([]string, 0, len(unique))
-	for directory := range unique {
-		result = append(result, directory)
+	if len(flag) < 2 || flag[0] != '-' || flag[1] == '-' {
+		return false
 	}
-	// 稳定排序使相同请求总是生成相同参数和 Session 指纹。
-	sort.Strings(result)
-	return result, nil
+	// Commander accepts attached values for -r and -w and splits boolean
+	// short options. Unknown prefixes and value-taking diagnostic options
+	// are not clusters of native flags (for example, -test.run or -dworktree).
+	for _, option := range flag[1:] {
+		switch option {
+		case 'p', 'c', 'r', 'w':
+			return true
+		case 'h', 'v':
+			continue
+		default:
+			return false
+		}
+	}
+	return false
 }
 
-// encodeMCPConfig 把 ACP MCP union 转成 CLI 接受的命名配置对象。
-func encodeMCPConfig(servers []acp.McpServer) (string, error) {
-	if len(servers) == 0 {
-		return "", nil
+func freezeLaunch(o LaunchOptions) (LaunchOptions, error) {
+	o.SettingSources = slices.Clone(o.SettingSources)
+	o.Tools = slices.Clone(o.Tools)
+	o.PluginDirectories = slices.Clone(o.PluginDirectories)
+	o.ExcludedWriteDirectories = slices.Clone(o.ExcludedWriteDirectories)
+	for _, source := range o.SettingSources {
+		if source != "user" && source != "project" && source != "local" {
+			return LaunchOptions{}, errors.New("invalid Claude settings source")
+		}
+		if o.WorkspaceOnly && source != "user" {
+			return LaunchOptions{}, errors.New("workspace policy requires trusted settings sources")
+		}
 	}
-	configured := make(map[string]any, len(servers))
-	for _, server := range servers {
-		name, value, err := convertMCPServer(server)
+	for _, tool := range o.Tools {
+		if tool == "" || strings.ContainsAny(tool, ", \r\n\t") {
+			return LaunchOptions{}, errors.New("invalid Claude tool selector")
+		}
+	}
+	for i, path := range o.PluginDirectories {
+		dir, err := realDirectory(path)
 		if err != nil {
-			return "", err
+			return LaunchOptions{}, errors.New("invalid Claude plugin directory")
 		}
-		if _, exists := configured[name]; exists {
-			return "", fmt.Errorf("encoding MCP server %q: %w: duplicate name", name, ErrInvalidMCPServer)
-		}
-		configured[name] = value
+		o.PluginDirectories[i] = dir
 	}
-	data, err := json.Marshal(mcpConfigEnvelope{MCPServers: configured})
+	if o.SettingsPath != "" {
+		info, err := os.Stat(o.SettingsPath)
+		if !filepath.IsAbs(o.SettingsPath) || err != nil || !info.Mode().IsRegular() {
+			return LaunchOptions{}, errors.New("invalid Claude settings file")
+		}
+	}
+	return o, nil
+}
+
+func realDirectory(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", errors.New("Claude directory must be absolute")
+	}
+	dir, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", fmt.Errorf("encoding MCP config: %w", err)
+		return "", errors.New("Claude directory is unavailable")
 	}
-	return string(data), nil
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("Claude directory is unavailable")
+	}
+	return dir, nil
 }
 
-// convertMCPServer 校验 union 恰有一个变体，并返回名称与 wire 配置。
-func convertMCPServer(server acp.McpServer) (string, map[string]any, error) {
-	variants := 0
-	if server.Stdio != nil {
-		variants++
-	}
-	if server.Http != nil {
-		variants++
-	}
-	if server.Sse != nil {
-		variants++
-	}
-	if server.Acp != nil {
-		variants++
-	}
-	if variants != 1 {
-		return "", nil, fmt.Errorf("encoding MCP server: %w: expected exactly one transport", ErrInvalidMCPServer)
-	}
+func streamArgs() []string {
+	return []string{"--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
+		"--permission-prompt-tool", "stdio", "--include-partial-messages", "--replay-user-messages"}
+}
 
-	switch {
-	case server.Stdio != nil:
-		value := server.Stdio
-		if strings.TrimSpace(value.Name) == "" || strings.TrimSpace(value.Command) == "" {
-			return "", nil, fmt.Errorf("encoding stdio MCP server: %w: name and command are required", ErrInvalidMCPServer)
-		}
-		env, err := environmentVariables(value.Env)
+func (c *Client) prepareLaunch(req openRequest, old *session) (launchPlan, error) {
+	cwd, err := realDirectory(req.cwd)
+	if err != nil {
+		return launchPlan{}, err
+	}
+	roots := make([]string, 0, len(req.additional))
+	for _, path := range req.additional {
+		root, err := realDirectory(path)
 		if err != nil {
-			return "", nil, fmt.Errorf("encoding stdio MCP server %q: %w", value.Name, err)
+			return launchPlan{}, err
 		}
-		return value.Name, map[string]any{
-			"type": "stdio", "command": value.Command, "args": value.Args, "env": env,
-		}, nil
-	case server.Http != nil:
-		return convertRemoteMCPServer("http", server.Http.Name, server.Http.Url, server.Http.Headers)
-	case server.Sse != nil:
-		return convertRemoteMCPServer("sse", server.Sse.Name, server.Sse.Url, server.Sse.Headers)
-	default:
-		return "", nil, fmt.Errorf("encoding ACP-transport MCP server: %w: unsupported transport", ErrInvalidMCPServer)
-	}
-}
-
-// convertRemoteMCPServer 校验 HTTP/SSE 必填字段并保留 header 值。
-func convertRemoteMCPServer(kind, name, rawURL string, headers []acp.HttpHeader) (string, map[string]any, error) {
-	if strings.TrimSpace(name) == "" || strings.TrimSpace(rawURL) == "" {
-		return "", nil, fmt.Errorf("encoding %s MCP server: %w: name and url are required", kind, ErrInvalidMCPServer)
-	}
-	parsedURL, err := url.ParseRequestURI(rawURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-		return "", nil, fmt.Errorf("encoding %s MCP server %q: %w: url must be absolute HTTP(S)", kind, name, ErrInvalidMCPServer)
-	}
-	headerValues := make(map[string]string, len(headers))
-	for _, header := range headers {
-		canonicalName := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(header.Name))
-		if canonicalName == "" {
-			return "", nil, fmt.Errorf("encoding %s MCP server %q: %w: header name is empty", kind, name, ErrInvalidMCPServer)
+		if root != cwd && !slices.Contains(roots, root) {
+			roots = append(roots, root)
 		}
-		if _, exists := headerValues[canonicalName]; exists {
-			return "", nil, fmt.Errorf("encoding %s MCP server %q: %w: duplicate header", kind, name, ErrInvalidMCPServer)
-		}
-		headerValues[canonicalName] = header.Value
 	}
-	return name, map[string]any{"type": kind, "url": rawURL, "headers": headerValues}, nil
-}
-
-// environmentVariables 把 ACP 键值列表转换为 CLI 配置对象，并拒绝重复键。
-func environmentVariables(values []acp.EnvVariable) (map[string]string, error) {
-	result := make(map[string]string, len(values))
-	for _, value := range values {
-		if strings.TrimSpace(value.Name) == "" {
-			return nil, fmt.Errorf("%w: environment variable name is empty", ErrInvalidMCPServer)
-		}
-		if _, exists := result[value.Name]; exists {
-			return nil, fmt.Errorf("%w: duplicate environment variable", ErrInvalidMCPServer)
-		}
-		result[value.Name] = value.Value
+	slices.Sort(roots)
+	instructions, err := acpmeta.DeveloperInstructions(req.meta)
+	if err != nil {
+		return launchPlan{}, acp.NewInvalidParams(map[string]any{"message": err.Error()})
 	}
-	return result, nil
-}
-
-// claudeLaunchArgs 按稳定顺序构造 Session CLI 参数。
-func claudeLaunchArgs(options launchOptions) []string {
-	args := []string{
-		"--output-format", "stream-json",
-		"--verbose",
-		"--input-format", "stream-json",
-		"--permission-prompt-tool", "stdio",
-		"--include-partial-messages",
-		"--replay-user-messages",
-		"--setting-sources=user,project,local",
+	if instructions == nil && old != nil {
+		instructions = old.launch.instructions
 	}
-	if options.Resume {
-		args = append(args, "--resume="+options.SessionID)
+	snapshotOff := instructions != nil && c.canReplaceInstructions()
+	if instructions != nil && req.resume && !snapshotOff {
+		return launchPlan{}, acp.NewInvalidParams(map[string]any{"message": "overriding resumed Claude instructions requires CLI 2.1.263 or later"})
+	}
+	mcp, err := nativeMCP(req.mcp)
+	if err != nil {
+		return launchPlan{}, err
+	}
+	o := c.options.Launch
+	policy, err := newWorkspacePolicy(o, cwd, roots)
+	if err != nil {
+		return launchPlan{}, err
+	}
+	sources := o.SettingSources
+	if sources == nil {
+		sources = []string{"user", "project", "local"}
+		if policy != nil {
+			sources = []string{"user"}
+		}
+	}
+	// The host may apply another advertised mode after opening. Begin from
+	// an explicit default so a settings file cannot silently select bypass.
+	args := append(streamArgs(), "--setting-sources="+strings.Join(sources, ","), "--permission-mode", "default")
+	if o.Tools != nil {
+		args = append(args, "--tools="+strings.Join(o.Tools, ","))
+	}
+	if policy != nil {
+		args = append(args, "--settings", policy.settings, "--managed-settings", `{"allowManagedHooksOnly":true}`)
+	} else if o.SettingsPath != "" {
+		args = append(args, "--settings", o.SettingsPath)
+	}
+	// The native SDK chooses one plugin delivery route at process launch.
+	// Managed hooks already require an initialize barrier, so deliver plugins
+	// there too; otherwise use the SDK's argv path without MCP discovery.
+	var initializePlugins []string
+	if policy != nil {
+		args = append(args, "--await-initialize")
+		if len(o.PluginDirectories) > 0 {
+			if acpmeta.VerifiedForkMode(c.version, "2.1.261", "initialize") != "initialize" {
+				return launchPlan{}, errors.New("Claude CLI 2.1.261 or later is required for plugins with managed workspace hooks")
+			}
+			initializePlugins = o.PluginDirectories
+		}
 	} else {
-		args = append(args, "--session-id="+options.SessionID)
+		for _, path := range o.PluginDirectories {
+			args = append(args, "--plugin-dir-no-mcp="+path)
+		}
 	}
-	if options.PermissionMode != "" {
-		args = append(args, "--permission-mode", options.PermissionMode)
+	if snapshotOff {
+		args = append(args, "--system-prompt-snapshot", "off")
 	}
-	if options.AllowDangerouslySkipPermissions {
+	if c.bypassEnabled() && policy == nil {
 		args = append(args, "--allow-dangerously-skip-permissions")
 	}
-	if options.MCPConfig != "" {
-		args = append(args, "--mcp-config", options.MCPConfig)
+	if mcp != "" {
+		args = append(args, "--strict-mcp-config", "--mcp-config", mcp)
 	}
-	for _, directory := range options.AdditionalDirectories {
-		args = append(args, "--add-dir", directory)
+	for _, root := range roots {
+		args = append(args, "--add-dir", root)
 	}
-	return args
+	data, _ := json.Marshal([]any{cwd, args, instructions, initializePlugins})
+	fingerprint := sha256.Sum256(data)
+	switch {
+	case req.forkSource != "":
+		args = append(args, "--resume="+req.forkSource, "--fork-session", "--session-id="+string(req.id))
+	case req.resume:
+		args = append(args, "--resume="+string(req.id))
+	default:
+		args = append(args, "--session-id="+string(req.id))
+	}
+	var mcpOnlyPrefixes []string
+	if o.Tools != nil && len(o.Tools) == 0 && o.SettingSources != nil && len(o.SettingSources) == 0 &&
+		len(o.PluginDirectories) == 0 && o.SettingsPath == "" && policy == nil {
+		for _, server := range req.mcp {
+			switch {
+			case server.Stdio != nil:
+				mcpOnlyPrefixes = append(mcpOnlyPrefixes, "mcp__"+server.Stdio.Name+"__")
+			case server.Http != nil:
+				mcpOnlyPrefixes = append(mcpOnlyPrefixes, "mcp__"+server.Http.Name+"__")
+			case server.Sse != nil:
+				mcpOnlyPrefixes = append(mcpOnlyPrefixes, "mcp__"+server.Sse.Name+"__")
+			}
+		}
+	}
+	return launchPlan{cwd: cwd, args: args, fingerprint: fingerprint, instructions: instructions, snapshotOff: snapshotOff,
+		mcpConfigured: len(req.mcp) > 0, mcpOnlyPrefixes: mcpOnlyPrefixes, initializePlugins: initializePlugins, workspace: policy}, nil
 }
 
-// launchFingerprint 标识会影响长期 Session 进程定义的参数。
-func launchFingerprint(options launchOptions) string {
-	data, _ := json.Marshal(options)
-	return string(data)
+func nativeMCP(servers []acp.McpServer) (string, error) {
+
+	rows := make(map[string]any, len(servers))
+	for _, server := range servers {
+		var name string
+		var row map[string]any
+		switch {
+		case server.Stdio != nil:
+			s := server.Stdio
+			name = s.Name
+			if s.Command == "" || strings.ContainsRune(s.Command, 0) {
+				return "", errors.New("invalid Claude MCP stdio command")
+			}
+			env := make(map[string]string, len(s.Env))
+			for _, pair := range s.Env {
+				if pair.Name == "" || strings.ContainsAny(pair.Name, "=\x00") {
+					return "", errors.New("invalid Claude MCP environment name")
+				}
+				if _, duplicate := env[pair.Name]; duplicate {
+					return "", errors.New("duplicate Claude MCP environment name")
+				}
+				env[pair.Name] = pair.Value
+			}
+			args := s.Args
+			if args == nil {
+				args = []string{}
+			}
+			row = map[string]any{"type": "stdio", "command": s.Command, "args": args, "env": env}
+		case server.Http != nil:
+			name = server.Http.Name
+			var err error
+			row, err = remoteMCP("http", server.Http.Url, server.Http.Headers)
+			if err != nil {
+				return "", err
+			}
+		case server.Sse != nil:
+			name = server.Sse.Name
+			var err error
+			row, err = remoteMCP("sse", server.Sse.Url, server.Sse.Headers)
+			if err != nil {
+				return "", err
+			}
+		default:
+			return "", errors.New("unsupported Claude MCP transport")
+		}
+		if name == "" || strings.ContainsAny(name, " \r\n\t") {
+			return "", errors.New("invalid Claude MCP server name")
+		}
+		if _, duplicate := rows[name]; duplicate {
+			return "", errors.New("duplicate Claude MCP server name")
+		}
+		rows[name] = row
+	}
+	data, err := json.Marshal(map[string]any{"mcpServers": rows})
+	return string(data), err
+}
+
+func remoteMCP(kind, raw string, headers []acp.HttpHeader) (map[string]any, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || u.Host == "" || u.Scheme != "http" && u.Scheme != "https" || u.User != nil {
+		return nil, errors.New("invalid Claude remote MCP URL")
+	}
+	values := make(map[string]string, len(headers))
+	for _, header := range headers {
+		key := strings.ToLower(header.Name)
+		if key == "" || strings.ContainsAny(key, " \r\n\t:") || strings.ContainsAny(header.Value, "\r\n") {
+			return nil, errors.New("invalid Claude MCP header")
+		}
+		if _, duplicate := values[key]; duplicate {
+			return nil, errors.New("duplicate Claude MCP header")
+		}
+		values[key] = header.Value
+	}
+	return map[string]any{"type": kind, "url": raw, "headers": values}, nil
+}
+
+func (c *Client) canReplaceInstructions() bool {
+	return acpmeta.VerifiedForkMode(c.version, "2.1.263", acpmeta.ForkLatest) == acpmeta.ForkLatest
+}
+
+func (c *Client) instructionCapability() map[string]any {
+	capability := acpmeta.DeveloperInstructionsCapability(c.forkMode() != acpmeta.ForkUnsupported)
+	capability["resume"] = c.canReplaceInstructions()
+	capability["load"] = c.canReplaceInstructions()
+	return capability
+}
+
+// streamEnvironment follows the CLI's SDK transport negotiation. The
+// compatibility entrypoint enables SDK control; this client still owns Go I/O.
+func (c *Client) streamEnvironment() []string {
+	env := make([]string, 0, len(c.options.Environment)+5)
+	for _, entry := range c.options.Environment {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && !strings.EqualFold(key, "NODE_OPTIONS") {
+			env = append(env, entry)
+		}
+	}
+	return append(env, "CLAUDE_CODE_ENTRYPOINT=sdk-ts", "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1",
+		"CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1", "CLAUDE_CODE_ENABLE_TODO_TOOLS=1",
+		"CLAUDE_AGENT_SDK_CLIENT_APP=acp-go/claude")
 }

@@ -1,5 +1,7 @@
 # WorkBuddy 协议来源与兼容基线
 
+下文保留固定上游及历史真实 CLI 证据。当前测试入口见 [README.md](README.md)。
+
 核对日期：2026-10-15。入口是 CodeBuddy Code 的标准登录组合根 `codebuddy/cbc --acp`，本机 CLI 版本 `2.151.0`。运行依赖由用户安装，不复制或嵌入该商业 CLI。
 
 | 来源 | 用途 |
@@ -15,7 +17,7 @@
 
 实际无模型探针观察到：初始化未返回 agentInfo，已由同一 CLI 的 `--version` 补全；声明 load、image、embeddedContext、HTTP/SSE MCP；未声明标准 session/list/resume/close/fork/additionalDirectories。新会话同时返回旧 models 和标准 configOptions，包含 model、thought_level、mode、sandbox 和 boolean multitask。仅规范化明确支持的配置，不主动开启 Multitask、沙箱或内部运行时。
 
-默认回归使用实际子进程 fake CLI 和两层 SDK：零私有元数据、完整环境、版本补齐、认证公开元数据、模型和思考原始 ID、布尔配置解析、MCP 原样挂载、new/load、两轮新增输入、审批、单选/多选/自由回答、拒答/取消、错误码原文、公开消息元数据和不支持的 steering。共享 nativeacp 的 FIFO、代际取消、文件/终端回调、进程回收与错误原文回归继续适用。
+默认回归使用实际子进程 fake CLI 和两层 SDK：零私有元数据、完整环境、版本补齐、认证公开元数据、模型和思考原始 ID、布尔配置解析、MCP 原样挂载、new/load、两轮新增输入、审批、单选/多选/自由回答、拒答/取消、错误码原文、公开消息元数据和不支持的 steering。共享层的当前验证见 [原生 ACP 验证矩阵](../../docs/NATIVE_ACP_TEST_MATRIX.md)。
 
 `TestInstalledWorkBuddyProtocol` 以 `WORKBUDDY_REAL_ACP=1` 显式开启，在临时 `CODEBUDDY_CONFIG_DIR` 与工作目录中验证实际 CLI 握手、新建、原生 auto 权限及跨进程 load，不登录、不发送 Prompt。真实服务商的模型回复、工具执行、问答、Teams/MCP-UI 和 Windows 进程树不由 fixture 或无模型探针证明。
 
