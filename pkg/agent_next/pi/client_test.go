@@ -57,7 +57,10 @@ func fixtureOptions(t *testing.T, dir string) Options {
 	}
 }
 
-type publicHost struct{ acp.Client }
+type publicHost struct {
+	// Client supplies unused SDK callbacks for the public wire fixture.
+	acp.Client
+}
 
 func (publicHost) SessionUpdate(context.Context, acp.SessionNotification) error { return nil }
 
@@ -188,8 +191,12 @@ func TestManagedBridgeKeepsMCPValuesOutOfSource(t *testing.T) {
 func TestPromptWaitsForSettlementAndReportsOnlyInvocationUsage(t *testing.T) {
 	client, ctx, session := fixtureClient(t, agentclient.HostCallbacks{})
 	for _, tc := range []struct {
-		prompt, text string
-		input        int64
+		// prompt selects the native fixture branch.
+		prompt string
+		// text is the native terminal answer.
+		text string
+		// input is the measured uncached input for this invocation.
+		input int64
 	}{{"first", "second attempt", 9}, {"second", "done", 2}} {
 		run, err := client.ReservePrompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock(tc.prompt)}}, agentclient.PromptOptions{})
 		if err != nil {
@@ -316,9 +323,14 @@ func TestUnknownUsageComponentPreservesObservedSubtotal(t *testing.T) {
 		t.Fatalf("partial prompt: %+v", got)
 	}
 	usage := got.Outcome.Turn.Usage
-	if usage == nil || usage.CacheReadTokens != nil || len(usage.Observations) != 1 ||
-		usage.Observations[0].Tokens.CacheReadTokens == nil || *usage.Observations[0].Tokens.CacheReadTokens != 3 {
-		t.Fatalf("partial usage: %+v", usage)
+	if usage == nil || usage.Complete || usage.Coverage != "assistant_messages" || len(usage.Observations) != 0 ||
+		usage.CacheReadTokens == nil || *usage.CacheReadTokens != 5 || usage.CacheWriteTokens == nil || *usage.CacheWriteTokens != 0 ||
+		usage.InputTokens == nil || *usage.InputTokens != 7 || usage.OutputTokens == nil || *usage.OutputTokens != 3 {
+		t.Fatalf("partial primary usage: %+v", usage)
+	}
+	model := usage.Models["test/alpha"]
+	if model.CacheReadTokens == nil || *model.CacheReadTokens != 5 || model.CacheWriteTokens == nil || *model.CacheWriteTokens != 0 {
+		t.Fatalf("partial model usage: %+v", usage.Models)
 	}
 }
 
@@ -521,9 +533,13 @@ func TestPiRPCFixture(t *testing.T) {
 			if prompt == "partial" {
 				event("message_end", map[string]any{"message": map[string]any{
 					"role": "assistant", "provider": "test", "model": "alpha", "stopReason": "toolUse",
-					"usage": map[string]any{"input": 1, "output": 1, "cacheRead": 3},
+					"usage": map[string]any{"input": 1, "output": 1, "cacheRead": 3, "cacheWrite": 0},
 				}})
-				message("done", "stop", 2)
+				message("next tool", "toolUse", 2)
+				event("message_end", map[string]any{"message": map[string]any{
+					"role": "assistant", "provider": "test", "model": "alpha", "stopReason": "stop",
+					"usage": map[string]any{"input": 4, "output": 1, "cacheRead": 2},
+				}})
 			} else if prompt == "first" {
 				message("retry output", "error", 4)
 				event("agent_end", map[string]any{"willRetry": true})

@@ -16,15 +16,24 @@ import (
 )
 
 type nativeCounters struct {
-	Input      *int64 `json:"input"`
-	Output     *int64 `json:"output"`
-	CacheRead  *int64 `json:"cacheRead"`
+	// Input counts uncached input tokens from one assistant response.
+	Input *int64 `json:"input"`
+	// Output counts native output tokens from that response.
+	Output *int64 `json:"output"`
+	// CacheRead counts input served from cache.
+	CacheRead *int64 `json:"cacheRead"`
+	// CacheWrite counts input written to cache.
 	CacheWrite *int64 `json:"cacheWrite"`
 }
 
+// tokenSubtotal counts observed values and preserves explicit zeros. Coverage
+// belongs to the accumulator, so a missing value never erases a known subtotal.
 type tokenSubtotal struct {
-	value    int64
-	known    bool
+	// value sums the available counter values.
+	value int64
+	// observed counts responses that supplied this component.
+	observed int
+	// overflow marks a subtotal that exceeded the integer range.
 	overflow bool
 }
 
@@ -32,87 +41,173 @@ func (s *tokenSubtotal) add(value *int64) {
 	if value == nil || *value < 0 || s.overflow {
 		return
 	}
+	s.observed++
 	if s.value > math.MaxInt64-*value {
 		s.overflow = true
 		return
 	}
 	s.value += *value
-	s.known = true
 }
 
-func (s tokenSubtotal) partial(total *int64) *int64 {
-	if total != nil || !s.known || s.overflow {
+func (s tokenSubtotal) total() *int64 {
+	if s.observed == 0 || s.overflow {
 		return nil
 	}
 	return pointer(s.value)
 }
 
+func (s tokenSubtotal) partial(messages int) bool {
+	return s.overflow || s.observed != 0 && s.observed != messages
+}
+
+type tokenTotals struct {
+	// input accumulates uncached input.
+	input tokenSubtotal
+	// output accumulates native output.
+	output tokenSubtotal
+	// cacheRead accumulates input read from cache.
+	cacheRead tokenSubtotal
+	// cacheWrite accumulates input written to cache.
+	cacheWrite tokenSubtotal
+	// messages counts all assistant responses in this scope.
+	messages int
+}
+
+func (t *tokenTotals) add(counters *nativeCounters) {
+	t.messages++
+	if counters == nil {
+		return
+	}
+	t.input.add(counters.Input)
+	t.output.add(counters.Output)
+	t.cacheRead.add(counters.CacheRead)
+	t.cacheWrite.add(counters.CacheWrite)
+}
+
+func (t tokenTotals) tokens() acpmeta.ModelUsage {
+	return acpmeta.ModelUsage{
+		InputTokens: t.input.total(), OutputTokens: t.output.total(),
+		CacheReadTokens: t.cacheRead.total(), CacheWriteTokens: t.cacheWrite.total(),
+	}
+}
+
+func (t tokenTotals) partial() bool {
+	return t.input.partial(t.messages) || t.output.partial(t.messages) ||
+		t.cacheRead.partial(t.messages) || t.cacheWrite.partial(t.messages)
+}
+
 type nativeMessage struct {
-	Role         string          `json:"role"`
-	Provider     string          `json:"provider"`
-	Model        string          `json:"model"`
-	StopReason   string          `json:"stopReason"`
-	ErrorMessage string          `json:"errorMessage"`
-	Content      json.RawMessage `json:"content"`
-	Usage        *nativeCounters `json:"usage"`
+	// Role identifies the producer of the message.
+	Role string `json:"role"`
+	// Provider identifies the service that produced an assistant response.
+	Provider string `json:"provider"`
+	// Model identifies the exact model that produced the response.
+	Model string `json:"model"`
+	// StopReason is the provider's per-message completion reason.
+	StopReason string `json:"stopReason"`
+	// ErrorMessage supplies private text for failure classification.
+	ErrorMessage string `json:"errorMessage"`
+	// Content holds the complete native message body.
+	Content json.RawMessage `json:"content"`
+	// Usage reports counters for this response.
+	Usage *nativeCounters `json:"usage"`
 }
 
 type nativeEvent struct {
-	Type      string        `json:"type"`
-	Aborted   *bool         `json:"aborted"`
-	Message   nativeMessage `json:"message"`
+	// Type selects the native event shape.
+	Type string `json:"type"`
+	// Aborted carries the native settlement cancellation fact when supplied.
+	Aborted *bool `json:"aborted"`
+	// Message is the typed message snapshot on lifecycle events.
+	Message nativeMessage `json:"message"`
+	// Assistant holds the native incremental text or thought update.
 	Assistant struct {
-		Type  string `json:"type"`
+		// Type identifies the native content change.
+		Type string `json:"type"`
+		// Delta is the incremental text emitted by that change.
 		Delta string `json:"delta"`
 	} `json:"assistantMessageEvent"`
-	ToolID        acp.ToolCallId                    `json:"toolCallId"`
-	ToolName      string                            `json:"toolName"`
-	Args          json.RawMessage                   `json:"args"`
-	Result        struct{ Content json.RawMessage } `json:"result"`
-	PartialResult struct{ Content json.RawMessage } `json:"partialResult"`
-	IsError       bool                              `json:"isError"`
-	Success       bool                              `json:"success"`
-	FinalError    string                            `json:"finalError"`
-	StatusKey     string                            `json:"statusKey"`
-	StatusText    string                            `json:"statusText"`
+	// ToolID correlates records for one native tool call.
+	ToolID acp.ToolCallId `json:"toolCallId"`
+	// ToolName is the provider's tool identifier.
+	ToolName string `json:"toolName"`
+	// Args contains the native tool parameters.
+	Args json.RawMessage `json:"args"`
+	// Result holds final tool output.
+	Result struct {
+		// Content contains the native output blocks.
+		Content json.RawMessage
+	} `json:"result"`
+	// PartialResult holds an in-progress tool snapshot.
+	PartialResult struct {
+		// Content contains the native output blocks.
+		Content json.RawMessage
+	} `json:"partialResult"`
+	// IsError marks the native tool result as failed.
+	IsError bool `json:"isError"`
+	// Success indicates the retry controller recovered.
+	Success bool `json:"success"`
+	// FinalError describes an exhausted retry for local classification.
+	FinalError string `json:"finalError"`
+	// StatusKey identifies the extension status channel.
+	StatusKey string `json:"statusKey"`
+	// StatusText contains the status channel's value.
+	StatusText string `json:"statusText"`
 }
 
 type turnEvents struct {
-	session                                                    *session
-	invocation                                                 *invocation
-	outcome                                                    *agentclient.NativeOutcome
-	inputID                                                    string
-	started                                                    bool
-	messageID                                                  string
-	lastMessage                                                *agentclient.FinalMessage
-	lastStop                                                   string
-	failure                                                    error
-	extensionError                                             error
-	counters                                                   nativeCounters
-	observedInput, observedOutput, observedRead, observedWrite tokenSubtotal
-	modelCounters                                              map[string]nativeCounters
-	modelCounts                                                map[string]int
-	messages                                                   int
-	usageSeen                                                  bool
-	attributionUnknown                                         bool
-	tools                                                      map[acp.ToolCallId]bool
+	// session is the native owner emitting this turn's records.
+	session *session
+	// invocation supplies the frozen host scope and lifetime.
+	invocation *invocation
+	// outcome accumulates the canonical result before publication.
+	outcome *agentclient.NativeOutcome
+	// inputID is the admitted host input associated with a native start.
+	inputID string
+	// started gates execution events on an observed agent_start.
+	started bool
+	// messageID associates deltas and replacement text for the current response.
+	messageID string
+	// lastMessage preserves the latest complete assistant text.
+	lastMessage *agentclient.FinalMessage
+	// lastStop is the latest assistant response's stop reason.
+	lastStop string
+	// failure is the current model error, which a successful retry may clear.
+	failure error
+	// extensionError is an extension fault independent of model retries.
+	extensionError error
+	// counters aggregates measured components over the invocation.
+	counters tokenTotals
+	// modelCounters partitions the same counters by native model.
+	modelCounters map[string]tokenTotals
+	// attributionUnknown omits model decomposition when identities are incomplete.
+	attributionUnknown bool
+	// tools tracks native tool calls that are still in progress.
+	tools map[acp.ToolCallId]bool
 
-	delivery        chan observed
-	deliveryDone    chan error
-	deliveryCancel  context.CancelFunc
-	deliveryBytes   atomic.Int64
+	// delivery queues bounded, ordered host observations.
+	delivery chan observed
+	// deliveryDone reports the observation worker's result.
+	deliveryDone chan error
+	// deliveryCancel stops the observation worker's callback context.
+	deliveryCancel context.CancelFunc
+	// deliveryBytes accounts for queued observation payloads.
+	deliveryBytes atomic.Int64
+	// deliveryFailure stores a local observation budget failure.
 	deliveryFailure error
 }
 
 type observed struct {
+	// notification is the ACP observation to deliver.
 	notification acp.SessionNotification
-	bytes        int64
+	// bytes is the payload size charged to the delivery queue.
+	bytes int64
 }
 
 func newTurnEvents(s *session, t *invocation, o *agentclient.NativeOutcome, inputID string) *turnEvents {
 	e := &turnEvents{
 		session: s, invocation: t, outcome: o, inputID: inputID,
-		modelCounters: make(map[string]nativeCounters), modelCounts: make(map[string]int), tools: make(map[acp.ToolCallId]bool),
+		modelCounters: make(map[string]tokenTotals), tools: make(map[acp.ToolCallId]bool),
 	}
 	if s.client.host.Observe != nil {
 		e.delivery = make(chan observed, 64)
@@ -252,10 +347,14 @@ func (e *turnEvents) output(event nativeEvent, size int) {
 			return
 		}
 		var report struct {
-			ToolID    acp.ToolCallId `json:"toolCallId"`
-			Outcome   string
+			// ToolID matches the native call evaluated by the reviewer.
+			ToolID acp.ToolCallId `json:"toolCallId"`
+			// Outcome is the reviewer decision.
+			Outcome string
+			// RiskLevel is the reviewer risk classification.
 			RiskLevel string `json:"risk_level"`
-			Failed    bool
+			// Failed records an unavailable or unsuccessful review.
+			Failed bool
 		}
 		if json.Unmarshal([]byte(event.StatusText), &report) == nil && report.ToolID != "" {
 			update := acp.UpdateToolCall(report.ToolID)
@@ -309,8 +408,11 @@ func (e *turnEvents) finish() {
 	if o.Turn.Status != "" {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(e.invocation.ctx), time.Second)
 		var stats struct {
+			// Context reports the current model context estimate.
 			Context struct {
-				Used   *int64 `json:"tokens"`
+				// Used is the native estimate, if available.
+				Used *int64 `json:"tokens"`
+				// Window is the native model context limit, if available.
 				Window *int64 `json:"contextWindow"`
 			} `json:"contextUsage"`
 		}
@@ -319,9 +421,7 @@ func (e *turnEvents) finish() {
 		}
 		cancel()
 	}
-	if e.usageSeen {
-		o.Turn.Usage = e.usage()
-	}
+	o.Turn.Usage = e.usage()
 	if used, window := o.ContextUsage.UsedTokens, o.ContextUsage.WindowTokens; used != nil && window != nil && *window > 0 && *window <= math.MaxInt && *used <= math.MaxInt {
 		var meta map[string]any
 		if o.Turn.Usage != nil {
@@ -377,73 +477,43 @@ func messageContent(raw json.RawMessage) []acp.ContentBlock {
 }
 
 func (e *turnEvents) recordUsage(msg nativeMessage) {
-	counters := nativeCounters{}
-	if msg.Usage != nil {
-		counters = *msg.Usage
-		e.usageSeen = e.usageSeen || nonnegative(counters.Input) != nil || nonnegative(counters.Output) != nil || nonnegative(counters.CacheRead) != nil || nonnegative(counters.CacheWrite) != nil
-	}
-	e.observedInput.add(counters.Input)
-	e.observedOutput.add(counters.Output)
-	e.observedRead.add(counters.CacheRead)
-	e.observedWrite.add(counters.CacheWrite)
-	e.counters = mergeCounters(e.counters, counters, e.messages == 0)
-	e.messages++
+	e.counters.add(msg.Usage)
 	if msg.Provider == "" || msg.Model == "" || len(msg.Provider)+len(msg.Model) > 512 {
 		e.attributionUnknown = true
 		return
 	}
 	key := msg.Provider + "/" + msg.Model
-	if _, exists := e.modelCounts[key]; !exists && len(e.modelCounts) >= 64 {
+	totals, exists := e.modelCounters[key]
+	if !exists && len(e.modelCounters) >= 64 {
 		e.attributionUnknown = true
 		return
 	}
-	e.modelCounters[key] = mergeCounters(e.modelCounters[key], counters, e.modelCounts[key] == 0)
-	e.modelCounts[key]++
+	totals.add(msg.Usage)
+	e.modelCounters[key] = totals
 }
 
 func (e *turnEvents) usage() *acpmeta.TurnUsage {
+	totals := e.counters.tokens()
+	if totals == (acpmeta.ModelUsage{}) {
+		return nil
+	}
 	u := &acpmeta.TurnUsage{
-		InputTokens: e.counters.Input, OutputTokens: e.counters.Output,
-		CacheReadTokens: e.counters.CacheRead, CacheWriteTokens: e.counters.CacheWrite,
+		InputTokens: totals.InputTokens, OutputTokens: totals.OutputTokens,
+		CacheReadTokens: totals.CacheReadTokens, CacheWriteTokens: totals.CacheWriteTokens,
 		Source: "pi.assistant_message.usage", Coverage: "assistant_messages",
-		Complete:     e.outcome.Turn.Status != "",
+		Complete:     e.outcome.Turn.Status != "" && !e.counters.partial(),
 		ContextKnown: e.outcome.ContextUsage.UsedTokens != nil && e.outcome.ContextUsage.WindowTokens != nil,
 	}
 	if !e.attributionUnknown && len(e.modelCounters) > 0 {
 		u.Models = make(map[string]acpmeta.ModelUsage, len(e.modelCounters))
-		for model, usage := range e.modelCounters {
-			u.Models[model] = acpmeta.ModelUsage{InputTokens: usage.Input, OutputTokens: usage.Output, CacheReadTokens: usage.CacheRead, CacheWriteTokens: usage.CacheWrite}
+		for model, counters := range e.modelCounters {
+			u.Models[model] = counters.tokens()
 			if len(e.modelCounters) == 1 {
 				u.Model = model
 			}
 		}
 	}
-	partial := acpmeta.ModelUsage{
-		InputTokens: e.observedInput.partial(u.InputTokens), OutputTokens: e.observedOutput.partial(u.OutputTokens),
-		CacheReadTokens: e.observedRead.partial(u.CacheReadTokens), CacheWriteTokens: e.observedWrite.partial(u.CacheWriteTokens),
-	}
-	if partial.InputTokens != nil || partial.OutputTokens != nil || partial.CacheReadTokens != nil || partial.CacheWriteTokens != nil {
-		u.Observations = []acpmeta.UsageObservation{{Source: u.Source, Coverage: "known_message_components", Tokens: partial}}
-	}
 	return u
-}
-
-func mergeCounters(total, next nativeCounters, first bool) nativeCounters {
-	return nativeCounters{
-		Input: addCounter(total.Input, next.Input, first), Output: addCounter(total.Output, next.Output, first),
-		CacheRead: addCounter(total.CacheRead, next.CacheRead, first), CacheWrite: addCounter(total.CacheWrite, next.CacheWrite, first),
-	}
-}
-
-func addCounter(total, next *int64, first bool) *int64 {
-	next = nonnegative(next)
-	if first || next == nil {
-		return next
-	}
-	if total == nil || *total > math.MaxInt64-*next {
-		return nil
-	}
-	return pointer(*total + *next)
 }
 
 func nonnegative(counter *int64) *int64 {

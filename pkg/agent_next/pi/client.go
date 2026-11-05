@@ -39,38 +39,63 @@ type Options struct {
 
 // Client owns one Pi process per exact native session file.
 type Client struct {
-	options  Options
-	host     agentclient.HostCallbacks
+	// options freezes the account environment and launch policy.
+	options Options
+	// host receives scoped events and owns interaction responses.
+	host agentclient.HostCallbacks
+	// openGate serializes native session creation, restoration, and discovery.
 	openGate chan struct{}
 
-	mu                 sync.Mutex
-	initialized        bool
-	version            string
-	closing            bool
-	sessions           map[acp.SessionId]*session
-	processes          map[*session]struct{}
+	// mu protects registration, closure, and receipt accounting.
+	mu sync.Mutex
+	// initialized marks the client ready for native operations.
+	initialized bool
+	// version is the version reported by the selected Pi executable.
+	version string
+	// closing withdraws admission before process teardown.
+	closing bool
+	// sessions indexes published sessions by their ACP identities.
+	sessions map[acp.SessionId]*session
+	// processes retains starting, live, and incompletely cleaned process owners.
+	processes map[*session]struct{}
+	// foregroundReceipts is negotiated by hosts that acknowledge results.
 	foregroundReceipts bool
-	retainedOutcomes   int
-	ledger             map[acp.SessionId]*outcomeLedger
+	// retainedOutcomes counts retained receipts and in-flight reservations.
+	retainedOutcomes int
+	// ledger retains receipts across process shutdown until acknowledgment.
+	ledger map[acp.SessionId]*outcomeLedger
 }
 
 type session struct {
-	client    *Client
-	id        acp.SessionId
-	file      string
-	cwd       string
+	// client supplies frozen launch policy and host callbacks.
+	client *Client
+	// id is the published ACP session identity.
+	id acp.SessionId
+	// file is the confirmed native JSONL transcript path.
+	file string
+	// cwd is the bound working directory.
+	cwd string
+	// directory holds this process's temporary instructions and extension.
 	directory string
-	rpc       *rpc
+	// rpc owns this session's native process and transport.
+	rpc *rpc
 
-	mu      sync.Mutex
-	busy    bool
+	// mu protects operation admission and the current prompt owner.
+	mu sync.Mutex
+	// busy reserves the session for one foreground operation.
+	busy bool
+	// closing prevents admission during teardown.
 	closing bool
-	turn    *invocation
+	// turn captures the prompt that an incoming cancellation may target.
+	turn *invocation
 }
 
 type outcomeLedger struct {
-	changed   chan struct{}
-	outcomes  []agentclient.NativeOutcome
+	// changed wakes waiters after a receipt or producer transition.
+	changed chan struct{}
+	// outcomes stores unacknowledged results in completion order.
+	outcomes []agentclient.NativeOutcome
+	// producers counts prompt continuations that may still publish a result.
 	producers int
 }
 
@@ -367,7 +392,10 @@ func (s *session) bindFile(ctx context.Context, state nativeState, requested str
 		if err := placeholder.Close(); err != nil {
 			return err
 		}
-		var result struct{ Cancelled bool }
+		var result struct {
+			// Cancelled indicates that a native extension refused the switch.
+			Cancelled bool
+		}
 		if err := s.rpc.call(ctx, "switch_session", map[string]any{"sessionPath": file}, &result); err != nil {
 			return err
 		}
@@ -568,7 +596,12 @@ func validateRoots(cwd string, additional []string) error {
 	return nil
 }
 
-type classifiedError struct{ kind, phase string }
+type classifiedError struct {
+	// kind is the safe public error classification.
+	kind string
+	// phase names the operation where the error arose.
+	phase string
+}
 
 func (e classifiedError) Error() string { return "Pi " + e.phase + ": " + e.kind }
 

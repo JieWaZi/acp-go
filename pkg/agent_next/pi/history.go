@@ -20,9 +20,12 @@ import (
 )
 
 type header struct {
+	// Type distinguishes the native session header from a journal entry.
 	Type string `json:"type"`
-	ID   string `json:"id"`
-	Cwd  string `json:"cwd"`
+	// ID is the Pi identity of this transcript.
+	ID string `json:"id"`
+	// Cwd is the workspace persisted by Pi for resumption.
+	Cwd string `json:"cwd"`
 }
 
 func (c *Client) sessionRoot(cwd string) string {
@@ -46,6 +49,7 @@ func (c *Client) sessionRoot(cwd string) string {
 	if override == "" {
 		for _, path := range []string{filepath.Join(root, "settings.json"), filepath.Join(cwd, ".pi", "settings.json")} {
 			var settings struct {
+				// SessionDir overrides the account transcript directory.
 				SessionDir string `json:"sessionDir"`
 			}
 			if raw, err := os.ReadFile(path); err == nil && json.Unmarshal(raw, &settings) == nil && settings.SessionDir != "" {
@@ -229,7 +233,10 @@ func (s *session) replay(ctx context.Context) error {
 	defer end()
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
-	var response struct{ Messages []nativeMessage }
+	var response struct {
+		// Messages contains the visible messages of the active native branch.
+		Messages []nativeMessage
+	}
 	if err := s.rpc.call(ctx, "get_messages", nil, &response); err != nil {
 		return err
 	}
@@ -306,7 +313,10 @@ func (c *Client) UnstableForkSession(ctx context.Context, r acp.UnstableForkSess
 	if err := acpmeta.BeginForkReceipt(r); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
-	var result struct{ Cancelled bool }
+	var result struct {
+		// Cancelled indicates that native policy refused the clone.
+		Cancelled bool
+	}
 	if err := clone.rpc.call(ctx, "clone", nil, &result); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}

@@ -18,16 +18,26 @@ import (
 )
 
 type invocation struct {
-	scope      agentclient.Scope
-	ctx        context.Context
-	cancel     context.CancelCauseFunc
+	// scope freezes the identities carried by observations and interactions.
+	scope agentclient.Scope
+	// ctx is the prompt lifetime shared by preparation and dialogs.
+	ctx context.Context
+	// cancel captures the first cause that interrupts this prompt.
+	cancel context.CancelCauseFunc
+	// eventQueue holds native records awaiting ordered settlement.
 	eventQueue chan []byte
-	uiQueue    chan uiRequest
+	// uiQueue holds interactive requests that can precede the prompt acknowledgment.
+	uiQueue chan uiRequest
 
-	mu          sync.Mutex
+	// mu guards the queue budget, send boundary, and captured cancellation.
+	mu sync.Mutex
+	// queuedBytes counts pending native events and dialogs.
 	queuedBytes int
-	submitted   bool
-	sealed      bool
+	// submitted marks that the prompt passed its final write gate.
+	submitted bool
+	// sealed prevents further records from joining the settled prompt.
+	sealed bool
+	// controlDone joins the single cancellation task before session reuse.
 	controlDone chan struct{}
 }
 
@@ -294,7 +304,10 @@ func (s *session) prompt(t *invocation, input agentclient.PromptSubmission, opti
 	if len(images) > 0 {
 		args["images"] = images
 	}
-	var ack struct{ Disposition string }
+	var ack struct {
+		// Disposition distinguishes started, queued, and handled prompts when supplied.
+		Disposition string
+	}
 	// Context cancellation independently starts clear_queue/abort. Continue
 	// collecting the response and native terminal through that control task.
 	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(t.ctx), 20*time.Second)

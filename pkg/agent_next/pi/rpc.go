@@ -23,33 +23,51 @@ const (
 )
 
 type record struct {
-	Type    string          `json:"type"`
-	ID      string          `json:"id"`
-	Command string          `json:"command"`
-	Success *bool           `json:"success"`
-	Error   string          `json:"error"`
-	Data    json.RawMessage `json:"data"`
+	// Type distinguishes RPC responses from session events.
+	Type string `json:"type"`
+	// ID correlates a response with its request.
+	ID string `json:"id"`
+	// Command echoes the native operation associated with a response.
+	Command string `json:"command"`
+	// Success preserves whether Pi explicitly accepted the command.
+	Success *bool `json:"success"`
+	// Error is native rejection text used for local classification.
+	Error string `json:"error"`
+	// Data holds the operation-specific result.
+	Data json.RawMessage `json:"data"`
 }
 
 type rpcRejection struct {
+	// command is the locally issued operation that Pi refused.
 	command string
-	detail  string
+	// detail is the private native error used to classify the refusal.
+	detail string
 }
 
 func (e *rpcRejection) Error() string { return "Pi rejected " + e.command }
 
 type rpc struct {
-	process     *agentclient.Process
-	writeGate   chan struct{}
+	// process owns the child process tree and its pipes.
+	process *agentclient.Process
+	// writeGate gives one command exclusive access to the stdin deadline and write.
+	writeGate chan struct{}
+	// dismissGate bounds concurrent replies to dialogs outside a prompt.
 	dismissGate chan struct{}
-	done        chan struct{}
-	ready       chan struct{}
-	sequence    atomic.Uint64
+	// done closes on the first transport failure or native exit.
+	done chan struct{}
+	// ready closes when the managed extension reports registration.
+	ready chan struct{}
+	// sequence allocates distinct command IDs for this process.
+	sequence atomic.Uint64
 
-	mu      sync.Mutex
+	// mu protects pending replies, transport failure, and active event routing.
+	mu sync.Mutex
+	// failure stores the first transport cause.
 	failure error
+	// pending maps command IDs to their response waiters.
 	pending map[string]chan record
-	active  *invocation
+	// active is the prompt eligible to receive session events.
+	active *invocation
 }
 
 func newRPC(p *agentclient.Process) *rpc {

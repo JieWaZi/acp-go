@@ -14,10 +14,14 @@ import (
 )
 
 type resources struct {
-	probe        bool
+	// probe suppresses session-only resources for a management launch.
+	probe bool
+	// instructions is the optional native system prompt addition.
 	instructions *string
-	directories  []string
-	servers      []acp.McpServer
+	// directories are the additional workspace roots checked at open.
+	directories []string
+	// servers contains the MCP descriptors frozen for this session.
+	servers []acp.McpServer
 }
 
 func openResources(meta map[string]any, directories []string, servers []acp.McpServer) (resources, error) {

@@ -13,10 +13,14 @@ import (
 )
 
 type nativeModel struct {
-	Provider  string `json:"provider"`
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Reasoning *bool  `json:"reasoning"`
+	// Provider identifies the native model service.
+	Provider string `json:"provider"`
+	// ID is the exact model identifier passed separately to Pi.
+	ID string `json:"id"`
+	// Name is the native display label.
+	Name string `json:"name"`
+	// Reasoning is the model's reported support for thinking controls.
+	Reasoning *bool `json:"reasoning"`
 }
 
 func (m nativeModel) key() string {
@@ -27,10 +31,14 @@ func (m nativeModel) key() string {
 }
 
 type nativeState struct {
-	SessionFile   string       `json:"sessionFile"`
-	SessionID     string       `json:"sessionId"`
-	Model         *nativeModel `json:"model"`
-	ThinkingLevel string       `json:"thinkingLevel"`
+	// SessionFile is the path returned by Pi for its active transcript.
+	SessionFile string `json:"sessionFile"`
+	// SessionID is the native identity stored in that transcript header.
+	SessionID string `json:"sessionId"`
+	// Model is the effective model selected by Pi.
+	Model *nativeModel `json:"model"`
+	// ThinkingLevel is the effective thinking level of Model.
+	ThinkingLevel string `json:"thinkingLevel"`
 }
 
 func (s *session) state(ctx context.Context) (nativeState, error) {
@@ -40,7 +48,10 @@ func (s *session) state(ctx context.Context) (nativeState, error) {
 }
 
 func (s *session) models(ctx context.Context) ([]nativeModel, error) {
-	var available struct{ Models []nativeModel }
+	var available struct {
+		// Models contains the configured models visible to this process.
+		Models []nativeModel
+	}
 	err := s.rpc.call(ctx, "get_available_models", nil, &available)
 	if err == nil && available.Models == nil {
 		err = errors.New("Pi did not return its model catalog")
@@ -49,7 +60,10 @@ func (s *session) models(ctx context.Context) ([]nativeModel, error) {
 }
 
 func (s *session) levels(ctx context.Context) ([]string, error) {
-	var available struct{ Levels []string }
+	var available struct {
+		// Levels contains the thinking menu for the selected model.
+		Levels []string
+	}
 	err := s.rpc.call(ctx, "get_available_thinking_levels", nil, &available)
 	if err == nil && len(available.Levels) == 0 {
 		err = errors.New("Pi did not return supported thinking levels")

@@ -10,16 +10,26 @@ import (
 )
 
 type uiRequest struct {
-	bytes       int
-	ID          string   `json:"id"`
-	Method      string   `json:"method"`
-	Title       string   `json:"title"`
-	Message     string   `json:"message"`
-	Options     []string `json:"options"`
-	Prefill     string   `json:"prefill"`
-	InitialText string   `json:"initialText"`
-	StatusKey   string   `json:"statusKey"`
-	StatusText  string   `json:"statusText"`
+	// bytes is the record size charged against the pending event budget.
+	bytes int
+	// ID correlates the extension's dialog and reply.
+	ID string `json:"id"`
+	// Method selects the native dialog or status operation.
+	Method string `json:"method"`
+	// Title is the heading supplied by the extension.
+	Title string `json:"title"`
+	// Message gives the human-readable dialog body.
+	Message string `json:"message"`
+	// Options contains the exact values offered by a select dialog.
+	Options []string `json:"options"`
+	// Prefill is the starting value of an input dialog.
+	Prefill string `json:"prefill"`
+	// InitialText is the starting value of an editor dialog.
+	InitialText string `json:"initialText"`
+	// StatusKey identifies an extension status channel.
+	StatusKey string `json:"statusKey"`
+	// StatusText holds the value emitted on that channel.
+	StatusText string `json:"statusText"`
 }
 
 func (u uiRequest) interactive() bool {
