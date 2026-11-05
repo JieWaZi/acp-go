@@ -59,7 +59,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	client, err := acpclient.NewClient(ctx, acpclient.Options{
 		Process: agentclient.ProcessSpec{
 			Executable: options.Executable, Args: append(slices.Clone(options.PrefixArgs), "--acp"),
-			Env: options.Environment, Dir: options.WorkingDirectory,
+			Env: append(slices.Clone(options.Environment), tokenUsageEnvironment(options.RuntimeID)), Dir: options.WorkingDirectory,
 			Redact: func(record string) string {
 				if token != "" && strings.Contains(record, token) {
 					return ""
@@ -70,8 +70,9 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		Version:   acpclient.VersionProbe{Args: append(slices.Clone(options.PrefixArgs), "--version"), Required: true},
 		RuntimeID: options.RuntimeID, Logger: options.Logger,
 		Protocol: acpclient.Protocol{
-			// Native Qoder returns standard counters without a verified scope.
+			// Preserve unknown counters from builds without the verified receipt.
 			PromptUsage:     acpclient.UsageUnattributed,
+			ReadPromptUsage: readPromptUsage,
 			NormalizeOption: normalizeOption,
 			SessionMissing:  sessionMissing,
 			Authentication:  acpclient.Authentication{Disabled: token != ""},

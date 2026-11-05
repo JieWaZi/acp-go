@@ -34,8 +34,12 @@ func TestNativeQoder(t *testing.T) {
 		runManagementFixture()
 		os.Exit(0)
 	}
+	version := os.Getenv("ACP_FAMILY_QODER_USAGE_VERSION")
 	if command == "--version" {
-		fmt.Println("Qoder CLI 0.15.0")
+		if version == "" {
+			version = "0.15.0"
+		}
+		fmt.Println("Qoder CLI " + version)
 		os.Exit(0)
 	}
 	if command != "--acp" {
@@ -87,7 +91,11 @@ func TestNativeQoder(t *testing.T) {
 			if expected := os.Getenv("ACP_FAMILY_QODER_PAT_ENV"); expected != "" && os.Getenv(expected) != "fixture-selected-token" {
 				os.Exit(9)
 			}
-			reply(frame.ID, map[string]any{"protocolVersion": 1, "authMethods": []any{map[string]any{"id": "qodercli-login", "name": "CLI login"}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}, "sessionCapabilities": map[string]any{"resume": map[string]any{}}}})
+			result := map[string]any{"protocolVersion": 1, "authMethods": []any{map[string]any{"id": "qodercli-login", "name": "CLI login"}}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}, "sessionCapabilities": map[string]any{"resume": map[string]any{}}}}
+			if version != "" {
+				result["agentInfo"] = map[string]string{"name": "qoder-cli", "version": version}
+			}
+			reply(frame.ID, result)
 		case "session/new":
 			opened++
 			id = "first"
@@ -141,6 +149,28 @@ func TestNativeQoder(t *testing.T) {
 					"toolCall":  map[string]any{"toolCallId": "qoder-tool", "title": "Fixture tool"},
 					"options":   []any{map[string]any{"optionId": "native-allow", "name": "Allow", "kind": "allow_once"}},
 				}})
+				continue
+			}
+			if variable := os.Getenv("ACP_FAMILY_QODER_USAGE_VARIABLE"); variable != "" {
+				var input, output, rawOutput int
+				if os.Getenv(variable) == "1" {
+					switch prompts {
+					case 1:
+						input, output, rawOutput = 24, 7, 7
+					case 2:
+						input, output, rawOutput = 35, 11, 11
+					case 4:
+						input, output, rawOutput = 35, 11, 9
+					}
+				}
+				quota := map[string]any{
+					"token_count": map[string]int{"input_tokens": input, "output_tokens": output},
+					"model_usage": []map[string]any{{"model": "qfmodel", "token_count": map[string]int{"input_tokens": input, "output_tokens": output}}},
+				}
+				reply(frame.ID, map[string]any{"stopReason": "end_turn",
+					"usage": map[string]int{"inputTokens": input, "outputTokens": rawOutput, "totalTokens": input + rawOutput},
+					"_meta": map[string]any{"quota": quota},
+				})
 				continue
 			}
 			notify("foreign", map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "unrelated"}})
@@ -716,5 +746,61 @@ func TestQoderNativeModePermissionAndMCPUseTheSameSession(t *testing.T) {
 	}
 	if strings.Contains(string(wire), `"developerInstructions"`) {
 		t.Fatalf("host-only instruction metadata reached the peer: %s", wire)
+	}
+}
+
+func TestQoderPromptUsageExposesVerifiedInvocationTokens(t *testing.T) {
+	for provider, variable := range map[string]string{"qoder": "QODER_EXPOSE_TOKEN_USAGE", "qoder-cn": "QODERCN_EXPOSE_TOKEN_USAGE"} {
+		t.Run(provider, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			options, _ := fixtureOptions(t, false)
+			options.RuntimeID = provider
+			options.Environment = append(options.Environment, "ACP_FAMILY_QODER_USAGE_VERSION=1.1.53",
+				"ACP_FAMILY_QODER_USAGE_VARIABLE="+variable, variable+"=0")
+			client, err := qoder.NewClient(ctx, options, agentclient.HostCallbacks{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+			if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+				t.Fatal(err)
+			}
+			session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: options.WorkingDirectory})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, want := range []int64{7, 11, 0, 0} {
+				run, err := client.ReservePrompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("fixture")}}, agentclient.PromptOptions{HostInvocationID: fmt.Sprint(i)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				result := run()
+				if result.Outcome == nil || result.Outcome.Turn.Usage == nil {
+					t.Fatalf("usage receipt missing: %+v", result)
+				}
+				usage := result.Outcome.Turn.Usage
+				if want == 0 {
+					if usage.OutputTokens != nil || len(usage.Models) != 0 {
+						t.Fatalf("zeroed or conflicting counters were attributed: %+v", usage)
+					}
+					continue
+				}
+				if usage.Complete || usage.InputTokens != nil || usage.CacheReadTokens != nil || usage.CacheWriteTokens != nil ||
+					usage.ReasoningTokens != nil || usage.OutputTokens == nil || *usage.OutputTokens != want {
+					t.Fatalf("incorrect measured invocation subtotal: %+v", usage)
+				}
+				model := usage.Models["qfmodel"]
+				if model.OutputTokens == nil || *model.OutputTokens != want || model.InputTokens != nil {
+					t.Fatalf("incorrect model attribution: %+v", usage.Models)
+				}
+				input := []int64{24, 35}[i]
+				if len(usage.Observations) != 1 || usage.Observations[0].InputTotalTokens == nil ||
+					*usage.Observations[0].InputTotalTokens != input || usage.Observations[0].TotalTokens == nil ||
+					*usage.Observations[0].TotalTokens != input+want {
+					t.Fatalf("native overlapping counters were lost: %+v", usage.Observations)
+				}
+			}
+		})
 	}
 }
