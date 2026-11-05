@@ -128,7 +128,7 @@ func (c *Client) NewSession(ctx context.Context, request acp.NewSessionRequest) 
 }
 
 func (c *Client) ResumeSession(ctx context.Context, request acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
-	if request.SessionId == "" {
+	if !c.validRestoreID(request.SessionId) {
 		return acp.ResumeSessionResponse{}, invalid("ACP agent restore requires an exact session ID")
 	}
 	if request.McpServers == nil {
@@ -142,7 +142,7 @@ func (c *Client) ResumeSession(ctx context.Context, request acp.ResumeSessionReq
 }
 
 func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	if request.SessionId == "" {
+	if !c.validRestoreID(request.SessionId) {
 		return acp.LoadSessionResponse{}, invalid("ACP agent restore requires an exact session ID")
 	}
 	if request.McpServers == nil {
@@ -153,6 +153,11 @@ func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest
 	result, err := c.open(ctx, setupRequest{method: acp.AgentMethodSessionLoad, id: request.SessionId, cwd: request.Cwd,
 		roots: request.AdditionalDirectories, servers: request.McpServers, meta: meta, params: request})
 	return acp.LoadSessionResponse{ConfigOptions: result.ConfigOptions, Modes: result.Modes, Meta: result.Meta}, err
+}
+
+func (c *Client) validRestoreID(id acp.SessionId) bool {
+	check := c.opts.Protocol.ValidateRestoreID
+	return id != "" && (check == nil || check(id))
 }
 
 func (c *Client) UnstableForkSession(ctx context.Context, request acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {

@@ -73,6 +73,7 @@ func (c *Client) applyConfigurationLocked(s *session, raw, legacyRaw json.RawMes
 			next.currentAt = cloneCurrent(next.currentAt)
 			if current {
 				next.currentAt[legacy.Id] = seq
+				next.legacyRequested = ""
 			}
 			next.legacy = true
 		}
@@ -91,10 +92,14 @@ func (c *Client) applyConfigurationLocked(s *session, raw, legacyRaw json.RawMes
 			next.currentAt = cloneCurrent(next.currentAt)
 			if current {
 				next.currentAt[legacy.Id] = seq
+				next.legacyRequested = ""
 			}
 		}
 	}
 	next.sequence = seq
+	if model := modelOption(next.options); model != nil && !next.legacy && next.currentAt[model.Id] == seq {
+		next.legacyRequested = ""
+	}
 	s.config = next
 	return nil
 }
@@ -294,11 +299,25 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	modelWrite := model != nil && model.Id == wanted.id
 	legacy := modelWrite && s.config.legacy
 	processWide := modelWrite && c.opts.Protocol.ModelScope == ModelPerProcess
-	confirmedCurrent := settingConfirmed(s.config, wanted) || legacy && s.config.legacyRequested == wanted.value
+	confirmedCurrent := currentSettingMatches(s.config, wanted, legacy)
+	legacyBehavior := c.opts.Protocol.LegacyModel
+	knownLegacy := legacy && legacyBehavior.ConfirmsValue != nil && legacyBehavior.ConfirmsValue(c.version)
+	if knownLegacy && legacyBehavior.OpeningValueIsNoop && s.config.legacyRequested != "" && !confirmedCurrent && model.CurrentValue == wanted.value {
+		c.mu.Unlock()
+		// The native setter short-circuits on the stale opening model ID.
+		return acp.SetSessionConfigOptionResponse{}, errUnconfirmedSetting
+	}
 	if confirmedCurrent && (!processWide || c.processModel == wanted.value) {
 		options := s.config.options
+		var meta map[string]any
+		if legacy && s.config.legacyRequested == wanted.value {
+			meta = map[string]any{"acp-go/model-acknowledgement": string(wanted.value)}
+			if knownLegacy {
+				options = withLegacyEffectiveModel(options, wanted)
+			}
+		}
 		c.mu.Unlock()
-		result, err := clone(acp.SetSessionConfigOptionResponse{ConfigOptions: options})
+		result, err := clone(acp.SetSessionConfigOptionResponse{ConfigOptions: options, Meta: meta})
 		return result, err
 	}
 	c.mu.Unlock()
@@ -337,8 +356,18 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 			confirmed = true
 		}
 	})
-	if err := sessionReceiptFailure(c, r, method, s.id); err != nil {
-		if r.PeerErr == nil && r.Write.BytesWritten > 0 && !confirmed {
+	appliedWithoutSaving := false
+	if knownLegacy && r.PeerErr != nil && legacyBehavior.AppliedOnError != nil && legacyBehavior.AppliedOnError(r.PeerErr) {
+		c.mu.Lock()
+		if s.config.sequence == initial {
+			s.config.legacyRequested = wanted.value
+			appliedWithoutSaving, confirmed = true, true
+		}
+		c.mu.Unlock()
+	}
+	if err := sessionReceiptFailure(c, r, method, s.id); err != nil && !appliedWithoutSaving {
+		if r.Write.BytesWritten > 0 && !confirmed &&
+			(r.PeerErr == nil || knownLegacy && legacyBehavior.AppliedOnError != nil && r.PeerErr.Code == -32603) {
 			c.invalidate()
 		}
 		return acp.SetSessionConfigOptionResponse{}, err
@@ -356,8 +385,37 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	meta := copyMeta(r.Result.Meta)
 	if legacy {
 		meta["acp-go/model-acknowledgement"] = string(wanted.value)
+		if knownLegacy {
+			options = withLegacyEffectiveModel(options, wanted)
+		}
+	}
+	if appliedWithoutSaving {
+		meta["acp-go/model-persistence"] = "unconfirmed"
 	}
 	return clone(acp.SetSessionConfigOptionResponse{ConfigOptions: options, Meta: meta})
+}
+
+// withLegacyEffectiveModel projects a verified setter result without replacing
+// the native opening model that a version-specific setter may still compare.
+func withLegacyEffectiveModel(options []acp.SessionConfigOption, wanted setting) []acp.SessionConfigOption {
+	index := slices.IndexFunc(options, func(option acp.SessionConfigOption) bool {
+		return option.Select != nil && option.Select.Id == wanted.id
+	})
+	if index < 0 {
+		return options
+	}
+	projected := slices.Clone(options)
+	model := *projected[index].Select
+	model.CurrentValue = wanted.value
+	projected[index].Select = &model
+	return projected
+}
+
+func currentSettingMatches(config configuration, wanted setting, legacy bool) bool {
+	if legacy && config.legacyRequested != "" {
+		return config.legacyRequested == wanted.value
+	}
+	return settingConfirmed(config, wanted)
 }
 
 func settingConfirmed(config configuration, wanted setting) bool {
@@ -431,7 +489,7 @@ func (c *Client) settingActiveLocked(s *session, wanted setting) bool {
 	config := s.config
 	model := modelOption(config.options)
 	isModel := model != nil && model.Id == wanted.id
-	confirmed := settingConfirmed(config, wanted) || isModel && config.legacy && config.legacyRequested == wanted.value
+	confirmed := currentSettingMatches(config, wanted, isModel && config.legacy)
 	return confirmed && (!isModel || c.opts.Protocol.ModelScope == ModelPerSession || c.processModel == wanted.value)
 }
 

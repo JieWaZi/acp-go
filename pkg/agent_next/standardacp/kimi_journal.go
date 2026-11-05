@@ -25,8 +25,8 @@ const (
 	kimiJournalLimit = 64 << 20
 )
 
-func kimiJournalHome(environment []string, cwd string) string {
-	home := environmentValue(environment, "KIMI_CODE_HOME")
+func kimiProfileHome(environment []string, cwd, variable, defaultName string) string {
+	home := environmentValue(environment, variable)
 	if home == "" {
 		userHome := environmentValue(environment, "HOME")
 		if userHome == "" {
@@ -35,7 +35,7 @@ func kimiJournalHome(environment []string, cwd string) string {
 		if userHome == "" {
 			return ""
 		}
-		home = filepath.Join(userHome, ".kimi-code")
+		home = filepath.Join(userHome, defaultName)
 	}
 	if !filepath.IsAbs(home) {
 		home = filepath.Join(cwd, home)

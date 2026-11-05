@@ -39,6 +39,8 @@ func TestStandardNativeLifecycle(t *testing.T) {
 			wantVersion := "1.2.3"
 			if provider == standardacp.OpenCode {
 				wantVersion = "1.18.34"
+			} else if provider == standardacp.Gemini {
+				wantVersion = "0.62.0"
 			}
 			if err != nil || initialized.AgentInfo == nil || acpmeta.RuntimeVersion(initialized.AgentInfo.Meta) != wantVersion {
 				t.Fatalf("initialize: %#v %v", initialized, err)
@@ -61,7 +63,7 @@ func TestStandardNativeLifecycle(t *testing.T) {
 			set, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
 				SessionId: session.SessionId, ConfigId: "model", Value: "fixture/alternate",
 			}})
-			if err != nil || len(set.ConfigOptions) != 1 {
+			if err != nil || len(set.ConfigOptions) != 1 || set.ConfigOptions[0].Select.CurrentValue != "fixture/alternate" {
 				t.Fatalf("set model: %#v %v", set, err)
 			}
 			for _, id := range []string{"first", "second"} {
@@ -104,6 +106,22 @@ func TestStandardNativeLifecycle(t *testing.T) {
 				}
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
+			}
+			if provider == standardacp.Gemini {
+				if _, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+					SessionId: session.SessionId, ConfigId: "model", Value: "fixture/default",
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				restored := reserve(t, ctx, client, session.SessionId, "return-default")()
+				if restored.Outcome == nil || restored.Outcome.OperationError != nil || restored.Outcome.NativeFailure != nil {
+					t.Fatalf("legacy session could not switch back to its opening model: %#v", restored)
+				}
+				if _, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+					SessionId: session.SessionId, ConfigId: "model", Value: "fixture/alternate",
+				}}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			loaded, err := client.LoadSession(ctx, acp.LoadSessionRequest{SessionId: session.SessionId, Cwd: cwd})
 			if err != nil || len(loaded.ConfigOptions) != 1 || loaded.ConfigOptions[0].Select.CurrentValue != "fixture/alternate" {
@@ -182,6 +200,31 @@ func TestStandardACPRestoreDistinguishesMissingResources(t *testing.T) {
 		if (data["classification"] == "session_missing") != test.wantMissing || (!test.wantMissing && native.Code == -32002) {
 			t.Fatalf("%s: %#v", test.id, native)
 		}
+	}
+}
+
+func TestGeminiRestoreRequiresExactNativeSession(t *testing.T) {
+	t.Setenv("STANDARD_ACP_GEMINI_UNVERIFIED_LOAD", "1")
+	cwd := t.TempDir()
+	client, ctx := newFixtureClient(t, standardacp.Gemini, cwd, agentclient.HostCallbacks{})
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []acp.SessionId{"latest", "1", " another-session "} {
+		_, err := client.LoadSession(ctx, acp.LoadSessionRequest{SessionId: id, Cwd: cwd})
+		var native *acp.RequestError
+		if !errors.As(err, &native) || native.Code != -32602 {
+			t.Fatalf("accepted ambiguous session alias %q: %v", id, err)
+		}
+	}
+	_, err := client.LoadSession(ctx, acp.LoadSessionRequest{SessionId: "native-previous", Cwd: cwd})
+	var native *acp.RequestError
+	if !errors.As(err, &native) {
+		t.Fatalf("unverified load: %v", err)
+	}
+	data, _ := native.Data.(map[string]any)
+	if data["classification"] != "session_restore_unverified" {
+		t.Fatalf("unverified load: %v", err)
 	}
 }
 
@@ -312,6 +355,51 @@ func TestOpenCodeEmptyAnswer(t *testing.T) {
 	}
 }
 
+func TestKimiLegacyModelAppliedBeforeConfigWrite(t *testing.T) {
+	for _, failure := range []string{"write", "ambiguous"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Setenv("STANDARD_ACP_KIMI_LEGACY", failure)
+			t.Setenv("KIMI_SHARE_DIR", t.TempDir())
+			cwd := t.TempDir()
+			client, ctx := newFixtureClient(t, standardacp.Kimi, cwd, agentclient.HostCallbacks{})
+			if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+				t.Fatal(err)
+			}
+			session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+			if err != nil {
+				t.Fatal(err)
+			}
+			set := func(id string) (acp.SetSessionConfigOptionResponse, error) {
+				return client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+					SessionId: session.SessionId, ConfigId: "model", Value: acp.SessionConfigValueId(id),
+				}})
+			}
+			response, err := set("fixture/alternate")
+			if failure == "ambiguous" {
+				if err == nil {
+					t.Fatal("ambiguous config failure was accepted")
+				}
+				if _, err := set("fixture/default"); !errors.Is(err, acpclient.ErrRestartRequired) {
+					t.Fatalf("uncertain session remained usable: %v", err)
+				}
+				return
+			}
+			if err != nil || response.Meta["acp-go/model-acknowledgement"] != "fixture/alternate" ||
+				response.Meta["acp-go/model-persistence"] != "unconfirmed" || len(response.ConfigOptions) != 1 ||
+				response.ConfigOptions[0].Select.CurrentValue != "fixture/alternate" {
+				t.Fatalf("setter receipt: %#v %v", response, err)
+			}
+			result := reserve(t, ctx, client, session.SessionId, "alternate")()
+			if result.Outcome == nil || result.Outcome.OperationError != nil || result.Outcome.NativeFailure != nil {
+				t.Fatalf("selected model not usable: %#v", result)
+			}
+			if _, err := set("fixture/default"); err == nil {
+				t.Fatal("Kimi acknowledged a no-op reversion to its opening model")
+			}
+		})
+	}
+}
+
 func TestKimiNativeJournalAndOpeningMode(t *testing.T) {
 	for _, mode := range []string{"failed", "unverified"} {
 		t.Run(mode, func(t *testing.T) { checkKimiNativeJournal(t, mode) })
@@ -417,7 +505,11 @@ func TestStandardACPProcess(t *testing.T) {
 	journalMode := os.Getenv("STANDARD_ACP_KIMI_JOURNAL")
 	restoreMode := os.Getenv("STANDARD_ACP_OPENCODE_RESTORE")
 	journal := journalMode != ""
+	kimiLegacy := os.Getenv("STANDARD_ACP_KIMI_LEGACY")
 	version := "1.2.3"
+	if provider == "gemini" {
+		version = "0.62.0"
+	}
 	if provider == "opencode" {
 		version = "1.18.34"
 		if restoreMode == "startup" {
@@ -428,6 +520,8 @@ func TestStandardACPProcess(t *testing.T) {
 	}
 	if journal {
 		version = "2.0.2"
+	} else if kimiLegacy != "" {
+		version = "1.52.0"
 	}
 	args := os.Args[slices.Index(os.Args, "--")+1:]
 	if slices.Equal(args, []string{"--version"}) {
@@ -570,10 +664,10 @@ func TestStandardACPProcess(t *testing.T) {
 						jsonObject{"id": "default", "name": "Default"}, jsonObject{"id": "auto", "name": "Auto"},
 					}}
 				}
-			} else {
+			} else if os.Getenv("STANDARD_ACP_GEMINI_UNVERIFIED_LOAD") == "" {
 				result["sessionId"] = request.Params["sessionId"]
 			}
-			if provider == "gemini" {
+			if provider == "gemini" || kimiLegacy != "" {
 				result["models"] = legacy()
 			} else {
 				result["configOptions"] = options()
@@ -585,6 +679,14 @@ func TestStandardACPProcess(t *testing.T) {
 			mode, _ = request.Params["modeId"].(string)
 		case "session/set_model":
 			model, _ = request.Params["modelId"].(string)
+			if kimiLegacy != "" && model == "fixture/alternate" {
+				path := filepath.Join(os.Getenv("KIMI_SHARE_DIR"), "config.toml")
+				detail := "could not read config.toml"
+				if kimiLegacy == "write" {
+					detail = "[Errno 13] Permission denied: '" + path + "'"
+				}
+				response["error"] = jsonObject{"code": -32603, "message": "Internal error", "data": jsonObject{"details": detail}}
+			}
 		case "session/set_config_option":
 			model, _ = request.Params["value"].(string)
 			result["configOptions"] = options()
@@ -607,8 +709,14 @@ func TestStandardACPProcess(t *testing.T) {
 				if err != nil || f.Close() != nil {
 					os.Exit(53)
 				}
-			} else if model != "fixture/alternate" {
-				os.Exit(45)
+			} else {
+				expected := "fixture/alternate"
+				if strings.Contains(s.Text(), `"text":"return-default"`) {
+					expected = "fixture/default"
+				}
+				if model != expected {
+					os.Exit(45)
+				}
 			}
 			line := s.Text()
 			if !strings.Contains(line, `"text":"empty-answer"`) && !strings.Contains(line, `"text":"/compact"`) {

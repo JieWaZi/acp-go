@@ -25,6 +25,8 @@ type Protocol struct {
 	CwdBoundProcess bool
 	// RequireLoadEvidence rejects an ID-less restore response without same-session history replay.
 	RequireLoadEvidence bool
+	// ValidateRestoreID rejects native selector aliases that cannot prove an exact session.
+	ValidateRestoreID func(acp.SessionId) bool
 	// ModeOption selects an advertised native config setter for permission modes.
 	ModeOption acp.SessionConfigId
 	// BlockUntypedExtensions protects providers whose raw methods expose credentials or unscoped mutations.
@@ -35,6 +37,8 @@ type Protocol struct {
 	NormalizeUsage func(*acp.SessionUsageUpdate) *acpmeta.UsageObservation
 	// ModelScope is session-scoped unless the native process shares a model.
 	ModelScope ModelScope
+	// LegacyModel describes a version-specific session/set_model mutation contract.
+	LegacyModel LegacyModelBehavior
 	// PromptUsage selects the native meaning of standard ACP usage.
 	PromptUsage PromptUsageScope
 	// ReadPromptUsage decodes provider-owned accounting and classifies the standard counters.
@@ -111,6 +115,16 @@ const (
 	ModelPerSession ModelScope = iota
 	ModelPerProcess
 )
+
+// LegacyModelBehavior describes the evidence returned by a native legacy setter.
+type LegacyModelBehavior struct {
+	// ConfirmsValue identifies versions whose successful setter applies the selected value.
+	ConfirmsValue func(string) bool
+	// OpeningValueIsNoop identifies setters that still compare against the opening value.
+	OpeningValueIsNoop bool
+	// AppliedOnError identifies an exact persistence failure after the mutation.
+	AppliedOnError func(*acp.RequestError) bool
+}
 
 // PromptUsageScope describes a provider's standard ACP usage payload.
 type PromptUsageScope uint8

@@ -79,7 +79,8 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		if policy == "full-access" {
 			protocol.OpeningMode = "yolo"
 		}
-		home := kimiJournalHome(environment, cwd)
+		home := kimiProfileHome(environment, cwd, "KIMI_CODE_HOME", ".kimi-code")
+		protocol.LegacyModel = kimiLegacyModelBehavior(environment, cwd)
 		protocol.CapturePromptJournal = func(ctx context.Context, scope acpclient.PromptJournalScope) func(context.Context, *acp.StopReason) acpclient.PromptJournalEvidence {
 			return captureKimiJournal(ctx, scope, home)
 		}
@@ -95,6 +96,16 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		args = []string{"--acp"}
 		// Gemini restores project state using the process launch workspace.
 		protocol.CwdBoundProcess = true
+		protocol.RequireLoadEvidence = true
+		protocol.ValidateRestoreID = func(id acp.SessionId) bool {
+			value := string(id)
+			return strings.TrimSpace(value) == value && value != "latest" && strings.Trim(value, "0123456789") != ""
+		}
+		// The pinned setter updates the current native session's model before ACK.
+		protocol.LegacyModel.ConfirmsValue = func(version string) bool { return version == "0.62.0" }
+		protocol.SessionMissing = func(err *acp.RequestError, id acp.SessionId) bool {
+			return exactResourceSessionMissing(err, id) || err.Code == -32602 && err.Message == "Session not found: "+string(id)
+		}
 		protocol.ReadPromptUsage = func(_ string, _ *acpclient.PromptUsageCounters, meta map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
 			return geminiPromptUsage(meta), acpclient.UsageUnattributed
 		}
