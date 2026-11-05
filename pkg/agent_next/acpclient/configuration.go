@@ -581,6 +581,28 @@ func (c *Client) discoverModels(ctx context.Context, conn *acp.ClientSideConnect
 			}
 		}
 	}
+	if read := c.opts.Protocol.ReadModelConfig; read != nil {
+		project := func(rows []acp.SessionConfigSelectOption) {
+			for i := range rows {
+				row := &rows[i]
+				// The current model's real configuration receipt remains authoritative.
+				if !probe.config.legacy && row.Value == opening {
+					continue
+				}
+				if settings, known := read(row.Meta); known {
+					row.Meta = acpmeta.WithModelConfigCatalog(row.Meta, settings)
+				}
+			}
+		}
+		if catalog.Options.Ungrouped != nil {
+			project(*catalog.Options.Ungrouped)
+		}
+		if catalog.Options.Grouped != nil {
+			for _, group := range *catalog.Options.Grouped {
+				project(group.Options)
+			}
+		}
+	}
 	// Legacy catalogs without a configurable model cannot establish per-model
 	// dependent selectors; their existing native model metadata is preserved.
 	if !probe.config.legacy && probe.config.currentAt[model.Id] != 0 && hasChoice(model, opening) {

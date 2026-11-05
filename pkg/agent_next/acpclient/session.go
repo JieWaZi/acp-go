@@ -21,6 +21,8 @@ const (
 type session struct {
 	// id becomes known only after an exact native binding.
 	id acp.SessionId
+	// cwd is the bound native workspace used by optional provider evidence readers.
+	cwd string
 	// config contains the current native options, including real setter keys.
 	config configuration
 	// usage keeps cumulative evidence for the native session counter.
@@ -117,7 +119,7 @@ func (c *Client) NewSession(ctx context.Context, request acp.NewSessionRequest) 
 		request.McpServers = []acp.McpServer{}
 	}
 	meta := request.Meta
-	request.Meta = nativeSessionMeta(meta)
+	request.Meta = c.nativeSessionMeta(meta)
 	result, err := c.open(ctx, setupRequest{method: acp.AgentMethodSessionNew, cwd: request.Cwd,
 		roots: request.AdditionalDirectories, servers: request.McpServers, meta: meta, params: request})
 	return result, err
@@ -131,7 +133,7 @@ func (c *Client) ResumeSession(ctx context.Context, request acp.ResumeSessionReq
 		request.McpServers = []acp.McpServer{}
 	}
 	meta := request.Meta
-	request.Meta = nativeSessionMeta(meta)
+	request.Meta = c.nativeSessionMeta(meta)
 	result, err := c.open(ctx, setupRequest{method: acp.AgentMethodSessionResume, id: request.SessionId, cwd: request.Cwd,
 		roots: request.AdditionalDirectories, servers: request.McpServers, meta: meta, params: request})
 	return acp.ResumeSessionResponse{ConfigOptions: result.ConfigOptions, Modes: result.Modes, Meta: result.Meta}, err
@@ -145,7 +147,7 @@ func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest
 		request.McpServers = []acp.McpServer{}
 	}
 	meta := request.Meta
-	request.Meta = nativeSessionMeta(meta)
+	request.Meta = c.nativeSessionMeta(meta)
 	result, err := c.open(ctx, setupRequest{method: acp.AgentMethodSessionLoad, id: request.SessionId, cwd: request.Cwd,
 		roots: request.AdditionalDirectories, servers: request.McpServers, meta: meta, params: request})
 	return acp.LoadSessionResponse{ConfigOptions: result.ConfigOptions, Modes: result.Modes, Meta: result.Meta}, err
@@ -166,7 +168,7 @@ func (c *Client) UnstableForkSession(ctx context.Context, request acp.UnstableFo
 	receipt := request.Meta["forkReceiptDirectory"] != nil
 	// The filesystem receipt path is private to the host and never goes to the CLI.
 	native := request
-	native.Meta = nativeSessionMeta(request.Meta)
+	native.Meta = c.nativeSessionMeta(request.Meta)
 	delete(native.Meta, "forkReceiptDirectory")
 	delete(native.Meta, "reconcileOnly")
 	setup := setupRequest{method: acp.AgentMethodSessionFork, source: request.SessionId,
@@ -205,7 +207,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	}
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
-	p := &opening{session: &session{id: request.id, usage: usageCounter{fresh: request.method == acp.AgentMethodSessionNew}}, source: request.source, replay: request.method == acp.AgentMethodSessionLoad,
+	p := &opening{session: &session{id: request.id, cwd: request.cwd, usage: usageCounter{fresh: request.method == acp.AgentMethodSessionNew}}, source: request.source, replay: request.method == acp.AgentMethodSessionLoad,
 		delivery: newDelivery(op)}
 	c.mu.Lock()
 	p.previous = c.sessions[request.id]
@@ -260,11 +262,15 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 		// durable fork receipt is written and absorb config that arrives here.
 		receiptErr = request.afterBind(p.session.id)
 	}
+	var modeErr error
+	if receiptErr == nil && c.opts.Protocol.OpeningMode != "" {
+		modeErr = c.applyOpeningMode(op, conn, p, c.opts.Protocol.OpeningMode)
+	}
 	c.mu.Lock()
 	response := acp.NewSessionResponse{}
 	if p.matched {
 		response.SessionId = p.session.id
-		if p.err == nil && receiptErr == nil && !p.overflow && !c.closed {
+		if p.err == nil && receiptErr == nil && modeErr == nil && !p.overflow && !c.closed {
 			response.ConfigOptions = p.session.config.options
 			response.Modes = p.session.modes
 			response.Meta = mcpMetadata(receipt.Result.Meta, len(request.servers))
@@ -283,7 +289,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 		}
 	}
 	c.sealDeliveryLocked(p.delivery)
-	normalizeErr := p.err
+	normalizeErr := errors.Join(p.err, modeErr)
 	if p.overflow {
 		normalizeErr = errors.Join(normalizeErr, errors.New("ACP agent session opening observation budget exhausted"))
 	}
@@ -445,9 +451,7 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 	defer c.end()
 	c.mu.Lock()
 	s := c.sessions[request.SessionId]
-	valid := s != nil && s.modes != nil && slices.ContainsFunc(s.modes.AvailableModes, func(mode acp.SessionMode) bool {
-		return mode.Id == request.ModeId
-	})
+	valid := s != nil && hasMode(s.modes, request.ModeId)
 	c.mu.Unlock()
 	if !valid {
 		return acp.SetSessionModeResponse{}, invalid("ACP agent did not advertise the requested mode")
@@ -462,6 +466,32 @@ func (c *Client) SetSessionMode(ctx context.Context, request acp.SetSessionModeR
 		result, err := c.setConfig(op, conn, s, wanted, params)
 		return acp.SetSessionModeResponse{Meta: result.Meta}, err
 	}
+	return c.setNativeMode(op, conn, s, request)
+}
+
+func hasMode(state *acp.SessionModeState, id acp.SessionModeId) bool {
+	return state != nil && slices.ContainsFunc(state.AvailableModes, func(mode acp.SessionMode) bool { return mode.Id == id })
+}
+
+func (c *Client) applyOpeningMode(ctx context.Context, conn *acp.ClientSideConnection, p *opening, id acp.SessionModeId) error {
+	c.mu.Lock()
+	if !p.matched || p.err != nil || c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	state, sessionID := p.session.modes, p.session.id
+	c.mu.Unlock()
+	if state == nil && id == "default" || state != nil && state.CurrentModeId == id {
+		return nil
+	}
+	if !hasMode(state, id) {
+		return invalid("ACP agent did not advertise the requested opening mode")
+	}
+	_, err := c.setNativeMode(ctx, conn, p.session, acp.SetSessionModeRequest{SessionId: sessionID, ModeId: id})
+	return err
+}
+
+func (c *Client) setNativeMode(op context.Context, conn *acp.ClientSideConnection, s *session, request acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	r := acp.SendClientRequestWithReceipt[acp.SetSessionModeResponse](conn, op, acp.AgentMethodSessionSetMode, request, boundedWrite(op, conn, nil),
 		func(r acp.RequestReceipt[acp.SetSessionModeResponse]) {
 			if r.ResultValid {
@@ -497,9 +527,12 @@ func ReadMCPObservation(meta map[string]any) (MCPObservation, bool) {
 	return observation, valid
 }
 
-func nativeSessionMeta(meta map[string]any) map[string]any {
+func (c *Client) nativeSessionMeta(meta map[string]any) map[string]any {
 	result := copyMeta(meta)
 	delete(result, "developerInstructions")
+	if prepare := c.opts.Protocol.PrepareSessionMeta; prepare != nil {
+		prepare(result)
+	}
 	return result
 }
 

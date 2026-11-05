@@ -222,6 +222,25 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 	if native.ProtocolVersion == 0 || native.ProtocolVersion != request.ProtocolVersion {
 		return acp.InitializeResponse{}, errors.New("ACP agent negotiated an unsupported ACP protocol version")
 	}
+	if validate := c.opts.Protocol.ValidateInitialize; validate != nil {
+		if err := validate(native); err != nil {
+			return acp.InitializeResponse{}, err
+		}
+	}
+	if allow := c.opts.Protocol.ForkAllowed; allow != nil && !allow(native) {
+		native.AgentCapabilities.SessionCapabilities.Fork = nil
+	}
+	if startup := c.opts.Protocol.StartupAuthentication; startup != nil {
+		method := startup(native)
+		if method != "" && slices.ContainsFunc(native.AuthMethods, func(auth acp.AuthMethod) bool {
+			return auth.Agent != nil && auth.Agent.Id == method
+		}) {
+			authenticated := send[acp.AuthenticateResponse](conn, ctx, acp.AgentMethodAuthenticate, acp.AuthenticateRequest{MethodId: method})
+			if err := receiptFailure(authenticated, acp.AgentMethodAuthenticate); err != nil {
+				return acp.InitializeResponse{}, err
+			}
+		}
+	}
 	response, err := clone(native)
 	if err != nil {
 		return acp.InitializeResponse{}, err

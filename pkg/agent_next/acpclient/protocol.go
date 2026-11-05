@@ -13,6 +13,14 @@ import (
 type Protocol struct {
 	// PrepareInitialize advertises a provider's documented client capability.
 	PrepareInitialize func(*acp.InitializeRequest)
+	// ValidateInitialize verifies the selected native protocol before publication.
+	ValidateInitialize func(acp.InitializeResponse) error
+	// PrepareSessionMeta adds frozen native launch policy to an owned metadata copy.
+	PrepareSessionMeta func(map[string]any)
+	// OpeningMode applies an advertised native mode before publishing a session.
+	OpeningMode acp.SessionModeId
+	// ForkAllowed narrows a native fork capability to verified versions.
+	ForkAllowed func(acp.InitializeResponse) bool
 	// CwdBoundProcess requires session cwd to match the launch directory.
 	CwdBoundProcess bool
 	// RequireLoadEvidence rejects an ID-less restore response without same-session history replay.
@@ -29,12 +37,21 @@ type Protocol struct {
 	ModelScope ModelScope
 	// PromptUsage selects the native meaning of standard ACP usage.
 	PromptUsage PromptUsageScope
+	// ReadPromptUsage decodes provider-owned accounting and classifies the standard counters.
+	ReadPromptUsage func(string, *PromptUsageCounters, map[string]any) (*acpmeta.TurnUsage, PromptUsageScope)
+	// CapturePromptJournal captures the read-only baseline of one native prompt.
+	// Both capture and settlement run under invocation ownership outside ACP locks.
+	CapturePromptJournal func(context.Context, PromptJournalScope) func(context.Context, *acp.StopReason) PromptJournalEvidence
 	// NormalizeOption changes presentation while preserving native IDs and values.
 	NormalizeOption func(acp.SessionConfigOption) acp.SessionConfigOption
+	// ReadModelConfig reads model-scoped settings carried in native model rows.
+	ReadModelConfig func(map[string]any) (acpmeta.ModelConfigCatalog, bool)
 	// ExecutionOption identifies additional native parameters frozen with each prompt.
 	ExecutionOption func(acp.SessionConfigOptionCategory) bool
 	// SessionMissing classifies a provider-specific error for the exact requested ID.
 	SessionMissing func(*acp.RequestError, acp.SessionId) bool
+	// RequireExactMissing lets the profile distinguish resource and session failures.
+	RequireExactMissing bool
 	// ClassifyText classifies one complete native text chunk for the running version.
 	ClassifyText func(version, text string) TextClass
 	// Private decodes known reverse method data without performing I/O.
@@ -45,6 +62,8 @@ type Protocol struct {
 	ParameterizedModelPicker bool
 	// Authentication limits standard ACP authentication and supplies an optional logout command.
 	Authentication Authentication
+	// StartupAuthentication selects an advertised noninteractive native method.
+	StartupAuthentication func(acp.InitializeResponse) string
 }
 
 // PromptEvidence extends an ACP response with proven provider-specific facts.
@@ -55,6 +74,28 @@ type PromptEvidence struct {
 	InputAccepted bool
 	// Failure describes a native prompt failure using safe structured fields.
 	Failure *acp.RequestError
+}
+
+// PromptJournalScope identifies the native process and its exact bound workspace.
+type PromptJournalScope struct {
+	// Version is the selected CLI's reported runtime version.
+	Version string
+	// SessionID is the admitted native session generation's ID.
+	SessionID acp.SessionId
+	// Cwd is the workspace bound during the successful new/load/resume.
+	Cwd string
+}
+
+// PromptJournalEvidence supplements a matched invocation using native persisted facts.
+type PromptJournalEvidence struct {
+	// NativeTurnID identifies a started native turn when the journal proves it.
+	NativeTurnID string
+	// UnverifiedTerminal marks a native response contradicted by missing journal evidence.
+	UnverifiedTerminal bool
+	// Failure describes a proven main-agent failure using safe fields.
+	Failure *acp.RequestError
+	// Usage contains independently scoped invocation counters.
+	Usage *acpmeta.TurnUsage
 }
 
 // ModelScope identifies where a native model set takes effect.

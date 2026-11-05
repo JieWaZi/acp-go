@@ -9,7 +9,7 @@ func TestUnattributedPromptUsageKeepsEvidenceWithoutLedgerCounters(t *testing.T)
 	counter := usageCounter{fresh: true}
 	for _, output := range []int64{4, 9, 2} {
 		var pending promptUsage
-		usage := pending.settle(&counter, UsageUnattributed, &promptResponse{Usage: &wireUsage{Input: acp.Ptr(int64(23)), Output: &output, Total: acp.Ptr(int64(100))}})
+		usage := pending.settle(&counter, UsageUnattributed, &promptResponse{Usage: &PromptUsageCounters{Input: acp.Ptr(int64(23)), Output: &output, Total: acp.Ptr(int64(100))}})
 		if usage == nil || usage.OutputTokens != nil || usage.InputTokens != nil || usage.Complete || len(usage.Observations) != 1 {
 			t.Fatalf("unproven scope entered ledger: %#v", usage)
 		}

@@ -83,7 +83,7 @@ type promptResponse struct {
 	// UserMessageID is an optional provider receipt for persisted user input.
 	UserMessageID string `json:"userMessageId"`
 	// Usage is an optional ACP counter whose scope depends on the provider.
-	Usage *wireUsage `json:"usage"`
+	Usage *PromptUsageCounters `json:"usage"`
 	// Meta can carry explicitly associated complete usage or a fork position.
 	Meta map[string]any `json:"_meta"`
 }
@@ -193,6 +193,10 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 			return result
 		}
 	}
+	var settleJournal func(context.Context, *acp.StopReason) PromptJournalEvidence
+	if capture := c.opts.Protocol.CapturePromptJournal; capture != nil {
+		settleJournal = capture(t.preparation, PromptJournalScope{Version: c.version, SessionID: t.session.id, Cwd: t.session.cwd})
+	}
 	wait, stopWait := context.WithCancel(c.ctx)
 	defer stopWait()
 	var writeDeadline *time.Timer
@@ -243,13 +247,49 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		}
 	}
 	operationErr := promptOperationError(c, r, t.session.id)
+	preAcceptanceRejection := c.preAcceptanceRejection(r.PeerErr, t.session.id)
+	var journal PromptJournalEvidence
+	if settleJournal != nil && !preAcceptanceRejection && r.Write.BytesWritten > 0 && r.Write.BytesWritten == r.Write.FrameBytes {
+		var reason *acp.StopReason
+		if r.ResultValid && knownStopReason(r.Result.StopReason) {
+			reason = &r.Result.StopReason
+		}
+		journal = settleJournal(c.ctx, reason)
+	}
 	c.mu.Lock()
 	if !t.terminal {
 		t.terminal = true
 		t.stopInteractions()
 		t.outcome = c.nativeOutcomeLocked(t, nil, nil)
 	}
-	preAcceptanceRejection := c.preAcceptanceRejection(r.PeerErr, t.session.id)
+	if journal.NativeTurnID != "" {
+		t.associated = true
+		if t.outcome == nil {
+			t.outcome = c.nativeOutcomeLocked(t, nil, r.PeerErr)
+		}
+		t.outcome.Turn.NativeTurnID = &journal.NativeTurnID
+	}
+	if t.outcome != nil {
+		if journal.UnverifiedTerminal && t.outcome.NativeFailure == nil {
+			t.outcome.StopReason, t.outcome.Turn.Status = nil, ""
+			t.outcome.Unavailable = append(t.outcome.Unavailable, "turn.terminal")
+			operationErr = errors.Join(operationErr, errors.New("ACP agent journal did not verify the prompt terminal"))
+			c.unusable = true
+		}
+		if journal.Failure != nil && t.outcome.NativeFailure == nil {
+			t.outcome.NativeFailure = freezeProtocolError(journal.Failure)
+			t.outcome.Turn.Status = acpmeta.NativeTurnFailed
+			t.authLost = journal.Failure.Code == -32000
+		}
+		if journal.Usage != nil {
+			report := *journal.Usage
+			if previous := t.outcome.Turn.Usage; previous != nil {
+				report.Observations = append(report.Observations, previous.Observations...)
+			}
+			report.ContextKnown = t.outcome.ContextUsage.UsedTokens != nil && t.outcome.ContextUsage.WindowTokens != nil
+			t.outcome.Turn.Usage = &report
+		}
+	}
 	if t.authLost || r.Write.BytesWritten > 0 && !knownStopReason(r.Result.StopReason) && !preAcceptanceRejection {
 		c.unusable = true
 	}
@@ -345,7 +385,15 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 		Turn:         acpmeta.NativeTurn{InvocationID: t.scope.NativeInvocationID, Origin: acpmeta.NativeTurnOriginHost},
 		ContextUsage: t.contextUsage, ObservedOutput: t.observedOutput, PossibleSideEffects: true,
 	}
-	outcome.Turn.Usage = t.usage.settle(&t.session.usage, c.opts.Protocol.PromptUsage, response)
+	scope := c.opts.Protocol.PromptUsage
+	if read := c.opts.Protocol.ReadPromptUsage; response != nil && read != nil {
+		nativeUsage, classified := read(c.version, response.Usage, response.Meta)
+		scope = classified
+		if nativeUsage != nil {
+			t.usage.recordMetadata(acpmeta.WithTurnUsage(nil, *nativeUsage))
+		}
+	}
+	outcome.Turn.Usage = t.usage.settle(&t.session.usage, scope, response)
 	if t.usage.truncated {
 		outcome.Unavailable = append(outcome.Unavailable, "turn.usage.observations")
 	}
@@ -381,7 +429,7 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 			outcome.Turn.Status = acpmeta.NativeTurnFailed
 		}
 	} else if peer != nil && t.associated {
-		outcome.NativeFailure = freezeProtocolError(safePeerError(peer, acp.AgentMethodSessionPrompt))
+		outcome.NativeFailure = freezeProtocolError(c.safeSessionPeerError(peer, acp.AgentMethodSessionPrompt, t.session.id))
 		outcome.Turn.Status = acpmeta.NativeTurnFailed
 	}
 	if outcome.StopReason == nil && !t.associated && !t.authLost && outcome.Turn.Usage == nil {
@@ -436,16 +484,27 @@ func (c *Client) missingSession(err *acp.RequestError, id acp.SessionId) bool {
 	if err == nil || id == "" {
 		return false
 	}
-	return err.Code == -32002 || c.opts.Protocol.SessionMissing != nil && c.opts.Protocol.SessionMissing(err, id)
+	return !c.opts.Protocol.RequireExactMissing && err.Code == -32002 ||
+		c.opts.Protocol.SessionMissing != nil && c.opts.Protocol.SessionMissing(err, id)
 }
 
 func sessionReceiptFailure[T any](c *Client, r acp.RequestReceipt[T], method string, id acp.SessionId) error {
-	if c.missingSession(r.PeerErr, id) {
-		result := safePeerError(r.PeerErr, method)
-		result.Data = map[string]any{"method": method, "classification": "session_missing"}
-		return result
+	if r.PeerErr != nil {
+		return c.safeSessionPeerError(r.PeerErr, method, id)
 	}
 	return receiptFailure(r, method)
+}
+
+func (c *Client) safeSessionPeerError(peer *acp.RequestError, method string, id acp.SessionId) *acp.RequestError {
+	result := safePeerError(peer, method)
+	if c.missingSession(peer, id) {
+		result.Data = map[string]any{"method": method, "classification": "session_missing"}
+	} else if c.opts.Protocol.RequireExactMissing && peer.Code == -32002 {
+		// Preserve an unrelated missing resource as a provider error. A bare
+		// -32002 would otherwise authorize session replacement in the host.
+		result = &acp.RequestError{Code: -32603, Message: "ACP agent resource unavailable", Data: map[string]any{"method": method}}
+	}
+	return result
 }
 
 func nonnegative(value *int64) *int64 {
