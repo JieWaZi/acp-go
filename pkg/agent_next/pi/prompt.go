@@ -132,6 +132,12 @@ func signalLedger(l *outcomeLedger) {
 }
 
 func (c *Client) ReadNativeOutcomes(ctx context.Context, r acpmeta.NativeTurnReceiptsRequest, wait bool) (agentclient.NativeOutcomePage, error) {
+	if r.SessionID == "" || len(r.AckInvocationIDs) > 128 {
+		return agentclient.NativeOutcomePage{}, acp.NewInvalidParams(nil)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return agentclient.NativeOutcomePage{}, err
+	}
 	acked := make(map[string]bool, len(r.AckInvocationIDs))
 	for _, id := range r.AckInvocationIDs {
 		acked[id] = true
@@ -141,7 +147,7 @@ func (c *Client) ReadNativeOutcomes(ctx context.Context, r acpmeta.NativeTurnRec
 		ledger := c.ledger[acp.SessionId(r.SessionID)]
 		if ledger == nil {
 			c.mu.Unlock()
-			return agentclient.NativeOutcomePage{}, missingSession()
+			return agentclient.NativeOutcomePage{}, nil
 		}
 		remaining := ledger.outcomes[:0]
 		for _, outcome := range ledger.outcomes {
@@ -152,7 +158,15 @@ func (c *Client) ReadNativeOutcomes(ctx context.Context, r acpmeta.NativeTurnRec
 		c.retainedOutcomes -= len(ledger.outcomes) - len(remaining)
 		clear(ledger.outcomes[len(remaining):])
 		ledger.outcomes = remaining
-		if len(remaining) > 0 || !wait || ledger.producers == 0 {
+		var nativeDone <-chan struct{}
+		if opened := c.sessions[acp.SessionId(r.SessionID)]; opened != nil && !c.closing {
+			select {
+			case <-opened.rpc.done:
+			default:
+				nativeDone = opened.rpc.done
+			}
+		}
+		if len(remaining) > 0 || !wait || ledger.producers == 0 && nativeDone == nil {
 			page := agentclient.NativeOutcomePage{More: len(remaining) > 16}
 			for _, outcome := range remaining[:min(16, len(remaining))] {
 				page.Outcomes = append(page.Outcomes, outcome.Snapshot())
@@ -167,6 +181,7 @@ func (c *Client) ReadNativeOutcomes(ctx context.Context, r acpmeta.NativeTurnRec
 		c.mu.Unlock()
 		select {
 		case <-changed:
+		case <-nativeDone:
 		case <-ctx.Done():
 			return agentclient.NativeOutcomePage{}, context.Cause(ctx)
 		}
@@ -348,6 +363,10 @@ func (s *session) prompt(t *invocation, input agentclient.PromptSubmission, opti
 		stream.finish()
 		if stream.started {
 			result.Receipt.Admission = agentclient.AdmissionConfirmed
+			if o.Turn.Status != "" {
+				// The native terminal subsumes an ACK lost to disconnect.
+				result.Receipt.OperationError = nil
+			}
 		} else if result.Receipt.Admission == agentclient.AdmissionUnknown {
 			result.Outcome = nil
 		}

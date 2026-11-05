@@ -289,6 +289,22 @@ func TestProcessExitKeepsUnknownTerminalUsage(t *testing.T) {
 	}
 }
 
+func TestReceiptReaderSurvivesIdleAndDrainsAfterClose(t *testing.T) {
+	client, ctx, session := fixtureClient(t, agentclient.HostCallbacks{})
+	request := acpmeta.NativeTurnReceiptsRequest{SessionID: string(session.SessionId)}
+	idle, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if page, err := client.ReadNativeOutcomes(idle, request, true); !errors.Is(err, context.DeadlineExceeded) || len(page.Outcomes) != 0 {
+		t.Fatalf("idle receipt reader returned before native owner closed: %+v %v", page, err)
+	}
+	if _, err := client.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId}); err != nil {
+		t.Fatal(err)
+	}
+	if page, err := client.ReadNativeOutcomes(ctx, request, false); err != nil || len(page.Outcomes) != 0 {
+		t.Fatalf("closed session's empty receipt drain: %+v %v", page, err)
+	}
+}
+
 func TestUnknownUsageComponentPreservesObservedSubtotal(t *testing.T) {
 	client, ctx, session := fixtureClient(t, agentclient.HostCallbacks{})
 	run, err := client.ReservePrompt(ctx, acp.PromptRequest{SessionId: session.SessionId, Prompt: []acp.ContentBlock{acp.TextBlock("partial")}}, agentclient.PromptOptions{})
@@ -339,7 +355,8 @@ func TestTerminalEventsRemainAuthoritativeWhenACKIsLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := run()
-	if got.Receipt.Admission != agentclient.AdmissionConfirmed || got.Outcome == nil || got.Outcome.Turn.Status != "completed" ||
+	if got.Receipt.Admission != agentclient.AdmissionConfirmed || got.Receipt.OperationError != nil || got.Outcome == nil ||
+		got.Outcome.Turn.Status != "completed" || got.Outcome.OperationError != nil ||
 		got.Outcome.Turn.Usage == nil || got.Outcome.Turn.Usage.InputTokens == nil || *got.Outcome.Turn.Usage.InputTokens != 7 {
 		t.Fatalf("terminal preceding absent ACK: %+v / %+v", got, got.Outcome)
 	}

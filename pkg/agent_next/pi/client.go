@@ -520,8 +520,11 @@ func (c *Client) release(ctx context.Context, s *session) error {
 	if c.sessions[s.id] == s {
 		delete(c.sessions, s.id)
 	}
-	if ledger := c.ledger[s.id]; ledger != nil && ledger.producers == 0 && len(ledger.outcomes) == 0 {
-		delete(c.ledger, s.id)
+	if ledger := c.ledger[s.id]; ledger != nil {
+		if ledger.producers == 0 && len(ledger.outcomes) == 0 {
+			delete(c.ledger, s.id)
+		}
+		signalLedger(ledger)
 	}
 	c.mu.Unlock()
 	return nil
