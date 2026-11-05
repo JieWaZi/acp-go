@@ -10,8 +10,9 @@ type grokEffortChoice struct {
 	ID string `json:"id"`
 	// Value is the native ReasoningEffort enum for this choice.
 	Value string `json:"value"`
-	// Label and Description are supplied by the native menu.
-	Label       string  `json:"label"`
+	// Label is the name supplied by the native menu.
+	Label string `json:"label"`
+	// Description is the native menu's optional explanation.
 	Description *string `json:"description"`
 	// Default marks the model's preferred choice.
 	Default *bool `json:"default"`

@@ -3,8 +3,10 @@ package standardacp_test
 import (
 	"bufio"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -177,7 +179,10 @@ func TestStandardACPWireProjectsGrokNativeUsage(t *testing.T) {
 	}
 }
 
-type wireObserver struct{ acp.Client }
+type wireObserver struct {
+	// Client supplies the unused reverse protocol methods.
+	acp.Client
+}
 
 func (*wireObserver) SessionUpdate(context.Context, acp.SessionNotification) error { return nil }
 
@@ -188,7 +193,9 @@ func TestStandardACPRestoreDistinguishesMissingResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		id          acp.SessionId
+		// id selects the fixture's precise native load refusal.
+		id acp.SessionId
+		// wantMissing requires evidence that the requested session was missing.
 		wantMissing bool
 	}{{"gone", true}, {"missing-resource", false}, {"wrong-session", false}} {
 		_, err := client.LoadSession(ctx, acp.LoadSessionRequest{SessionId: test.id, Cwd: cwd})
@@ -393,6 +400,11 @@ func TestKimiLegacyModelAppliedBeforeConfigWrite(t *testing.T) {
 			if result.Outcome == nil || result.Outcome.OperationError != nil || result.Outcome.NativeFailure != nil {
 				t.Fatalf("selected model not usable: %#v", result)
 			}
+			usage := result.Outcome.Turn.Usage
+			if usage == nil || usage.InputTokens == nil || *usage.InputTokens != 7 || usage.OutputTokens == nil ||
+				*usage.OutputTokens != 5 || usage.Complete || usage.Source != "kimi.python.wire.status" {
+				t.Fatalf("Python Kimi per-request usage: %#v", usage)
+			}
 			if _, err := set("fixture/default"); err == nil {
 				t.Fatal("Kimi acknowledged a no-op reversion to its opening model")
 			}
@@ -562,8 +574,11 @@ func TestStandardACPProcess(t *testing.T) {
 	}
 	for s.Scan() {
 		var request struct {
-			ID     json.RawMessage
+			// ID is the original JSON-RPC identifier.
+			ID json.RawMessage
+			// Method selects the child fixture's native operation.
 			Method string
+			// Params retains the request body for protocol assertions.
 			Params jsonObject
 		}
 		if json.Unmarshal(s.Bytes(), &request) != nil {
@@ -650,6 +665,14 @@ func TestStandardACPProcess(t *testing.T) {
 				}
 				result["sessionId"] = id
 				nextSession++
+				if kimiLegacy != "" {
+					workspace, _ := request.Params["cwd"].(string)
+					directory := filepath.Join(os.Getenv("KIMI_SHARE_DIR"), "sessions", fmt.Sprintf("%x", md5.Sum([]byte(workspace))), id)
+					wire = filepath.Join(directory, "wire.jsonl")
+					if os.MkdirAll(directory, 0700) != nil || os.WriteFile(wire, []byte(`{"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":90,"output":90}}}}`+"\n"), 0600) != nil {
+						os.Exit(55)
+					}
+				}
 				if journal {
 					home := os.Getenv("KIMI_CODE_HOME")
 					dir := filepath.Join(home, "sessions", id)
@@ -710,6 +733,18 @@ func TestStandardACPProcess(t *testing.T) {
 					os.Exit(53)
 				}
 			} else {
+				if kimiLegacy != "" {
+					file, err := os.OpenFile(wire, os.O_APPEND|os.O_WRONLY, 0600)
+					if err != nil {
+						os.Exit(56)
+					}
+					_, err = file.WriteString(`{"message":{"type":"TurnBegin","payload":{"user_input":"example"}}}` + "\n" +
+						`{"message":{"type":"StatusUpdate","payload":{"message_id":"step-1","token_usage":{"input_other":7,"output":5,"input_cache_read":3,"input_cache_creation":2}}}}` + "\n" +
+						`{"message":{"type":"TurnEnd","payload":{}}}` + "\n")
+					if err != nil || file.Close() != nil {
+						os.Exit(57)
+					}
+				}
 				expected := "fixture/alternate"
 				if strings.Contains(s.Text(), `"text":"return-default"`) {
 					expected = "fixture/default"

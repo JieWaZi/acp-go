@@ -301,7 +301,7 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	processWide := modelWrite && c.opts.Protocol.ModelScope == ModelPerProcess
 	confirmedCurrent := currentSettingMatches(s.config, wanted, legacy)
 	legacyBehavior := c.opts.Protocol.LegacyModel
-	knownLegacy := legacy && legacyBehavior.ConfirmsValue != nil && legacyBehavior.ConfirmsValue(c.version)
+	knownLegacy := legacy && legacyBehavior.ConfirmsValue != nil && legacyBehavior.ConfirmsValue(c.verifiedNativeVersion())
 	if knownLegacy && legacyBehavior.OpeningValueIsNoop && s.config.legacyRequested != "" && !confirmedCurrent && model.CurrentValue == wanted.value {
 		c.mu.Unlock()
 		// The native setter short-circuits on the stale opening model ID.

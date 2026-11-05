@@ -204,7 +204,7 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 	}
 	var settleJournal func(context.Context, *acp.StopReason) PromptJournalEvidence
 	if capture := c.opts.Protocol.CapturePromptJournal; capture != nil {
-		settleJournal = capture(t.preparation, PromptJournalScope{Version: c.version, SessionID: t.session.id, Cwd: t.session.cwd})
+		settleJournal = capture(t.preparation, PromptJournalScope{Version: c.verifiedNativeVersion(), SessionID: t.session.id, Cwd: t.session.cwd})
 	}
 	wait, stopWait := context.WithCancel(c.ctx)
 	defer stopWait()
@@ -396,7 +396,7 @@ func (c *Client) nativeOutcomeLocked(t *turn, response *promptResponse, peer *ac
 	}
 	scope := c.opts.Protocol.PromptUsage
 	if read := c.opts.Protocol.ReadPromptUsage; response != nil && read != nil {
-		nativeUsage, classified := read(c.version, response.Usage, response.Meta)
+		nativeUsage, classified := read(c.verifiedNativeVersion(), response.Usage, response.Meta)
 		scope = classified
 		if nativeUsage != nil {
 			t.usage.recordMetadata(acpmeta.WithTurnUsage(nil, *nativeUsage))

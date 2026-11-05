@@ -3,8 +3,10 @@ package standardacp
 import (
 	"bufio"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -20,9 +22,10 @@ import (
 )
 
 const (
-	kimiWireVersion  = "2.0.2"
-	kimiIndexLimit   = 16 << 20
-	kimiJournalLimit = 64 << 20
+	kimiWireVersion       = "2.0.2"
+	kimiPythonWireVersion = "1.52.0"
+	kimiIndexLimit        = 16 << 20
+	kimiJournalLimit      = 64 << 20
 )
 
 func kimiProfileHome(environment []string, cwd, variable, defaultName string) string {
@@ -43,9 +46,12 @@ func kimiProfileHome(environment []string, cwd, variable, defaultName string) st
 	return home
 }
 
-func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope, home string) func(context.Context, *acp.StopReason) acpclient.PromptJournalEvidence {
-	// Only the fixed Kimi Code generation has this verified Wire contract.
-	if scope.Version != kimiWireVersion || home == "" || ctx.Err() != nil {
+func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope, home, pythonHome string) func(context.Context, *acp.StopReason) acpclient.PromptJournalEvidence {
+	python := scope.Version == kimiPythonWireVersion
+	if python {
+		home = pythonHome
+	}
+	if !python && scope.Version != kimiWireVersion || home == "" || ctx.Err() != nil {
 		return nil
 	}
 	root, err := os.OpenRoot(home)
@@ -53,7 +59,17 @@ func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope,
 		return nil
 	}
 	defer root.Close()
-	relative := kimiJournalPath(ctx, root, home, scope)
+	var relative string
+	if python {
+		id := string(scope.SessionID)
+		if !filepath.IsAbs(scope.Cwd) || id == "." || !filepath.IsLocal(id) || filepath.Base(id) != id {
+			return nil
+		}
+		// WorkDirMeta.sessions_dir uses MD5 to name the exact native workspace.
+		relative = filepath.Join("sessions", fmt.Sprintf("%x", md5.Sum([]byte(scope.Cwd))), id, "wire.jsonl")
+	} else {
+		relative = kimiJournalPath(ctx, root, home, scope)
+	}
 	if relative == "" {
 		return nil
 	}
@@ -78,7 +94,7 @@ func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope,
 		return nil
 	}
 	return func(ctx context.Context, reason *acp.StopReason) acpclient.PromptJournalEvidence {
-		return settleKimiJournal(ctx, reason, home, relative, baseline, offset)
+		return settleKimiJournal(ctx, reason, home, relative, baseline, offset, python)
 	}
 }
 
@@ -99,8 +115,9 @@ func kimiJournalPath(ctx context.Context, root *os.Root, home string, scope acpc
 			return ""
 		}
 		var row struct {
-			// ID and Cwd match the exact native generation.
-			ID  string `json:"sessionId"`
+			// ID identifies the indexed native session.
+			ID string `json:"sessionId"`
+			// Cwd binds the indexed session to its original workspace.
 			Cwd string `json:"workDir"`
 			// Directory is the absolute session path recorded by Kimi.
 			Directory string `json:"sessionDir"`
@@ -121,14 +138,14 @@ func kimiJournalPath(ctx context.Context, root *os.Root, home string, scope acpc
 	return result
 }
 
-func settleKimiJournal(ctx context.Context, reason *acp.StopReason, home, relative string, baseline os.FileInfo, offset int64) acpclient.PromptJournalEvidence {
+func settleKimiJournal(ctx context.Context, reason *acp.StopReason, home, relative string, baseline os.FileInfo, offset int64, python bool) acpclient.PromptJournalEvidence {
 	root, err := os.OpenRoot(home)
 	if err != nil {
 		return acpclient.PromptJournalEvidence{}
 	}
 	defer root.Close()
 	if reason == nil || *reason != acp.StopReasonEndTurn {
-		evidence, _, _ := scanKimiJournal(ctx, root, relative, baseline, offset)
+		evidence, _, _ := scanKimiJournal(ctx, root, relative, baseline, offset, python)
 		if reason != nil && *reason == acp.StopReasonCancelled {
 			evidence.Failure = nil
 		}
@@ -142,7 +159,7 @@ func settleKimiJournal(ctx context.Context, reason *acp.StopReason, home, relati
 	defer ticker.Stop()
 	var latest acpclient.PromptJournalEvidence
 	for {
-		evidence, started, terminal := scanKimiJournal(wait, root, relative, baseline, offset)
+		evidence, started, terminal := scanKimiJournal(wait, root, relative, baseline, offset, python)
 		if terminal {
 			return evidence
 		}
@@ -196,7 +213,7 @@ type kimiWireEvent struct {
 	Usage *kimiWireCounters `json:"usage"`
 }
 
-func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseline os.FileInfo, offset int64) (acpclient.PromptJournalEvidence, bool, bool) {
+func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseline os.FileInfo, offset int64, python bool) (acpclient.PromptJournalEvidence, bool, bool) {
 	var evidence acpclient.PromptJournalEvidence
 	file, err := openKimiJournalFile(root, relative)
 	if err != nil {
@@ -212,9 +229,13 @@ func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseli
 	scanner.Buffer(make([]byte, 4096), 8<<20)
 	var turn *int64
 	var calls int
+	source := "kimi.wire.usage"
+	if python {
+		source = "kimi.python.wire.status"
+	}
 	for scanner.Scan() && ctx.Err() == nil {
-		var event kimiWireEvent
-		if json.Unmarshal(scanner.Bytes(), &event) != nil {
+		event, valid := decodeKimiWireEvent(scanner.Bytes(), python)
+		if !valid {
 			break
 		}
 		switch {
@@ -224,11 +245,13 @@ func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseli
 				return acpclient.PromptJournalEvidence{}, false, false
 			}
 			turn = event.Turn
-			evidence.NativeTurnID = strconv.FormatInt(*turn, 10)
+			if !python {
+				evidence.NativeTurnID = strconv.FormatInt(*turn, 10)
+			}
 		case turn == nil || event.Turn != nil && *event.Turn != *turn:
 		case event.Type == "usage.record" && event.Agent == "main" && event.Scope == "turn" && event.Usage != nil:
 			if evidence.Usage == nil {
-				evidence.Usage = &acpmeta.TurnUsage{Source: "kimi.wire.usage", Coverage: "observed_requests", Model: event.Model}
+				evidence.Usage = &acpmeta.TurnUsage{Source: source, Coverage: "observed_requests", Model: event.Model}
 			} else if evidence.Usage.Model != event.Model {
 				evidence.Usage.Model = ""
 			}
@@ -242,6 +265,53 @@ func scanKimiJournal(ctx context.Context, root *os.Root, relative string, baseli
 		}
 	}
 	return evidence, turn != nil, false
+}
+
+func decodeKimiWireEvent(raw []byte, python bool) (kimiWireEvent, bool) {
+	var event kimiWireEvent
+	if !python {
+		err := json.Unmarshal(raw, &event)
+		return event, err == nil
+	}
+	var record struct {
+		// Message is the native WireMessage envelope.
+		Message struct {
+			// Type identifies a durable start, step usage, or end.
+			Type string `json:"type"`
+			// Payload retains counters supplied by a completed native request.
+			Payload struct {
+				// Usage contains explicitly reported independent token classes.
+				Usage *struct {
+					// Input excludes cache reads and creation.
+					Input *int64 `json:"input_other"`
+					// Output is native output for this request.
+					Output *int64 `json:"output"`
+					// CacheRead counts cache hit input.
+					CacheRead *int64 `json:"input_cache_read"`
+					// CacheWrite counts cache creation input.
+					CacheWrite *int64 `json:"input_cache_creation"`
+				} `json:"token_usage"`
+			} `json:"payload"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return event, false
+	}
+	// Python has no native turn ID. The sentinel is private to the one
+	// append range and is never projected as a durable native identity.
+	event.Agent, event.Turn = "main", acp.Ptr(int64(-1))
+	switch record.Message.Type {
+	case "TurnBegin":
+		event.Type = "turn.prompt"
+	case "StatusUpdate":
+		if usage := record.Message.Payload.Usage; usage != nil {
+			event.Type, event.Scope = "usage.record", "turn"
+			event.Usage = &kimiWireCounters{Input: usage.Input, Output: usage.Output, CacheRead: usage.CacheRead, CacheWrite: usage.CacheWrite}
+		}
+	case "TurnEnd":
+		event.Type = "turn.ended"
+	}
+	return event, true
 }
 
 func openKimiJournalFile(root *os.Root, name string) (*os.File, error) {

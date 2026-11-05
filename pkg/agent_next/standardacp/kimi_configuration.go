@@ -12,7 +12,7 @@ import (
 func kimiLegacyModelBehavior(environment []string, cwd string) acpclient.LegacyModelBehavior {
 	home := kimiProfileHome(environment, cwd, "KIMI_SHARE_DIR", ".kimi")
 	return acpclient.LegacyModelBehavior{
-		ConfirmsValue:      func(version string) bool { return version == "1.52.0" },
+		ConfirmsValue:      func(version string) bool { return version == kimiPythonWireVersion },
 		OpeningValueIsNoop: true,
 		AppliedOnError: func(err *acp.RequestError) bool {
 			if home == "" || err.Code != -32603 || err.Message != "Internal error" {

@@ -80,9 +80,10 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			protocol.OpeningMode = "yolo"
 		}
 		home := kimiProfileHome(environment, cwd, "KIMI_CODE_HOME", ".kimi-code")
+		pythonHome := kimiProfileHome(environment, cwd, "KIMI_SHARE_DIR", ".kimi")
 		protocol.LegacyModel = kimiLegacyModelBehavior(environment, cwd)
 		protocol.CapturePromptJournal = func(ctx context.Context, scope acpclient.PromptJournalScope) func(context.Context, *acp.StopReason) acpclient.PromptJournalEvidence {
-			return captureKimiJournal(ctx, scope, home)
+			return captureKimiJournal(ctx, scope, home, pythonHome)
 		}
 		protocol.ForkAllowed = func(response acp.InitializeResponse) bool {
 			// The fixed 2.0.2 contract returns the new native ID and supports cleanup.

@@ -10,8 +10,9 @@ import (
 )
 
 type mcpDirectory struct {
-	// path and info recognize both canonical paths and aliases of the same directory.
+	// path identifies the canonical provider registry key.
 	path string
+	// info recognizes alternate spellings of the same directory.
 	info os.FileInfo
 	// hasRoutes distinguishes a session that can register directory-wide MCP servers.
 	hasRoutes bool
