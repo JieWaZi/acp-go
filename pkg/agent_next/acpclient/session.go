@@ -253,6 +253,11 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 		c.mu.Unlock()
 		p.delivery.cancel()
 	}()
+	if prepare := c.opts.Protocol.PrepareRestore; request.method == acp.AgentMethodSessionLoad && prepare != nil {
+		if err := prepare(op, c.verifiedNativeVersion(), request.cwd, request.id); err != nil {
+			return acp.NewSessionResponse{}, err
+		}
+	}
 	if request.beforeWrite != nil {
 		if err := request.beforeWrite(); err != nil {
 			return acp.NewSessionResponse{}, err

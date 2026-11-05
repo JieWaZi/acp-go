@@ -27,6 +27,8 @@ type Protocol struct {
 	RequireLoadEvidence bool
 	// ValidateRestoreID rejects native selector aliases that cannot prove an exact session.
 	ValidateRestoreID func(acp.SessionId) bool
+	// PrepareRestore protects exact native history before a restore can write it.
+	PrepareRestore func(context.Context, string, string, acp.SessionId) error
 	// ModeOption selects an advertised native config setter for permission modes.
 	ModeOption acp.SessionConfigId
 	// BlockUntypedExtensions protects providers whose raw methods expose credentials or unscoped mutations.

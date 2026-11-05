@@ -303,6 +303,13 @@ func (c *Client) begin(ctx context.Context) (*acp.ClientSideConnection, error) {
 	return c.conn, nil
 }
 
+func (c *Client) verifiedNativeVersion() string {
+	if c.initialized != nil && c.initialized.AgentInfo != nil && c.initialized.AgentInfo.Version == c.version {
+		return c.version
+	}
+	return ""
+}
+
 func (c *Client) admissionLocked(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
