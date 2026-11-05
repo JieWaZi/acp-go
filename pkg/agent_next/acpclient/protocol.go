@@ -54,6 +54,8 @@ type Protocol struct {
 	ReadModelConfig func(map[string]any) (acpmeta.ModelConfigCatalog, bool)
 	// ReadOnlyModelCatalog disables discovery setters that can persist native defaults.
 	ReadOnlyModelCatalog bool
+	// DisposableModelCatalog permits probes without restoring a persistent default.
+	DisposableModelCatalog bool
 	// ExecutionOption identifies additional native parameters frozen with each prompt.
 	ExecutionOption func(acp.SessionConfigOptionCategory) bool
 	// SessionMissing classifies a provider-specific error for the exact requested ID.

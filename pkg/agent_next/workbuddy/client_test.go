@@ -312,6 +312,57 @@ func TestWorkBuddyCatalogKeepsOpeningReceiptWithoutModelWrites(t *testing.T) {
 	}
 }
 
+func TestWorkBuddyDisposableCatalogReadsEffortWithUnlistedOpeningModel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, home := t.TempDir(), t.TempDir()
+	path := filepath.Join(home, "settings.json")
+	if err := os.WriteFile(path, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := workbuddy.PrepareModelCatalog(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	client, err := workbuddy.NewClient(ctx, workbuddy.Options{
+		Executable: executable, PrefixArgs: []string{"-test.run=^TestNativeWorkBuddy$", "--"},
+		Environment:      append(os.Environ(), "WORKBUDDY_FIXTURE=disposable-catalog", "WORKBUDDY_TRACE="+filepath.Join(cwd, "trace.jsonl"), "CODEBUDDY_CONFIG_DIR="+home),
+		WorkingDirectory: cwd, CatalogConfigHome: root,
+	}, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(context.Background())
+	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := client.ReadModels(ctx)
+	if err != nil || catalog.DefaultID != nil || catalog.Options.Ungrouped == nil {
+		t.Fatalf("catalog = %+v, %v", catalog, err)
+	}
+	want := map[acp.SessionConfigValueId]acp.SessionConfigValueId{"fast-model": "low", "DeepSeek-V4.1-Flash": "max"}
+	for _, row := range *catalog.Options.Ungrouped {
+		config, ok := acpmeta.ReadModelConfigCatalog(row.Meta)
+		if !ok || len(config.Options) != 1 || config.Options[0].Select == nil || config.Options[0].Select.CurrentValue != want[row.Value] {
+			t.Fatalf("%s config = %+v", row.Value, config)
+		}
+		delete(want, row.Value)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing models: %v", want)
+	}
+	source, sourceErr := os.ReadFile(path)
+	copy, copyErr := os.ReadFile(filepath.Join(root, "settings.json"))
+	if sourceErr != nil || copyErr != nil || string(source) != "original" || string(copy) != "DeepSeek-V4.1-Flash" {
+		t.Fatalf("model write escaped the disposable scope: %v %v", sourceErr, copyErr)
+	}
+}
+
 func TestNativeWorkBuddy(t *testing.T) {
 	scenario := os.Getenv("WORKBUDDY_FIXTURE")
 	if scenario == "" {
@@ -341,6 +392,12 @@ func TestNativeWorkBuddy(t *testing.T) {
 	request := func(id, method string, params any) {
 		_ = out.Encode(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 	}
+	disposableOptions := func(model, effort string) []any {
+		return []any{
+			map[string]any{"type": "select", "id": "model", "category": "model", "name": "Model", "currentValue": model, "options": []map[string]string{{"value": "fast-model", "name": "Fast"}, {"value": "DeepSeek-V4.1-Flash", "name": "DeepSeek"}}},
+			map[string]any{"type": "select", "id": "thought_level", "category": "thought_level", "name": "Thinking", "currentValue": effort, "options": []map[string]string{{"value": effort, "name": effort}}},
+		}
+	}
 	for in.Scan() {
 		var frame struct {
 			// ID identifies the request or reply to the native reverse request.
@@ -358,6 +415,10 @@ func TestNativeWorkBuddy(t *testing.T) {
 		case "initialize":
 			reply(frame.ID, map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true}})
 		case "session/new":
+			if scenario == "disposable-catalog" {
+				reply(frame.ID, map[string]any{"sessionId": "probe", "configOptions": disposableOptions("unlisted-alias", "medium")})
+				continue
+			}
 			if scenario == "catalog" {
 				reply(frame.ID, map[string]any{"sessionId": "workbuddy-probe", "configOptions": []any{
 					map[string]any{"type": "select", "id": "model", "category": "model", "name": "Model", "currentValue": "fast-model", "options": []map[string]string{{"value": "fast-model", "name": "Fast"}, {"value": "DeepSeek-V4.1-Flash", "name": "DeepSeek V4.1 Flash"}}},
@@ -378,6 +439,15 @@ func TestNativeWorkBuddy(t *testing.T) {
 			}
 			reply(frame.ID, map[string]any{})
 		case "session/set_config_option":
+			if scenario == "disposable-catalog" {
+				model, _ := frame.Params["value"].(string)
+				effort := map[string]string{"fast-model": "low", "DeepSeek-V4.1-Flash": "max"}[model]
+				if frame.Params["configId"] != "model" || effort == "" || os.WriteFile(filepath.Join(os.Getenv("CODEBUDDY_CONFIG_DIR"), "settings.json"), []byte(model), 0600) != nil {
+					os.Exit(5)
+				}
+				reply(frame.ID, map[string]any{"configOptions": disposableOptions(model, effort)})
+				continue
+			}
 			if frame.Params["configId"] != "mode" || frame.Params["value"] != "auto" {
 				os.Exit(5)
 			}

@@ -663,7 +663,8 @@ func (c *Client) discoverModels(ctx context.Context, conn *acp.ClientSideConnect
 	}
 	// Legacy catalogs without a configurable model cannot establish per-model
 	// dependent selectors; their existing native model metadata is preserved.
-	if !probe.config.legacy && probe.config.currentAt[model.Id] != 0 && hasChoice(model, opening) {
+	if !probe.config.legacy && probe.config.currentAt[model.Id] != 0 &&
+		(hasChoice(model, opening) || c.opts.Protocol.DisposableModelCatalog) {
 		deadline := time.Now().Add(5 * time.Second)
 		if end, ok := op.Deadline(); ok && end.Add(-2250*time.Millisecond).Before(deadline) {
 			deadline = end.Add(-2250 * time.Millisecond)
@@ -722,7 +723,7 @@ func (c *Client) discoverModels(ctx context.Context, conn *acp.ClientSideConnect
 				}
 			}
 		}
-		if selected != opening && !uncertain {
+		if selected != opening && !uncertain && !c.opts.Protocol.DisposableModelCatalog {
 			restore, stop := c.operationContext(context.WithoutCancel(ctx), time.Second)
 			receipt := send[setupResult](conn, restore, acp.AgentMethodSessionSetConfigOption, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{SessionId: r.Result.ID, ConfigId: model.Id, Value: opening}})
 			stop()

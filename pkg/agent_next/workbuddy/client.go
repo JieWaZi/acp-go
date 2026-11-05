@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strings"
 
 	agentclient "github.com/JieWaZi/acp-go/pkg/agent_next"
 	"github.com/JieWaZi/acp-go/pkg/agent_next/acpclient"
@@ -26,6 +29,8 @@ type Options struct {
 	Logger *slog.Logger
 	// ExplicitCredential disables interactive account changes for a selected API key or token.
 	ExplicitCredential bool
+	// CatalogConfigHome is a disposable configuration root owned by the catalog caller.
+	CatalogConfigHome string
 }
 
 // NewClient freezes the CodeBuddy launch without starting a process.
@@ -33,6 +38,19 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	discover := options.Executable == ""
 	if discover {
 		options.Executable = "codebuddy"
+	}
+	if options.CatalogConfigHome != "" {
+		if !filepath.IsAbs(options.CatalogConfigHome) {
+			return nil, errors.New("CodeBuddy catalog configuration root must be absolute")
+		}
+		if options.Environment == nil {
+			options.Environment = os.Environ()
+		}
+		options.Environment = slices.DeleteFunc(slices.Clone(options.Environment), func(entry string) bool {
+			key, _, _ := strings.Cut(entry, "=")
+			return strings.EqualFold(key, "CODEBUDDY_CONFIG_DIR")
+		})
+		options.Environment = append(options.Environment, "CODEBUDDY_CONFIG_DIR="+options.CatalogConfigHome)
 	}
 	launch := acpclient.Options{
 		Process: agentclient.ProcessSpec{
@@ -47,7 +65,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			ReadPromptEvidence: readPromptEvidence, NormalizeUsage: normalizeUsage,
 			ExecutionOption: executionOption, Authentication: acpclient.Authentication{Disabled: options.ExplicitCredential},
 			// CodeBuddy's model setter also writes the user's selected model.
-			ReadOnlyModelCatalog: true,
+			ReadOnlyModelCatalog: options.CatalogConfigHome == "", DisposableModelCatalog: options.CatalogConfigHome != "",
 		},
 	}
 	client, err := acpclient.NewClient(ctx, launch, host)
