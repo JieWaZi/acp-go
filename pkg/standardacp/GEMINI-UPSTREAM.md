@@ -2,6 +2,8 @@
 
 下文保留固定上游和旧适配器的证据。当前实现及测试入口见 [开发与验证](../../README.md#开发与验证)。
 
+当前标准适配器已核实 Gemini CLI 0.62.0、0.65.0 和 0.67.0 的 legacy 模型设置：成功回执可确认所选模型，旧的会话起始 `auto` 不覆盖该确认。0.65.0 和 0.67.0 的本轮 ACP 用量直接读取输入、候选输出、缓存读取和思考计数；普通输入扣除缓存读取，输出包含思考，缓存写入保持未知。其他版本不据此确认模型或扩展用量口径。0.67.0 已经 API Key 入口验证模型切换及真实 flash-lite 终态用量；冻结报文覆盖旧版本、未知版本及连续两轮不累计。
+
 固定来源：[官方 v0.62.0](https://github.com/google-gemini/gemini-cli/tree/b460678f3db508407554afd604cc9d6635becb2a)，SHA `b460678f3db508407554afd604cc9d6635becb2a`。适配器只启动已安装 CLI，使用现有 `coder/acp-go-sdk`；不执行 acpx，不下载或内嵌完整 CLI。[acpx v0.19.4](https://github.com/openclaw/acpx/tree/v0.19.4) 仅为 registry/process/config 状态惯例参考。
 
 | 项目 | 固定源码与适配行为 |

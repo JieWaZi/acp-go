@@ -96,7 +96,7 @@ type geminiQuota struct {
 // geminiNativePromptUsage reads the per-prompt ledger emitted by verified ACP releases.
 func geminiNativePromptUsage(version string, raw *acpclient.PromptUsageCounters, meta map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
 	fallback := geminiPromptUsage(meta)
-	if version != "0.65.0" || raw == nil || !exactCounter(raw.Input) || !exactCounter(raw.Output) || !exactCounter(raw.Total) ||
+	if (version != "0.65.0" && version != "0.67.0") || raw == nil || !exactCounter(raw.Input) || !exactCounter(raw.Output) || !exactCounter(raw.Total) ||
 		*raw.Input+*raw.Output != *raw.Total || *raw.Total == 0 || raw.CacheWrite != nil {
 		return fallback, acpclient.UsageUnattributed
 	}

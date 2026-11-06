@@ -22,26 +22,30 @@ import (
 	"github.com/JieWaZi/acp-go/pkg/standardacp"
 )
 
-func TestGemini065LegacyModelAcknowledgement(t *testing.T) {
-	t.Setenv("STANDARD_ACP_GEMINI_VERSION", "0.65.0")
-	cwd := t.TempDir()
-	client, ctx := newFixtureClient(t, standardacp.Gemini, cwd, agentclient.HostCallbacks{})
-	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
-		t.Fatal(err)
-	}
-	session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
-		SessionId: session.SessionId, ConfigId: "model", Value: "fixture/alternate",
-	}})
-	if err != nil || len(result.ConfigOptions) != 1 || result.ConfigOptions[0].Select.CurrentValue != "fixture/alternate" {
-		t.Fatalf("accepted native model change was not confirmed: %+v %v", result, err)
+func TestGeminiVerifiedLegacyModelAcknowledgement(t *testing.T) {
+	for _, version := range []string{"0.62.0", "0.65.0", "0.67.0"} {
+		t.Run(version, func(t *testing.T) {
+			t.Setenv("STANDARD_ACP_GEMINI_VERSION", version)
+			cwd := t.TempDir()
+			client, ctx := newFixtureClient(t, standardacp.Gemini, cwd, agentclient.HostCallbacks{})
+			if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+				t.Fatal(err)
+			}
+			session, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := client.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+				SessionId: session.SessionId, ConfigId: "model", Value: "fixture/alternate",
+			}})
+			if err != nil || len(result.ConfigOptions) != 1 || result.ConfigOptions[0].Select.CurrentValue != "fixture/alternate" {
+				t.Fatalf("accepted native model change was not confirmed: %+v %v", result, err)
+			}
+		})
 	}
 }
 
-func TestGemini065PromptUsagePreservesNativeBreakdown(t *testing.T) {
+func TestGeminiVerifiedPromptUsagePreservesNativeBreakdown(t *testing.T) {
 	for _, tc := range []struct {
 		// name identifies the native prompt usage shape.
 		name string
@@ -58,6 +62,8 @@ func TestGemini065PromptUsagePreservesNativeBreakdown(t *testing.T) {
 		// reasoning is the output subset, or nil when unproven.
 		reasoning *int64
 	}{
+		{name: "0.67 flash lite native breakdown", version: "0.67.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29,"cachedReadTokens":4,"thoughtTokens":3}`,
+			input: acp.Ptr(int64(19)), output: 9, read: acp.Ptr(int64(4)), reasoning: acp.Ptr(int64(3))},
 		{name: "flash lite native breakdown", version: "0.65.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29,"cachedReadTokens":4,"thoughtTokens":3}`,
 			input: acp.Ptr(int64(19)), output: 9, read: acp.Ptr(int64(4)), reasoning: acp.Ptr(int64(3))},
 		{name: "positive only optional counters omitted", version: "0.65.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29}`,
