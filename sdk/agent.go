@@ -97,7 +97,13 @@ func (c *AgentSideConnection) SetPromptPreparation(capture func(PromptRequest) P
 	c.promptPreparation = capture
 }
 
-// Done exposes a channel that closes when the peer disconnects.
+// Close aborts the logical connection and its in-flight operations. It is
+// idempotent and does not wait for or close the caller's borrowed streams.
+// The stream owner must unblock any physical Read or Write that is in progress.
+func (c *AgentSideConnection) Close() { c.conn.Close() }
+
+// Done closes when the peer disconnects or Close aborts the connection.
+// It does not report whether a borrowed stream has finished reading.
 func (c *AgentSideConnection) Done() <-chan struct{} { return c.conn.Done() }
 
 // SetLogger directs connection diagnostics to the provided logger.

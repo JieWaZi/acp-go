@@ -207,3 +207,73 @@ func TestSessionAdmissionRunsCapturedCancelAfterEnqueueFailure(t *testing.T) {
 		t.Fatal("cancel waited for earlier notifications to drain")
 	}
 }
+
+func TestConnectionCloseAbortsQueuedNotificationsAndReleasesCapturedCancel(t *testing.T) {
+	input, writer := io.Pipe()
+	entered, captured := make(chan struct{}), make(chan struct{})
+	released := make(chan error, 2)
+	var ordinary atomic.Int32
+	agent := &AgentSideConnection{}
+	agent.SetSessionAdmission(SessionAdmission{
+		Prompt: func(context.Context, PromptRequest, PromptPreparation) (func() (PromptResponse, error), error) {
+			return nil, errors.New("unexpected prompt")
+		},
+		Cancel: func(CancelNotification) (func(context.Context) error, error) {
+			return func(ctx context.Context) error { released <- context.Cause(ctx); return nil }, nil
+		},
+	})
+	handler := func(ctx context.Context, method string, _ json.RawMessage) (any, *RequestError) {
+		if method == "_hold" {
+			close(entered)
+			<-ctx.Done()
+		} else {
+			ordinary.Add(1)
+		}
+		return nil, nil
+	}
+	prepare := func(ctx context.Context, message *anyMessage) inboundContinuation {
+		if message.Method == "_fence" {
+			close(captured)
+		}
+		return agent.prepareSessionInbound(ctx, message)
+	}
+	connection := newConnection(handler, prepare, io.Discard, struct{ io.Reader }{input}, nil)
+	t.Cleanup(func() { connection.Close(); _ = input.Close(); _ = writer.Close() })
+	workerDone, readerDone := make(chan struct{}), make(chan struct{})
+	go func() { connection.processNotifications(); close(workerDone) }()
+	go func() { connection.receive(); close(readerDone) }()
+	frames := `{"jsonrpc":"2.0","method":"_hold"}` + "\n" +
+		`{"jsonrpc":"2.0","method":"_ordinary"}` + "\n" + admissionCancelFrame +
+		`{"jsonrpc":"2.0","method":"_fence"}` + "\n"
+	if _, err := io.WriteString(writer, frames); err != nil {
+		t.Fatal(err)
+	}
+	receiveLifecycle(t, entered)
+	receiveLifecycle(t, captured)
+	connection.notifyMu.Lock()
+	target := connection.lastEnqueuedNotificationSeq
+	connection.notifyMu.Unlock()
+	drainDone := make(chan struct{})
+	go func() { connection.waitForNotificationDrain(target, time.Hour); close(drainDone) }()
+	connection.Close()
+	receiveLifecycle(t, workerDone)
+	receiveLifecycle(t, drainDone)
+	if err := receiveLifecycle(t, released); !errors.Is(err, context.Canceled) {
+		t.Fatalf("captured cancel lost owner abort: %v", err)
+	}
+	if got := ordinary.Load(); got != 0 {
+		t.Fatalf("owner close dispatched %d queued ordinary notifications", got)
+	}
+	// Only the caller can unblock its borrowed reader. No later frame may
+	// acquire a new operation after the logical connection was closed.
+	if _, err := io.WriteString(writer, admissionCancelFrame); err != nil {
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	receiveLifecycle(t, readerDone)
+	select {
+	case <-released:
+		t.Fatal("captured cancel ran more than once or a post-close frame was admitted")
+	default:
+	}
+}

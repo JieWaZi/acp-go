@@ -517,6 +517,13 @@ func (c *Connection) receive() {
 
 	var sequence uint64
 	for scanner.Scan() {
+		if c.ctx.Err() != nil {
+			// A borrowed reader may finish only after its owner releases it.
+			// Closing the logical connection must prevent that next frame from
+			// acquiring a new application operation.
+			c.shutdownReceive(context.Cause(c.ctx), nil)
+			return
+		}
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
@@ -654,10 +661,22 @@ func (c *Connection) shutdownReceive(cause error, unqueued *queuedNotification) 
 	c.loggerOrDefault().Info("connection closed", "category", connectionFailureCategory(cause))
 }
 
-// processNotifications processes notifications sequentially to maintain order.
-// It terminates when notificationQueue is closed (e.g. on disconnect in receive()).
+// processNotifications drains received notifications after EOF. An explicit
+// owner abort cancels inboundCtx immediately and stops ordinary dispatch;
+// captured continuations still run once through prepareNotificationDispatch.
+// The worker does not wait for the owner to unblock a borrowed reader.
 func (c *Connection) processNotifications() {
-	for queued := range c.notificationQueue {
+	for {
+		var queued queuedNotification
+		select {
+		case <-c.inboundCtx.Done():
+			return
+		case notification, ok := <-c.notificationQueue:
+			if !ok || c.inboundCtx.Err() != nil {
+				return
+			}
+			queued = notification
+		}
 		c.handleInbound(c.inboundCtx, queued.msg, queued.run, nil)
 
 		c.notifyMu.Lock()
@@ -1323,7 +1342,7 @@ func (c *Connection) waitForNotificationDrain(target uint64, timeout time.Durati
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.inboundCtx, timeout)
 	defer cancel()
 
 	stopWake := make(chan struct{})
@@ -1398,8 +1417,8 @@ func (c *Connection) prepareNotification(method string, params any) (anyMessage,
 	return msg, nil
 }
 
-// Done returns a channel that is closed when the underlying reader loop exits
-// (typically when the peer disconnects or the input stream is closed).
+// Done closes when the reader exits or the owner aborts the logical connection.
+// Borrowed physical streams can remain blocked until their owner releases them.
 func (c *Connection) Done() <-chan struct{} {
 	return c.ctx.Done()
 }

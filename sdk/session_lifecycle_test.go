@@ -2,11 +2,79 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
 )
+
+// borrowedLifecycleReader deliberately has no Close method. Its owner must
+// release an in-progress Read independently of the logical connection.
+type borrowedLifecycleReader struct {
+	// reading closes when the SDK enters its first physical read.
+	reading chan struct{}
+	// release ends that read when the caller gives up the borrowed transport.
+	release chan struct{}
+}
+
+func (r borrowedLifecycleReader) Read([]byte) (int, error) {
+	close(r.reading)
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestAgentConnectionCloseCancelsPendingControlWithoutWaitingForBorrowedRead(t *testing.T) {
+	input := borrowedLifecycleReader{reading: make(chan struct{}), release: make(chan struct{})}
+	defer close(input.release)
+	peer, output := io.Pipe()
+	t.Cleanup(func() { _ = peer.Close(); _ = output.Close() })
+	connection := NewAgentSideConnection(&agentFuncs{}, output, input)
+	// Assert the public lifecycle boundary without making the RED stage a
+	// compile failure against an SDK that has not exposed it yet.
+	closer, ok := any(connection).(interface{ Close() })
+	if !ok {
+		t.Fatal("agent-side connection has no explicit logical close")
+	}
+	defer closer.Close()
+	receiveLifecycle(t, input.reading)
+	control := make(chan error, 1)
+	go func() {
+		_, err := connection.CallExtension(context.Background(), "_pending", nil)
+		control <- err
+	}()
+	var request anyMessage
+	if err := json.NewDecoder(peer).Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	go func() { closer.Close(); closer.Close(); close(closed) }()
+	receiveLifecycle(t, closed)
+	receiveLifecycle(t, connection.Done())
+	receiveLifecycle(t, connection.conn.inboundCtx.Done())
+	if err := receiveLifecycle(t, control); err == nil {
+		t.Fatal("logical close left a control request waiting for a peer reply")
+	}
+}
+
+func TestAgentConnectionCloseCancelsActiveInboundPrompt(t *testing.T) {
+	input, writer := io.Pipe()
+	t.Cleanup(func() { _ = input.Close(); _ = writer.Close() })
+	agent := &lifecycleTestAgent{ownLifecycle: true, started: make(chan context.Context, 1), cancelled: make(chan struct{}), closed: make(chan struct{})}
+	connection := NewAgentSideConnection(agent, io.Discard, struct{ io.Reader }{input})
+	closer, ok := any(connection).(interface{ Close() })
+	if !ok {
+		t.Fatal("agent-side connection has no explicit logical close")
+	}
+	defer closer.Close()
+	if _, err := io.WriteString(writer, admissionPromptFrame); err != nil {
+		t.Fatal(err)
+	}
+	promptCtx := receiveLifecycle(t, agent.started)
+	closer.Close()
+	receiveLifecycle(t, promptCtx.Done())
+}
 
 // lifecycleTestAgent exposes prompt request contexts and owns its native cancel result.
 type lifecycleTestAgent struct {

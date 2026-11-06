@@ -12,6 +12,8 @@
 
 本地验证在此目录运行 `GOWORK=off go test -race .`；上层 Adapter 与使用方须引用同一 SDK 版本。
 
+`AgentSideConnection.Close` 由服务拥有者显式结束逻辑连接，复用 `Connection.Close` 取消请求等待、活动入站上下文与通知消费者。自然 EOF 仍先交付已收通知再取消入站上下文；拥有者主动关闭则停止普通通知分发，已捕获的取消延续由既有一次性回调释放。Close 幂等，不等待或关闭调用方借用的输入输出；无法中断的物理 Read/Write 仍须由流拥有者解除阻塞。需要主动关闭传输的连接继续使用既有 `ConnectionOptions.CloseTransport` 明确交付所有权。验证见 `session_lifecycle_test.go`、`session_admission_test.go` 和 `connection_terminal_test.go`。
+
 `connection.go` 的 `SendRequestWithWriteHooks` 使用既有 pending 请求所有者，在同一连接写入门内执行同步准入及真实字节回执。写入等待 context 可与原生响应等待分开；取消发生在编码或写入准入前时不提交请求。部分写入或写入错误使连接失效，避免后续帧复用损坏的 JSONL 流。所有请求、通知、响应共用该写入门，既有通知水位屏障保留。验证见 `connection_write_test.go`。
 
 `pkg/acpclient` 消费这些钩子，以同一 Prompt 所有者处理准备、FIFO／拒绝并发、交互取消、原生终态和有序取消写入。未提交的 Prompt 不发送原生 cancel；已提交后等待真实终态，宽限期耗尽关闭连接。Adapter 无需另存一套 submitted/cancel 状态。该功能需要更新后的 SDK；仅使用本地 go.work 通过不能证明远端固定版本已发布。
