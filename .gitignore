@@ -1,0 +1,8 @@
+.agents
+.codegraph
+skills-lock.json
+.upstream/
+node_modules/
+.codex
+.idea
+.openbitfun/

@@ -1,0 +1,17 @@
+package acpserver_test
+
+import (
+	"context"
+	"io"
+	"testing"
+
+	acp "github.com/JieWaZi/acp-go-sdk"
+	"github.com/JieWaZi/acp-go/pkg/acpserver"
+)
+
+// TestPublicAPICompiles 验证外部模块可以组合 Registry 与 Server 公开入口。
+func TestPublicAPICompiles(t *testing.T) {
+	var _ func(string) (*acpserver.Registry, error) = acpserver.NewRegistry
+	var _ func(acp.Agent, io.Reader, io.Writer) (*acpserver.Server, error) = acpserver.New
+	var _ func(*acpserver.Server, context.Context) error = (*acpserver.Server).Serve
+}

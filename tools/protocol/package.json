@@ -1,0 +1,10 @@
+{
+  "name": "acp-go-protocol-tools",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@openai/codex": "0.148.0",
+    "quicktype": "26.0.0"
+  }
+}
