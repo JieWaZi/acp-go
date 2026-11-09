@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	acp "github.com/JieWaZi/acp-go-sdk"
@@ -148,8 +149,12 @@ type qoderHistoryRow struct {
 	Session string `json:"sessionId"`
 	// Cwd binds the entry to the original workspace despite slug collisions.
 	Cwd string `json:"cwd"`
-	// Version pins the persisted schema independently of the running CLI.
+	// Version records the native release for diagnostics without gating parsing.
 	Version string `json:"version"`
+	// Timestamp is the native entry time, as RFC3339 text or epoch milliseconds.
+	Timestamp json.RawMessage `json:"timestamp"`
+	// RuntimeModel is the effective selection recorded by a native runtime-config snapshot.
+	RuntimeModel string `json:"model"`
 	// Sidechain excludes independently persisted subagent work.
 	Sidechain bool `json:"isSidechain"`
 	// ModelSource distinguishes custom-provider responses from first-party responses.
@@ -206,10 +211,20 @@ func readQoderHistory(ctx context.Context, home, name, cwd, session, turn string
 	scanner.Buffer(make([]byte, 4096), qoderHistoryLine)
 	rows := make(map[string]qoderHistoryRow)
 	order := []string{}
+	var configurations []qoderHistoryRow
 	for scanner.Scan() && ctx.Err() == nil {
 		var row qoderHistoryRow
 		if json.Unmarshal(scanner.Bytes(), &row) != nil {
 			return nil
+		}
+		if row.Type == "runtime-config" {
+			if row.Session == session && !row.Sidechain && (row.Cwd == "" || row.Cwd == cwd) {
+				if len(configurations) >= qoderHistoryRows {
+					return nil
+				}
+				configurations = append(configurations, row)
+			}
+			continue
 		}
 		if row.Session != session || row.Cwd != cwd || row.Sidechain || (row.Type != "user" && row.Type != "assistant" && row.Type != "system" && row.Type != "attachment") {
 			continue
@@ -257,11 +272,17 @@ func readQoderHistory(ctx context.Context, home, name, cwd, session, turn string
 		}
 		return false
 	}
+	runtimeModel := qoderRuntimeModel(configurations, start)
 	seen := make(map[string]qoderHistoryRow)
 	for _, id := range order {
 		row := rows[id]
 		if row.Type != "assistant" || !belongs(row) || row.Message.Usage == nil {
 			continue
+		}
+		// Some native responses retain the placeholder "auto" after an explicit
+		// model switch. Only a session-bound, preceding native snapshot can resolve it.
+		if row.Message.Model == "auto" && runtimeModel != "" && row.ModelSource == "" && row.CustomProvider == "" {
+			row.Message.Model = runtimeModel
 		}
 		u := row.Message.Usage
 		if !qoderValidOptional(u.Input) || !qoderValidOptional(u.Output) || !qoderValidOptional(u.CacheRead) || !qoderValidOptional(u.CacheWrite) {
@@ -369,4 +390,44 @@ func qoderAddModel(part *acpmeta.ModelUsage, u *qoderHistoryUsage) bool {
 		}
 	}
 	return true
+}
+
+// qoderRuntimeModel resolves only an unambiguous native snapshot preceding this input.
+// A concrete response model always takes precedence over this route selection.
+func qoderRuntimeModel(configurations []qoderHistoryRow, start qoderHistoryRow) string {
+	inputAt := qoderHistoryTime(start.Timestamp)
+	if inputAt.IsZero() {
+		return ""
+	}
+	var latest time.Time
+	model := ""
+	conflict := false
+	for _, row := range configurations {
+		at := qoderHistoryTime(row.Timestamp)
+		if at.IsZero() || at.After(inputAt) || !qoderHistoryID(row.RuntimeModel) {
+			continue
+		}
+		if at.After(latest) {
+			latest, model, conflict = at, row.RuntimeModel, false
+		} else if at.Equal(latest) && row.RuntimeModel != model {
+			conflict = true
+		}
+	}
+	if conflict {
+		return ""
+	}
+	return model
+}
+
+func qoderHistoryTime(raw json.RawMessage) time.Time {
+	var milliseconds int64
+	if json.Unmarshal(raw, &milliseconds) == nil && milliseconds > 0 {
+		return time.UnixMilli(milliseconds)
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return time.Time{}
+	}
+	at, _ := time.Parse(time.RFC3339Nano, text)
+	return at
 }
