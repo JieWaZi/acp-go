@@ -27,6 +27,8 @@ type Options struct {
 	Executable string
 	// PrefixArgs precedes the fixed native ACP and version arguments.
 	PrefixArgs []string
+	// PluginDirectories lists local plugins loaded by the ACP process only.
+	PluginDirectories []string
 	// Environment is the complete launch environment, or nil to snapshot the host.
 	Environment []string
 	// WorkingDirectory is the workspace selected for this CLI process.
@@ -41,6 +43,10 @@ type Options struct {
 
 // NewClient freezes the CodeBuddy launch without starting a process.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	directories, err := agentclient.PhysicalPluginDirectories(options.PluginDirectories, options.PrefixArgs)
+	if err != nil {
+		return nil, err
+	}
 	discover := options.Executable == ""
 	if discover {
 		options.Executable = "codebuddy"
@@ -59,9 +65,14 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		options.Environment = append(options.Environment, "CODEBUDDY_CONFIG_DIR="+options.CatalogConfigHome)
 	}
 	historyHome := workBuddyHistoryHome(options.Environment, options.WorkingDirectory)
+	args := slices.Clone(options.PrefixArgs)
+	if len(directories) > 0 {
+		args = append(args, "--plugin-dir")
+		args = append(args, directories...)
+	}
 	launch := acpclient.Options{
 		Process: agentclient.ProcessSpec{
-			Executable: options.Executable, Args: append(slices.Clone(options.PrefixArgs), "--acp"),
+			Executable: options.Executable, Args: append(args, "--acp"),
 			Env: options.Environment, Dir: options.WorkingDirectory, Redact: agentclient.RedactProcessDiagnostic,
 		},
 		Version:   acpclient.VersionProbe{Args: append(slices.Clone(options.PrefixArgs), "--version")},

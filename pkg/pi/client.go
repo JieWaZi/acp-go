@@ -25,6 +25,8 @@ type Options struct {
 	Executable string
 	// PrefixArgs precedes the owned native RPC arguments.
 	PrefixArgs []string
+	// PluginDirectories contains local Pi packages attached for this RPC launch only.
+	PluginDirectories []string
 	// Environment is the complete child environment. Nil snapshots the host.
 	Environment []string
 	// WorkingDirectory selects the model-discovery and account root base directory.
@@ -124,6 +126,11 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	if options.PermissionMode == "auto" && options.MCPModulePath == "" {
 		return nil, errors.New("Pi automatic approval requires the managed bridge")
 	}
+	directories, err := agentclient.PhysicalPluginDirectories(options.PluginDirectories, options.PrefixArgs)
+	if err != nil {
+		return nil, err
+	}
+	options.PluginDirectories = directories
 	options.PrefixArgs = slices.Clone(options.PrefixArgs)
 	options.Environment = slices.Clone(options.Environment)
 	if options.Environment == nil {
@@ -266,9 +273,13 @@ func (*Client) Logout(context.Context, acp.LogoutRequest) (acp.LogoutResponse, e
 func (c *Client) UserInputRequiresReady() bool { return c.options.MCPModulePath != "" }
 
 func (c *Client) processSpec(cwd string, args, environment []string) agentclient.ProcessSpec {
+	prefix := slices.Clone(c.options.PrefixArgs)
+	for _, dir := range c.options.PluginDirectories {
+		prefix = append(prefix, "--extension", dir)
+	}
 	return agentclient.ProcessSpec{
 		Executable: c.options.Executable, Dir: cwd,
-		Args: append(append(slices.Clone(c.options.PrefixArgs), "--mode", "rpc"), args...),
+		Args: append(append(prefix, "--mode", "rpc"), args...),
 		Env:  append(slices.Clone(c.options.Environment), environment...),
 	}
 }

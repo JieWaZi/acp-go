@@ -826,7 +826,7 @@ func TestStandardACPProcess(t *testing.T) {
 				"mcpCapabilities":     jsonObject{"http": true}},
 			}
 			if provider == "grok" {
-				result["_meta"] = jsonObject{"grokShell": true, "agentVersion": version, "defaultAuthMethodId": "xai.api_key"}
+				result["_meta"] = jsonObject{"grokShell": true, "x.ai/pluginDirs": os.Getenv("GROK_PLUGIN_FIXTURE_DIR") != "", "agentVersion": version, "defaultAuthMethodId": "xai.api_key"}
 				result["authMethods"] = []any{jsonObject{"id": "xai.api_key", "name": "API key"}, jsonObject{"id": "grok.com", "name": "Interactive"}}
 			} else {
 				result["agentInfo"] = jsonObject{"name": name, "version": version}
@@ -852,6 +852,14 @@ func TestStandardACPProcess(t *testing.T) {
 				os.Exit(54)
 			}
 		case "session/new", "session/load", "session/resume":
+			if directory := os.Getenv("GROK_PLUGIN_FIXTURE_DIR"); directory != "" {
+				meta, _ := request.Params["_meta"].(map[string]any)
+				dirs, _ := meta["pluginDirs"].([]any)
+				if len(dirs) != 1 || dirs[0] != directory {
+					os.Exit(76)
+				}
+			}
+
 			if request.Method == "session/resume" && restoreMode != "" {
 				restoreCalls++
 				if restoreCalls == 1 {
@@ -1068,4 +1076,33 @@ func TestStandardACPProcess(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestGrokSessionPluginDirectoryRequiresNativeCapability(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		cwd := t.TempDir()
+		directory, _ := filepath.EvalSymlinks(t.TempDir())
+		env := append(os.Environ(), "STANDARD_ACP_FIXTURE=grok")
+		if supported {
+			env = append(env, "GROK_PLUGIN_FIXTURE_DIR="+directory)
+		}
+		client, err := standardacp.NewClient(t.Context(), standardacp.Options{Provider: standardacp.Grok, Executable: os.Args[0], PrefixArgs: []string{"-test.run=^TestStandardACPProcess$", "--"}, WorkingDirectory: cwd, Environment: env, PermissionMode: "auto", PluginDirectories: []string{directory}}, agentclient.HostCallbacks{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close(context.Background())
+		_, err = client.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: 1})
+		if !supported {
+			if err == nil {
+				t.Fatal("native peer did not advertise session plugin directories")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.NewSession(t.Context(), acp.NewSessionRequest{Cwd: cwd}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

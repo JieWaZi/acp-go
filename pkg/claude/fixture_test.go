@@ -56,6 +56,8 @@ func TestClaudeFixture(t *testing.T) {
 			}
 		case arg == "--settings" && i+1 < len(os.Args):
 			_ = json.Unmarshal([]byte(os.Args[i+1]), &f.workspace)
+		case strings.HasPrefix(arg, "--plugin-dir="):
+			f.mark("complete-plugin", strings.TrimPrefix(arg, "--plugin-dir="))
 		case strings.HasPrefix(arg, "--plugin-dir-no-mcp="):
 			f.pluginArgv = append(f.pluginArgv, strings.TrimPrefix(arg, "--plugin-dir-no-mcp="))
 		case arg == "--permission-mode" && i+1 < len(os.Args):

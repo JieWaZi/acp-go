@@ -23,6 +23,8 @@ type Options struct {
 	Executable string
 	// PrefixArgs precedes each subcommand and cannot override the selected account, policy, or workspace.
 	PrefixArgs []string
+	// PluginDirectories lists local plugins loaded by the ACP process only.
+	PluginDirectories []string
 	// Environment is the complete launch environment; nil snapshots the current host environment.
 	Environment []string
 	// WorkingDirectory is the initial process working directory.
@@ -121,8 +123,15 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		}
 		options.WorkingDirectory = dir
 	}
+	directories, err := agentclient.PhysicalPluginDirectories(options.PluginDirectories, options.PrefixArgs)
+	if err != nil {
+		return nil, err
+	}
 	apiKey := envValue(options.Environment, "CURSOR_API_KEY")
 	args := slices.Clone(options.PrefixArgs)
+	for _, dir := range directories {
+		args = append(args, "--plugin-dir", dir)
+	}
 	switch options.PermissionMode {
 	case "", "default":
 	case "auto":

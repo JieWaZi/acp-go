@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -669,6 +670,16 @@ func TestPromptCancelledBeforeSubmissionStaysUnsent(t *testing.T) {
 }
 
 func TestPiRPCFixture(t *testing.T) {
+	if expected := os.Getenv("PI_FIXTURE_PLUGIN"); expected != "" {
+		i := slices.Index(os.Args, "--extension")
+		if slices.Contains(os.Args, "--version") {
+			if i >= 0 {
+				os.Exit(85)
+			}
+		} else if i < 0 || i+1 >= len(os.Args) || os.Args[i+1] != expected {
+			os.Exit(86)
+		}
+	}
 	if os.Getenv("ACP_PI_NEXT_FIXTURE") != "1" {
 		return
 	}
@@ -897,4 +908,23 @@ func argValue(flag string) string {
 		}
 	}
 	return ""
+}
+
+func TestPiLoadsLocalSkillPackageDuringRPCOnly(t *testing.T) {
+	dir := t.TempDir()
+	plugin, _ := filepath.EvalSymlinks(t.TempDir())
+	options := fixtureOptions(t, dir)
+	options.PluginDirectories = []string{plugin}
+	options.Environment = append(options.Environment, "PI_FIXTURE_PLUGIN="+plugin)
+	client, err := NewClient(t.Context(), options, agentclient.HostCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(context.Background())
+	if _, err = client.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.NewSession(t.Context(), acp.NewSessionRequest{Cwd: dir}); err != nil {
+		t.Fatal(err)
+	}
 }

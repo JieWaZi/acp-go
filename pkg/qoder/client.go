@@ -26,6 +26,8 @@ type Options struct {
 	Executable string
 	// PrefixArgs precedes native ACP or management command arguments.
 	PrefixArgs []string
+	// PluginDirectories lists local plugins loaded by the ACP process only.
+	PluginDirectories []string
 	// Environment is the complete process environment; nil snapshots the host environment.
 	Environment []string
 	// WorkingDirectory is the native command's launch directory.
@@ -64,8 +66,15 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	if err != nil {
 		return nil, err
 	}
+	directories, err := agentclient.PhysicalPluginDirectories(options.PluginDirectories, options.PrefixArgs)
+	if err != nil {
+		return nil, err
+	}
 	token := selectedToken(options)
 	acpArgs := slices.Clone(options.PrefixArgs)
+	for _, dir := range directories {
+		acpArgs = append(acpArgs, "--plugin-dir", dir)
+	}
 	if options.Model != "" {
 		acpArgs = append(acpArgs, "--model="+options.Model)
 	}

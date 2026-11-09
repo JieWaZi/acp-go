@@ -22,6 +22,8 @@ type LaunchOptions struct {
 	Tools []string
 	// PluginDirectories contains local, physical plugin directories.
 	PluginDirectories []string
+	// LoadPluginMCP selects the documented full plugin loader for complete, host-approved packages.
+	LoadPluginMCP bool
 	// SettingsPath points to a native flag settings file supplied by the host.
 	SettingsPath string
 	// WorkspaceOnly requires native Bash sandbox and write-hook verification.
@@ -223,8 +225,12 @@ func (c *Client) prepareLaunch(req openRequest, old *session) (launchPlan, error
 			initializePlugins = o.PluginDirectories
 		}
 	} else {
+		flag := "--plugin-dir-no-mcp="
+		if o.LoadPluginMCP {
+			flag = "--plugin-dir="
+		}
 		for _, path := range o.PluginDirectories {
-			args = append(args, "--plugin-dir-no-mcp="+path)
+			args = append(args, flag+path)
 		}
 	}
 	if snapshotOff {

@@ -445,3 +445,17 @@ func TestLegacyClaudeModelACKUsesExactFrozenRoleTarget(t *testing.T) {
 		})
 	}
 }
+
+func TestCompletePluginUsesDocumentedClaudeDirectoryOption(t *testing.T) {
+	plugin, _ := filepath.EvalSymlinks(t.TempDir())
+	client, dir, ctx := startClientMode(t, agentclient.HostCallbacks{}, "rereview-plugin", func(o *claude.Options) {
+		o.Launch.PluginDirectories = []string{plugin}
+		o.Launch.LoadPluginMCP = true
+	})
+	if _, err := client.NewSession(ctx, acp.NewSessionRequest{Cwd: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(marker(t, ctx, filepath.Join(dir, "complete-plugin"))); got != plugin {
+		t.Fatal(got)
+	}
+}

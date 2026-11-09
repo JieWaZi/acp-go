@@ -34,6 +34,8 @@ type Options struct {
 	Executable string
 	// PrefixArgs precede the CLI's native ACP or version arguments.
 	PrefixArgs []string
+	// PluginDirectories contains per-session Grok plugin roots confirmed during initialization.
+	PluginDirectories []string
 	// Environment is the complete child environment. Nil snapshots the host environment.
 	Environment []string
 	// WorkingDirectory is the absolute native workspace after resolution.
@@ -58,6 +60,13 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	if options.Environment == nil {
 		options.Environment = os.Environ()
 	}
+	directories, err := agentclient.PhysicalPluginDirectories(options.PluginDirectories, options.PrefixArgs)
+	if err != nil {
+		return nil, err
+	}
+	if len(directories) > 0 && options.Provider != Grok {
+		return nil, errors.New("native ACP provider cannot load plugin directories")
+	}
 	environment := slices.Clone(options.Environment)
 	policy := options.PermissionMode
 	switch policy {
@@ -69,6 +78,9 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		PromptUsage: acpclient.UsageUnattributed, RequireExactMissing: true,
 		SessionMissing: exactResourceSessionMissing,
 		ValidateInitialize: func(response acp.InitializeResponse) error {
+			if len(directories) > 0 && response.Meta["x.ai/pluginDirs"] != true {
+				return errors.New("Grok did not advertise session plugin directories")
+			}
 			return validateIdentity(options.Provider, response)
 		},
 	}
@@ -141,6 +153,10 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		}
 		protocol.PrepareSessionMeta = func(meta map[string]any) {
 			// The native requirements gate still decides if auto is available.
+			delete(meta, "pluginDirs")
+			if len(directories) > 0 {
+				meta["pluginDirs"] = slices.Clone(directories)
+			}
 			meta["autoMode"] = policy == "auto"
 			meta["yoloMode"] = policy == "full-access"
 		}
