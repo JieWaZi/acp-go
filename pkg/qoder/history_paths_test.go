@@ -17,10 +17,10 @@ func TestQoderJournalLongPathMatchesNativeEncoder(t *testing.T) {
 	}
 }
 
-func TestQoderJournalRejectsConflictingInitializedVersion(t *testing.T) {
+func TestQoderJournalUsesSchemaDespiteVersionChange(t *testing.T) {
 	capture := captureQoderHistory(context.Background(), acpclient.PromptJournalScope{Version: "1.1.84", LauncherVersion: "1.1.83", Cwd: t.TempDir(), SessionID: acp.SessionId("11111111-1111-4111-8111-111111111111")}, t.TempDir())
-	if capture != nil {
-		t.Fatal("launcher version overrode unsupported initialized version")
+	if capture == nil {
+		t.Fatal("native version change disabled history capture")
 	}
 }
 

@@ -806,6 +806,8 @@ func TestQoderPromptUsageExposesVerifiedInvocationTokens(t *testing.T) {
 		{provider: "qoder", version: "1.1.53", variable: "QODER_EXPOSE_TOKEN_USAGE"},
 		{provider: "qoder-cn", version: "1.1.53", variable: "QODERCN_EXPOSE_TOKEN_USAGE"},
 		{provider: "qoder", version: "1.1.83", variable: "QODER_EXPOSE_TOKEN_USAGE"},
+		{provider: "qoder", version: "1.1.85", variable: "QODER_EXPOSE_TOKEN_USAGE"},
+		{provider: "qoder-cn", version: "99.0.0", variable: "QODERCN_EXPOSE_TOKEN_USAGE"},
 	} {
 		t.Run(tc.provider+"/"+tc.version, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

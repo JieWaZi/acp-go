@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	workBuddyHistoryVersion  = "2.180.0"
 	workBuddyHistoryLimit    = 16 << 20
 	workBuddyHistoryLine     = 4 << 20
 	workBuddyHistoryRequests = 1024
@@ -84,8 +83,7 @@ func workBuddyProjectSlug(cwd string) string {
 
 func captureWorkBuddyHistory(ctx context.Context, scope acpclient.PromptJournalScope, home string) func(context.Context, acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
 	id := string(scope.SessionID)
-	if (scope.Version != workBuddyHistoryVersion && scope.LauncherVersion != workBuddyHistoryVersion) ||
-		home == "" || !workBuddyHistorySession.MatchString(id) ||
+	if home == "" || !workBuddyHistorySession.MatchString(id) ||
 		!filepath.IsAbs(scope.Cwd) || ctx.Err() != nil {
 		return nil
 	}

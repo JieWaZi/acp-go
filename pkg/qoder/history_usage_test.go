@@ -19,7 +19,7 @@ const journalSession = "11111111-1111-4111-8111-111111111111"
 // These integration cases catch missing journal wiring, cross-turn attribution,
 // duplicate accounting, and treating native default zeroes as measured evidence.
 func TestQoderPromptUsageFromNativeJournal(t *testing.T) {
-	for _, scenario := range []string{"measured", "tool-chain", "foreign", "duplicate", "repeat-response", "fragments", "zero-then-measured", "zero", "unknown-cache", "custom", "conflict", "unsupported", "missing", "no-receipt", "foreign-cwd", "foreign-session", "sidechain", "broken-parent", "invalid-count", "replaced-file", "symlink", "partial-line", "cancelled", "failed"} {
+	for _, scenario := range []string{"measured", "tool-chain", "foreign", "duplicate", "repeat-response", "fragments", "zero-then-measured", "zero", "unknown-cache", "custom", "conflict", "new-version", "missing", "no-receipt", "foreign-cwd", "foreign-session", "sidechain", "broken-parent", "invalid-count", "replaced-file", "symlink", "partial-line", "cancelled", "failed"} {
 		t.Run(scenario, func(t *testing.T) {
 			executable, err := os.Executable()
 			if err != nil {
@@ -62,7 +62,7 @@ func TestQoderPromptUsageFromNativeJournal(t *testing.T) {
 				if usage.Complete || usage.InputTokens != nil || usage.ReasoningTokens != nil {
 					t.Fatalf("invented complete components: %+v", usage)
 				}
-				enriched := scenario == "measured" || scenario == "tool-chain" || scenario == "foreign" || scenario == "duplicate" || scenario == "fragments" || scenario == "repeat-response" || scenario == "zero-then-measured" || scenario == "unknown-cache" || scenario == "custom"
+				enriched := scenario == "measured" || scenario == "tool-chain" || scenario == "foreign" || scenario == "duplicate" || scenario == "fragments" || scenario == "repeat-response" || scenario == "zero-then-measured" || scenario == "unknown-cache" || scenario == "custom" || scenario == "new-version"
 				if !enriched {
 					if usage.Source == "qoder.history.usage" || usage.CacheReadTokens != nil || usage.CacheWriteTokens != nil {
 						t.Fatalf("unproven journal attributed: %+v", usage)
@@ -120,7 +120,11 @@ func TestQoderPromptUsageFromNativeJournal(t *testing.T) {
 }
 
 func journalRow(cwd, session, id, parent, kind string, usage map[string]any) map[string]any {
-	row := map[string]any{"type": kind, "uuid": id, "parentUuid": parent, "sessionId": session, "cwd": cwd, "version": "1.1.83", "isSidechain": false}
+	version := "1.1.83"
+	if os.Getenv("QODER_JOURNAL_FIXTURE") == "new-version" {
+		version = "1.1.85"
+	}
+	row := map[string]any{"type": kind, "uuid": id, "parentUuid": parent, "sessionId": session, "cwd": cwd, "version": version, "isSidechain": false}
 	if kind == "assistant" {
 		row["message"] = map[string]any{"id": id + "-message", "model": "actual-model", "stop_reason": "end_turn", "usage": usage}
 		row["requestTokenAnchor"] = map[string]any{"requestId": id + "-request"}
@@ -147,8 +151,8 @@ func TestNativeQoderJournal(t *testing.T) {
 		return
 	}
 	version := "1.1.83"
-	if scenario == "unsupported" {
-		version = "1.1.84"
+	if scenario == "new-version" {
+		version = "1.1.85"
 	}
 	if os.Args[len(os.Args)-1] == "--version" {
 		fmt.Println(version)

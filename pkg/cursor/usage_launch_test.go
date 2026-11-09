@@ -400,3 +400,109 @@ function check(mode) {
 for (const mode of ['unmatched', 'unmatched-throw', 'patched', 'digest-rejected', 'patched-fallback', 'patched-fallback-throw']) check(mode);
 process.stdout.write('arguments-ok');
 `
+
+func TestCursorUsagePreloadAttemptsUnknownArtifactVersion(t *testing.T) {
+	data := []byte(`module.exports=class {async processPrompt(e,t,s){const R={sendUpdate:async(e,t)=>{this.claimTaskToolCall(t,s)}};const m={},c={},P=[],w={};let q;q=e=>this.sharedServices.agentClient.run(t,this.agentStore.getConversationStateStructure(),e,m.modelDetails,R,this.resources,this.agentStore.getBlobStore(),c,this.agentStore,P,w);return q;}};`)
+	for _, shape := range []string{"compatible", "changed", "ambiguous"} {
+		t.Run(shape, func(t *testing.T) {
+			artifact := filepath.Join(t.TempDir(), "future-version")
+			if err := os.Mkdir(artifact, 0700); err != nil {
+				t.Fatal(err)
+			}
+			content := data
+			if shape == "changed" {
+				content = []byte("exports.changed=true;")
+			}
+			filename := filepath.Join(artifact, "123.index.js")
+			if err := os.WriteFile(filename, content, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if shape == "ambiguous" {
+				if err := os.WriteFile(filepath.Join(artifact, "456.index.js"), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.CommandContext(t.Context(), cursorUsageTestNode(t), "-e", "const fs=require('node:fs'),Module=require('node:module');const f=process.argv[1];const m=new Module(f);m.filename=f;m.paths=[];m._compile(fs.readFileSync(f,'utf8'),f);process.stdout.write('compiled');", filename)
+			command.Env = cursorUsageEnvironment(filepath.Join(artifact, "cursor-agent"), directory, os.Environ())
+			output, err := command.CombinedOutput()
+			if err != nil || string(output) != "compiled" {
+				t.Fatalf("native compile changed: %s %v", output, err)
+			}
+			raw, err := os.ReadFile(filepath.Join(directory, "health.json"))
+			var health map[string]any
+			if err != nil || json.Unmarshal(raw, &health) != nil {
+				t.Fatalf("health missing: %v", err)
+			}
+			want := "rejected"
+			if shape == "compatible" {
+				want = "ready"
+			}
+			if health["status"] != want {
+				t.Fatalf("artifact shape %s: %s", shape, raw)
+			}
+		})
+	}
+}
+
+func TestCursorUsagePreloadMovedCallbacksPreserveNativeExecution(t *testing.T) {
+	for _, sibling := range []string{"local", "update", "run"} {
+		t.Run(sibling, func(t *testing.T) {
+			artifact := filepath.Join(t.TempDir(), "future-version")
+			if err := os.Mkdir(artifact, 0700); err != nil {
+				t.Fatal(err)
+			}
+			update := `const R={sendUpdate:async(e,t)=>{this.claimTaskToolCall(t)}};`
+			run := `const m={},c={},P=[],w={};let q;q=e=>this.sharedServices.agentClient.run(t,this.agentStore.getConversationStateStructure(),e,m.modelDetails,R,this.resources,this.agentStore.getBlobStore(),c,this.agentStore,P,w);return await q({action:{case:"userMessageAction",value:{userMessage:{messageId:"33333333-3333-4333-8333-333333333333"}}}});`
+			body, helper := update+run, ""
+			if sibling == "update" {
+				body = `const R=this.updates();` + run
+				helper = `updates(){` + update + `return R;}`
+			}
+			if sibling == "run" {
+				body = update + `return this.run(R,t);`
+				helper = `async run(R,t){` + run + `}`
+			}
+			source := `module.exports=class {constructor(){this.sessionId="11111111-1111-4111-8111-111111111111";this.claimTaskToolCall=()=>{};this.agentStore={getConversationStateStructure(){},getBlobStore(){},async getLastRequestIdFromConversation(){return "44444444-4444-4444-8444-444444444444"}};this.sharedServices={agentClient:{async run(t,state,e,m,R){await R.sendUpdate(null,{message:{case:"turnEnded",value:{inputTokens:51n,outputTokens:10n,cacheReadTokens:40n,cacheWriteTokens:0n}}});return "native-result"}}};}async processPrompt(e,t,s){` + body + `}` + helper + `};`
+			filename := filepath.Join(artifact, "123.index.js")
+			if err := os.WriteFile(filename, []byte(source), 0600); err != nil {
+				t.Fatal(err)
+			}
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			script := `const T=require(process.argv[1]);new T().processPrompt({_meta:{'acp-go/cursor-usage-nonce':'22222222-2222-4222-8222-222222222222'}}).then(x=>process.stdout.write(x)).catch(e=>{process.stderr.write(e.stack);process.exitCode=1});`
+			for _, preload := range []bool{false, true} {
+				command := exec.CommandContext(t.Context(), cursorUsageTestNode(t), "-e", script, filename)
+				if preload {
+					command.Env = cursorUsageEnvironment(filepath.Join(artifact, "cursor-agent"), directory, os.Environ())
+				}
+				output, err := command.CombinedOutput()
+				if err != nil || string(output) != "native-result" {
+					t.Fatalf("sibling=%s preload=%t changed execution: %s %v", sibling, preload, output, err)
+				}
+			}
+			entries, err := os.ReadDir(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows := 0
+			for _, entry := range entries {
+				if entry.Name() != "health.json" {
+					rows++
+				}
+			}
+			want := 0
+			if sibling == "local" {
+				want = 1
+			}
+			if rows != want {
+				t.Fatalf("callback layout %s emitted %d usage rows, want %d", sibling, rows, want)
+			}
+		})
+	}
+}

@@ -47,11 +47,15 @@ func kimiProfileHome(environment []string, cwd, variable, defaultName string) st
 }
 
 func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope, home, pythonHome string) func(context.Context, acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
-	python := scope.Version == kimiPythonWireVersion
-	if python {
-		home = pythonHome
+	// Discover native layouts from the selected session, independently of release labels.
+	if capture := captureKimiJournalLayout(ctx, scope, home, false); capture != nil {
+		return capture
 	}
-	if !python && scope.Version != kimiWireVersion || home == "" || ctx.Err() != nil {
+	return captureKimiJournalLayout(ctx, scope, pythonHome, true)
+}
+
+func captureKimiJournalLayout(ctx context.Context, scope acpclient.PromptJournalScope, home string, python bool) func(context.Context, acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
+	if home == "" || ctx.Err() != nil {
 		return nil
 	}
 	root, err := os.OpenRoot(home)
@@ -67,6 +71,9 @@ func captureKimiJournal(ctx context.Context, scope acpclient.PromptJournalScope,
 		}
 		// WorkDirMeta.sessions_dir uses MD5 to name the exact native workspace.
 		relative = filepath.Join("sessions", fmt.Sprintf("%x", md5.Sum([]byte(scope.Cwd))), id, "wire.jsonl")
+		if info, err := root.Stat(filepath.Dir(relative)); err != nil || !info.IsDir() {
+			return nil
+		}
 	} else {
 		relative = kimiJournalPath(ctx, root, home, scope)
 	}

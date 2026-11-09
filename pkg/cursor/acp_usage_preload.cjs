@@ -1,6 +1,6 @@
 'use strict';
 
-// This preload observes usage in pinned ACP releases without retaining prompts, replies, credentials, or terminal execution results.
+// This preload observes structurally compatible ACP artifacts without retaining prompts, replies, credentials, or terminal execution results.
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -175,7 +175,7 @@ function prompt(sessionID, nonce) {
   };
 }
 
-// This pure function accepts a digest for fixtures that never run the release; production digests come only from the pinned manifests above.
+// Check compiled content against the selected on-disk artifact and require unique instrumentation anchors.
 function patchACPSource(content, expectedDigest) {
   if (typeof content !== 'string' ||
       crypto.createHash('sha256').update(content).digest('hex') !== expectedDigest) {
@@ -187,8 +187,8 @@ function patchACPSource(content, expectedDigest) {
   }
   const patched = content
         .replace(ENTRY, ENTRY + 'const __acpGoUsage=globalThis[Symbol.for("acp-go/cursor-usage-hook/v1")].prompt(this.sessionId,e?._meta?.["acp-go/cursor-usage-nonce"]);')
-        .replace(UPDATE, 'sendUpdate:async(e,t)=>{__acpGoUsage.observe(t);this.claimTaskToolCall')
-        .replace(RUN, 'q=async e=>{const __acpGoUsageRun=__acpGoUsage.start(e,m.requestedModel?.modelId??m.modelDetails?.modelId);try{return await this.sharedServices.agentClient.run(t,this.agentStore.getConversationStateStructure(),e,m.modelDetails,R,this.resources,this.agentStore.getBlobStore(),c,this.agentStore,P,w)}finally{await __acpGoUsage.finish(__acpGoUsageRun,this.agentStore,t)}}');
+        .replace(UPDATE, 'sendUpdate:async(e,t)=>{if(typeof __acpGoUsage!=="undefined")__acpGoUsage.observe(t);this.claimTaskToolCall')
+        .replace(RUN, 'q=async e=>{if(typeof __acpGoUsage==="undefined")return this.sharedServices.agentClient.run(t,this.agentStore.getConversationStateStructure(),e,m.modelDetails,R,this.resources,this.agentStore.getBlobStore(),c,this.agentStore,P,w);const __acpGoUsageRun=__acpGoUsage.start(e,m.requestedModel?.modelId??m.modelDetails?.modelId);try{return await this.sharedServices.agentClient.run(t,this.agentStore.getConversationStateStructure(),e,m.modelDetails,R,this.resources,this.agentStore.getBlobStore(),c,this.agentStore,P,w)}finally{await __acpGoUsage.finish(__acpGoUsageRun,this.agentStore,t)}}');
   return { code: patched, reason: '' };
 }
 
@@ -208,7 +208,21 @@ try {
   artifactDir = fs.realpathSync(selectedArtifact);
   version = path.basename(artifactDir);
   manifest = MANIFESTS[version];
-  if (!manifest) throw new Error('unsupported_version');
+  if (!manifest) {
+    // Discover one compatible native chunk; release names do not disable collection.
+    const matches = [];
+    for (const entry of fs.readdirSync(artifactDir, { withFileTypes: true }).slice(0, 4096)) {
+      if (!entry.isFile() || !/^\d+\.index\.js$/.test(entry.name)) continue;
+      const filename = path.join(artifactDir, entry.name);
+      if (fs.statSync(filename).size > 32 * 1024 * 1024) continue;
+      const content = fs.readFileSync(filename, 'utf8');
+      if (!content.includes(ENTRY) || !content.includes(UPDATE) || !content.includes(RUN)) continue;
+      const digest = crypto.createHash('sha256').update(content).digest('hex');
+      if (patchACPSource(content, digest).code !== null) matches.push({ chunk: entry.name, sha256: digest });
+    }
+    if (matches.length !== 1) throw new Error('instrumentation_anchor_mismatch');
+    manifest = matches[0];
+  }
 
   Object.defineProperty(globalThis, HOOK, {
     value: Object.freeze({ prompt }),
@@ -220,7 +234,9 @@ try {
   let inspected = false;
   Module.prototype._compile = function cursorUsageCompile(...args) {
     const [content, filename] = args;
-    if (path.resolve(filename) !== expectedFile || inspected) {
+    let compiledFile = path.resolve(filename);
+    try { compiledFile = fs.realpathSync(compiledFile); } catch (_) {}
+    if (compiledFile !== expectedFile || inspected) {
       return Reflect.apply(originalCompile, this, args);
     }
     inspected = true;
@@ -253,6 +269,6 @@ try {
   health('rejected', error && [
     'invalid_configuration',
     'event_directory_not_private',
-    'unsupported_version',
+    'instrumentation_anchor_mismatch',
   ].includes(error.message) ? error.message : 'preload_initialization_failed');
 }

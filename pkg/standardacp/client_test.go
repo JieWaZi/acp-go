@@ -23,7 +23,7 @@ import (
 )
 
 func TestGeminiVerifiedLegacyModelAcknowledgement(t *testing.T) {
-	for _, version := range []string{"0.62.0", "0.65.0", "0.67.0"} {
+	for _, version := range []string{"0.62.0", "0.65.0", "0.67.0", "99.0.0"} {
 		t.Run(version, func(t *testing.T) {
 			t.Setenv("STANDARD_ACP_GEMINI_VERSION", version)
 			cwd := t.TempDir()
@@ -73,7 +73,7 @@ func TestGeminiVerifiedPromptUsagePreservesNativeBreakdown(t *testing.T) {
 		{name: "cache exceeds input", version: "0.65.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29,"cachedReadTokens":24}`, output: 6},
 		{name: "negative thought count", version: "0.65.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29,"thoughtTokens":-1}`, output: 6},
 		{name: "thought is excluded from native total", version: "0.65.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":32,"thoughtTokens":3}`, output: 6},
-		{name: "unknown version", version: "0.66.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29,"cachedReadTokens":4,"thoughtTokens":3}`, output: 6},
+		{name: "unknown version", version: "99.0.0", raw: `{"inputTokens":23,"outputTokens":6,"totalTokens":29,"cachedReadTokens":4,"thoughtTokens":3}`, input: acp.Ptr(int64(19)), output: 9, read: acp.Ptr(int64(4)), reasoning: acp.Ptr(int64(3))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("STANDARD_ACP_GEMINI_VERSION", tc.version)
@@ -268,13 +268,13 @@ func TestStandardNativeLifecycle(t *testing.T) {
 						*usage.OutputTokens != 7 || usage.Complete || usage.Coverage != "observed_requests" {
 						t.Fatalf("OpenCode last assistant request usage: %#v", usage)
 					}
-				} else if usage == nil || !slices.ContainsFunc(usage.Observations, func(o acpmeta.UsageObservation) bool { return o.Coverage == "unknown" }) {
+				} else if provider != standardacp.Gemini && (usage == nil || !slices.ContainsFunc(usage.Observations, func(o acpmeta.UsageObservation) bool { return o.Coverage == "unknown" })) {
 					t.Fatalf("unattributed native usage: %#v", usage)
 				}
 				if provider == standardacp.Grok && (usage.InputTokens == nil || *usage.InputTokens != 10 || usage.OutputTokens == nil || *usage.OutputTokens != 7 || !usage.Complete) {
 					t.Fatalf("Grok prompt ledger: %#v", usage)
 				}
-				if provider == standardacp.Gemini && (usage.InputTokens != nil || usage.OutputTokens == nil || *usage.OutputTokens != 6 || usage.Complete) {
+				if provider == standardacp.Gemini && (usage.InputTokens == nil || *usage.InputTokens != 16 || usage.OutputTokens == nil || *usage.OutputTokens != 4 || usage.Complete) {
 					t.Fatalf("Gemini request usage: %#v", usage)
 				}
 			}
@@ -425,6 +425,7 @@ func TestGeminiRestoreRequiresExactNativeSession(t *testing.T) {
 
 func TestGeminiDefaultedZeroQuotaRemainsUnknown(t *testing.T) {
 	t.Setenv("STANDARD_ACP_GEMINI_ZERO_QUOTA", "1")
+	t.Setenv("STANDARD_ACP_GEMINI_USAGE", `{"inputTokens":0,"outputTokens":0,"totalTokens":0}`)
 	cwd := t.TempDir()
 	client, ctx := newFixtureClient(t, standardacp.Gemini, cwd, agentclient.HostCallbacks{})
 	if _, err := client.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {

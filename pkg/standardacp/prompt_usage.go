@@ -94,9 +94,9 @@ type geminiQuota struct {
 }
 
 // geminiNativePromptUsage reads the per-prompt ledger emitted by verified ACP releases.
-func geminiNativePromptUsage(version string, raw *acpclient.PromptUsageCounters, meta map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
+func geminiNativePromptUsage(_ string, raw *acpclient.PromptUsageCounters, meta map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
 	fallback := geminiPromptUsage(meta)
-	if (version != "0.65.0" && version != "0.67.0") || raw == nil || !exactCounter(raw.Input) || !exactCounter(raw.Output) || !exactCounter(raw.Total) ||
+	if raw == nil || !exactCounter(raw.Input) || !exactCounter(raw.Output) || !exactCounter(raw.Total) ||
 		*raw.Input+*raw.Output != *raw.Total || *raw.Total == 0 || raw.CacheWrite != nil {
 		return fallback, acpclient.UsageUnattributed
 	}
@@ -187,12 +187,9 @@ func exactCounter(value *int64) bool {
 func openCodePromptUsage(version string, raw *acpclient.PromptUsageCounters, _ map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
 	source, coverage := "opencode.assistant.usage", "observed_requests"
 	switch version {
-	case "1.18.34":
 	case "2.0.29":
 		// translate.recordStep sums this turn's root-session steps and excludes child sessions.
 		source, coverage = "opencode.prompt.usage", "main_loop"
-	default:
-		return nil, acpclient.UsageUnattributed
 	}
 	if raw == nil || !exactCounter(raw.Input) || !exactCounter(raw.Output) || !exactCounter(raw.Total) {
 		return nil, acpclient.UsageUnattributed

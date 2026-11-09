@@ -15,7 +15,7 @@ import (
 func TestWorkBuddyHistoryInputUsesCurrentRequestAndNativeCacheDetails(t *testing.T) {
 	home, cwd := t.TempDir(), t.TempDir()
 	cwd, _ = filepath.EvalSymlinks(cwd)
-	scope := acpclient.PromptJournalScope{SessionID: "session", Cwd: cwd, Version: workBuddyHistoryVersion}
+	scope := acpclient.PromptJournalScope{SessionID: "session", Cwd: cwd, Version: "2.181.0"}
 	path := filepath.Join(home, "projects", workBuddyProjectSlug(cwd), "session.jsonl")
 	firstRequest, secondRequest := "0198a1b2c3d47e5f8a9b0c1d2e3f4a5b", "0198a1b2c3d47e5f8a9b0c1d2e3f4a6b"
 	writeHistoryInputRows(t, path, inputHistoryRow(cwd, firstRequest, "stale", 999, 100, 0, 0))
@@ -74,7 +74,7 @@ func TestWorkBuddyHistoryKeepsUnprovenInputBreakdownsUnknown(t *testing.T) {
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				t.Fatal(err)
 			}
-			capture := captureWorkBuddyHistory(t.Context(), acpclient.PromptJournalScope{SessionID: "session", Cwd: cwd, Version: workBuddyHistoryVersion}, home)
+			capture := captureWorkBuddyHistory(t.Context(), acpclient.PromptJournalScope{SessionID: "session", Cwd: cwd, Version: "2.181.0"}, home)
 			if capture == nil {
 				t.Fatal("missing capture")
 			}
@@ -124,9 +124,11 @@ func TestWorkBuddyHistoryKeepsUnprovenInputBreakdownsUnknown(t *testing.T) {
 	}
 }
 
-func TestWorkBuddyHistoryUnknownVersionDoesNotReadInput(t *testing.T) {
-	if captureWorkBuddyHistory(t.Context(), acpclient.PromptJournalScope{Version: "2.181.0", SessionID: "session", Cwd: t.TempDir()}, t.TempDir()) != nil {
-		t.Fatal("unsupported history protocol was read")
+func TestWorkBuddyHistoryUnknownVersionAttemptsCapture(t *testing.T) {
+	for _, version := range []string{"2.181.0", "99.0.0", ""} {
+		if captureWorkBuddyHistory(t.Context(), acpclient.PromptJournalScope{Version: version, SessionID: "session", Cwd: t.TempDir()}, t.TempDir()) == nil {
+			t.Fatalf("version %q disabled schema-validated capture", version)
+		}
 	}
 }
 
@@ -157,7 +159,7 @@ func TestWorkBuddyHistoryRetainsKnownCacheWhenWriteIsUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := "0198a1b2c3d47e5f8a9b0c1d2e3f4a5b"
-	capture := captureWorkBuddyHistory(t.Context(), acpclient.PromptJournalScope{SessionID: "session", Cwd: cwd, Version: workBuddyHistoryVersion}, home)
+	capture := captureWorkBuddyHistory(t.Context(), acpclient.PromptJournalScope{SessionID: "session", Cwd: cwd, Version: "2.181.0"}, home)
 	row := inputHistoryRow(cwd, request, "one", 300, 200, 30, 5)
 	raw := row["providerData"].(map[string]any)["rawUsage"].(map[string]any)
 	delete(raw, "cache_creation_input_tokens")

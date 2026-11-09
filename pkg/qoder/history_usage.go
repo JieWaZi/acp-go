@@ -20,10 +20,9 @@ import (
 )
 
 const (
-	qoderHistoryVersion = "1.1.83"
-	qoderHistoryLimit   = 16 << 20
-	qoderHistoryLine    = 4 << 20
-	qoderHistoryRows    = 4096
+	qoderHistoryLimit = 16 << 20
+	qoderHistoryLine  = 4 << 20
+	qoderHistoryRows  = 4096
 )
 
 var qoderHistoryUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -98,11 +97,7 @@ func qoderProjectSlug(cwd string) string {
 }
 
 func captureQoderHistory(ctx context.Context, scope acpclient.PromptJournalScope, home string) func(context.Context, acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
-	version := scope.Version
-	if version == "" {
-		version = scope.LauncherVersion
-	}
-	if version != qoderHistoryVersion || home == "" || !qoderHistoryUUID.MatchString(string(scope.SessionID)) || !filepath.IsAbs(scope.Cwd) || ctx.Err() != nil {
+	if home == "" || !qoderHistoryUUID.MatchString(string(scope.SessionID)) || !filepath.IsAbs(scope.Cwd) || ctx.Err() != nil {
 		return nil
 	}
 	cwd, err := filepath.EvalSymlinks(scope.Cwd)
@@ -216,7 +211,7 @@ func readQoderHistory(ctx context.Context, home, name, cwd, session, turn string
 		if json.Unmarshal(scanner.Bytes(), &row) != nil {
 			return nil
 		}
-		if row.Session != session || row.Cwd != cwd || row.Version != qoderHistoryVersion || row.Sidechain || (row.Type != "user" && row.Type != "assistant" && row.Type != "system" && row.Type != "attachment") {
+		if row.Session != session || row.Cwd != cwd || row.Sidechain || (row.Type != "user" && row.Type != "assistant" && row.Type != "system" && row.Type != "attachment") {
 			continue
 		}
 		if !qoderHistoryID(row.UUID) || len(rows) >= qoderHistoryRows {

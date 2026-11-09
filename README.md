@@ -42,6 +42,8 @@ SDK 从 `coder/acp-go-sdk v0.13.5` 迁入定制补丁并合并官方 main，由�
 
 CLI 由用户安装并按厂商流程登录。可选执行路径使用 `CODEX_PATH`、`CLAUDE_CODE_EXECUTABLE`、`CURSOR_PATH`、`PI_PATH`、`WORKBUDDY_PATH`、`QODER_PATH`、`QODER_CN_PATH`、`KIMI_PATH`、`GEMINI_PATH`、`GROK_PATH` 或 `OPENCODE_PATH`。Pi 的 MCP bridge 通过 `PI_MCP_MODULE_PATH` 配置。
 
+用量采集不按 CLI 版本白名单启停：适配器尝试解析当前 ACP 回执或会话历史，以字段形状、计数关系及会话／请求身份验证消费。兼容格式在新版本继续采集；缺失或不兼容格式保留未知，不制造零值或完整覆盖。Cursor 的内存钩子按模块结构定位，结构冲突或编译内容不一致时保持原生执行。
+
 客户端按初始化能力发送 `mcpServers`、Elicitation 和会话操作。原生会话、模型、权限与用量以各 CLI 的握手和回执为准。
 
 ## 作为 Go 包使用

@@ -121,9 +121,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			return prepareGeminiRestore(ctx, environment, cwd, id)
 		}
 		// The pinned setter updates the current native session's model before ACK.
-		protocol.LegacyModel.ConfirmsValue = func(version string) bool {
-			return version == "0.62.0" || version == "0.65.0" || version == "0.67.0"
-		}
+		protocol.LegacyModel.ConfirmsValue = func(string) bool { return true }
 		protocol.SessionMissing = func(err *acp.RequestError, id acp.SessionId) bool {
 			return exactResourceSessionMissing(err, id) || err.Code == -32602 && err.Message == "Session not found: "+string(id)
 		}

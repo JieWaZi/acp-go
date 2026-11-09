@@ -31,14 +31,11 @@ type qoderPromptQuota struct {
 	Models []qoderPromptModelUsage `json:"model_usage"`
 }
 
-// readPromptUsage reads the Qoder 1.1.53 and 1.1.83 ACP prompt receipt.
-// Both builds report the current query's counters separately from session
+// readPromptUsage validates the Qoder ACP prompt receipt shape.
+// The query counters are reported separately from session
 // totals. The receipt can redact both counters to zero and omits cache and
 // reasoning, so keep only positive output and observe raw input separately.
-func readPromptUsage(version string, raw *acpclient.PromptUsageCounters, meta map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
-	if version != "1.1.53" && version != "1.1.83" {
-		return nil, acpclient.UsageUnattributed
-	}
+func readPromptUsage(_ string, raw *acpclient.PromptUsageCounters, meta map[string]any) (*acpmeta.TurnUsage, acpclient.PromptUsageScope) {
 	if raw == nil || raw.CacheRead != nil || raw.CacheWrite != nil || raw.Thought != nil ||
 		!validQoderTokenCount(raw.Input) ||
 		!validQoderTokenCount(raw.Output) || !validQoderTokenCount(raw.Total) ||

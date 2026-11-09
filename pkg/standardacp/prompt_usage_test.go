@@ -1,7 +1,11 @@
 package standardacp
 
 import (
+	"crypto/md5"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	acp "github.com/JieWaZi/acp-go-sdk"
@@ -150,7 +154,7 @@ func TestOpenCodePromptUsageRejectsUnprovenCounters(t *testing.T) {
 		// raw contains native counters to validate.
 		raw *acpclient.PromptUsageCounters
 	}{
-		{name: "unknown version", version: "2.0.30", raw: &acpclient.PromptUsageCounters{Input: acp.Ptr(int64(1)), Output: acp.Ptr(int64(1)), Total: acp.Ptr(int64(2))}},
+
 		{name: "missing usage", version: "2.0.29"},
 		{name: "missing input", version: "2.0.29", raw: &acpclient.PromptUsageCounters{Output: acp.Ptr(int64(1)), Total: acp.Ptr(int64(1))}},
 		{name: "inconsistent total", version: "2.0.29", raw: &acpclient.PromptUsageCounters{Input: acp.Ptr(int64(1)), Output: acp.Ptr(int64(1)), Total: acp.Ptr(int64(3))}},
@@ -163,5 +167,55 @@ func TestOpenCodePromptUsageRejectsUnprovenCounters(t *testing.T) {
 				t.Fatalf("unproven counters became consumption: report=%#v scope=%v", report, scope)
 			}
 		})
+	}
+}
+
+func TestOpenCodeUsageAttemptsUnknownVersions(t *testing.T) {
+	for _, version := range []string{"2.0.30", "99.0.0", ""} {
+		raw := &acpclient.PromptUsageCounters{Input: acp.Ptr(int64(1)), Output: acp.Ptr(int64(2)), Total: acp.Ptr(int64(3))}
+		report, _ := openCodePromptUsage(version, raw, nil)
+		if report == nil || report.OutputTokens == nil || *report.OutputTokens != 2 || report.Complete {
+			t.Fatalf("version %q discarded valid observed counters: %+v", version, report)
+		}
+	}
+}
+
+func TestKimiJournalCaptureUsesLayoutInsteadOfVersion(t *testing.T) {
+	for _, python := range []bool{false, true} {
+		home, pythonHome, cwd := t.TempDir(), t.TempDir(), t.TempDir()
+		scope := acpclient.PromptJournalScope{Version: "99.0.0", SessionID: "session", Cwd: cwd}
+		var wire string
+		if python {
+			wire = filepath.Join(pythonHome, "sessions", fmt.Sprintf("%x", md5.Sum([]byte(cwd))), "session", "wire.jsonl")
+		} else {
+			directory := filepath.Join(home, "sessions", "session")
+			wire = filepath.Join(directory, "agents", "main", "wire.jsonl")
+			index, _ := json.Marshal(map[string]string{"sessionId": "session", "workDir": cwd, "sessionDir": directory})
+			if err := os.WriteFile(filepath.Join(home, "session_index.jsonl"), append(index, '\n'), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(wire), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(wire, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		capture := captureKimiJournal(t.Context(), scope, home, pythonHome)
+		if capture == nil {
+			t.Fatalf("layout python=%t was disabled by version", python)
+		}
+		data := "{\"type\":\"turn.prompt\",\"agentId\":\"main\",\"turnId\":0}\n{\"type\":\"usage.record\",\"agentId\":\"main\",\"model\":\"model\",\"usageScope\":\"turn\",\"usage\":{\"inputOther\":7,\"output\":5}}\n{\"type\":\"turn.ended\",\"agentId\":\"main\",\"turnId\":0,\"reason\":\"completed\"}\n"
+		if python {
+			data = "{\"message\":{\"type\":\"TurnBegin\",\"payload\":{}}}\n{\"message\":{\"type\":\"StatusUpdate\",\"payload\":{\"message_id\":\"step\",\"token_usage\":{\"input_other\":7,\"output\":5}}}}\n{\"message\":{\"type\":\"TurnEnd\",\"payload\":{}}}\n"
+		}
+		if err := os.WriteFile(wire, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		stop := acp.StopReasonEndTurn
+		evidence := capture(t.Context(), acpclient.PromptJournalReceipt{StopReason: &stop})
+		if evidence.Usage == nil || evidence.Usage.OutputTokens == nil || *evidence.Usage.OutputTokens != 5 {
+			t.Fatalf("layout python=%t lost usage: %+v", python, evidence)
+		}
 	}
 }
