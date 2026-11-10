@@ -26,7 +26,7 @@ func TestNativeQoder(t *testing.T) {
 		return
 	}
 	command := os.Args[len(os.Args)-1]
-	if command == "--sdk" && os.Getenv("QODER_CATALOG_RENDEZVOUS") != "" {
+	if command == "--sdk" && (os.Getenv("QODER_CATALOG_RENDEZVOUS") != "" || os.Getenv("QODER_SDK_DIRECTORY_FIXTURE") == "1") {
 		runSDKDirectoryFixture()
 	}
 	if len(os.Args) >= 3 && strings.Join(os.Args[len(os.Args)-3:], " ") == "status -o json" {
@@ -93,6 +93,12 @@ func TestNativeQoder(t *testing.T) {
 		}
 		fmt.Fprintln(trace, string(in.Bytes()))
 		id, _ := frame.Params["sessionId"].(string)
+		if method := os.Getenv("QODER_AUTH_ERROR_METHOD"); method != "" && frame.Method == method {
+			_ = out.Encode(map[string]any{"jsonrpc": "2.0", "id": frame.ID, "error": map[string]any{
+				"code": -32000, "message": "Authentication required: selected credential expired", "data": map[string]any{"reason": "credential_expired"},
+			}})
+			continue
+		}
 		switch frame.Method {
 		case "initialize":
 			if expected := os.Getenv("ACP_FAMILY_QODER_PAT_ENV"); expected != "" && os.Getenv(expected) != "fixture-selected-token" {

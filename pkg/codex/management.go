@@ -312,14 +312,6 @@ func (c *Client) CredentialProof(ctx context.Context, kind string) (string, [sha
 	return home, sha256.Sum256([]byte(reply.AuthToken)), nil
 }
 
-func (c *Client) checkAccount(ctx context.Context) error {
-	account, err := c.ReadAccount(ctx)
-	if err == nil && account.RequiresAuthentication && account.Account == nil {
-		err = acp.NewAuthRequired(nil)
-	}
-	return err
-}
-
 func (c *Client) authMethods() []acp.AuthMethod {
 	methods := []acp.AuthMethod{{Agent: &acp.AuthMethodAgent{Id: "api-key", Name: "API Key", Meta: map[string]any{"api-key": map[string]any{"provider": "openai"}}}}}
 	if c.getenv("NO_BROWSER") == "" {

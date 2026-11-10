@@ -58,6 +58,16 @@ func TestAppServerFixture(t *testing.T) {
 		turn := func(status string) map[string]any {
 			return map[string]any{"threadId": "thread-1", "turn": map[string]any{"id": nativeTurn, "status": status}}
 		}
+		if strings.HasPrefix(mode, "no_account_read") && call.Method == "account/read" {
+			_ = out.Encode(map[string]any{"id": call.ID, "error": map[string]any{"code": -32601, "message": "account preflight is forbidden"}})
+			continue
+		}
+		if call.Method == strings.TrimPrefix(mode, "no_account_read_auth_") {
+			_ = out.Encode(map[string]any{"id": call.ID, "error": map[string]any{
+				"code": -32000, "message": "Authentication required: selected credential expired", "data": map[string]any{"resource": "thread"},
+			}})
+			continue
+		}
 		switch call.Method {
 		case "initialize":
 			if mode == "initialize_rejected_live" {

@@ -255,9 +255,6 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 		}
 		c.mu.Unlock()
 	}()
-	if err := c.checkAccount(ctx); err != nil {
-		return acp.NewSessionResponse{}, err
-	}
 	mode := acp.SessionModeId(intent.Mode)
 	if mode == "" {
 		mode = "agent"

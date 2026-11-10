@@ -119,11 +119,11 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	return &Client{Client: client, management: management{options: options}}, nil
 }
 
-// Initialize validates the account's advertised model context sizes before launching with an override.
+// Initialize validates the model's advertised context sizes before launching with an override.
 func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) (acp.InitializeResponse, error) {
 	options := c.management.options
 	if options.ContextWindow > 0 {
-		rows, err := c.ReadModelDirectory(ctx)
+		rows, err := c.readModelDirectory(ctx, false)
 		if err != nil {
 			return acp.InitializeResponse{}, err
 		}

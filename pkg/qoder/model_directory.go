@@ -255,13 +255,19 @@ func qoderACPModelGroup(id acp.SessionConfigValueId) (acp.SessionConfigGroupId, 
 
 // ReadModelDirectory reads the complete SDK catalog without opening a session or submitting input.
 func (c *Client) ReadModelDirectory(ctx context.Context) ([]ModelDirectoryEntry, error) {
+	return c.readModelDirectory(ctx, true)
+}
+
+func (c *Client) readModelDirectory(ctx context.Context, verifyIdentity bool) ([]ModelDirectoryEntry, error) {
 	var result struct {
 		// Models preserves native order and distinguishes an empty catalog from a missing field.
 		Models []ModelDirectoryEntry `json:"models"`
 	}
 	err := c.management.daemonQueries(ctx, func(channel *controlChannel) error {
-		if _, err := c.management.daemonIdentity(channel); err != nil {
-			return err
+		if verifyIdentity {
+			if _, err := c.management.daemonIdentity(channel); err != nil {
+				return err
+			}
 		}
 		if err := channel.requestPayload("daemon.get_models", map[string]string{
 			"type": "daemon.get_models", "fetchStrategy": "live",
