@@ -55,8 +55,10 @@ type opening struct {
 	session *session
 	// source is the original session for fork.
 	source acp.SessionId
-	// replay allows history only on explicit load.
+	// replay identifies a native load that can emit history before its response.
 	replay bool
+	// continuation folds settings and restore evidence without retaining history for delivery.
+	continuation bool
 	// started marks the native request write gate.
 	started bool
 	// restoredHistory records a transcript frame for the exact requested ID.
@@ -110,6 +112,8 @@ type setupRequest struct {
 	meta map[string]any
 	// params is the SDK request encoded to the selected native operation.
 	params any
+	// continuation requests a load for a host that owns its displayed history.
+	continuation bool
 	// beforeWrite reserves the optional host fork receipt.
 	beforeWrite func() error
 	// afterBind persists the actual child ID before the owner can be released.
@@ -142,6 +146,17 @@ func (c *Client) ResumeSession(ctx context.Context, request acp.ResumeSessionReq
 }
 
 func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	return c.loadSession(ctx, request, false)
+}
+
+// LoadSessionForContinuation verifies and reopens the same native session for
+// hosts that read history from their own store. The response includes restored
+// configuration and modes. Observations resume after the session is ready.
+func (c *Client) LoadSessionForContinuation(ctx context.Context, request acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	return c.loadSession(ctx, request, true)
+}
+
+func (c *Client) loadSession(ctx context.Context, request acp.LoadSessionRequest, continuation bool) (acp.LoadSessionResponse, error) {
 	if !c.validRestoreID(request.SessionId) {
 		return acp.LoadSessionResponse{}, invalid("ACP agent restore requires an exact session ID")
 	}
@@ -151,7 +166,7 @@ func (c *Client) LoadSession(ctx context.Context, request acp.LoadSessionRequest
 	meta := request.Meta
 	request.Meta = c.nativeSessionMeta(meta)
 	result, err := c.open(ctx, setupRequest{method: acp.AgentMethodSessionLoad, id: request.SessionId, cwd: request.Cwd,
-		roots: request.AdditionalDirectories, servers: request.McpServers, meta: meta, params: request})
+		roots: request.AdditionalDirectories, servers: request.McpServers, meta: meta, params: request, continuation: continuation})
 	return acp.LoadSessionResponse{ConfigOptions: result.ConfigOptions, Modes: result.Modes, Meta: result.Meta}, err
 }
 
@@ -219,7 +234,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	op, cancel := c.operationContext(ctx, requestTimeout)
 	defer cancel()
 	p := &opening{session: &session{id: request.id, cwd: request.cwd, usage: usageCounter{fresh: request.method == acp.AgentMethodSessionNew}}, source: request.source, replay: request.method == acp.AgentMethodSessionLoad,
-		delivery: newDelivery(op)}
+		continuation: request.continuation, delivery: newDelivery(op)}
 	p.session.mcpDirectory = mcpDirectory
 	c.mu.Lock()
 	p.previous = c.sessions[request.id]

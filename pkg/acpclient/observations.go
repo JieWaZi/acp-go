@@ -215,6 +215,11 @@ func (c *Client) applyOpeningUpdate(p *opening, update receivedUpdate) {
 	if p.replay && (u.UserMessageChunk != nil || u.AgentMessageChunk != nil || u.AgentThoughtChunk != nil || u.ToolCall != nil) {
 		p.restoredHistory = true
 	}
+	if p.continuation {
+		// The setup response already carries the folded settings. Replayed
+		// content belongs to the native session and serves as restore evidence.
+		return
+	}
 	if p.replay || sessionUpdate(u) {
 		if len(p.observations) >= maxOpeningFrames || p.observationBytes+update.size > maxOpeningBytes {
 			p.overflow = true
