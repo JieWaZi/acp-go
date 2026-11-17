@@ -133,7 +133,7 @@ func cliName(path string) string {
 
 func (c *Client) runCommandTo(ctx context.Context, env []string, command string, limit int64, output io.Writer, args ...string) (result error) {
 	argv := append(slices.Clone(c.opts.PrefixArgs), command)
-	proc, err := agentclient.NewProcess(agentclient.ProcessSpec{
+	proc, err := agentclient.NewProcess(agentclient.ProcessSpec{Guardian: c.opts.Guardian,
 		Executable: c.opts.Executable, Args: append(argv, args...), Env: env, Dir: c.opts.WorkingDirectory,
 	})
 	if err != nil {

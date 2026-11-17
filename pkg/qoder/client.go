@@ -20,6 +20,8 @@ import (
 
 // Options freezes the regional launcher and credentials selected by the caller.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// RuntimeID selects qoder or qoder-cn.
 	RuntimeID string
 	// Executable overrides executable discovery for the selected edition.
@@ -59,6 +61,11 @@ var ErrContextWindowUnsupported = errors.New("Qoder model does not advertise the
 
 // NewClient freezes a Qoder launch without starting a child process.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -82,7 +89,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		acpArgs = append(acpArgs, "--context-window="+strconv.FormatInt(options.ContextWindow, 10))
 	}
 	client, err := acpclient.NewClient(ctx, acpclient.Options{
-		Process: agentclient.ProcessSpec{
+		Process: agentclient.ProcessSpec{Guardian: options.Guardian,
 			Executable: options.Executable, Args: append(acpArgs, "--acp"),
 			Env: append(slices.Clone(options.Environment), tokenUsageEnvironment(options.RuntimeID)), Dir: options.WorkingDirectory,
 			Redact: func(record string) string {
@@ -168,7 +175,7 @@ func freezeOptions(options Options) (Options, error) {
 	}
 	if options.Executable == "" {
 		for _, name := range candidates {
-			process, err := agentclient.NewProcess(agentclient.ProcessSpec{Executable: name, Env: options.Environment, Dir: options.WorkingDirectory})
+			process, err := agentclient.NewProcess(agentclient.ProcessSpec{Guardian: options.Guardian, Executable: name, Env: options.Environment, Dir: options.WorkingDirectory})
 			if err == nil {
 				options.Executable = process.Executable()
 				return options, nil

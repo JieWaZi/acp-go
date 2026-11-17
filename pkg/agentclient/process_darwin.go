@@ -85,3 +85,18 @@ func groupSignalError(pid int, err error) error {
 	}
 	return nil
 }
+
+// processGroupAlive observes the kernel group while its leader identity is reserved.
+func processGroupAlive(pid int) (bool, error) {
+	members, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pid)
+	if err != nil {
+		return false, err
+	}
+	const zombie = 5 // SZOMB: the process has already released its resources.
+	for _, member := range members {
+		if member.Proc.P_stat != zombie {
+			return true, nil
+		}
+	}
+	return false, nil
+}

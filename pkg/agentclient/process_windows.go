@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -126,7 +127,19 @@ func (*processTree) terminate(*os.Process) (bool, error) { return false, nil }
 
 func (tree *processTree) stop(child *os.Process) error {
 	if tree.assigned {
-		return windows.TerminateJobObject(tree.job, 1)
+		if err := windows.TerminateJobObject(tree.job, 1); err != nil {
+			return err
+		}
+		for {
+			var accounting jobProcessAccounting
+			if err := windows.QueryInformationJobObject(tree.job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); err != nil {
+				return err
+			}
+			if accounting.ActiveProcesses == 0 {
+				return nil
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	// Assignment failed while the child was still suspended. It cannot have
 	// descendants; the native handle remains safe across a simultaneous reap.
@@ -210,4 +223,24 @@ func platformProcessPipe() (*os.File, *os.File, error) {
 		return nil, nil, err
 	}
 	return os.NewFile(uintptr(read), "agent-pipe-reader"), os.NewFile(uintptr(write), "agent-pipe-writer"), nil
+}
+
+// jobProcessAccounting is JOBOBJECT_BASIC_ACCOUNTING_INFORMATION's fixed ABI.
+type jobProcessAccounting struct {
+	// TotalUserTime is aggregate user CPU time.
+	TotalUserTime int64
+	// TotalKernelTime is aggregate kernel CPU time.
+	TotalKernelTime int64
+	// ThisPeriodTotalUserTime is user CPU time since the last limit update.
+	ThisPeriodTotalUserTime int64
+	// ThisPeriodTotalKernelTime is kernel CPU time since the last limit update.
+	ThisPeriodTotalKernelTime int64
+	// TotalPageFaultCount is aggregate page faults.
+	TotalPageFaultCount uint32
+	// TotalProcesses counts all processes assigned to the job.
+	TotalProcesses uint32
+	// ActiveProcesses counts processes that have not exited.
+	ActiveProcesses uint32
+	// TotalTerminatedProcesses counts processes terminated by the job limit.
+	TotalTerminatedProcesses uint32
 }

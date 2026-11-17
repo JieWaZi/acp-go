@@ -18,6 +18,13 @@
 
 [agentclient](pkg/agentclient) 提供原生客户端合同、进程所有权和 ACP 投影。[acpclient](pkg/acpclient) 管理标准 ACP 连接、会话、回调和执行，也供宿主接入自定义 ACP。[acpmeta](pkg/acpmeta) 提供协商后的元数据合同，[acpserver](pkg/acpserver) 提供独立命令的注册和服务边界。[sessionfiles](pkg/sessionfiles) 提供原生会话文件的目录持久化。公共代码统一放在 `pkg`。
 
+宿主需要在自身崩溃后继续清理原生进程时，可向各客户端 `Options.Guardian` 传入 `agentclient.ProcessGuardian`。Darwin/Linux 的同一宿主二进制应提供内部入口，在普通服务初始化前调用 `RunProcessGuardian()`；guardian 持有原生 Process 和宿主提供的 close-only 内核租约，私有控制管道 EOF 触发原进程组收尾。宿主只在最后一份租约释放后恢复服务；租约不得传给 CLI/工具。完整启动参数送达后即可能已派发，宿主中途死亡不能据此推断输入未消费。
+
+Unix 收尾保留未 reap 的 leader 身份，直到内核观察确认组内没有活跃成员；Windows 保留 `KILL_ON_JOB_CLOSE`，正常 Close 还等待 Job 的 ActiveProcesses 归零。取消等待或收尾超时不会丢弃原所有者。Unix 主动 setsid/setpgid 脱组、guardian 自身被强杀不在进程组保证内，宿主不能把这些未知活动推断为已释放。该选项不更改 CLI 参数、协议流、账号、模型或工具权限；普通 SDK 调用方不配置 guardian 时保留原进程所有者。
+
+Linux 的组状态观察依赖与宿主 PID namespace 一致、且原组成员可见的 `/proc`。先通过 `getpgid` 排除无关进程，再读取成员状态；无关进程的 `stat` 权限限制不会阻止收尾，无法确认组身份或成员状态的错误仍保留所有者。`hidepid=2/4` 等策略若把相关成员从目录枚举中隐藏，则不在这份进程组枚举证明内；不能将其描述为已经确认全部资源释放，也没有通过限制 CLI 正常工具权限来规避此边界。
+
+
 ## 源码构建
 
 Go 版本与依赖版本以 [go.mod](go.mod) 为准。ACP SDK 通过 Go modules 获取，仓库不内嵌 SDK 源码，不需要本地 `go.work` 或 `replace`。克隆仓库后，在仓库根目录运行：

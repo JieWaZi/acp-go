@@ -38,6 +38,8 @@ const (
 
 // Options freezes the account, CLI and provider-specific launch inputs.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// Executable selects Claude Code, defaulting to claude on the frozen PATH.
 	Executable string
 	// PrefixArgs precedes the Claude arguments. Native launch controls are reserved.
@@ -93,6 +95,11 @@ var (
 
 // NewClient validates and freezes startup inputs without launching native work.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -122,7 +129,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	if err != nil {
 		return nil, err
 	}
-	frozen, err := agentclient.NewProcess(agentclient.ProcessSpec{
+	frozen, err := agentclient.NewProcess(agentclient.ProcessSpec{Guardian: options.Guardian,
 		Executable: options.Executable, Env: options.Environment, Dir: options.WorkingDirectory,
 	})
 	if err != nil {
@@ -367,7 +374,7 @@ func (c *Client) Close(ctx context.Context) error {
 }
 
 func (c *Client) process(args []string, cwd string, environment []string) (*agentclient.Process, error) {
-	return agentclient.NewProcess(agentclient.ProcessSpec{
+	return agentclient.NewProcess(agentclient.ProcessSpec{Guardian: c.options.Guardian,
 		Executable: c.options.Executable, Env: environment, Dir: cwd,
 		Args: append(slices.Clone(c.options.PrefixArgs), args...), Redact: c.redactDiagnostic,
 	})

@@ -23,6 +23,8 @@ type Client struct {
 
 // Options freezes the executable and the account's launch environment.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// Executable selects a CodeBuddy CLI; otherwise codebuddy and cbc are tried in order.
 	Executable string
 	// PrefixArgs precedes the fixed native ACP and version arguments.
@@ -43,6 +45,11 @@ type Options struct {
 
 // NewClient freezes the CodeBuddy launch without starting a process.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	directories, err := agentclient.PhysicalPluginDirectories(options.PluginDirectories, options.PrefixArgs)
 	if err != nil {
 		return nil, err
@@ -71,7 +78,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		args = append(args, directories...)
 	}
 	launch := acpclient.Options{
-		Process: agentclient.ProcessSpec{
+		Process: agentclient.ProcessSpec{Guardian: options.Guardian,
 			Executable: options.Executable, Args: append(args, "--acp"),
 			Env: options.Environment, Dir: options.WorkingDirectory, Redact: agentclient.RedactProcessDiagnostic,
 		},

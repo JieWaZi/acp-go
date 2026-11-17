@@ -30,6 +30,8 @@ var (
 
 // ProcessSpec describes a single launch. NewProcess snapshots all launch inputs.
 type ProcessSpec struct {
+	// Guardian optionally transfers Unix native ownership to a private host subprocess.
+	Guardian *ProcessGuardian `json:"-"`
 	// Executable is a path or a name resolved against the frozen absolute PATH entries.
 	Executable string
 	// Args excludes argv[0].
@@ -59,6 +61,10 @@ type ProcessExit struct {
 
 // Process owns one child, its pipes and its exit observation. It cannot restart.
 type Process struct {
+	// remote proxies the guardian owner after its process has started.
+	remote *guardianProcess
+	// forwarded directly connects native streams inside the guardian without protocol buffering.
+	forwarded *forwardedProcessStreams
 	// spec contains the frozen launch, including its resolved absolute executable.
 	spec ProcessSpec
 	// mu protects launch admission and stream publication.
@@ -85,6 +91,8 @@ type Process struct {
 	stopMu sync.Mutex
 	// stopped closes once tree termination was requested successfully.
 	stopped chan struct{}
+	// exitObserved wakes the owner after exit observation returns, before cleanup or reap can block.
+	exitObserved chan struct{}
 	// reaped closes after the leader has been reaped, publishing exit.
 	reaped chan struct{}
 	// exit holds the leader's native outcome without stderr.
@@ -113,6 +121,11 @@ type processCleanup struct {
 
 // NewProcess freezes the launch without starting a child or allocating pipes.
 func NewProcess(spec ProcessSpec) (*Process, error) {
+	if spec.Guardian != nil {
+		frozen := *spec.Guardian
+		frozen.Args = append([]string(nil), frozen.Args...)
+		spec.Guardian = &frozen
+	}
 	dir, err := filepath.Abs(spec.Dir)
 	if err != nil {
 		return nil, processOperationError("freeze agent process directory", err)
@@ -140,7 +153,7 @@ func NewProcess(spec ProcessSpec) (*Process, error) {
 	}
 	return &Process{
 		spec: spec, ready: make(chan struct{}), stopped: make(chan struct{}),
-		reaped: make(chan struct{}), drained: make(chan struct{}),
+		exitObserved: make(chan struct{}), reaped: make(chan struct{}), drained: make(chan struct{}),
 	}, nil
 }
 
@@ -234,6 +247,9 @@ func (p *Process) Start(ctx context.Context) error {
 	p.attempted = true
 	p.mu.Unlock()
 	defer close(p.ready)
+	if handled, err := p.startGuardian(ctx); handled {
+		return err
+	}
 
 	cmd := &exec.Cmd{Path: p.spec.Executable, Args: append([]string{p.spec.Executable}, p.spec.Args...), Dir: p.spec.Dir, Env: p.spec.Env}
 	var files []*os.File
@@ -270,6 +286,9 @@ func (p *Process) Start(ctx context.Context) error {
 		return processOperationError("allocate agent stderr", err)
 	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = childInput, childOutput, childDiagnostic
+	if p.forwarded != nil {
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = p.forwarded.stdin, p.forwarded.stdout, p.forwarded.stderr
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -286,7 +305,14 @@ func (p *Process) Start(ctx context.Context) error {
 	p.child, p.stdin, p.stdout, p.stderr = cmd.Process, stdin, stdout, stderr
 	p.started = setupErr == nil
 	p.mu.Unlock()
-	go p.readDiagnostics(stderr)
+	if p.forwarded != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		close(p.drained)
+	} else {
+		go p.readDiagnostics(stderr)
+	}
 	go p.reap(cmd)
 	if setupErr != nil {
 		// A partially started native process remains owned by p; Close can retry.
@@ -298,6 +324,7 @@ func (p *Process) Start(ctx context.Context) error {
 
 func (p *Process) reap(cmd *exec.Cmd) {
 	observeErr := p.tree.observeExit(cmd.Process.Pid)
+	close(p.exitObserved)
 	if p.tree.usesLeaderIdentity() {
 		// Keep the PID reserved until the group has been signaled. Reaping
 		// first would let a late stop target a recycled process group ID.
@@ -446,6 +473,10 @@ func (p *Process) runCleanup(attempt *processCleanup) {
 		attempt.err = p.tree.release()
 		return
 	}
+	if p.remote != nil {
+		attempt.err = p.remote.cleanup(p)
+		return
+	}
 	pipeErr := closeProcessFile(p.stdin)
 	graceful, err := p.beginStop()
 	if err != nil {
@@ -494,6 +525,9 @@ func awaitProcess(ctx context.Context, done <-chan struct{}) error {
 }
 
 func closeProcessFile(file *os.File) error {
+	if file == nil {
+		return nil
+	}
 	if err := file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 		return processOperationError("close agent process pipe", err)
 	}

@@ -19,6 +19,8 @@ import (
 
 // Options freezes the selected Cursor executable, credentials, and startup scope.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// Executable is the selected Cursor CLI path or command name.
 	Executable string
 	// PrefixArgs precedes each subcommand and cannot override the selected account, policy, or workspace.
@@ -81,6 +83,11 @@ var _ agentclient.Client = (*Client)(nil)
 
 // NewClient resolves and freezes options without starting any native process.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -143,7 +150,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	default:
 		return nil, invalid("invalid Cursor startup permission mode")
 	}
-	spec := agentclient.ProcessSpec{
+	spec := agentclient.ProcessSpec{Guardian: options.Guardian,
 		Executable: options.Executable, Args: append(args, "acp"), Env: options.Environment, Dir: options.WorkingDirectory,
 		Redact: func(record string) string {
 			if apiKey != "" && strings.Contains(record, apiKey) {

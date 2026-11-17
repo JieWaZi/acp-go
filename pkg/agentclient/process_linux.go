@@ -2,6 +2,7 @@ package agentclient
 
 import (
 	"errors"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,3 +24,12 @@ func (*processExitObserver) wait(pid int) error {
 }
 
 func groupSignalError(_ int, err error) error { return err }
+
+// processGroupAlive reads kernel process facts; failed observation never means empty.
+func processGroupAlive(pid int) (bool, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false, err
+	}
+	return observeProcProcessGroup(pid, entries, unix.Getpgid, os.ReadFile)
+}

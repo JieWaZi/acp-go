@@ -21,6 +21,8 @@ import (
 
 // Options freezes a single Pi account and the launch policy used by its sessions.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// Executable selects the Pi binary. An empty value resolves pi in Environment.
 	Executable string
 	// PrefixArgs precedes the owned native RPC arguments.
@@ -106,6 +108,11 @@ var _ agentclient.NativeOutcomeReader = (*Client)(nil)
 
 // NewClient freezes the launch without starting the CLI or reading credentials.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	if err := context.Cause(ctx); err != nil {
 		return nil, err
 	}
@@ -141,7 +148,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		return nil, err
 	}
 	options.WorkingDirectory = cwd
-	process, err := agentclient.NewProcess(agentclient.ProcessSpec{Executable: options.Executable, Dir: cwd, Env: options.Environment})
+	process, err := agentclient.NewProcess(agentclient.ProcessSpec{Guardian: options.Guardian, Executable: options.Executable, Dir: cwd, Env: options.Environment})
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +284,7 @@ func (c *Client) processSpec(cwd string, args, environment []string) agentclient
 	for _, dir := range c.options.PluginDirectories {
 		prefix = append(prefix, "--extension", dir)
 	}
-	return agentclient.ProcessSpec{
+	return agentclient.ProcessSpec{Guardian: c.options.Guardian,
 		Executable: c.options.Executable, Dir: cwd,
 		Args: append(append(prefix, "--mode", "rpc"), args...),
 		Env:  append(slices.Clone(c.options.Environment), environment...),

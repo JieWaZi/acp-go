@@ -30,7 +30,7 @@ func (m *management) run(ctx context.Context, args []string, read func(context.C
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	process, err := agentclient.NewProcess(agentclient.ProcessSpec{
+	process, err := agentclient.NewProcess(agentclient.ProcessSpec{Guardian: m.options.Guardian,
 		Executable: m.options.Executable, Args: append(slices.Clone(m.options.PrefixArgs), args...),
 		Env: m.options.Environment, Dir: m.options.WorkingDirectory,
 	})

@@ -43,6 +43,8 @@ var (
 
 // Options freezes one app-server launch and its configuration overrides.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// Executable is an explicit Codex executable or a command on the frozen PATH.
 	Executable string
 	// PrefixArgs is prepended to the app-server command.
@@ -193,6 +195,11 @@ func (w frameWrite) submission() agentclient.Submission {
 
 // NewClient validates and freezes options without starting the process.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -235,7 +242,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		args = append(args, "-c", key+"="+strings.TrimSpace(literal))
 	}
 	args = append(args, "app-server", "--listen", "stdio://")
-	process, err := agentclient.NewProcess(agentclient.ProcessSpec{
+	process, err := agentclient.NewProcess(agentclient.ProcessSpec{Guardian: options.Guardian,
 		Executable: options.Executable, Args: args, Dir: dir, Env: options.Environment,
 		Redact: func(record string) string {
 			record = safeDiagnostic(record)

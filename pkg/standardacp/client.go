@@ -28,6 +28,8 @@ const (
 
 // Options freezes the executable, credential environment, and native launch policy.
 type Options struct {
+	// Guardian supplies the original host process owner for every native launch and restart.
+	Guardian *agentclient.ProcessGuardian `json:"-"`
 	// Provider selects the documented native CLI profile.
 	Provider Provider
 	// Executable overrides lookup in the frozen environment.
@@ -50,6 +52,11 @@ type Options struct {
 
 // NewClient freezes the selected CLI without launching it.
 func NewClient(ctx context.Context, options Options, host agentclient.HostCallbacks) (*acpclient.Client, error) {
+	if options.Guardian != nil {
+		owner := *options.Guardian
+		owner.Args = append([]string(nil), owner.Args...)
+		options.Guardian = &owner
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -181,7 +188,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 		executable = string(options.Provider)
 	}
 	return acpclient.NewClient(ctx, acpclient.Options{
-		Process: agentclient.ProcessSpec{
+		Process: agentclient.ProcessSpec{Guardian: options.Guardian,
 			Executable: executable, Args: append(slices.Clone(options.PrefixArgs), args...),
 			Env: environment, Dir: cwd,
 		},
