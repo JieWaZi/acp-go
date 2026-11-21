@@ -36,7 +36,7 @@ func TestCursorUsageJournalRequiresFreshNativeProof(t *testing.T) {
 	for _, scenario := range []string{"known", "launcher-version", "native-version-mismatch", "zero", "unknown-cache", "duplicate", "later-run-index", "conflict", "foreign-nonce", "foreign-session", "foreign-request", "foreign-user", "foreign-version", "foreign-source", "foreign-schema", "invalid-user", "invalid-cache", "missing", "stale", "bad-health", "no-receipt"} {
 		t.Run(scenario, func(t *testing.T) {
 			db, root := usageTestDB(t)
-			usageTestTurn(t, db, usageTestOldRequest, usageTestOldUser)
+			usageTestTurn(t, db, usageTestOldRequest, usageTestOldUser, nil)
 			directory := t.TempDir()
 			health := map[string]any{"schema": 1, "status": "ready", "version": "2026.11.05-86047df"}
 			if scenario == "bad-health" {
@@ -51,17 +51,11 @@ func TestCursorUsageJournalRequiresFreshNativeProof(t *testing.T) {
 				scope.Version, scope.LauncherVersion = "2026.10.22-27dcf5f", scope.Version
 			}
 			capture := captureCursorUsageJournal(t.Context(), scope, root, directory, usageTestNonce)
-			if scenario == "bad-health" || scenario == "native-version-mismatch" {
-				if capture != nil {
-					t.Fatal("rejected preload enabled collection")
-				}
-				return
-			}
 			if capture == nil {
 				t.Fatal("capture unavailable")
 			}
 			if scenario != "stale" {
-				usageTestTurn(t, db, usageTestRequest, usageTestUser)
+				usageTestTurn(t, db, usageTestRequest, usageTestUser, nil)
 			}
 			event := map[string]any{"schema": 1, "source": "cursor.acp.turn_ended", "version": "2026.11.05-86047df", "nonce": usageTestNonce, "session_id": usageTestSession,
 				"request_id": usageTestRequest, "user_message_id": usageTestUser, "run_id": "1394fdfa-0fe3-443a-81d6-1eb21c3e1459", "run_index": 1,
@@ -132,6 +126,60 @@ func TestCursorUsageJournalRequiresFreshNativeProof(t *testing.T) {
 			}
 			if u.InputTokens == nil || *u.InputTokens != input || u.OutputTokens == nil || *u.OutputTokens != output || u.CacheReadTokens == nil || *u.CacheReadTokens != read || u.CacheWriteTokens == nil || *u.CacheWriteTokens != 0 {
 				t.Fatalf("wrong counters: %+v", u)
+			}
+		})
+	}
+}
+
+func TestCursorContextFromMatchedNativeRootWithoutUsageHook(t *testing.T) {
+	for _, scenario := range []string{"fresh", "explicit-zero", "missing", "incomplete", "invalid", "truncated", "stale", "cancelled", "foreign-turn"} {
+		t.Run(scenario, func(t *testing.T) {
+			db, root := usageTestDB(t)
+			usageTestTurn(t, db, usageTestOldRequest, usageTestOldUser, usageTestTokenDetails(500, 100_000))
+			capture := captureCursorUsageJournal(t.Context(), acpclient.PromptJournalScope{
+				SessionID: acp.SessionId(usageTestSession),
+			}, root, "", "")
+			if capture == nil {
+				t.Fatal("native context capture requires a usage hook")
+			}
+			details := usageTestTokenDetails(600, 200_000)
+			receipt := acpclient.PromptJournalReceipt{StopReason: acp.Ptr(acp.StopReasonEndTurn)}
+			switch scenario {
+			case "explicit-zero":
+				details = usageTestTokenDetails(0, 200_000)
+			case "missing":
+				details = nil
+			case "incomplete":
+				details = []byte{8, 10}
+			case "invalid":
+				details = usageTestTokenDetails(201_000, 200_000)
+			case "truncated":
+				details = []byte{8, 0xff}
+			case "cancelled":
+				receipt.StopReason = acp.Ptr(acp.StopReasonCancelled)
+			case "foreign-turn":
+				receipt.NativeTurnID = usageTestOldRequest
+			}
+			if scenario != "stale" {
+				usageTestTurn(t, db, usageTestRequest, usageTestUser, details)
+			}
+			evidence := capture(t.Context(), receipt)
+			if evidence.Usage != nil || evidence.NativeTurnID != "" || evidence.Failure != nil || evidence.UnverifiedTerminal {
+				t.Fatalf("context altered independent billing or terminal facts: %+v", evidence)
+			}
+			used, window := evidence.ContextUsage.UsedTokens, evidence.ContextUsage.WindowTokens
+			if scenario != "fresh" && scenario != "explicit-zero" {
+				if used != nil || window != nil {
+					t.Fatalf("unverified context escaped: %+v", evidence)
+				}
+				return
+			}
+			wantUsed := int64(600)
+			if scenario == "explicit-zero" {
+				wantUsed = 0
+			}
+			if used == nil || window == nil || *used != wantUsed || *window != 200_000 {
+				t.Fatalf("context snapshot lost: %+v", evidence)
 			}
 		})
 	}

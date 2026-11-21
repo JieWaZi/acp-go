@@ -299,6 +299,14 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 			t.outcome.Turn.Status = acpmeta.NativeTurnFailed
 			t.authLost = journal.Failure.Code == -32000
 		}
+		if observed := t.outcome.ContextUsage; observed.UsedTokens == nil || observed.WindowTokens == nil {
+			if snapshot := journal.ContextUsage; snapshot.UsedTokens != nil && snapshot.WindowTokens != nil {
+				t.outcome.ContextUsage = snapshot
+				if t.outcome.Turn.Usage != nil {
+					t.outcome.Turn.Usage.ContextKnown = true
+				}
+			}
+		}
 		if journal.Usage != nil {
 			report := *journal.Usage
 			if previous := t.outcome.Turn.Usage; previous != nil {

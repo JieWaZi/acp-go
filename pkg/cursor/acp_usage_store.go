@@ -7,20 +7,24 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
 
 	acp "github.com/JieWaZi/acp-go-sdk"
+	"github.com/JieWaZi/acp-go/pkg/agentclient"
 	sqlite3 "github.com/ncruces/go-sqlite3"
 )
 
-// cursorACPUsageIdentity retains only the authoritative turn's request and user-input identities.
+// cursorACPUsageIdentity retains the authoritative turn's identities and its conversation context.
 type cursorACPUsageIdentity struct {
 	// requestID is the request_id of the AgentTurn referenced by the latest root.
 	requestID string
-	// userID is the user_message_id from that same AgentTurn.
+	// userID is the verified user message UUID for that same AgentTurn.
 	userID string
+	// context is the optional context occupancy read from the same authoritative root.
+	context agentclient.ContextUsage
 }
 
 // readCursorACPUsageIdentity follows metadata, the root, and the latest turn while preserving visibility of native WAL writes.
@@ -109,9 +113,9 @@ func readCursorACPUsageIdentity(ctx context.Context, configRoot string, session 
 	if err != nil {
 		return identity, err
 	}
-	identity.requestID, identity.userID = string(request), string(user)
-	if !validCursorUsageID(identity.requestID) || !validCursorUsageID(identity.userID) {
-		return cursorACPUsageIdentity{}, errors.New("invalid Cursor ACP authoritative usage identity")
+	identity.requestID = string(request)
+	if !validCursorUsageID(identity.requestID) {
+		return cursorACPUsageIdentity{}, errors.New("invalid Cursor ACP authoritative request identity")
 	}
 	userBlobID, err := cursorACPUsageField(turn, 1)
 	if err != nil {
@@ -123,10 +127,19 @@ func readCursorACPUsageIdentity(ctx context.Context, configRoot string, session 
 			return cursorACPUsageIdentity{}, err
 		}
 		nativeUser, err := cursorACPUsageField(userBlob, 2)
-		if err != nil || nativeUser != nil && string(nativeUser) != identity.userID {
+		if err != nil || user != nil && nativeUser != nil && string(nativeUser) != string(user) {
 			return cursorACPUsageIdentity{}, errors.New("Cursor ACP authoritative user identities disagree")
 		}
+		// Older native turns keep the UUID only in their referenced UserMessage.
+		if user == nil {
+			user = nativeUser
+		}
 	}
+	identity.userID = string(user)
+	if !validCursorUsageID(identity.userID) {
+		return cursorACPUsageIdentity{}, errors.New("invalid Cursor ACP authoritative user identity")
+	}
+	identity.context = cursorACPContextUsage(root)
 	return identity, nil
 }
 
@@ -154,8 +167,30 @@ func cursorACPUsageBlob(db *sqlite3.Conn, id []byte) ([]byte, error) {
 	return statement.ColumnBlob(1, nil), nil
 }
 
-// cursorACPUsageField extracts one length-delimited field without recursively parsing message or tool content.
+// cursorACPContextUsage reads ConversationStateStructure.token_details, the snapshot used by the native UI.
+func cursorACPContextUsage(root []byte) agentclient.ContextUsage {
+	details, err := cursorACPUsageField(root, 5)
+	if err != nil || details == nil {
+		return agentclient.ContextUsage{}
+	}
+	usedField, usedErr := cursorACPUsageWireField(details, 1<<3)
+	windowField, windowErr := cursorACPUsageWireField(details, 2<<3)
+	used, usedLen := binary.Uvarint(usedField)
+	window, windowLen := binary.Uvarint(windowField)
+	if usedErr != nil || windowErr != nil || usedLen <= 0 || windowLen <= 0 ||
+		window == 0 || window > math.MaxUint32 || used > window {
+		return agentclient.ContextUsage{}
+	}
+	return agentclient.ContextUsage{UsedTokens: acp.Ptr(int64(used)), WindowTokens: acp.Ptr(int64(window))}
+}
+
+// cursorACPUsageField extracts the last length-delimited value of a known field.
 func cursorACPUsageField(data []byte, wanted uint64) ([]byte, error) {
+	return cursorACPUsageWireField(data, wanted<<3|2)
+}
+
+// cursorACPUsageWireField extracts one known wire field without decoding message or tool content.
+func cursorACPUsageWireField(data []byte, wanted uint64) ([]byte, error) {
 	if len(data) > 8<<20 {
 		return nil, errors.New("Cursor ACP usage proof exceeds retained size")
 	}
@@ -175,6 +210,9 @@ func cursorACPUsageField(data []byte, wanted uint64) ([]byte, error) {
 			if n <= 0 {
 				return nil, errors.New("invalid Cursor ACP usage proof integer")
 			}
+			if key == wanted {
+				result = data[:n]
+			}
 			data = data[n:]
 		case 1, 5:
 			size := 8
@@ -191,7 +229,7 @@ func cursorACPUsageField(data []byte, wanted uint64) ([]byte, error) {
 				return nil, errors.New("truncated Cursor ACP usage proof bytes")
 			}
 			data = data[n:]
-			if key>>3 == wanted {
+			if key == wanted {
 				result = data[:int(size)]
 			}
 			data = data[int(size):]

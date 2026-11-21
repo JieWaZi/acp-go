@@ -48,7 +48,12 @@ func usageTestBytes(field int, value []byte) []byte {
 	return append(data, value...)
 }
 
-func usageTestTurn(t *testing.T, db *sql.DB, request, user string) {
+func usageTestTokenDetails(used, window uint64) []byte {
+	data := binary.AppendUvarint([]byte{8}, used)
+	return binary.AppendUvarint(append(data, 16), window)
+}
+
+func usageTestTurn(t *testing.T, db *sql.DB, request, user string, tokenDetails []byte) {
 	t.Helper()
 	put := func(label string, data []byte) []byte {
 		id := sha256.Sum256([]byte(label))
@@ -60,9 +65,16 @@ func usageTestTurn(t *testing.T, db *sql.DB, request, user string) {
 	userBlob := put("user:"+user, usageTestBytes(2, []byte(user)))
 	turn := usageTestBytes(1, userBlob)
 	turn = append(turn, usageTestBytes(3, []byte(request))...)
-	turn = append(turn, usageTestBytes(10, []byte(user))...)
+	// The context fixture omits the duplicated user ID to cover older native storage.
+	if tokenDetails == nil {
+		turn = append(turn, usageTestBytes(10, []byte(user))...)
+	}
 	turnBlob := put("turn:"+request, usageTestBytes(1, turn))
-	rootBlob := put("root:"+request, usageTestBytes(8, turnBlob))
+	root := usageTestBytes(8, turnBlob)
+	if tokenDetails != nil {
+		root = append(root, usageTestBytes(5, tokenDetails)...)
+	}
+	rootBlob := put("root:"+request, root)
 	meta, _ := json.Marshal(map[string]string{"agentId": usageTestSession, "latestRootBlobId": hex.EncodeToString(rootBlob)})
 	if _, err := db.Exec("INSERT OR REPLACE INTO meta VALUES ('0',?)", hex.EncodeToString(meta)); err != nil {
 		t.Fatal(err)
@@ -71,12 +83,12 @@ func usageTestTurn(t *testing.T, db *sql.DB, request, user string) {
 
 func TestCursorACPUsageIdentityReadsOnlyAuthoritativeRootAndWAL(t *testing.T) {
 	db, root := usageTestDB(t)
-	usageTestTurn(t, db, usageTestOldRequest, usageTestOldUser)
+	usageTestTurn(t, db, usageTestOldRequest, usageTestOldUser, nil)
 	before, err := readCursorACPUsageIdentity(t.Context(), root, acp.SessionId(usageTestSession))
 	if err != nil || before.requestID != usageTestOldRequest || before.userID != usageTestOldUser {
 		t.Fatalf("before=%+v err=%v", before, err)
 	}
-	usageTestTurn(t, db, usageTestRequest, usageTestUser)
+	usageTestTurn(t, db, usageTestRequest, usageTestUser, nil)
 	if _, err := db.Exec("INSERT INTO blobs VALUES ('unreferenced',?)", []byte{0xff, 0xff}); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +100,7 @@ func TestCursorACPUsageIdentityReadsOnlyAuthoritativeRootAndWAL(t *testing.T) {
 
 func TestCursorACPUsageIdentityRejectsForeignAccountStoreMetadata(t *testing.T) {
 	db, root := usageTestDB(t)
-	usageTestTurn(t, db, usageTestRequest, usageTestUser)
+	usageTestTurn(t, db, usageTestRequest, usageTestUser, nil)
 	meta, _ := json.Marshal(map[string]string{"agentId": "foreign", "latestRootBlobId": "00"})
 	if _, err := db.Exec("UPDATE meta SET value=? WHERE key='0'", hex.EncodeToString(meta)); err != nil {
 		t.Fatal(err)
@@ -100,7 +112,7 @@ func TestCursorACPUsageIdentityRejectsForeignAccountStoreMetadata(t *testing.T) 
 
 func TestCursorACPUsageIdentityRejectsDifferentNativeUserBlob(t *testing.T) {
 	db, root := usageTestDB(t)
-	usageTestTurn(t, db, usageTestRequest, usageTestUser)
+	usageTestTurn(t, db, usageTestRequest, usageTestUser, nil)
 	id := sha256.Sum256([]byte("user:" + usageTestUser))
 	if _, err := db.Exec("UPDATE blobs SET data=? WHERE id=?", usageTestBytes(2, []byte(usageTestOldUser)), hex.EncodeToString(id[:])); err != nil {
 		t.Fatal(err)

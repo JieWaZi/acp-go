@@ -58,13 +58,57 @@ type cursorUsageEvent struct {
 	CacheWrite *int64 `json:"cache_write_tokens"`
 }
 
-// captureCursorUsageJournal freezes native identity before submission and settles only usage proven to belong to that turn.
+// captureCursorUsageJournal freezes the prior native turn and settles fresh facts after the matched ACP reply.
 func captureCursorUsageJournal(ctx context.Context, scope acpclient.PromptJournalScope, configRoot, directory, nonce string) func(context.Context, acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
+	if ctx.Err() != nil || !validCursorUsageID(string(scope.SessionID)) {
+		return nil
+	}
+	before, err := readCursorACPUsageIdentity(ctx, configRoot, scope.SessionID)
+	if err != nil {
+		return nil
+	}
 	// When official ACP omits agentInfo, the shared layer supplies the independently probed launcher version.
 	if scope.Version == "" {
 		scope.Version = scope.LauncherVersion
 	}
-	if ctx.Err() != nil || scope.Version == "" || !validCursorUsageID(string(scope.SessionID)) || !validCursorUsageID(nonce) || !filepath.IsAbs(directory) {
+	baseline := cursorUsageBaseline(scope, directory, nonce)
+	return func(ctx context.Context, receipt acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
+		if ctx.Err() != nil || !cursorUsageMatchedReceipt(receipt.StopReason) {
+			return acpclient.PromptJournalEvidence{}
+		}
+		after, err := readCursorACPUsageIdentity(ctx, configRoot, scope.SessionID)
+		if err != nil || !validCursorUsageID(after.requestID) || !validCursorUsageID(after.userID) ||
+			after.requestID == before.requestID || after.userID == before.userID ||
+			receipt.NativeTurnID != "" && receipt.NativeTurnID != after.requestID {
+			return acpclient.PromptJournalEvidence{}
+		}
+		var evidence acpclient.PromptJournalEvidence
+		// A cancelled or refused prompt may have persisted an input before measuring its context.
+		if *receipt.StopReason == acp.StopReasonEndTurn || *receipt.StopReason == acp.StopReasonMaxTokens ||
+			*receipt.StopReason == acp.StopReasonMaxTurnRequests {
+			evidence.ContextUsage = after.context
+		}
+		if baseline == nil {
+			return evidence
+		}
+		root, err := os.OpenRoot(directory)
+		if err != nil {
+			return evidence
+		}
+		defer root.Close()
+		if !cursorUsageHealth(root, scope.Version) {
+			return evidence
+		}
+		if usage := sumCursorUsageEvents(readCursorUsageEvents(ctx, root, scope, nonce, baseline), after); usage != nil {
+			evidence.NativeTurnID, evidence.Usage = after.requestID, usage
+		}
+		return evidence
+	}
+}
+
+// cursorUsageBaseline snapshots existing bridge files solely for billable consumption attribution.
+func cursorUsageBaseline(scope acpclient.PromptJournalScope, directory, nonce string) map[string]bool {
+	if scope.Version == "" || !validCursorUsageID(nonce) || !filepath.IsAbs(directory) {
 		return nil
 	}
 	root, err := os.OpenRoot(directory)
@@ -79,41 +123,11 @@ func captureCursorUsageJournal(ctx context.Context, scope acpclient.PromptJourna
 	if err != nil {
 		return nil
 	}
-	before, err := readCursorACPUsageIdentity(ctx, configRoot, scope.SessionID)
-	if err != nil {
-		return nil
-	}
 	baseline := make(map[string]bool, len(names))
 	for _, name := range names {
 		baseline[name] = true
 	}
-	return func(ctx context.Context, receipt acpclient.PromptJournalReceipt) acpclient.PromptJournalEvidence {
-		if ctx.Err() != nil || !cursorUsageMatchedReceipt(receipt.StopReason) {
-			return acpclient.PromptJournalEvidence{}
-		}
-		root, err := os.OpenRoot(directory)
-		if err != nil {
-			return acpclient.PromptJournalEvidence{}
-		}
-		defer root.Close()
-		if !cursorUsageHealth(root, scope.Version) {
-			return acpclient.PromptJournalEvidence{}
-		}
-		events := readCursorUsageEvents(ctx, root, scope, nonce, baseline)
-		if len(events) == 0 {
-			return acpclient.PromptJournalEvidence{}
-		}
-		after, err := readCursorACPUsageIdentity(ctx, configRoot, scope.SessionID)
-		if err != nil || !validCursorUsageID(after.requestID) || !validCursorUsageID(after.userID) ||
-			after.requestID == before.requestID || after.userID == before.userID {
-			return acpclient.PromptJournalEvidence{}
-		}
-		usage := sumCursorUsageEvents(events, after)
-		if usage == nil {
-			return acpclient.PromptJournalEvidence{}
-		}
-		return acpclient.PromptJournalEvidence{NativeTurnID: after.requestID, Usage: usage}
-	}
+	return baseline
 }
 
 func cursorUsageMatchedReceipt(reason *acp.StopReason) bool {

@@ -3,6 +3,7 @@ package cursor
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ func TestCursorUsageClientFixture(t *testing.T) {
 		os.Exit(0)
 	}
 	scanner, encoder := bufio.NewScanner(os.Stdin), json.NewEncoder(os.Stdout)
+	prompts := 0
 	for scanner.Scan() {
 		var request struct {
 			// ID correlates this JSON-RPC call with its response.
@@ -47,7 +49,7 @@ func TestCursorUsageClientFixture(t *testing.T) {
 			// The official ACP handshake omits agentInfo; a separate CLI probe supplies its version.
 			reply(map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"promptCapabilities": map[string]any{"image": true}}})
 		case "session/new":
-			reply(map[string]any{"sessionId": "usage-session", "configOptions": []map[string]any{{"id": "model", "name": "Model", "type": "select", "category": "model", "currentValue": "composer", "options": []map[string]any{{"value": "composer", "name": "Composer"}}}}})
+			reply(map[string]any{"sessionId": usageTestSession, "configOptions": []map[string]any{{"id": "model", "name": "Model", "type": "select", "category": "model", "currentValue": "composer", "options": []map[string]any{{"value": "composer", "name": "Composer"}}}}})
 		case "session/set_config_option":
 			reply(map[string]any{"configOptions": []map[string]any{{"id": "model", "name": "Model", "type": "select", "category": "model", "currentValue": "composer", "options": []map[string]any{{"value": "composer", "name": "Composer"}}}}})
 		case "cursor/list_available_models":
@@ -63,8 +65,29 @@ func TestCursorUsageClientFixture(t *testing.T) {
 			if closeErr := file.Close(); err != nil || closeErr != nil {
 				t.Fatal(errors.Join(err, closeErr))
 			}
+			if os.Getenv("CURSOR_CONTEXT_CLIENT_FIXTURE") == "1" {
+				prompts++
+				nativeStore := filepath.Join(os.Getenv("CURSOR_CONFIG_DIR"), "acp-sessions", usageTestSession, "store.db")
+				db, err := sql.Open("sqlite3", nativeStore)
+				if err != nil {
+					t.Fatal(err)
+				}
+				requestID, userID := usageTestRequest, usageTestUser
+				if prompts == 2 {
+					requestID, userID = usageTestOldRequest, usageTestOldUser
+				}
+				usageTestTurn(t, db, requestID, userID, usageTestTokenDetails(uint64(600*prompts), 200_000))
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if prompts == 2 {
+					_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{
+						"sessionId": usageTestSession, "update": map[string]any{"sessionUpdate": "usage_update", "used": 750, "size": 128_000},
+					}})
+				}
+			}
 			for _, text := range []string{"one", "two", "three"} {
-				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "usage-session", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text}}}})
+				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": usageTestSession, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text}}}})
 			}
 			reply(map[string]any{"stopReason": "end_turn"})
 		case "session/cancel":
@@ -76,14 +99,15 @@ func TestCursorUsageClientFixture(t *testing.T) {
 	}
 }
 
-func newCursorUsageFixtureClient(t *testing.T, host agentclient.HostCallbacks) (*Client, acp.SessionId, string) {
+func newCursorUsageFixtureClient(t *testing.T, host agentclient.HostCallbacks, extraEnvironment ...string) (*Client, acp.SessionId, string) {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	trace := filepath.Join(t.TempDir(), "nonces")
-	client, err := NewClient(context.Background(), Options{Executable: executable, PrefixArgs: []string{"-test.run=^TestCursorUsageClientFixture$", "--"}, Environment: append(os.Environ(), "CURSOR_USAGE_CLIENT_FIXTURE=1", "CURSOR_USAGE_CLIENT_TRACE="+trace, "CURSOR_CONFIG_DIR="+t.TempDir()), UsageHook: true}, host)
+	environment := append(os.Environ(), "CURSOR_USAGE_CLIENT_FIXTURE=1", "CURSOR_USAGE_CLIENT_TRACE="+trace, "CURSOR_CONFIG_DIR="+t.TempDir())
+	client, err := NewClient(context.Background(), Options{Executable: executable, PrefixArgs: []string{"-test.run=^TestCursorUsageClientFixture$", "--"}, Environment: append(environment, extraEnvironment...), UsageHook: true}, host)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,6 +263,34 @@ func TestCursorUsageMissingJournalPreservesACPStreaming(t *testing.T) {
 	}
 	if _, ok := any(client).(agentclient.NativeOutcomeReader); ok {
 		t.Fatal("usage hook added a second execution outcome owner")
+	}
+}
+
+func TestCursorTerminalContextPrefersCompleteACPAndFallsBackToNativeStore(t *testing.T) {
+	_, root := usageTestDB(t)
+	client, id, _ := newCursorUsageFixtureClient(t, agentclient.HostCallbacks{},
+		"CURSOR_CONTEXT_CLIENT_FIXTURE=1", "CURSOR_CONFIG_DIR="+root)
+	for i, text := range []string{"first", "second"} {
+		run, err := client.ReservePrompt(t.Context(), acp.PromptRequest{
+			SessionId: id, Prompt: []acp.ContentBlock{acp.TextBlock(text)},
+		}, agentclient.PromptOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := run()
+		if result.Receipt.OperationError != nil || result.Outcome == nil || result.Outcome.Turn.Status != acpmeta.NativeTurnCompleted ||
+			result.Outcome.Turn.Usage != nil {
+			t.Fatalf("context altered terminal or billing facts: %+v", result)
+		}
+		metrics := result.Outcome.ContextUsage
+		wantUsed, wantWindow := int64(600), int64(200_000)
+		if i == 1 {
+			wantUsed, wantWindow = 750, 128_000
+		}
+		if metrics.UsedTokens == nil || metrics.WindowTokens == nil ||
+			*metrics.UsedTokens != wantUsed || *metrics.WindowTokens != wantWindow {
+			t.Fatalf("turn %d context = %+v, want %d/%d", i+1, metrics, wantUsed, wantWindow)
+		}
 	}
 }
 

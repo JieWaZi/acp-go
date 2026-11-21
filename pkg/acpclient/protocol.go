@@ -7,6 +7,7 @@ import (
 
 	acp "github.com/JieWaZi/acp-go-sdk"
 	"github.com/JieWaZi/acp-go/pkg/acpmeta"
+	"github.com/JieWaZi/acp-go/pkg/agentclient"
 )
 
 // Protocol describes observed deviations at specific ACP boundaries.
@@ -126,6 +127,8 @@ type PromptJournalEvidence struct {
 	Failure *acp.RequestError
 	// Usage contains independently scoped invocation counters.
 	Usage *acpmeta.TurnUsage
+	// ContextUsage is a complete context snapshot from the matched native conversation state.
+	ContextUsage agentclient.ContextUsage
 }
 
 // ModelScope identifies where a native model set takes effect.
