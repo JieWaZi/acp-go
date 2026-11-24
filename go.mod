@@ -14,6 +14,7 @@ require (
 
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/klauspost/compress v1.18.6
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/ncruces/go-sqlite3 v0.34.0
 	github.com/segmentio/asm v1.1.3 // indirect

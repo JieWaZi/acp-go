@@ -20,10 +20,13 @@ import (
 type Provider string
 
 const (
-	Kimi     Provider = "kimi"
-	Gemini   Provider = "gemini"
-	Grok     Provider = "grok"
-	OpenCode Provider = "opencode"
+	Kimi        Provider = "kimi"
+	Gemini      Provider = "gemini"
+	Grok        Provider = "grok"
+	OpenCode    Provider = "opencode"
+	Hermes      Provider = "hermes"
+	DeepSeek    Provider = "deepseek"
+	Antigravity Provider = "antigravity"
 )
 
 // Options freezes the executable, credential environment, and native launch policy.
@@ -32,6 +35,8 @@ type Options struct {
 	Provider Provider
 	// Executable overrides lookup in the frozen environment.
 	Executable string
+	// LauncherVersion is the selected installation's already observed version.
+	LauncherVersion string
 	// PrefixArgs precede the CLI's native ACP or version arguments.
 	PrefixArgs []string
 	// PluginDirectories contains per-session Grok plugin roots confirmed during initialization.
@@ -46,6 +51,10 @@ type Options struct {
 	Logger *slog.Logger
 	// RequireVerifiedMCP rejects MCP requests that lack a native loading receipt.
 	RequireVerifiedMCP bool
+	// DeepSeekCatalogPatch points to the provider's temporary session-persistence overlay.
+	DeepSeekCatalogPatch string
+	// AntigravityCatalogHome holds the disposable provider profile for model discovery.
+	AntigravityCatalogHome string
 }
 
 // NewClient freezes the selected CLI without launching it.
@@ -69,10 +78,12 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	}
 	environment := slices.Clone(options.Environment)
 	policy := options.PermissionMode
-	switch policy {
-	case "", "default", "auto", "full-access":
-	default:
-		return nil, errors.New("unknown native ACP permission mode")
+	if options.Provider != Hermes {
+		switch policy {
+		case "", "default", "auto", "full-access":
+		default:
+			return nil, errors.New("unknown native ACP permission mode")
+		}
 	}
 	protocol := acpclient.Protocol{
 		PromptUsage: acpclient.UsageUnattributed, RequireExactMissing: true,
@@ -158,6 +169,20 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			meta["autoMode"] = policy == "auto"
 			meta["yoloMode"] = policy == "full-access"
 		}
+	case DeepSeek:
+		args, err = configureDeepSeek(options, &protocol)
+	case Antigravity:
+		args, err = configureAntigravity(options, &protocol)
+		if options.AntigravityCatalogHome != "" {
+			environment = slices.DeleteFunc(environment, func(entry string) bool {
+				key, _, _ := strings.Cut(entry, "=")
+				return strings.EqualFold(key, "GEMINI_HOME")
+			})
+			environment = append(environment, "GEMINI_HOME="+options.AntigravityCatalogHome)
+		}
+	case Hermes:
+		err = configureHermes(&protocol, policy)
+		protocol.CapturePromptJournal = (hermesGatewayJournal{home: hermesUsageHome(environment)}).capture
 	case OpenCode:
 		if policy == "auto" {
 			return nil, errors.New("OpenCode has no native automatic risk review mode")
@@ -176,9 +201,25 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 	default:
 		return nil, errors.New("unknown standard ACP provider")
 	}
+	if err != nil {
+		return nil, err
+	}
 	executable := options.Executable
 	if executable == "" {
 		executable = string(options.Provider)
+		switch options.Provider {
+		case DeepSeek:
+			executable = "dsh"
+		case Antigravity:
+			executable = "agy"
+		}
+	}
+	version := acpclient.VersionProbe{Args: append(slices.Clone(options.PrefixArgs), "--version")}
+	switch options.Provider {
+	case DeepSeek:
+		version = acpclient.VersionProbe{Frozen: options.LauncherVersion}
+	case Hermes, Antigravity:
+		version = acpclient.VersionProbe{}
 	}
 	return acpclient.NewClient(ctx, acpclient.Options{
 		Process: agentclient.ProcessSpec{
@@ -186,7 +227,7 @@ func NewClient(ctx context.Context, options Options, host agentclient.HostCallba
 			Env: environment, Dir: cwd,
 		},
 		RuntimeID: string(options.Provider), Logger: options.Logger, Protocol: protocol,
-		Version:            acpclient.VersionProbe{Args: append(slices.Clone(options.PrefixArgs), "--version")},
+		Version:            version,
 		RequireVerifiedMCP: options.RequireVerifiedMCP,
 	}, host)
 }
@@ -207,6 +248,12 @@ func validateIdentity(provider Provider, response acp.InitializeResponse) error 
 		valid = response.Meta["grokShell"] == true
 	case OpenCode:
 		valid = strings.EqualFold(name, "OpenCode")
+	case Hermes:
+		valid = name == "hermes-agent"
+	case DeepSeek:
+		valid = name == deepSeekACPName
+	case Antigravity:
+		valid = name == "Antigravity ACP Server"
 	}
 	if !valid {
 		return errors.New("ACP initialization did not identify the selected native CLI")

@@ -66,6 +66,8 @@ type Client struct {
 	conn *acp.ClientSideConnection
 	// initialized contains immutable native capabilities, separate from wire projection.
 	initialized *acp.InitializeResponse
+	// nativeFork selects the provider API after verification of the launcher and ACP handshake.
+	nativeFork bool
 	// ctx and stop cancel this owner independently of the caller's admission lifetime.
 	ctx  context.Context
 	stop context.CancelFunc
@@ -232,6 +234,14 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 	if allow := c.opts.Protocol.ForkAllowed; allow != nil && !allow(native) {
 		native.AgentCapabilities.SessionCapabilities.Fork = nil
 	}
+	forkAPI := c.opts.Protocol.SupportsNativeFork
+	nativeFork := c.opts.Protocol.ForkNativeSession != nil && forkAPI != nil &&
+		native.AgentCapabilities.SessionCapabilities.Resume != nil && forkAPI(native, version)
+	if nativeFork {
+		native.AgentCapabilities.SessionCapabilities.Fork = acpmeta.ForkCapability(acpmeta.ForkTurn)
+		native.Meta = copyMeta(native.Meta)
+		native.Meta["fork"] = acpmeta.ForkMetadata(acpmeta.ForkTurn)["fork"]
+	}
 	if startup := c.opts.Protocol.StartupAuthentication; startup != nil {
 		method := startup(native)
 		if method != "" && slices.ContainsFunc(native.AuthMethods, func(auth acp.AuthMethod) bool {
@@ -264,6 +274,9 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 			return method.Agent == nil || method.Agent.Id != auth.Method
 		})
 	}
+	if c.opts.Protocol.PreferLoadForContinuation && response.AgentCapabilities.LoadSession {
+		response.AgentCapabilities.SessionCapabilities.Resume = nil
+	}
 	// These standard capabilities do not imply a compatible optional local method.
 	response.AgentCapabilities.SessionCapabilities.Delete = nil
 	response.Meta = copyMeta(response.Meta)
@@ -287,6 +300,7 @@ func (c *Client) Initialize(ctx context.Context, request acp.InitializeRequest) 
 		return acp.InitializeResponse{}, ErrRestartRequired
 	}
 	c.conn, c.initialized, c.version = conn, &native, version
+	c.nativeFork = nativeFork
 	c.workers.Add(1)
 	go c.deliver()
 	return response, nil
@@ -365,6 +379,9 @@ func (c *Client) Close(ctx context.Context) error {
 	}
 	select {
 	case <-c.released:
+		if cleanup := c.opts.Protocol.CloseAuxiliary; cleanup != nil {
+			return cleanup(ctx)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

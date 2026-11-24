@@ -17,6 +17,8 @@ func (c *Client) Executable() string { return c.proc.Executable() }
 
 // VersionProbe reads bounded version evidence from the selected executable.
 type VersionProbe struct {
+	// Frozen is version evidence already collected by the installation owner.
+	Frozen string
 	// Args is the complete argument list for the one-shot native command.
 	Args []string
 	// Required rejects startup when the executable does not prove its version.
@@ -29,7 +31,7 @@ var semanticVersion = regexp.MustCompile(`\b[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a
 
 func (c *Client) probeVersion(ctx context.Context) (version string, err error) {
 	if c.probe == nil {
-		return "", nil
+		return c.opts.Version.Frozen, nil
 	}
 	options := c.opts.Version
 	op, cancel := context.WithTimeout(ctx, 3*time.Second)

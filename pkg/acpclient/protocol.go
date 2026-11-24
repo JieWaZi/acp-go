@@ -22,10 +22,22 @@ type Protocol struct {
 	OpeningMode acp.SessionModeId
 	// ForkAllowed narrows a native fork capability to verified versions.
 	ForkAllowed func(acp.InitializeResponse) bool
+	// SupportsNativeFork enables an optional provider fork API with exact positions for a verified ACP handshake and launcher.
+	SupportsNativeFork func(acp.InitializeResponse, string) bool
+	// ForkNativeSession creates a durable independent child through the selected provider API.
+	ForkNativeSession func(context.Context, *Client, acp.UnstableForkSessionRequest) (acp.SessionId, error)
+	// CloseAuxiliary retries cleanup of provider-owned processes and files after native workers stop.
+	CloseAuxiliary func(context.Context) error
 	// CwdBoundProcess requires session cwd to match the launch directory.
 	CwdBoundProcess bool
+	// PreferLoadForContinuation hides native resume when it can select a different session.
+	PreferLoadForContinuation bool
+	// FreshUsageOnRestore identifies versions whose new process starts restore accounting at zero.
+	FreshUsageOnRestore func(acp.InitializeResponse) bool
 	// RequireLoadEvidence rejects an ID-less restore response without same-session history replay.
 	RequireLoadEvidence bool
+	// RequireLoadHistory requires same-session history even when load echoes the requested ID.
+	RequireLoadHistory bool
 	// ValidateRestoreID rejects native selector aliases that cannot prove an exact session.
 	ValidateRestoreID func(acp.SessionId) bool
 	// PrepareRestore protects exact native history before a restore can write it.
@@ -107,6 +119,8 @@ type PromptJournalScope struct {
 	SessionID acp.SessionId
 	// Cwd is the workspace bound during the successful new/load/resume.
 	Cwd string
+	// Prompt is the exact read-only content sent to the native peer, including any attached instructions.
+	Prompt []acp.ContentBlock
 }
 
 // PromptJournalReceipt identifies the matched native prompt response, when available.
@@ -115,12 +129,16 @@ type PromptJournalReceipt struct {
 	StopReason *acp.StopReason
 	// NativeTurnID comes from the provider-specific evidence in that result.
 	NativeTurnID string
+	// UsageReported indicates the matched native response actually included usage counters.
+	UsageReported bool
 }
 
 // PromptJournalEvidence supplements a matched invocation using native persisted facts.
 type PromptJournalEvidence struct {
 	// NativeTurnID identifies a started native turn when the journal proves it.
 	NativeTurnID string
+	// ForkPosition names the exact durably persisted terminal boundary.
+	ForkPosition string
 	// UnverifiedTerminal marks a native response contradicted by missing journal evidence.
 	UnverifiedTerminal bool
 	// Failure describes a proven main-agent failure using safe fields.
@@ -143,6 +161,8 @@ const (
 type LegacyModelBehavior struct {
 	// ConfirmsValue identifies versions whose successful setter applies the selected value.
 	ConfirmsValue func(string) bool
+	// ResetsUsageCounter means a confirmed write replaces the process-local usage counter.
+	ResetsUsageCounter bool
 	// OpeningValueIsNoop identifies setters that still compare against the opening value.
 	OpeningValueIsNoop bool
 	// AppliedOnError identifies an exact persistence failure after the mutation.

@@ -204,7 +204,7 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 	}
 	var settleJournal func(context.Context, PromptJournalReceipt) PromptJournalEvidence
 	if capture := c.opts.Protocol.CapturePromptJournal; capture != nil {
-		scope := PromptJournalScope{Version: c.verifiedNativeVersion(), SessionID: t.session.id, Cwd: t.session.cwd}
+		scope := PromptJournalScope{Version: c.verifiedNativeVersion(), SessionID: t.session.id, Cwd: t.session.cwd, Prompt: request.Prompt}
 		if c.initialized.AgentInfo == nil {
 			scope.LauncherVersion = c.version
 		}
@@ -266,6 +266,7 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		var receipt PromptJournalReceipt
 		if r.ResultValid && knownStopReason(r.Result.StopReason) {
 			receipt.StopReason = &r.Result.StopReason
+			receipt.UsageReported = r.Result.Usage != nil && r.Result.Usage.Output != nil
 			c.mu.Lock()
 			if t.outcome != nil && t.outcome.Turn.NativeTurnID != nil {
 				receipt.NativeTurnID = *t.outcome.Turn.NativeTurnID
@@ -288,6 +289,9 @@ func (c *Client) runPrompt(t *turn, request acp.PromptRequest, options agentclie
 		t.outcome.Turn.NativeTurnID = &journal.NativeTurnID
 	}
 	if t.outcome != nil {
+		if journal.ForkPosition != "" && !journal.UnverifiedTerminal && journal.Failure == nil && t.outcome.NativeFailure == nil {
+			t.outcome.ForkPosition = journal.ForkPosition
+		}
 		if journal.UnverifiedTerminal && t.outcome.NativeFailure == nil {
 			t.outcome.StopReason, t.outcome.Turn.Status = nil, ""
 			t.outcome.Unavailable = append(t.outcome.Unavailable, "turn.terminal")

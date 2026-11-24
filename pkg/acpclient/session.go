@@ -238,6 +238,11 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 	p.session.mcpDirectory = mcpDirectory
 	c.mu.Lock()
 	p.previous = c.sessions[request.id]
+	if p.previous == nil && request.method != acp.AgentMethodSessionNew {
+		if fresh := c.opts.Protocol.FreshUsageOnRestore; fresh != nil {
+			p.session.usage.fresh = fresh(*c.initialized)
+		}
+	}
 	for _, server := range request.servers {
 		if server.Acp != nil {
 			p.session.mcpIDs = append(p.session.mcpIDs, acp.UnstableMcpServerAcpId(server.Acp.Id))
@@ -278,6 +283,46 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 			return acp.NewSessionResponse{}, err
 		}
 	}
+	var forkChild acp.SessionId
+	if request.method == acp.AgentMethodSessionFork && c.nativeFork {
+		forkRequest := request.params.(acp.UnstableForkSessionRequest)
+		child, err := c.opts.Protocol.ForkNativeSession(op, c, forkRequest)
+		if !c.validRestoreID(child) || child == request.source {
+			return acp.NewSessionResponse{}, errors.Join(err, acpmeta.ErrForkUnconfirmed)
+		}
+		c.mu.Lock()
+		_, childAlreadyBound := c.sessions[child]
+		c.mu.Unlock()
+		if childAlreadyBound {
+			return acp.NewSessionResponse{}, acpmeta.ErrForkUnconfirmed
+		}
+		// Keep the durable child receipt even if attaching ACP fails or is interrupted.
+		forkChild = child
+		if request.afterBind != nil {
+			receiptErr := request.afterBind(child)
+			if receiptErr != nil {
+				return acp.NewSessionResponse{SessionId: child}, errors.Join(err, receiptErr)
+			}
+			request.afterBind = nil
+		}
+		if err != nil {
+			return acp.NewSessionResponse{SessionId: child}, err
+		}
+		c.mu.Lock()
+		p.session.id = child
+		c.mu.Unlock()
+		request.method, request.id = acp.AgentMethodSessionResume, child
+		resume := acp.ResumeSessionRequest{
+			SessionId: child, Cwd: request.cwd, AdditionalDirectories: request.roots,
+			McpServers: request.servers, Meta: copyMeta(forkRequest.Meta),
+		}
+		delete(resume.Meta, "sourceCwd")
+		delete(resume.Meta, "forkPosition")
+		if resume.McpServers == nil {
+			resume.McpServers = []acp.McpServer{}
+		}
+		request.params = resume
+	}
 	restore := func() acp.RequestReceipt[setupResult] {
 		return acp.SendClientRequestWithReceipt[setupResult](conn, op, request.method, request.params,
 			boundedWrite(op, conn, func() error {
@@ -306,7 +351,7 @@ func (c *Client) open(ctx context.Context, request setupRequest) (acp.NewSession
 		modeErr = c.applyOpeningMode(op, conn, p, c.opts.Protocol.OpeningMode)
 	}
 	c.mu.Lock()
-	response := acp.NewSessionResponse{}
+	response := acp.NewSessionResponse{SessionId: forkChild}
 	if p.matched {
 		response.SessionId = p.session.id
 		modes, _ := c.sessionModeState(p.session)
@@ -386,7 +431,7 @@ func (c *Client) bindOpening(p *opening, r acp.RequestReceipt[setupResult]) {
 			p.err = errors.New("ACP agent restore returned a different native session")
 			return
 		}
-		if p.replay && c.opts.Protocol.RequireLoadEvidence && id == "" && !p.restoredHistory {
+		if p.replay && !p.restoredHistory && (c.opts.Protocol.RequireLoadHistory || c.opts.Protocol.RequireLoadEvidence && id == "") {
 			p.err = &acp.RequestError{Code: -32603, Message: "ACP agent did not verify restored history",
 				Data: map[string]any{"method": acp.AgentMethodSessionLoad, "classification": "session_restore_unverified"}}
 			return
@@ -584,7 +629,7 @@ func hasMode(state *acp.SessionModeState, id acp.SessionModeId) bool {
 }
 
 func openingModeMatches(state *acp.SessionModeState, id acp.SessionModeId) bool {
-	return state == nil && id == "default" || state != nil && state.CurrentModeId == id
+	return state == nil && id == "default" || hasMode(state, id) && state.CurrentModeId == id
 }
 
 func (c *Client) applyOpeningMode(ctx context.Context, conn *acp.ClientSideConnection, p *opening, id acp.SessionModeId) error {

@@ -383,6 +383,9 @@ func (c *Client) setConfig(ctx context.Context, conn *acp.ClientSideConnection, 
 	if processWide {
 		c.processModel = wanted.value
 	}
+	if knownLegacy && legacyBehavior.ResetsUsageCounter {
+		s.usage = usageCounter{fresh: true}
+	}
 	options := s.config.options
 	c.mu.Unlock()
 	meta := copyMeta(r.Result.Meta)
@@ -449,7 +452,8 @@ func (c *Client) freezeSettings(config configuration) []setting {
 		if config.currentAt[id] == 0 || model != nil && model.Id == id {
 			continue
 		}
-		if selectOption := option.Select; selectOption != nil && c.executionCategory(selectOption.Category) && selectOption.CurrentValue != "" {
+		if selectOption := option.Select; selectOption != nil && c.executionCategory(selectOption.Category) &&
+			(selectOption.CurrentValue != "" || hasChoice(selectOption, "")) {
 			plan = append(plan, setting{id: id, value: selectOption.CurrentValue})
 		}
 		if boolean := option.Boolean; boolean != nil && c.executionCategory(boolean.Category) {
