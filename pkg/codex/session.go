@@ -30,6 +30,8 @@ const (
 
 // OpenSettings carries native thread overrides.
 type OpenSettings struct {
+	// Ephemeral requires a new thread whose history is not persisted by Codex.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 	// Mode sets the native permission policy from the moment the thread opens.
 	Mode string `json:"mode,omitempty"`
 	// Model is the exact requested model ID, or nil to inherit.
@@ -212,6 +214,9 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 	if err != nil {
 		return acp.NewSessionResponse{}, err
 	}
+	if intent.Ephemeral && method != "thread/start" {
+		return acp.NewSessionResponse{}, acp.NewInvalidParams("ephemeral is supported only when starting a new thread")
+	}
 	instructions, err := acpmeta.DeveloperInstructions(input.meta)
 	if err != nil {
 		return acp.NewSessionResponse{}, acp.NewInvalidParams(err.Error())
@@ -274,6 +279,9 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 	params := map[string]any{"cwd": input.cwd, "config": config, "approvalPolicy": approval, "sandbox": sandbox}
 	if instructions != nil {
 		params["developerInstructions"] = *instructions
+	}
+	if intent.Ephemeral {
+		params["ephemeral"] = true
 	}
 	if intent.Model != nil {
 		params["model"] = *intent.Model
@@ -354,7 +362,9 @@ func (c *Client) open(ctx context.Context, method string, input openInput, repla
 				s.admittedModel = opened.Model
 			}
 			s.observe(strings.ReplaceAll(method, "/", "_"), opened.Model, opened.Effort, opened.Tier)
-			if opened.Cwd != "" && filepath.Clean(opened.Cwd) != input.cwd {
+			if intent.Ephemeral && !opened.Thread.Ephemeral {
+				captureErr = errors.New("Codex did not confirm an ephemeral thread")
+			} else if opened.Cwd != "" && filepath.Clean(opened.Cwd) != input.cwd {
 				captureErr = errors.New("Codex opened an unexpected working directory")
 			}
 		})
